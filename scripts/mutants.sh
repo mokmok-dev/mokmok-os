@@ -9,10 +9,14 @@ cd "$(dirname "$0")/.."
 # gate's own sensitivity can be demonstrated without editing it.
 readonly TARGET="${MUTANTS_TARGET:-95}"
 
+# The scored member. Overridable so the one gate serves every package; the default is the package
+# it was written for, so an existing invocation keeps scoring the same crate.
+readonly PACKAGE="${MUTANTS_PACKAGE:-mokmok-event-bus}"
+
 # Extra arguments pass through, so `./scripts/mutants.sh --list` shows what would run and
 # `--shard 1/4` splits a long run.
 status=0
-cargo mutants --package mokmok-event-bus "$@" || status=$?
+cargo mutants --package "$PACKAGE" "$@" || status=$?
 
 if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
   echo "cargo mutants failed with status $status" >&2
