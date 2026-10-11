@@ -1,5 +1,10 @@
 [workspace]
-members = ["mokmok-event-bus", "mokmok-protocol", "mokmok-sandbox"]
+members = [
+  "mokmok-event-bus",
+  "mokmok-protocol",
+  "mokmok-sandbox",
+  "mokmok-state-machine",
+]
 resolver = "3"
 
 [workspace.dependencies]
@@ -14,6 +19,7 @@ nix = { version = "0.30", default-features = false, features = [
   "signal",
 ] }
 proptest = "1.12.0"
+proptest-state-machine = "0.9.0"
 rusqlite = { version = "0.40.2", default-features = false }
 serde = { version = "1.0.229", default-features = false }
 serde_json = "1.0.151"
