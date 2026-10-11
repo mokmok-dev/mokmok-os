@@ -1,12 +1,20 @@
+mod marker;
+
+pub use marker::*;
+
+mod private {
+    pub trait Sealed {}
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(transparent)]
-pub struct ID<M> {
+pub struct ID<M: private::Sealed> {
     value: uuid::Uuid,
     #[serde(skip)]
     _marker: core::marker::PhantomData<M>,
 }
 
-impl<M> ID<M> {
+impl<M: private::Sealed> ID<M> {
     #[must_use]
     pub fn new(ts: uuid::timestamp::Timestamp) -> Self {
         Self {
@@ -25,6 +33,8 @@ mod tests {
 
     #[derive(Debug, serde::Deserialize, serde::Serialize)]
     struct Marker;
+
+    impl super::private::Sealed for Marker {}
 
     /// The highest whole second that keeps a version 7 UUID's millisecond
     /// timestamp inside its 48-bit field for every sub-second value.
