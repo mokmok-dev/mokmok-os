@@ -89,7 +89,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] when the file cannot be created, opened, or read.
+    /// Returns an [`Error`] when the file cannot be created, opened, or read. Creating the schema
+    /// needs the write lock, so a process that opens a file another process is writing answers
+    /// [`Error::Query`] over `SQLITE_BUSY` once the five-second wait is spent. Nothing was created,
+    /// so the caller may retry.
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(parent) = path
             .parent()
@@ -132,6 +135,9 @@ impl Store {
     /// `commit` must come from this store's log. A commit from another file whose position happens
     /// to exist here is accepted, and the inbox and checkpoint then name an unrelated commit.
     ///
+    /// A rollback the database performs inside the closure leaves none of the store's own rows
+    /// behind, and the caller may retry.
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] when the caller's write or the bookkeeping cannot be committed.
@@ -149,8 +155,11 @@ impl Store {
         }
 
         let value = apply(&WriteTx::new(&transaction))?;
+        live(&transaction)?;
         insert_inbox(&transaction, consumer, commit.position())?;
+        live(&transaction)?;
         advance_checkpoint(&transaction, consumer, commit.position())?;
+        live(&transaction)?;
         transaction.commit().map_err(Error::Query)?;
 
         Ok(Processed::Applied(value))
@@ -317,12 +326,24 @@ fn prepare(connection: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// SQLite can end a whole transaction from inside a statement: a `RAISE(ROLLBACK)` in a trigger, or
+/// the I/O error it answers by rolling back. A statement issued after that runs in autocommit and
+/// commits on its own, so the inbox row or the checkpoint would survive without the work it names.
+fn live(connection: &Connection) -> Result<(), Error> {
+    if connection.is_autocommit() {
+        return Err(Error::Aborted);
+    }
+
+    Ok(())
+}
+
 /// Runs the append program inside a savepoint, so an error cannot leave a half-written append in
 /// whatever transaction the caller owns.
 pub fn append_in(
     connection: &Connection,
     append: &Append,
 ) -> Result<Outcome, Error> {
+    live(connection)?;
     connection
         .execute_batch("SAVEPOINT append;")
         .map_err(Error::Query)?;
@@ -336,8 +357,11 @@ pub fn append_in(
         },
         Err(error) => {
             // A caller that drops this error still commits, so the transaction must not carry a
-            // half-written append out of here.
-            let _ = connection.execute_batch("ROLLBACK TO append; RELEASE append;");
+            // half-written append out of here. There is no savepoint to roll back to once the
+            // database has ended the transaction, so the cleanup runs only while it still exists.
+            if !connection.is_autocommit() {
+                let _ = connection.execute_batch("ROLLBACK TO append; RELEASE append;");
+            }
             Err(error)
         },
     }
@@ -751,6 +775,7 @@ pub fn put_projection_in(
     payload: &Payload,
     position: CommitPosition,
 ) -> Result<(), Error> {
+    live(connection)?;
     connection
         .execute(
             "INSERT INTO projection (consumer, key, payload, position) VALUES (?1, ?2, ?3, ?4)

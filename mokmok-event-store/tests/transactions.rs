@@ -213,6 +213,177 @@ mod tests {
     }
 
     #[test]
+    fn a_rollback_triggered_inside_the_closure_leaves_no_bookkeeping() {
+        let scratch = Scratch::new("rollback-closure");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let outer = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON event
+             WHEN NEW.ordinal = 1
+             BEGIN SELECT RAISE(ROLLBACK, 'x'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let inner = append(CommandId::new(), stream, Expected::At(Version::new(1)), 2);
+        let result = store.consume(consumer, &outer, |tx| {
+            tx.put_projection(
+                consumer,
+                "turn",
+                outer.events()[0].payload(),
+                outer.position(),
+            )?;
+            let _ = tx.append(&inner);
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(Error::Aborted)),
+            "the ended transaction is refused: {result:?}",
+        );
+
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM inbox"),
+            0,
+            "no inbox row"
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM checkpoint"),
+            0,
+            "no checkpoint",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM projection"),
+            0,
+            "no projection",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM commit_log"),
+            1,
+            "only the outer commit",
+        );
+
+        raw.execute_batch("DROP TRIGGER boom;").unwrap();
+        let retried = store
+            .consume(consumer, &outer, |tx| {
+                tx.put_projection(
+                    consumer,
+                    "turn",
+                    outer.events()[0].payload(),
+                    outer.position(),
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(retried, Processed::Applied(())),
+            "the retry applies: {retried:?}",
+        );
+        assert_eq!(number(&raw, "SELECT COUNT(*) FROM inbox"), 1);
+        assert_eq!(number(&raw, "SELECT COUNT(*) FROM checkpoint"), 1);
+        assert_eq!(number(&raw, "SELECT COUNT(*) FROM projection"), 1);
+    }
+
+    #[test]
+    fn an_append_after_a_triggered_rollback_is_refused() {
+        let scratch = Scratch::new("append-after-rollback");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let outer = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON event
+             WHEN NEW.ordinal = 0
+             BEGIN SELECT RAISE(ROLLBACK, 'x'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let first = append(CommandId::new(), stream, Expected::At(outer.version()), 1);
+        let second = append(CommandId::new(), stream, Expected::At(outer.version()), 1);
+        let result = store.consume(consumer, &outer, |tx| {
+            let _ = tx.append(&first);
+            tx.append(&second)
+        });
+        assert!(
+            matches!(result, Err(Error::Aborted)),
+            "the append into the ended transaction is refused: {result:?}",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM commit_log"),
+            1,
+            "the rolled-back append left no commit row",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM inbox"),
+            0,
+            "the refused consume left no inbox row",
+        );
+
+        raw.execute_batch("DROP TRIGGER boom;").unwrap();
+        let retried = store
+            .append(&append(
+                CommandId::new(),
+                stream,
+                Expected::At(outer.version()),
+                1,
+            ))
+            .unwrap();
+        let Outcome::Committed(retried) = retried else {
+            panic!("the retry did not commit: {retried:?}");
+        };
+        assert_eq!(retried.version(), Version::new(2));
+    }
+
+    #[test]
+    fn a_projection_written_after_a_rollback_is_refused() {
+        let scratch = Scratch::new("projection-after-rollback");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let seeded = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON event
+             WHEN NEW.ordinal = 1
+             BEGIN SELECT RAISE(ROLLBACK, 'x'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let inner = append(CommandId::new(), stream, Expected::At(seeded.version()), 2);
+        let result = store.consume(consumer, &seeded, |tx| {
+            let _ = tx.append(&inner);
+            tx.put_projection(
+                consumer,
+                "turn",
+                seeded.events()[0].payload(),
+                seeded.position(),
+            )
+        });
+        assert!(
+            matches!(result, Err(Error::Aborted)),
+            "the second write is refused: {result:?}",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM projection"),
+            0,
+            "the projection never landed",
+        );
+    }
+
+    #[test]
     fn a_dropped_inner_append_error_does_not_leave_a_torn_commit() {
         let scratch = Scratch::new("torn-append");
         let stream = StreamId::new();

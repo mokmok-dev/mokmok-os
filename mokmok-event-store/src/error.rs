@@ -10,4 +10,6 @@ pub enum Error {
     Schema { found: i64 },
     #[error("the event store holds a value this version cannot read: {what}")]
     Corrupt { what: &'static str },
+    #[error("the database ended the transaction while the event store was working on it")]
+    Aborted,
 }
