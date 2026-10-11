@@ -340,10 +340,14 @@ async fn handle(
                 },
                 Phase::Publisher { topic },
             )),
-            Err(reason) => Ok((
-                wire::Response::Refused { reason },
-                Phase::Publisher { topic },
-            )),
+            Err(reason) => {
+                tracing::warn!(%reason, "refused a publish");
+
+                Ok((
+                    wire::Response::Refused { reason },
+                    Phase::Publisher { topic },
+                ))
+            },
         },
         (
             Phase::Opened {
@@ -356,10 +360,14 @@ async fn handle(
                 wire::Response::from(batch),
                 Phase::Subscriber { entry, ticks },
             )),
-            Err(reason) => Ok((
-                wire::Response::Refused { reason },
-                Phase::Subscriber { entry, ticks },
-            )),
+            Err(reason) => {
+                tracing::warn!(%reason, "refused a pull");
+
+                Ok((
+                    wire::Response::Refused { reason },
+                    Phase::Subscriber { entry, ticks },
+                ))
+            },
         },
         _ => Err(PROTOCOL_ERROR),
     }

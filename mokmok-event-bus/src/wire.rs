@@ -263,7 +263,7 @@ impl<'de> serde::Deserialize<'de> for Response {
                         "at" => parts.at = Some(map.next_value()?),
                         "lapsed" => {
                             parts.lapsed_present = true;
-                            parts.lapsed = Some(map.next_value()?);
+                            parts.lapsed = map.next_value::<Option<Lapsed>>()?;
                         },
                         "events" => parts.events = Some(map.next_value()?),
                         "reason" => parts.reason = Some(map.next_value()?),

@@ -5,7 +5,6 @@ use std::path::Path;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use tokio::net::UnixStream;
-
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -47,14 +46,9 @@ impl Publisher {
         socket: &Path,
         topic: Topic,
     ) -> Result<Self, Error> {
-        let mut stream = connect(socket).await?;
-
-        match exchange(&mut stream, &Request::Open { topic }).await? {
-            Some(Response::Opened { .. }) => Ok(Self { stream }),
-            Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
-            Some(_) => Err(Error::Protocol(UNEXPECTED)),
-            None => Err(Error::Closed),
-        }
+        Ok(Self {
+            stream: open(socket, topic).await?,
+        })
     }
 
     /// Appends `payload` and returns once the bus has stored it.
@@ -91,17 +85,10 @@ impl Subscriber {
         topic: Topic,
         at: Position,
     ) -> Result<Self, Error> {
-        let mut stream = connect(socket).await?;
-
-        match exchange(&mut stream, &Request::Open { topic }).await? {
-            Some(Response::Opened { .. }) => Ok(Self {
-                stream,
-                position: at,
-            }),
-            Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
-            Some(_) => Err(Error::Protocol(UNEXPECTED)),
-            None => Err(Error::Closed),
-        }
+        Ok(Self {
+            stream: open(socket, topic).await?,
+            position: at,
+        })
     }
 
     /// Reads the next delivery, waiting for one while the log has nothing newer to hand over.
@@ -157,6 +144,29 @@ async fn connect(socket: &Path) -> Result<WebSocketStream<UnixStream>, Error> {
         .map_err(|error| Error::Transport(Box::new(error)))?;
 
     Ok(stream)
+}
+
+/// Opens a session and names its topic. The bus refuses a connection at its ceiling before it
+/// reads anything, so a failed write is not fatal here: the refusal may already be waiting, and
+/// dropping it would turn a typed refusal into a broken pipe.
+async fn open(
+    socket: &Path,
+    topic: Topic,
+) -> Result<WebSocketStream<UnixStream>, Error> {
+    let mut stream = connect(socket).await?;
+    let written = send(&mut stream, &Request::Open { topic }).await;
+
+    let answered = match receive(&mut stream).await {
+        Ok(answered) => answered,
+        Err(error) => return Err(written.err().unwrap_or(error)),
+    };
+
+    match answered {
+        Some(Response::Opened { .. }) => Ok(stream),
+        Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
+        Some(_) => Err(Error::Protocol(UNEXPECTED)),
+        None => Err(Error::Closed),
+    }
 }
 
 async fn exchange(

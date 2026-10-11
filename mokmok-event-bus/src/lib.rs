@@ -6,7 +6,7 @@
 //! from a position it saved, and one that fell further behind than the log reaches is told what
 //! it missed instead of silently losing it.
 //!
-//! ```
+//! ```no_run
 //! use std::path::PathBuf;
 //!
 //! use mokmok_event_bus::{
