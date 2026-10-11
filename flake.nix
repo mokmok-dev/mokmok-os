@@ -74,6 +74,7 @@
                     src
                     cargoArtifacts
                     ;
+                  cargoNextestExtraArgs = "--no-tests=pass";
                 }
               );
             };
