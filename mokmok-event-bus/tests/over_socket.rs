@@ -1,11 +1,11 @@
 use mokmok_event_bus::{
-    Batch, Config, Error, Limits, Payload, Position, Publisher, Refusal, Retention, ServeError,
-    Subscriber, Timeouts, Topic, serve,
+    Batch, Config, Cursor, Error, Limits, Payload, Publisher, Refusal, Retention, Seq, ServeError,
+    Subscriber, SubscriberId, Timeouts, Topic, serve,
 };
 use mokmok_protocol::AgentID;
 use serde::Serialize;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -31,20 +31,36 @@ mod tests {
     /// instead of hanging the suite.
     const BOUND: Duration = Duration::from_secs(3);
 
-    fn socket_path() -> PathBuf {
-        let name = format!(
-            "mokmok-bus-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-        );
+    fn unique(name: &str) -> PathBuf {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
 
-        std::env::temp_dir().join(name)
+        std::env::temp_dir().join(format!("mokmok-{name}-{}-{id}", std::process::id()))
     }
 
+    fn socket_path() -> PathBuf {
+        unique("bus")
+    }
+
+    fn store_path() -> PathBuf {
+        unique("store")
+    }
+
+    /// A fresh socket and store per call, so no two tests share a database.
     fn config() -> Config {
+        config_with(store_path())
+    }
+
+    fn config_with(store: PathBuf) -> Config {
         Config {
             path: socket_path(),
+            store,
             ..Config::default()
+        }
+    }
+
+    fn remove_store(store: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", store.display()));
         }
     }
 
@@ -84,7 +100,7 @@ mod tests {
         }
     }
 
-    async fn connect(path: &std::path::Path) -> tokio_tungstenite::WebSocketStream<UnixStream> {
+    async fn connect(path: &Path) -> tokio_tungstenite::WebSocketStream<UnixStream> {
         let stream = within("connect", UnixStream::connect(path)).await.unwrap();
         let (peer, _) = within("upgrade", tokio_tungstenite::client_async(URL, stream))
             .await
@@ -173,6 +189,7 @@ mod tests {
 
     struct Bus {
         path: PathBuf,
+        store: PathBuf,
         stop: Option<oneshot::Sender<()>>,
         serving: Option<JoinHandle<Result<(), ServeError>>>,
     }
@@ -180,12 +197,14 @@ mod tests {
     impl Bus {
         async fn start(config: Config) -> Self {
             let path = config.path.clone();
+            let store = config.store.clone();
             let (stop, stopped) = oneshot::channel();
             let serving = tokio::spawn(serve(config, async move {
                 let _ = stopped.await;
             }));
             let bus = Self {
                 path,
+                store,
                 stop: Some(stop),
                 serving: Some(serving),
             };
@@ -224,6 +243,7 @@ mod tests {
                 serving.abort();
             }
 
+            remove_store(&self.store);
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -234,7 +254,7 @@ mod tests {
         let topic = agent_topic();
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, topic, Position::Beginning),
+            Subscriber::open(&bus.path, topic, SubscriberId::new()),
         )
         .await
         .unwrap();
@@ -262,13 +282,13 @@ mod tests {
         let bus = Bus::start(config()).await;
         let mut first = within(
             "first subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
+            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
         let mut second = within(
             "second subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
+            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
@@ -308,17 +328,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_subscriber_that_reconnects_resumes_from_its_position() {
-        let bus = Bus::start(config()).await;
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
+    async fn an_event_survives_a_bus_restart() {
+        let store = store_path();
+        let topic = Topic::Global;
+        let mut first = Bus::start(config_with(store.clone())).await;
+
+        let mut publisher = within("open", Publisher::open(&first.path, topic))
             .await
             .unwrap();
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
+        let receipt = within("publish", publisher.publish(payload(&"durable")))
+            .await
+            .unwrap();
+        drop(publisher);
+        first.shutdown().await.unwrap();
+
+        let second = Bus::start(config_with(store.clone())).await;
+        let mut resumed = within(
+            "resume",
+            Subscriber::open(&second.path, topic, SubscriberId::new()),
         )
         .await
         .unwrap();
+        let batch = within("next", resumed.next()).await.unwrap();
+
+        assert_eq!(batch.events().len(), 1);
+        assert_eq!(batch.events()[0].id(), receipt.id());
+        assert_eq!(payloads(&batch), [r#""durable""#]);
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_replays_events_that_were_not_acked() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
 
         within("first publish", publisher.publish(payload(&"first")))
             .await
@@ -327,45 +372,310 @@ mod tests {
             .await
             .unwrap();
 
-        let first = within("first next", subscriber.next()).await.unwrap();
-        assert_eq!(payloads(&first), [r#""first""#, r#""second""#]);
-
-        let saved = subscriber.position();
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let first = within("next", subscriber.next()).await.unwrap();
+        assert_eq!(seqs(&first), [0, 1]);
         drop(subscriber);
 
         within("third publish", publisher.publish(payload(&"third")))
             .await
             .unwrap();
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, Topic::Global, saved))
+        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
             .await
             .unwrap();
-        let third = within("resumed next", resumed.next()).await.unwrap();
+        let replayed = within("replayed next", resumed.next()).await.unwrap();
 
-        assert_eq!(payloads(&third), [r#""third""#]);
-        assert_eq!(seqs(&third), [2]);
+        assert_eq!(
+            seqs(&replayed),
+            [0, 1, 2],
+            "an un-acked batch is replayed even when newer events exist",
+        );
     }
 
     #[tokio::test]
-    async fn a_subscriber_that_fell_behind_learns_what_it_missed() {
+    async fn a_replayed_event_carries_the_same_id() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+        within("publish", publisher.publish(payload(&1)))
+            .await
+            .unwrap();
+
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let first = within("next", subscriber.next()).await.unwrap();
+        let original = first.events()[0].id();
+        drop(subscriber);
+
+        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let replayed = within("replayed next", resumed.next()).await.unwrap();
+
+        assert_eq!(
+            replayed.events()[0].id(),
+            original,
+            "a duplicate must carry the same id so the consumer can deduplicate",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_consumer_is_handed_at_most_in_flight_events() {
         let bus = Bus::start(Config {
-            path: socket_path(),
+            limits: Limits {
+                in_flight: NonZeroUsize::new(2).unwrap(),
+                ..Limits::default()
+            },
+            ..config()
+        })
+        .await;
+        let topic = Topic::Global;
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+        for turn in 0..10 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
+
+        let mut subscriber = within(
+            "subscribe",
+            Subscriber::open(&bus.path, topic, SubscriberId::new()),
+        )
+        .await
+        .unwrap();
+        let first = within("first next", subscriber.next()).await.unwrap();
+
+        assert_eq!(
+            seqs(&first),
+            [0, 1],
+            "a batch stops at the in-flight ceiling",
+        );
+
+        let parked = tokio::time::timeout(Duration::from_millis(300), subscriber.next()).await;
+        assert!(
+            parked.is_err(),
+            "a spent credit parks instead of answering an empty batch",
+        );
+
+        within("ack", subscriber.ack(first.after())).await.unwrap();
+        let freed = within("freed next", subscriber.next()).await.unwrap();
+
+        assert_eq!(seqs(&freed), [2, 3]);
+    }
+
+    #[tokio::test]
+    async fn an_ack_advances_the_checkpoint_so_it_is_not_replayed() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+        for turn in 0..3 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
+
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let batch = within("next", subscriber.next()).await.unwrap();
+        assert_eq!(seqs(&batch), [0, 1, 2]);
+        within("ack", subscriber.ack(batch.after())).await.unwrap();
+        drop(subscriber);
+
+        within("later publish", publisher.publish(payload(&3)))
+            .await
+            .unwrap();
+
+        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let next = within("next after ack", resumed.next()).await.unwrap();
+
+        assert_eq!(seqs(&next), [3], "the acked batch is not replayed");
+    }
+
+    #[tokio::test]
+    async fn an_ack_answers_alone_so_the_pull_after_it_reads_the_next_event() {
+        let bus = Bus::start(Config {
+            limits: Limits {
+                in_flight: NonZeroUsize::new(3).unwrap(),
+                ..Limits::default()
+            },
+            ..config()
+        })
+        .await;
+        let topic = Topic::Global;
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+        for turn in 0..3 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
+
+        let mut subscriber = within(
+            "subscribe",
+            Subscriber::open(&bus.path, topic, SubscriberId::new()),
+        )
+        .await
+        .unwrap();
+        let first = within("first next", subscriber.next()).await.unwrap();
+        assert_eq!(seqs(&first), [0, 1, 2]);
+
+        // Spending the credit parks the next pull, which is where an ack resumes from.
+        let parked = tokio::time::timeout(Duration::from_millis(300), subscriber.next()).await;
+        assert!(parked.is_err(), "a spent credit parks");
+
+        within("fourth publish", publisher.publish(payload(&3)))
+            .await
+            .unwrap();
+        within("ack", subscriber.ack(first.after())).await.unwrap();
+
+        let second = within("second next", subscriber.next()).await.unwrap();
+        assert_eq!(
+            seqs(&second),
+            [3],
+            "a frame the ack left behind would be read as this pull's answer",
+        );
+
+        within("fifth publish", publisher.publish(payload(&4)))
+            .await
+            .unwrap();
+        within("second ack", subscriber.ack(second.after()))
+            .await
+            .unwrap();
+
+        let third = within("third next", subscriber.next()).await.unwrap();
+
+        assert_eq!(seqs(&third), [4]);
+    }
+
+    #[tokio::test]
+    async fn an_ack_past_what_was_delivered_does_not_advance_the_checkpoint() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+        for turn in 0..2 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
+
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let batch = within("next", subscriber.next()).await.unwrap();
+        let epoch = batch.window().epoch();
+        within("ack", subscriber.ack(batch.after())).await.unwrap();
+
+        // The checkpoint is at two; an ack that names ninety-nine must not move it there.
+        within("over-ack", subscriber.ack(Cursor::new(epoch, Seq::new(99))))
+            .await
+            .unwrap();
+        drop(subscriber);
+
+        within("later publish", publisher.publish(payload(&2)))
+            .await
+            .unwrap();
+
+        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let next = within("next after over-ack", resumed.next()).await.unwrap();
+
+        assert_eq!(
+            seqs(&next),
+            [2],
+            "the checkpoint stayed where the ack left it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_from_a_stale_epoch_does_not_advance_the_checkpoint() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+        for turn in 0..2 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
+
+        // A second topic mints its own epoch, which is a foreign one for the first.
+        let mut other = within("other open", Publisher::open(&bus.path, agent_topic()))
+            .await
+            .unwrap();
+        within("other publish", other.publish(payload(&9)))
+            .await
+            .unwrap();
+        let mut other_sub = within(
+            "other subscribe",
+            Subscriber::open(&bus.path, agent_topic(), SubscriberId::new()),
+        )
+        .await
+        .unwrap();
+        let other_batch = within("other next", other_sub.next()).await.unwrap();
+
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let batch = within("next", subscriber.next()).await.unwrap();
+        assert_ne!(batch.window().epoch(), other_batch.window().epoch());
+
+        within(
+            "stale ack",
+            subscriber.ack(Cursor::new(other_batch.window().epoch(), Seq::new(1))),
+        )
+        .await
+        .unwrap();
+        drop(subscriber);
+
+        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let replayed = within("replayed next", resumed.next()).await.unwrap();
+
+        assert_eq!(
+            seqs(&replayed),
+            [0, 1],
+            "a stale-epoch ack must not move the checkpoint",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_older_than_retention_gets_lapsed() {
+        let bus = Bus::start(Config {
             retention: Retention {
                 events: NonZeroUsize::new(2).unwrap(),
                 ..Retention::default()
             },
-            ..Config::default()
+            ..config()
         })
         .await;
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
             .await
             .unwrap();
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
-        )
-        .await
-        .unwrap();
 
         within("first publish", publisher.publish(payload(&0)))
             .await
@@ -373,8 +683,14 @@ mod tests {
         within("second publish", publisher.publish(payload(&1)))
             .await
             .unwrap();
+
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
         let first = within("first next", subscriber.next()).await.unwrap();
         assert_eq!(seqs(&first), [0, 1]);
+        within("ack", subscriber.ack(first.after())).await.unwrap();
+        drop(subscriber);
 
         for turn in 2..6 {
             within("publish", publisher.publish(payload(&turn)))
@@ -382,7 +698,10 @@ mod tests {
                 .unwrap();
         }
 
-        let behind = within("behind next", subscriber.next()).await.unwrap();
+        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let behind = within("behind next", resumed.next()).await.unwrap();
 
         let lapsed = behind.lapsed().unwrap();
         assert_eq!(lapsed.held().seq().get(), 2);
@@ -392,58 +711,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cursor_from_a_previous_epoch_is_unresumable() {
-        let config = config();
-        let path = config.path.clone();
-        let mut first = Bus::start(config).await;
-        let mut publisher = within("open", Publisher::open(&path, Topic::Global))
+    async fn a_checkpoint_from_a_reclaimed_topic_gets_lapsed() {
+        let bus = Bus::start(Config {
+            limits: Limits {
+                topics: NonZeroUsize::new(1).unwrap(),
+                ..Limits::default()
+            },
+            retention: Retention {
+                idle: Duration::ZERO,
+                ..Retention::default()
+            },
+            ..config()
+        })
+        .await;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
             .await
             .unwrap();
+        for turn in 0..2 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
+
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, Topic::Global, id))
+            .await
+            .unwrap();
+        let batch = within("next", subscriber.next()).await.unwrap();
+        let epoch = batch.window().epoch();
+        within("ack", subscriber.ack(Cursor::new(epoch, Seq::new(1))))
+            .await
+            .unwrap();
+        drop(subscriber);
+        drop(publisher);
+
+        // Only an open at the topic ceiling sweeps, so a second topic forces the reclaim. It is
+        // dropped again so the first topic can be reopened; each retry waits out the old session.
+        let mut forced = None;
+        for _ in 0..100 {
+            if let Ok(opened) = within("force", Publisher::open(&bus.path, agent_topic())).await {
+                forced = Some(opened);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(forced.expect("the second topic was never accepted"));
+
+        let mut reopened = None;
+        for _ in 0..100 {
+            if let Ok(opened) = within("reopen", Publisher::open(&bus.path, Topic::Global)).await {
+                reopened = Some(opened);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut reopened = reopened.expect("the first topic was never reopened");
+        within("reopened publish", reopened.publish(payload(&2)))
+            .await
+            .unwrap();
+
+        let mut resumed = within("resume", Subscriber::open(&bus.path, Topic::Global, id))
+            .await
+            .unwrap();
+        let answered = within("resumed next", resumed.next()).await.unwrap();
+
+        let lapsed = answered
+            .lapsed()
+            .expect("a reclaimed topic must report the hole, not refuse it");
+        assert_eq!(lapsed.held().seq().get(), 1);
+        assert_eq!(lapsed.from().get(), 2);
+        assert_eq!(lapsed.held().epoch(), answered.window().epoch());
+        assert_eq!(seqs(&answered), [2]);
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_from_a_previous_epoch_is_refused_at_open() {
+        let store = store_path();
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut first = Bus::start(config_with(store.clone())).await;
+
+        let mut publisher = within("open", Publisher::open(&first.path, topic))
+            .await
+            .unwrap();
+        within("publish", publisher.publish(payload(&1)))
+            .await
+            .unwrap();
+        let mut subscriber = within("subscribe", Subscriber::open(&first.path, topic, id))
+            .await
+            .unwrap();
+        let batch = within("next", subscriber.next()).await.unwrap();
+        let epoch = batch.window().epoch();
+        within("ack", subscriber.ack(Cursor::new(epoch, Seq::new(1))))
+            .await
+            .unwrap();
+        drop(subscriber);
+        drop(publisher);
+        first.shutdown().await.unwrap();
+
+        // The topic row is replaced while the checkpoint survives, which is the one way the bus
+        // can hold an id whose epoch it cannot account for.
+        let connection = rusqlite::Connection::open(&store).unwrap();
+        connection.execute("DELETE FROM topic", []).unwrap();
+        drop(connection);
+
+        let second = Bus::start(config_with(store.clone())).await;
+        let refused = within("resume", Subscriber::open(&second.path, topic, id)).await;
+
+        assert!(
+            matches!(refused, Err(Error::Refused(Refusal::Unresumable { .. }))),
+            "expected an unresumable subscriber at open, got {:?}",
+            refused.err(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_burst_arrives_in_order_exactly_once() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&path, Topic::Global, Position::Beginning),
+            Subscriber::open(&bus.path, topic, SubscriberId::new()),
         )
         .await
         .unwrap();
 
-        within("publish", publisher.publish(payload(&1)))
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
             .await
             .unwrap();
-        let batch = within("next", subscriber.next()).await.unwrap();
-        assert_eq!(seqs(&batch), [0]);
-        let saved = subscriber.position();
-        drop(subscriber);
-        drop(publisher);
+        for turn in 0..1000 {
+            within("publish", publisher.publish(payload(&turn)))
+                .await
+                .unwrap();
+        }
 
-        first.shutdown().await.unwrap();
-        assert!(!path.exists());
+        let mut seen = Vec::new();
+        while seen.len() < 1000 {
+            let batch = within("burst next", subscriber.next()).await.unwrap();
+            assert!(!batch.is_empty(), "a batch must carry at least one event");
+            let start = seen.len();
+            for (offset, event) in batch.events().iter().enumerate() {
+                assert_eq!(event.seq().get(), (start + offset) as u64);
+                seen.push(event.seq().get());
+            }
+            within("ack", subscriber.ack(batch.after())).await.unwrap();
+        }
 
-        let _second = Bus::start(Config {
-            path: path.clone(),
-            ..Config::default()
-        })
-        .await;
-        let mut resumed = within("resume", Subscriber::open(&path, Topic::Global, saved))
-            .await
-            .unwrap();
-
-        let refusal = within("refusal", resumed.next()).await.unwrap_err();
-
-        assert!(
-            matches!(refusal, Error::Refused(Refusal::Unresumable { .. })),
-            "expected an unresumable cursor, got {refusal:?}",
-        );
+        assert_eq!(seen, (0..1000).collect::<Vec<u64>>());
     }
 
     #[tokio::test]
     async fn the_bus_refuses_a_connection_past_its_ceiling() {
         let bus = Bus::start(Config {
-            path: socket_path(),
             limits: Limits {
                 connections: NonZeroUsize::new(1).unwrap(),
                 ..Limits::default()
             },
-            ..Config::default()
+            ..config()
         })
         .await;
         let _busy = within("busy open", Publisher::open(&bus.path, Topic::Global))
@@ -467,18 +891,17 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_parked_subscriber_frees_its_connection() {
         let bus = Bus::start(Config {
-            path: socket_path(),
             limits: Limits {
                 connections: NonZeroUsize::new(1).unwrap(),
                 ..Limits::default()
             },
-            ..Config::default()
+            ..config()
         })
         .await;
 
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
+            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
@@ -509,7 +932,7 @@ mod tests {
         let bus = Bus::start(config()).await;
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
+            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
@@ -570,12 +993,11 @@ mod tests {
     #[tokio::test]
     async fn a_client_that_closes_its_connection_releases_it() {
         let bus = Bus::start(Config {
-            path: socket_path(),
             limits: Limits {
                 connections: NonZeroUsize::new(1).unwrap(),
                 ..Limits::default()
             },
-            ..Config::default()
+            ..config()
         })
         .await;
 
@@ -607,12 +1029,11 @@ mod tests {
     #[tokio::test]
     async fn a_peer_that_answers_pings_is_kept() {
         let bus = Bus::start(Config {
-            path: socket_path(),
             timeouts: Timeouts {
                 heartbeat: NonZeroU32::new(20).unwrap(),
                 deadline: NonZeroU32::new(300).unwrap(),
             },
-            ..Config::default()
+            ..config()
         })
         .await;
         let mut peer = connect(&bus.path).await;
@@ -681,12 +1102,13 @@ mod tests {
     #[tokio::test]
     async fn a_frame_larger_than_the_limit_is_refused_without_stopping_the_bus() {
         let bus = Bus::start(Config {
-            path: socket_path(),
             limits: Limits {
-                frame_bytes: NonZeroUsize::new(64).unwrap(),
+                // Large enough for an `open` that names a subscriber, small enough that the
+                // oversized payload below is refused.
+                frame_bytes: NonZeroUsize::new(256).unwrap(),
                 ..Limits::default()
             },
-            ..Config::default()
+            ..config()
         })
         .await;
         let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
@@ -708,7 +1130,7 @@ mod tests {
             .unwrap();
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
+            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
@@ -723,86 +1145,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_cursor_from_a_reclaimed_topic_is_unresumable() {
-        let bus = Bus::start(Config {
-            path: socket_path(),
-            limits: Limits {
-                topics: NonZeroUsize::new(1).unwrap(),
-                ..Limits::default()
-            },
-            retention: Retention {
-                idle: Duration::ZERO,
-                ..Retention::default()
-            },
-            ..Config::default()
-        })
-        .await;
-
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
-        within("publish", publisher.publish(payload(&1)))
-            .await
-            .unwrap();
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, Position::Beginning),
-        )
-        .await
-        .unwrap();
-        assert_eq!(seqs(&within("next", subscriber.next()).await.unwrap()), [0]);
-        let saved = subscriber.position();
-        drop(subscriber);
-        drop(publisher);
-
-        // The sweep only reclaims a topic nobody watches, so wait for the session to let go.
-        let mut second = None;
-        for _ in 0..100 {
-            if let Ok(opened) =
-                within("second topic", Publisher::open(&bus.path, agent_topic())).await
-            {
-                second = Some(opened);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let mut second = second.expect("the second topic was never accepted");
-        within("second publish", second.publish(payload(&2)))
-            .await
-            .unwrap();
-        drop(second);
-
-        let mut resumed = within("resume", Subscriber::open(&bus.path, Topic::Global, saved))
-            .await
-            .unwrap();
-        // The reopened log restarts its sequences at zero, so the stale cursor lands inside it.
-        let mut again = within("again open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
-        within("again publish", again.publish(payload(&3)))
-            .await
-            .unwrap();
-        within("again second publish", again.publish(payload(&4)))
-            .await
-            .unwrap();
-
-        let answered = within("resumed next", resumed.next()).await;
-
-        assert!(
-            matches!(answered, Err(Error::Refused(Refusal::Unresumable { .. }))),
-            "expected an unresumable cursor from the reclaimed topic, got {answered:?}",
-        );
-    }
-
-    #[tokio::test]
     async fn a_peer_that_stops_reading_is_closed() {
         let bus = Bus::start(Config {
-            path: socket_path(),
             timeouts: Timeouts {
                 heartbeat: NonZeroU32::new(20).unwrap(),
                 deadline: NonZeroU32::new(150).unwrap(),
             },
-            ..Config::default()
+            ..config()
         })
         .await;
         let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
@@ -816,7 +1165,7 @@ mod tests {
         assert!(
             within("publish", publisher.publish(payload(&1)))
                 .await
-                .is_err()
+                .is_err(),
         );
     }
 }
