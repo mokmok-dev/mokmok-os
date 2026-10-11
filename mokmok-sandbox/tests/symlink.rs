@@ -28,7 +28,7 @@ mod tests {
         let mut request = shell(&format!("cat {}", requested.display()));
         request.exposures = vec![
             Exposure::read_execute("/nix/store"),
-            Exposure::read(&granted),
+            Exposure::read(&requested),
         ];
         let mut capabilities = issued();
         capabilities.push(Capability::issued(&granted, Access::READ));
@@ -36,10 +36,20 @@ mod tests {
         let sandbox = Confined::new(config(&scratch)).unwrap();
         let refused = match sandbox.spawn(&request, &capabilities) {
             Err(refused) => refused,
-            Ok(_run) => panic!("the gate approved a path that resolves to {}", secret.display()),
+            Ok(_run) => panic!(
+                "the gate approved a path that resolves to {}",
+                secret.display()
+            ),
         };
 
-        assert!(matches!(&refused, Refusal::Uncovered(_)), "got {refused:?}");
+        assert!(
+            matches!(
+                &refused,
+                Refusal::Uncovered(exposure, resolved)
+                    if exposure.as_path() == requested.as_path() && resolved == secret.as_path()
+            ),
+            "got {refused:?}",
+        );
     }
 
     #[tokio::test]
@@ -63,7 +73,15 @@ mod tests {
             ),
         };
 
-        assert!(matches!(&refused, Refusal::Uncovered(_)), "got {refused:?}");
+        assert!(
+            matches!(
+                &refused,
+                Refusal::Uncovered(exposure, resolved)
+                    if exposure.as_path() == granted.join("link").as_path()
+                        && resolved == secret.parent().unwrap()
+            ),
+            "got {refused:?}",
+        );
     }
 
     #[tokio::test]

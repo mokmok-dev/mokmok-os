@@ -3,10 +3,11 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use mokmok_protocol::ExecutionID;
 use tokio::process::Command;
 
 use crate::artifact;
-use crate::capability::{Capability, Exposure, uncovered};
+use crate::capability::{self, Capability, Exposure, uncovered_index};
 use crate::config::Config;
 use crate::limits::Limits;
 use crate::plan;
@@ -23,18 +24,25 @@ pub trait Sandbox {
     /// capability: the workload's own file, because a program that cannot be read cannot run, and
     /// the workspace, because that is the sandbox's own scope.
     ///
+    /// Both backends resolve the exposures and the issued capabilities before they gate, and the
+    /// plan records the resolved exposures, so the gate and the rule the confiner builds name the
+    /// same object. An exposure that cannot be resolved is refused, not dropped.
+    ///
     /// `Ok` proves the plan was accepted, not that confinement is live yet. The confiner refuses
     /// before `exec` when it cannot enforce the plan, so a workload that runs at all ran under the
     /// plan, and [`Run::wait`] reports that refusal as [`Error::Confine`](crate::Error::Confine).
+    /// An `Ok` means the workload possibly started; only such a confinement failure means it did
+    /// not run.
     ///
     /// The workload's working directory is its workspace, its stdin is `/dev/null`, and
     /// [`Request::env`] is added to the inherited environment.
     ///
     /// # Errors
     ///
-    /// Returns a [`Refusal`], having created nothing, when an exposure is uncovered, a declared
-    /// artifact is not a plain relative path, the program is not absolute, the execution
-    /// directory cannot be prepared, or the child cannot be started.
+    /// Returns a [`Refusal`], having created nothing, when an exposure is uncovered or cannot be
+    /// resolved, a declared artifact is not a plain relative path, the program is not absolute,
+    /// the execution id is already in use, the execution directory cannot be prepared, or the
+    /// child cannot be started.
     fn spawn(
         &self,
         request: &Request,
@@ -59,7 +67,16 @@ impl Confined {
             return Err(Refusal::Confiner(config.confiner));
         }
 
-        if plan::probe(&config.confiner, &config.root).is_err() {
+        // Every rule the probe builds is opened without following a symlink, so its workspace has
+        // to be a directory that is there. The root is not created until the first execution, and
+        // the confiner's own directory is one the check above proved exists.
+        let probed = config
+            .confiner
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("/"));
+
+        if plan::probe(&config.confiner, probed).is_err() {
             return Err(Refusal::Kernel);
         }
 
@@ -73,17 +90,14 @@ impl Sandbox for Confined {
         request: &Request,
         issued: &[Capability],
     ) -> Result<Run, Refusal> {
-        check(request, issued)?;
-
-        let workspace =
-            Workspace::create(&self.config.root, request.execution).map_err(|source| {
-                Refusal::Setup {
-                    path: Workspace::directory_path(&self.config.root, request.execution),
-                    source,
-                }
-            })?;
+        let exposures = check(request, issued)?;
+        let workspace = prepare_workspace(&self.config.root, request.execution)?;
+        let work = resolve_work(&workspace)?;
         let plan_path = workspace.plan();
-        let written = plan::Plan::write(&plan_path, &plan::Plan::of(request, workspace.work()));
+        let written = plan::Plan::write(
+            &plan_path,
+            &plan::Plan::of(request, &expose_of(&request.program), &work, &exposures),
+        );
 
         if let Err(source) = written {
             let _ = workspace.remove();
@@ -141,13 +155,7 @@ impl Sandbox for LimitsOnly {
     ) -> Result<Run, Refusal> {
         check(request, issued)?;
 
-        let workspace =
-            Workspace::create(&self.config.root, request.execution).map_err(|source| {
-                Refusal::Setup {
-                    path: Workspace::directory_path(&self.config.root, request.execution),
-                    source,
-                }
-            })?;
+        let workspace = prepare_workspace(&self.config.root, request.execution)?;
         let mut command = Command::new(SHELL);
         command
             .arg("-c")
@@ -184,8 +192,19 @@ const SHELL: &str = "sh";
 /// instead, and it means the workload never ran.
 #[derive(Debug, thiserror::Error)]
 pub enum Refusal {
-    #[error("the exposure at {} is not covered by an issued capability", .0.as_path().display())]
-    Uncovered(Exposure),
+    #[error(
+        "the exposure at {} is not covered by an issued capability: it resolves to {}",
+        .0.as_path().display(),
+        .1.display()
+    )]
+    Uncovered(Exposure, PathBuf),
+    #[error("the exposure at {} could not be resolved: {source}", .exposure.as_path().display())]
+    Unresolved {
+        exposure: Exposure,
+        source: io::Error,
+    },
+    #[error("the execution {} is already in use", .0.as_uuid())]
+    Exists(ExecutionID),
     #[error("the artifact path {} is not a plain path relative to the workspace", .0.display())]
     Artifact(PathBuf),
     #[error("the program {} is not an absolute path", .0.display())]
@@ -200,15 +219,14 @@ pub enum Refusal {
     Spawn(io::Error),
 }
 
-/// Everything the two backends refuse the same way, before they create anything.
+/// Everything the two backends do the same way, before they create anything.
+///
+/// Returns the resolved exposures, which is what the plan records: the gate, the plan, and the
+/// rule the confiner builds then name the same object.
 fn check(
     request: &Request,
     issued: &[Capability],
-) -> Result<(), Refusal> {
-    if let Some(exposure) = uncovered(&request.exposures, issued) {
-        return Err(Refusal::Uncovered(exposure.clone()));
-    }
-
+) -> Result<Vec<Exposure>, Refusal> {
     if let Some(path) = request
         .artifacts
         .iter()
@@ -221,7 +239,82 @@ fn check(
         return Err(Refusal::Program(request.program.clone()));
     }
 
-    Ok(())
+    let mut resolved = Vec::with_capacity(request.exposures.len());
+    for exposure in &request.exposures {
+        match capability::resolve(exposure.as_path()) {
+            Ok(path) => resolved.push(Exposure::path(path, exposure.access())),
+            Err(source) => {
+                return Err(Refusal::Unresolved {
+                    exposure: exposure.clone(),
+                    source,
+                });
+            },
+        }
+    }
+
+    let resolved_issued: Vec<Capability> = issued
+        .iter()
+        .filter_map(
+            |capability| match capability::resolve(capability.as_path()) {
+                Ok(path) => Some(Capability::issued(path, capability.access())),
+                Err(error) => {
+                    // A capability nobody can resolve names no object, so it covers nothing. The
+                    // exposure that needed it is refused below instead of being passed here.
+                    tracing::debug!(
+                        path = %capability.as_path().display(),
+                        %error,
+                        "an issued capability that cannot be resolved covers nothing",
+                    );
+
+                    None
+                },
+            },
+        )
+        .collect();
+
+    if let Some(index) = uncovered_index(&resolved, &resolved_issued) {
+        return Err(Refusal::Uncovered(
+            request.exposures[index].clone(),
+            resolved[index].as_path().to_path_buf(),
+        ));
+    }
+
+    Ok(resolved)
+}
+
+/// Creates this execution's own directory, mapping an id already in use to its own refusal so a
+/// durable-execution caller can tell a live id from a filesystem refusal.
+fn prepare_workspace(
+    root: &Path,
+    execution: ExecutionID,
+) -> Result<Workspace, Refusal> {
+    Workspace::create(root, execution).map_err(|source| {
+        if source.kind() == io::ErrorKind::AlreadyExists {
+            Refusal::Exists(execution)
+        } else {
+            Refusal::Setup {
+                path: Workspace::directory_path(root, execution),
+                source,
+            }
+        }
+    })
+}
+
+/// The workspace directory exists by the time the plan is written, so a resolution failure is a
+/// setup failure.
+fn resolve_work(workspace: &Workspace) -> Result<PathBuf, Refusal> {
+    capability::resolve(workspace.work()).map_err(|source| Refusal::Setup {
+        path: workspace.work().to_path_buf(),
+        source,
+    })
+}
+
+/// The resolved program, or the path as given when it cannot be resolved.
+///
+/// A program that is not there must still reach the confiner, which reports it, so a resolution
+/// failure is not a refusal here.
+fn expose_of(program: &Path) -> PathBuf {
+    capability::resolve(program).unwrap_or_else(|_| program.to_path_buf())
 }
 
 fn configure(

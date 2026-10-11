@@ -62,7 +62,7 @@ fn confine(plan_path: &Path) -> Failure {
         Err(error) => return Failure::Unknown(format!("{}: {error}", status_path.display())),
     };
 
-    if let Err(error) = status.reserved() {
+    if let Err(error) = status.prepared() {
         return Failure::Unknown(format!("{}: {error}", status_path.display()));
     }
 
@@ -80,7 +80,11 @@ fn confine(plan_path: &Path) -> Failure {
     };
 
     match ruleset.restrict_self() {
-        Ok(enforced) if enforced.ruleset == RulesetStatus::FullyEnforced => {},
+        Ok(enforced) if enforced.ruleset == RulesetStatus::FullyEnforced => {
+            if let Err(error) = status.confined() {
+                return Failure::Unknown(format!("{}: {error}", status_path.display()));
+            }
+        },
         Ok(enforced) => {
             return refuse(
                 &mut status,
@@ -88,6 +92,11 @@ fn confine(plan_path: &Path) -> Failure {
             );
         },
         Err(error) => return refuse(&mut status, Failure::Ruleset(error.to_string())),
+    }
+
+    // A successful exec replaces this process, so this is the last record the supervisor can see.
+    if let Err(error) = status.attempted() {
+        return Failure::Unknown(format!("{}: {error}", status_path.display()));
     }
 
     // `exec` only returns when it failed, and this is the one refusal written after the ruleset is

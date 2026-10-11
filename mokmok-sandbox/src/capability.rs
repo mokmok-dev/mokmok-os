@@ -1,3 +1,4 @@
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// The access a capability or an exposure names, as a set of three component rights.
@@ -53,6 +54,10 @@ impl<'de> serde::Deserialize<'de> for Access {
 }
 
 /// A path a caller asks the sandbox to expose, with the access it wants there.
+///
+/// The path is a name for an object, not the object itself. Both backends resolve it before they
+/// gate, and one that cannot be resolved is refused rather than dropped: an exposure is a grant,
+/// and a name that reaches nothing is not a grant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Exposure {
     path: PathBuf,
@@ -115,6 +120,16 @@ impl Capability {
             access,
         }
     }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn access(&self) -> Access {
+        self.access
+    }
 }
 
 /// The mechanical gate: the first exposure the issued set does not cover.
@@ -129,9 +144,35 @@ pub fn uncovered<'a>(
     exposures: &'a [Exposure],
     issued: &[Capability],
 ) -> Option<&'a Exposure> {
+    uncovered_index(exposures, issued).map(|index| &exposures[index])
+}
+
+/// The position of the first exposure the issued set does not cover.
+///
+/// The gate refuses with both the requested exposure and the resolved path it did not cover, and
+/// those are two lists held side by side; the position is what pairs them without a second
+/// comparison.
+#[must_use]
+pub fn uncovered_index(
+    exposures: &[Exposure],
+    issued: &[Capability],
+) -> Option<usize> {
     exposures
         .iter()
-        .find(|exposure| !issued.iter().any(|capability| covers(capability, exposure)))
+        .position(|exposure| !issued.iter().any(|capability| covers(capability, exposure)))
+}
+
+/// The one resolution the gate and the plan share.
+///
+/// `canonicalize` follows every symlink, so two names for one object resolve to the same path and
+/// the gate compares resolved objects rather than the names a caller wrote.
+///
+/// # Errors
+///
+/// Returns the `canonicalize` error: `NotFound` for a name that is not there, `ELOOP` for a
+/// symlink loop, and the permissions error for a component that cannot be searched.
+pub fn resolve(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
 }
 
 fn covers(

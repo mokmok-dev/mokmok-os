@@ -1,22 +1,28 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access as _, AccessFs, BitFlags, CompatLevel, Compatible as _, PathBeneath, PathFd,
-    Ruleset, RulesetAttr as _, RulesetCreated, RulesetCreatedAttr as _,
+    ABI, Access as _, AccessFs, BitFlags, CompatLevel, Compatible as _, PathBeneath, Ruleset,
+    RulesetAttr as _, RulesetCreated, RulesetCreatedAttr as _,
 };
+use nix::fcntl::{AT_FDCWD, OFlag, OpenHow, ResolveFlag, openat2};
+use nix::sys::stat::Mode;
 
-use crate::capability::Access;
+use crate::capability::{Access, Exposure, resolve};
 use crate::limits::Limits;
 use crate::request::Request;
 use crate::run::Failure;
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Plan {
+    /// What the caller passed, which becomes `argv[0]`.
     pub program: text::Text,
+    /// The resolved program, which is the object the program's own rule names.
+    pub expose: text::Text,
     pub args: Vec<text::Text>,
     pub workspace: text::Text,
     pub exposures: Vec<Grant>,
@@ -30,21 +36,24 @@ pub struct Grant {
 }
 
 impl Plan {
+    /// Records only resolved paths, so the gate, the plan, and the ruleset name the same object.
     #[must_use]
     pub fn of(
         request: &Request,
+        expose: &Path,
         workspace: &Path,
+        exposures: &[Exposure],
     ) -> Self {
         Self {
             program: text::Text::from(request.program.as_path()),
+            expose: text::Text::from(expose),
             args: request
                 .args
                 .iter()
                 .map(|arg| text::Text::from(arg.as_os_str()))
                 .collect(),
             workspace: text::Text::from(workspace),
-            exposures: request
-                .exposures
+            exposures: exposures
                 .iter()
                 .map(|exposure| Grant {
                     path: text::Text::from(exposure.as_path()),
@@ -90,7 +99,7 @@ pub fn ruleset(plan: &Plan) -> Result<RulesetCreated, Failure> {
     // file is exposed whether or not a capability also names it.
     merge(
         &mut by_path,
-        plan.program.to_path_buf(),
+        plan.expose.to_path_buf(),
         Access::READ_EXECUTE,
     );
     merge(
@@ -110,27 +119,35 @@ pub fn ruleset(plan: &Plan) -> Result<RulesetCreated, Failure> {
         .map_err(ruleset_failure)?;
 
     for (path, mut access) in by_path {
-        if !path.exists() {
-            tracing::debug!(
-                path = %path.display(),
-                "skipping a rule for a path that is not there",
-            );
-
-            continue;
-        }
-
         if !path.is_dir() {
             access &= AccessFs::from_file(ABI::V3);
         }
 
-        let rule = PathFd::new(&path).map_err(ruleset_failure)?;
+        // The plan records resolved paths, so a symlink anywhere in one means the object moved
+        // after the plan was written; refusing it is the fail-closed direction.
+        let opened = open_resolved(&path)
+            .map_err(|error| Failure::Path(format!("{}: {error}", path.display())))?;
 
         ruleset = ruleset
-            .add_rule(PathBeneath::new(rule, access))
+            .add_rule(PathBeneath::new(opened, access))
             .map_err(ruleset_failure)?;
     }
 
     Ok(ruleset)
+}
+
+/// Opens a resolved path atomically, with no symlink resolution, so a symlink planted after the
+/// plan was written cannot move the rule to an object the gate never covered.
+fn open_resolved(path: &Path) -> io::Result<OwnedFd> {
+    openat2(
+        AT_FDCWD,
+        path,
+        OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_CLOEXEC)
+            .mode(Mode::empty())
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )
+    .map_err(io::Error::from)
 }
 
 fn merge(
@@ -149,10 +166,15 @@ pub fn probe(
     program: &Path,
     workspace: &Path,
 ) -> Result<(), Failure> {
+    // The confiner opens every rule path with no symlink resolution, and a real plan records
+    // resolved paths, so the probe hands it resolved inputs too.
+    let expose = resolve(program).unwrap_or_else(|_| program.to_path_buf());
+    let resolved = resolve(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let plan = Plan {
         program: text::Text::from(program),
+        expose: text::Text::from(expose.as_path()),
         args: Vec::new(),
-        workspace: text::Text::from(workspace),
+        workspace: text::Text::from(resolved.as_path()),
         exposures: Vec::new(),
         limits: Limits::default(),
     };
@@ -183,10 +205,24 @@ fn ruleset_failure(error: impl std::fmt::Display) -> Failure {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Status {
-    /// Written before the confiner does anything that can fail.
-    Reserved,
+    /// Written as the confiner's first write of all, before anything can fail.
+    Prepared,
+    /// Written after `restrict_self` reports `FullyEnforced`.
+    Confined,
+    /// Written immediately before the exec call.
+    Attempted,
     /// The workload never ran.
     Refused { failure: Failure },
+}
+
+/// The states a reader has to name when the confiner stopped before the exec attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reached {
+    /// The confiner wrote its first record and then stopped.
+    Prepared,
+    /// The confiner enforced the ruleset and then stopped.
+    Confined,
 }
 
 /// The status file, or `None` when it is absent or does not parse.
@@ -221,8 +257,16 @@ impl StatusFile {
         Ok(Self { file })
     }
 
-    pub fn reserved(&mut self) -> io::Result<()> {
-        self.record(&Status::Reserved)
+    pub fn prepared(&mut self) -> io::Result<()> {
+        self.record(&Status::Prepared)
+    }
+
+    pub fn confined(&mut self) -> io::Result<()> {
+        self.record(&Status::Confined)
+    }
+
+    pub fn attempted(&mut self) -> io::Result<()> {
+        self.record(&Status::Attempted)
     }
 
     pub fn refuse(
@@ -357,7 +401,7 @@ mod tests {
         let mut request = Request::new(ExecutionID::new(Timestamp::now(NoContext)), program);
         request.limits = Limits::default();
 
-        Plan::of(&request, workspace)
+        Plan::of(&request, program, workspace, &request.exposures)
     }
 
     #[test]
@@ -375,15 +419,40 @@ mod tests {
     }
 
     #[test]
-    fn a_nonexistent_path_is_skipped() {
+    fn a_path_that_is_not_there_is_refused() {
         let missing = std::env::temp_dir().join("mokmok-plan-missing-path");
 
         let built = ruleset(&plan(&missing, &missing));
 
         assert!(
-            built.is_ok(),
-            "a plan whose paths are absent still builds: {built:?}",
+            matches!(built, Err(Failure::Path(_))),
+            "a path that is not there was accepted: {built:?}",
         );
+    }
+
+    #[test]
+    fn a_path_through_a_symlink_is_refused() {
+        let directory =
+            std::env::temp_dir().join(format!("mokmok-plan-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut request = Request::new(
+            ExecutionID::new(Timestamp::now(NoContext)),
+            directory.join("absent-program"),
+        );
+        request.limits = Limits::default();
+        let exposures = [crate::capability::Exposure::read(&link)];
+        let built = ruleset(&Plan::of(&request, &target, &directory, &exposures));
+
+        assert!(
+            matches!(built, Err(Failure::Path(_))),
+            "a path that resolves through a symlink was accepted: {built:?}",
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
@@ -400,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn the_status_file_round_trips_both_states() {
+    fn the_status_file_round_trips_every_state() {
         let path = std::env::temp_dir().join(format!(
             "mokmok-status-{}-{}.json",
             std::process::id(),
@@ -411,8 +480,14 @@ mod tests {
         ));
         let mut status = StatusFile::create(&path).unwrap();
 
-        status.reserved().unwrap();
-        assert!(matches!(read_status(&path), Some(Status::Reserved)));
+        status.prepared().unwrap();
+        assert!(matches!(read_status(&path), Some(Status::Prepared)));
+
+        status.confined().unwrap();
+        assert!(matches!(read_status(&path), Some(Status::Confined)));
+
+        status.attempted().unwrap();
+        assert!(matches!(read_status(&path), Some(Status::Attempted)));
 
         let failure = Failure::Session("no session".into());
         status.refuse(&failure).unwrap();
@@ -428,7 +503,7 @@ mod tests {
 
     #[test]
     fn an_unknown_access_bit_is_refused_at_the_wire() {
-        let json = r#"{"program":"/bin/sh","args":[],"workspace":"/tmp","exposures":[{"path":"/x","access":8}],"limits":{"address_space":null,"cpu":null,"file_size":null,"open_files":null,"output":1024}}"#;
+        let json = r#"{"program":"/bin/sh","expose":"/bin/sh","args":[],"workspace":"/tmp","exposures":[{"path":"/x","access":8}],"limits":{"address_space":null,"cpu":null,"file_size":null,"open_files":null,"output":1024}}"#;
         let parsed: Result<Plan, _> = serde_json::from_str(json);
 
         assert!(
@@ -455,7 +530,7 @@ mod tests {
             directory.join("absent-program"),
         );
         request.exposures = vec![crate::capability::Exposure::read_write(&file)];
-        let built = ruleset(&Plan::of(&request, &directory));
+        let built = ruleset(&Plan::of(&request, &file, &directory, &request.exposures));
 
         // `ReadDir` and `MakeDir` are directory-only and Landlock rejects them on a file rule.
         assert!(built.is_ok(), "a file rule builds: {built:?}");

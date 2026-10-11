@@ -8,8 +8,8 @@ mod tests {
         Scratch, alive, await_death, config, issued, nothing_left, shell, which, within,
     };
     use mokmok_sandbox::{
-        Completed, Config, Confined, Error, Exposure, Failure, Outcome, Refusal, Run, Sandbox,
-        Signal,
+        Completed, Config, Confined, Error, Exposure, Failure, LimitsOnly, Outcome, Reached,
+        Refusal, Run, Sandbox, Signal, Started,
     };
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
@@ -330,7 +330,32 @@ mod tests {
         let refused = refusal(sandbox.spawn(&request, &issued()));
 
         assert!(
-            matches!(&refused, Refusal::Uncovered(exposure) if exposure.as_path() == Path::new("/etc/passwd")),
+            matches!(
+                &refused,
+                Refusal::Uncovered(exposure, resolved)
+                    if exposure.as_path() == Path::new("/etc/passwd")
+                        && resolved == Path::new("/etc/passwd")
+            ),
+            "got {refused:?}",
+        );
+        assert!(nothing_left(&scratch.root()));
+    }
+
+    #[tokio::test]
+    async fn an_exposure_that_cannot_be_resolved_is_refused_with_nothing_left_behind() {
+        let scratch = Scratch::new("unresolved");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let mut request = shell("exit 0");
+        let missing = scratch.path().join("no-such-exposure.txt");
+        request.exposures = vec![Exposure::read(&missing)];
+
+        let refused = refusal(sandbox.spawn(&request, &issued()));
+
+        assert!(
+            matches!(
+                &refused,
+                Refusal::Unresolved { exposure, .. } if exposure.as_path() == missing.as_path()
+            ),
             "got {refused:?}",
         );
         assert!(nothing_left(&scratch.root()));
@@ -382,7 +407,32 @@ mod tests {
         let error = finished(within("wait", run.wait()).await);
 
         assert!(
-            matches!(&error, Error::Confine(Failure::Exec { program, .. }) if program == &request.program),
+            matches!(
+                &error,
+                Error::Confine(Failure::Path(message))
+                    if message.contains(&request.program.display().to_string())
+            ),
+            "got {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_program_that_cannot_be_executed_is_a_confinement_failure() {
+        let scratch = Scratch::new("unexecutable-program");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        // No execute bit: the rule for the program's own file is built, and the exec is what fails.
+        let program = scratch.write("bin/program.txt", "not executed\n");
+        let mut request = shell("exit 0");
+        request.program = program.clone();
+
+        let run = sandbox.spawn(&request, &issued()).unwrap();
+        let error = finished(within("wait", run.wait()).await);
+
+        assert!(
+            matches!(
+                &error,
+                Error::Confine(Failure::Exec { program: named, .. }) if named == &program
+            ),
             "got {error:?}",
         );
     }
@@ -403,6 +453,143 @@ mod tests {
             matches!(error, Error::Confine(Failure::Unknown(_))),
             "got {error:?}",
         );
+    }
+
+    /// A confiner that writes one status record and exits without exec'ing, which is how a test
+    /// reaches the states a real confiner only passes through.
+    fn reporting(
+        scratch: &Scratch,
+        name: &str,
+        state: &str,
+    ) -> Config {
+        Config {
+            confiner: scratch.script(
+                name,
+                &format!(
+                    "#!{}\nprintf '{{\"state\":\"{state}\"}}' > \"${{1%/*}}/status.json\"\nexit 1\n",
+                    which("sh").display(),
+                ),
+            ),
+            ..config(scratch)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confiner_that_stops_after_preparing_is_an_interrupted_confinement() {
+        let scratch = Scratch::new("status-prepared");
+        let sandbox =
+            Confined::new(reporting(&scratch, "prepared-confiner.sh", "prepared")).unwrap();
+
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let error = finished(within("wait", run.wait()).await);
+
+        assert!(
+            matches!(
+                error,
+                Error::Confine(Failure::Interrupted {
+                    reached: Reached::Prepared
+                })
+            ),
+            "got {error:?}",
+        );
+        assert!(nothing_left(&scratch.root()));
+    }
+
+    #[tokio::test]
+    async fn a_confiner_that_stops_after_confining_is_an_interrupted_confinement() {
+        let scratch = Scratch::new("status-confined");
+        let sandbox =
+            Confined::new(reporting(&scratch, "confined-confiner.sh", "confined")).unwrap();
+
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let error = finished(within("wait", run.wait()).await);
+
+        assert!(
+            matches!(
+                error,
+                Error::Confine(Failure::Interrupted {
+                    reached: Reached::Confined
+                })
+            ),
+            "got {error:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confiner_that_reports_an_attempt_may_have_started_the_workload() {
+        let scratch = Scratch::new("status-attempted");
+        let sandbox =
+            Confined::new(reporting(&scratch, "attempted-confiner.sh", "attempted")).unwrap();
+
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert_eq!(completed.started(), Started::Attempted);
+        completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_confined_run_reports_the_attempt() {
+        let scratch = Scratch::new("started-confined");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert_eq!(completed.started(), Started::Attempted);
+        completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_limits_only_run_reports_an_unknown_start() {
+        let scratch = Scratch::new("started-limits");
+        let sandbox = LimitsOnly::new(config(&scratch));
+
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert_eq!(completed.started(), Started::Unknown);
+        completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reusing_a_live_execution_id_is_refused_and_leaves_the_first_run_alone() {
+        let scratch = Scratch::new("exclusive");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let request = shell("sleep 30");
+
+        let run = sandbox.spawn(&request, &issued()).unwrap();
+        let survivor = run.workspace().join("survivor.txt");
+        std::fs::write(&survivor, b"first\n").unwrap();
+
+        let refused = refusal(sandbox.spawn(&request, &issued()));
+
+        assert!(
+            matches!(&refused, Refusal::Exists(id) if id == &request.execution),
+            "got {refused:?}",
+        );
+        assert!(
+            survivor.is_file(),
+            "the refused attempt touched the first run's workspace",
+        );
+
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn an_execution_id_is_usable_again_after_cleanup() {
+        let scratch = Scratch::new("reusable");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let request = shell("exit 0");
+
+        let run = sandbox.spawn(&request, &issued()).unwrap();
+        within("wait", run.wait()).await.unwrap().cleanup().unwrap();
+
+        let run = sandbox.spawn(&request, &issued()).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert_eq!(completed.outcome(), Outcome::Exited(0));
+        completed.cleanup().unwrap();
     }
 
     #[tokio::test]

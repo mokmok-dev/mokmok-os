@@ -29,6 +29,12 @@ impl Workspace {
         let directory = Self::directory_path(root, execution);
         let work = directory.join("work");
         let ctl = directory.join("ctl");
+
+        // The root is shared and idempotent; the execution directory is this execution's alone, so
+        // an id already in use fails with `AlreadyExists` instead of silently mixing two runs.
+        shared(root)?;
+        private(&directory)?;
+
         let created = private(&work).and_then(|()| private(&ctl));
 
         if let Err(error) = created {
@@ -75,6 +81,12 @@ impl Workspace {
 /// local user can search, and the workload's files, the plan, and the status file are nobody
 /// else's business.
 fn private(path: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// The shared root is idempotent: every execution creates it, and only the execution directory
+/// beneath it has to be exclusive.
+fn shared(path: &Path) -> io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)

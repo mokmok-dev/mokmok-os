@@ -13,10 +13,16 @@
 //! - `Ok(Run)` from [`Sandbox::spawn`] proves the plan was accepted, not that confinement is live
 //!   yet. The confiner refuses before `exec` when it cannot enforce the plan, so a workload that
 //!   runs at all ran under the plan; [`Run::wait`] reports that refusal as [`Error::Confine`].
+//! - A [`Completed`] means the workload possibly started. Only an [`Error::Confine`] means it did
+//!   not run; [`Completed::started`] reports what the confiner said about the exec attempt.
 //! - The process tree is **not** contained against a workload that calls `setsid` itself. The
 //!   syscall needs no binary, and the child it spawns leaves the group every signal here goes to.
 //!   A pid namespace (`unshare(CLONE_NEWUSER | CLONE_NEWPID)` in the confiner, plus an init that
 //!   forwards signals) is the fix, and it is future work.
+//!
+//! The plan names resolved paths, so the gate and the ruleset mean the same object. A real
+//! directory swapped into a path between the supervisor's resolution and the confiner's open is
+//! outside this contract: closing it would need a file descriptor pinned across the two processes.
 //!
 //! Resource limits are the sandbox's own per-execution [`Limits`] and [`Request::deadline`]. The
 //! agent's execution budget is a different responsibility and lives with the agent runtime.
@@ -86,6 +92,7 @@ pub use config::Config;
 pub use confine::run;
 pub use limits::Limits;
 pub use output::Captured;
+pub use plan::Reached;
 pub use request::Request;
-pub use run::{Completed, Error, Failure, Outcome, Run, Signal};
+pub use run::{Completed, Error, Failure, Outcome, Run, Signal, Started};
 pub use sandbox::{Confined, LimitsOnly, Refusal, Sandbox};

@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::artifact::{self, Artifact};
 use crate::output::{Captured, Pump};
-use crate::plan::{self, Status};
+use crate::plan::{self, Reached, Status};
 use crate::request::Request;
 use crate::workspace::{self, Workspace};
 
@@ -56,6 +56,19 @@ pub enum Outcome {
     Signalled(i32),
     /// The execution deadline passed while the workload was still running.
     Overran,
+}
+
+/// Whether the workload may have started, as far as the supervisor can tell.
+///
+/// A caller that must not repeat work blindly treats both variants as possibly started; only an
+/// [`Error::Confine`] means the workload did not run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Started {
+    /// The confiner reported the exec attempt. The workload ran, unless the confiner stopped in
+    /// the window between that report and the exec call.
+    Attempted,
+    /// Nothing reported an attempt, so whether the workload ran is unknown.
+    Unknown,
 }
 
 /// Where the child reports a confinement refusal, if it reports at all.
@@ -176,6 +189,9 @@ impl Run {
 
     /// Reaps the workload, capturing both streams and registering the declared artifacts.
     ///
+    /// An `Ok` means the workload possibly started; [`Completed::started`] reports what the
+    /// confiner said about the exec attempt.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Wait`] when the workload cannot be reaped, and [`Error::Confine`] when
@@ -205,20 +221,31 @@ impl Run {
         let stdout = self.stdout.join().await.map_err(Error::Wait)?;
         let stderr = self.stderr.join().await.map_err(Error::Wait)?;
 
+        let mut started = Started::Unknown;
         if let Reporting::Confiner = self.reporting {
             match plan::read_status(&self.workspace.status()) {
                 Some(Status::Refused { failure }) => return Err(Error::Confine(failure)),
-                Some(Status::Reserved) => {},
+                Some(Status::Attempted) => started = Started::Attempted,
+                Some(Status::Prepared) => {
+                    return Err(Error::Confine(Failure::Interrupted {
+                        reached: Reached::Prepared,
+                    }));
+                },
+                Some(Status::Confined) => {
+                    return Err(Error::Confine(Failure::Interrupted {
+                        reached: Reached::Confined,
+                    }));
+                },
                 None => {
-                    // A confiner that started reserves the status before anything else can fail,
-                    // so an absent status is a confiner that never got as far as the plan. An
-                    // overran run is reported as overrun instead, because the deadline fired while
-                    // its pid was still there.
-                    if !self.overran.load(Ordering::Acquire) {
-                        return Err(Error::Confine(Failure::Unknown(format!(
-                            "the confiner stopped ({status}) without reporting",
-                        ))));
-                    }
+                    // A confiner that started writes `Prepared` before anything else can fail, and
+                    // every record is one fixed-size write replaced whole, so an absent or
+                    // unparsable status means the confiner never wrote at all and the workload
+                    // cannot have run. That holds with the deadline too: a pid that was still there
+                    // was the confiner's, and reporting it as a workload that overran would claim a
+                    // start this cannot prove.
+                    return Err(Error::Confine(Failure::Unknown(format!(
+                        "the confiner stopped ({status}) without reporting",
+                    ))));
                 },
             }
         }
@@ -238,6 +265,7 @@ impl Run {
         let completed = Completed {
             id: self.id,
             outcome,
+            started,
             stdout,
             stderr,
             artifacts,
@@ -272,11 +300,15 @@ impl Drop for Run {
 
 /// The end state of one execution.
 ///
+/// A `Completed` means the workload possibly started; only an [`Error::Confine`] means it did not
+/// run. [`Completed::started`] reports what the confiner said about the exec attempt.
+///
 /// The workspace stays where it is until [`Completed::cleanup`] is called or the value drops,
 /// because the artifacts live inside it.
 pub struct Completed {
     id: ExecutionID,
     outcome: Outcome,
+    started: Started,
     stdout: Captured,
     stderr: Captured,
     artifacts: Vec<Artifact>,
@@ -294,6 +326,14 @@ impl Completed {
     #[must_use]
     pub const fn outcome(&self) -> Outcome {
         self.outcome
+    }
+
+    /// Whether the confiner reported that it was about to run the workload, which is all the
+    /// supervisor can observe: the confiner cannot report again after a successful exec, because
+    /// the exec replaces it.
+    #[must_use]
+    pub const fn started(&self) -> Started {
+        self.started
     }
 
     #[must_use]
@@ -371,6 +411,10 @@ pub enum Failure {
         program: PathBuf,
         message: String,
     },
+    #[error("the path {0} is not the object the plan recorded")]
+    Path(String),
+    #[error("the confiner stopped after reaching {reached:?} without attempting the workload")]
+    Interrupted { reached: Reached },
     #[error("the confiner stopped without reporting: {0}")]
     Unknown(String),
 }
