@@ -567,23 +567,35 @@ async fn pull(
     let from = Seq::new(delivered.get().max(window.first().get()));
     let ceiling = acked.get().saturating_add(limits.in_flight.get() as u64);
     let credit = usize::try_from(ceiling.saturating_sub(from.get())).unwrap_or(usize::MAX);
-    let mut count = max.get().min(credit);
-
-    if count == 0 && delivered < window.first() && window.first() < window.next() {
-        // The checkpoint is behind the retained floor and the credit cannot cover the gap. The
-        // lapse is the only way forward, so hand over one event rather than park for a commit
-        // that could never free enough credit.
-        count = 1;
-    }
+    let count = max.get().min(credit);
 
     if count == 0 {
-        // A commit cannot free spent credit, so that park must not be woken by one.
-        let parked = if delivered.get() >= ceiling {
-            Parked::Spent
-        } else {
-            Parked::CaughtUp { max }
-        };
+        if delivered < window.first() {
+            // The checkpoint is behind the retained floor, so the events it names can never be
+            // handed over. The gap travels on its own, with no event and no credit spent: the
+            // caller acks the lapse, which moves its checkpoint to the floor and frees the credit.
+            // Handing an event over instead would let a subscriber that never acks keep drawing
+            // them, because eviction raises the floor the credit is measured against.
+            return Step::Answer {
+                response: wire::Response::Batch {
+                    window,
+                    lapsed: Some(Lapsed::new(
+                        Cursor::new(window.epoch(), delivered),
+                        window.first(),
+                    )),
+                    events: Vec::new(),
+                },
+                phase: Phase::Subscriber {
+                    topic,
+                    entry: Arc::clone(entry),
+                    subscriber,
+                    delivered: window.first(),
+                    acked,
+                },
+            };
+        }
 
+        // Only an ack can free spent credit, so this park must not be woken by a commit.
         return Step::Park {
             phase: Phase::Subscriber {
                 topic,
@@ -592,7 +604,7 @@ async fn pull(
                 delivered,
                 acked,
             },
-            parked,
+            parked: Parked::Spent,
         };
     }
 
@@ -935,7 +947,6 @@ mod tests {
                         response: Response::Batch { window, lapsed, events },
                         phase,
                     } => {
-                        prop_assert!(!events.is_empty());
                         prop_assert!(events.len() <= max.get());
                         for pair in events.windows(2) {
                             prop_assert_eq!(pair[1].seq().get(), pair[0].seq().get() + 1);
@@ -951,20 +962,25 @@ mod tests {
                             );
                             prop_assert_eq!(lapsed.from(), window.first());
                         }
-                        prop_assert_eq!(events.first().unwrap().seq().get(), from);
 
                         let Phase::Subscriber { delivered: next, .. } = phase else {
                             return Err(TestCaseError::fail(
                                 "a batch left the subscriber phase",
                             ));
                         };
-                        let last = events.last().unwrap().seq().get();
-                        prop_assert_eq!(next.get(), last + 1);
-                        prop_assert!(next.get() <= ceiling.max(first + 1));
-                        if next.get() > ceiling {
-                            // The lapse hand-over is the one deliberate overshoot of the credit
-                            // ceiling, and it happens only when the checkpoint is behind the floor.
-                            prop_assert!(delivered < first);
+
+                        if events.is_empty() {
+                            // Only the lapse travels alone, and the cursor it leaves behind is the
+                            // floor, which is the ack that moves the checkpoint up and frees the
+                            // credit. An empty batch without a lapse would be an answer with
+                            // nothing in it.
+                            prop_assert!(lapsed.is_some(), "an empty batch carried no lapse");
+                            prop_assert_eq!(next.get(), first);
+                        } else {
+                            prop_assert_eq!(events.first().unwrap().seq().get(), from);
+                            let last = events.last().unwrap().seq().get();
+                            prop_assert_eq!(next.get(), last + 1);
+                            prop_assert!(next.get() <= ceiling, "a batch ran past the credit");
                         }
                     },
                     Step::Answer { .. } => {

@@ -100,6 +100,11 @@ impl Subscriber {
 
     /// Reads the next delivery, waiting for one while the topic has nothing newer to hand over.
     ///
+    /// An answer that carries a [`Lapsed`](crate::Lapsed) and no events means the checkpoint fell
+    /// behind the retained window, so the events it named can no longer be read. Acking that
+    /// batch, which [`Batch::after`](crate::Batch::after) positions at the floor, moves the
+    /// checkpoint up and frees the credit.
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] if the bus refuses the held checkpoint, closes the connection, or if
