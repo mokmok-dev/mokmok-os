@@ -759,7 +759,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -871,6 +871,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+
         #[test]
         fn a_pull_keeps_the_credit_and_lapse_contract(
             events in 1_usize..=6,
@@ -880,6 +882,7 @@ mod tests {
             delivered in 0_u64..=12,
             in_flight in 1_usize..=6,
             max in 1_usize..=6,
+            reclaim in any::<bool>(),
         ) {
             runtime().block_on(async {
                 let config = Config {
@@ -892,12 +895,22 @@ mod tests {
                     ..Config::default()
                 };
                 let bus = Bus::open(config.clone()).unwrap();
+                bus.store().open_topic(Topic::Global).await.unwrap();
+                for size in &sizes {
+                    bus.store()
+                        .append(Topic::Global, payload(*size), SystemTime::now())
+                        .await
+                        .unwrap();
+                }
+                if reclaim {
+                    bus.store()
+                        .reclaim(Topic::Global, SystemTime::now())
+                        .await
+                        .unwrap();
+                }
                 let Ok((entry, _ticks)) = bus.open_topic(Topic::Global).await else {
                     panic!("the topic could not be opened");
                 };
-                for size in &sizes {
-                    entry.append(Topic::Global, payload(*size)).await.unwrap();
-                }
                 let server = Server {
                     bus: Arc::clone(&bus),
                     config,

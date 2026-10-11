@@ -292,3 +292,132 @@ impl Drop for ConnectionPermit {
         self.inner.connections.fetch_sub(1, Ordering::AcqRel);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Bus, OpenError, StoreError};
+    use crate::config::{Config, Limits, Retention};
+    use crate::event::{Refusal, Seq};
+    use crate::payload::Payload;
+    use crate::topic::Topic;
+    use mokmok_protocol::AgentID;
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    const OTHER: Topic = Topic::Agent(AgentID::from_uuid(Uuid::from_u128(1)));
+
+    fn config(
+        topics: usize,
+        idle: Duration,
+    ) -> Config {
+        Config {
+            store: PathBuf::from(":memory:"),
+            limits: Limits {
+                topics: NonZeroUsize::new(topics).unwrap(),
+                ..Limits::default()
+            },
+            retention: Retention {
+                idle,
+                ..Retention::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn max(events: usize) -> NonZeroUsize {
+        NonZeroUsize::new(events).unwrap()
+    }
+
+    fn payload() -> Payload {
+        Payload::json(&0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_watched_topic_holds_its_slot_against_the_ceiling() {
+        let bus = Bus::open(config(1, Duration::from_mins(10))).unwrap();
+        let Ok((_entry, _ticks)) = bus.open_topic(Topic::Global).await else {
+            panic!("the first topic was refused");
+        };
+
+        let refused = bus.open_topic(OTHER).await;
+
+        assert!(matches!(
+            refused,
+            Err(OpenError::Refused(Refusal::TopicLimit))
+        ));
+        bus.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_reclaim_sweep_spares_a_topic_a_session_is_watching() {
+        let bus = Bus::open(config(1, Duration::ZERO)).unwrap();
+        let Ok((entry, _ticks)) = bus.open_topic(Topic::Global).await else {
+            panic!("the first topic was refused");
+        };
+        for _ in 0..3 {
+            entry.append(Topic::Global, payload()).await.unwrap();
+        }
+
+        let refused = bus.open_topic(OTHER).await;
+
+        assert!(matches!(
+            refused,
+            Err(OpenError::Refused(Refusal::TopicLimit))
+        ));
+        let (_, events) = bus
+            .store()
+            .read(Topic::Global, Seq::new(0), max(8))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.seq().get())
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        bus.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_reclaim_sweep_spares_a_topic_that_is_not_idle() {
+        let bus = Bus::open(config(1, Duration::from_mins(10))).unwrap();
+        let Ok((entry, ticks)) = bus.open_topic(Topic::Global).await else {
+            panic!("the first topic was refused");
+        };
+        for _ in 0..3 {
+            entry.append(Topic::Global, payload()).await.unwrap();
+        }
+        drop(ticks);
+
+        let refused = bus.open_topic(OTHER).await;
+
+        assert!(matches!(
+            refused,
+            Err(OpenError::Refused(Refusal::TopicLimit))
+        ));
+        let (_, events) = bus
+            .store()
+            .read(Topic::Global, Seq::new(0), max(8))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        bus.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_store_the_bus_holds() {
+        let bus = Bus::open(config(1, Duration::from_mins(10))).unwrap();
+        let Ok((entry, _ticks)) = bus.open_topic(Topic::Global).await else {
+            panic!("the first topic was refused");
+        };
+        bus.shutdown().await.unwrap();
+
+        let appended = entry.append(Topic::Global, payload()).await;
+
+        assert!(matches!(appended, Err(StoreError::Closed)));
+    }
+}

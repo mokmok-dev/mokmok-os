@@ -750,9 +750,22 @@ mod tests {
     use crate::topic::Topic;
     use proptest::prelude::*;
     use std::num::NonZeroUsize;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch(name: &str) -> PathBuf {
+        let unique = format!(
+            "mokmok-store-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        );
+
+        std::env::temp_dir().join(unique)
+    }
 
     fn retention(
         events: usize,
@@ -1087,6 +1100,43 @@ mod tests {
         assert!(!clock.idle(now, Duration::from_secs(600)));
         assert!(clock.idle(now + Duration::from_secs(600), Duration::from_secs(600)));
         assert!(clock.idle(now, Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_store() {
+        let store = store(4, 1 << 20);
+        open(&store).await;
+        store.shutdown().await.unwrap();
+
+        let appended = store
+            .append(Topic::Global, payload(3), SystemTime::UNIX_EPOCH)
+            .await;
+
+        assert!(matches!(appended, Err(StoreError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn open_creates_a_missing_parent_directory() {
+        let parent = scratch("parent");
+        let path = parent.join("bus.db");
+        assert!(!parent.exists(), "the parent starts missing");
+
+        let store = Store::open(&path, retention(4, 64)).unwrap();
+
+        assert!(parent.is_dir(), "the parent was created");
+        store.shutdown().await.unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn an_append_resets_the_idle_window() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let later = now + Duration::from_secs(3_600);
+        let clock = AppendClock::new(now);
+
+        clock.record(later);
+
+        assert!(!clock.idle(later, Duration::from_secs(600)));
     }
 
     /// The start index the byte bound settles on: pop until the suffix fits, but never evict the
