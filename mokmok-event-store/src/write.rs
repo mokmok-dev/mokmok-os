@@ -45,8 +45,11 @@ impl<'a> WriteTx<'a> {
         crate::store::append_in(self.tx, append)
     }
 
-    /// At most `max` commits of `stream` whose whole version range is at or after `from`, plus the
+    /// At most `max` commits of `stream` whose version range reaches past `from`, plus the
     /// stream's snapshot and version.
+    ///
+    /// A commit that straddles `from` comes back whole, so a caller filtering by version still
+    /// sees every event of the commit it resumed inside.
     ///
     /// # Errors
     ///

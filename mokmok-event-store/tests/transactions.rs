@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod tests {
     use super::*;
 
-    /// A database directory of this test's own, removed when the test ends.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -39,6 +38,15 @@ mod tests {
 
     fn max(count: usize) -> NonZeroUsize {
         NonZeroUsize::new(count).unwrap()
+    }
+
+    fn number(
+        connection: &rusqlite::Connection,
+        sql: &str,
+    ) -> i64 {
+        connection
+            .query_row(sql, rusqlite::params![], |row| row.get(0))
+            .unwrap()
     }
 
     fn event(index: usize) -> NewEvent {
@@ -202,5 +210,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             "the same events at the same positions",
         );
+    }
+
+    #[test]
+    fn a_dropped_inner_append_error_does_not_leave_a_torn_commit() {
+        let scratch = Scratch::new("torn-append");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let seeded = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+        assert_eq!(seeded.version(), Version::new(1));
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER refuse_second_event BEFORE INSERT ON event
+             WHEN NEW.ordinal = 1
+             BEGIN SELECT RAISE(ABORT, 'the second event is refused'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let inner = append(CommandId::new(), stream, Expected::At(Version::new(1)), 2);
+        let applied = store
+            .consume(consumer, &seeded, |tx| {
+                let _ = tx.append(&inner);
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(applied, Processed::Applied(())));
+
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM commit_log"),
+            1,
+            "the failed append left no commit row",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM event"),
+            1,
+            "the failed append left no event row",
+        );
+        assert_eq!(
+            number(&raw, "SELECT version FROM stream"),
+            1,
+            "the stream version did not move",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM outbox"),
+            0,
+            "the failed append left no outbox row",
+        );
+
+        let fresh = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::At(Version::new(1)), 1),
+        );
+        assert_eq!(fresh.version(), Version::new(2));
     }
 }

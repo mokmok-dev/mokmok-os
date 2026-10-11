@@ -1,6 +1,5 @@
 use core::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mokmok_protocol::EventID;
@@ -14,17 +13,6 @@ use crate::event::{Event, Kind, Slice};
 use crate::model::{CommandId, CommitPosition, ConsumerId, StreamId, Version};
 use crate::payload::Payload;
 use crate::write::WriteTx;
-
-/// The wait is set before anything that can take a lock, because another process may hold one. It
-/// is not enough to have it somewhere in the batch: switching a fresh file to WAL needs an
-/// exclusive lock, and a connection without a busy handler answers `SQLITE_BUSY` on the spot
-/// rather than waiting for the other process to commit.
-const PRAGMAS: &str = "
-    PRAGMA busy_timeout = 5000;
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = FULL;
-    PRAGMA foreign_keys = ON;
-";
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS commit_log (
@@ -96,6 +84,9 @@ pub struct Store {
 impl Store {
     /// Opens or creates the store at `path`, applying the schema.
     ///
+    /// A file that is not a store yet is adopted when its `user_version` is 0: the tables are added
+    /// beside whatever is already in it. Any other version is refused.
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] when the file cannot be created, opened, or read.
@@ -107,20 +98,24 @@ impl Store {
             std::fs::create_dir_all(parent).map_err(Error::Io)?;
         }
 
-        Ok(Self {
-            connection: open(path)?,
-        })
+        let connection = Connection::open(path).map_err(Error::Open)?;
+        prepare(&connection)?;
+
+        Ok(Self { connection })
     }
 
     /// Runs the append program in one `BEGIN IMMEDIATE` transaction.
     ///
     /// A caller that retries after a [`Outcome::Conflicted`] can keep losing to a concurrent
     /// writer, because each attempt compares against a version the last attempt read. Pass
-    /// [`Expected::Any`] when the append does not depend on the version that was read.
+    /// [`Expected::Any`](crate::Expected::Any) when the append does not depend on the version that
+    /// was read.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] when the command cannot be committed.
+    /// Returns an [`Error`] when the command cannot be committed. Another process that holds the
+    /// write lock past the five-second wait yields [`Error::Query`] over `SQLITE_BUSY`; nothing was
+    /// written, so the caller may retry.
     pub fn append(
         &mut self,
         append: &Append,
@@ -134,9 +129,14 @@ impl Store {
 
     /// One transaction: inbox dedup, the caller's writes, the inbox row, and the checkpoint.
     ///
+    /// `commit` must come from this store's log. A commit from another file whose position happens
+    /// to exist here is accepted, and the inbox and checkpoint then name an unrelated commit.
+    ///
     /// # Errors
     ///
     /// Returns an [`Error`] when the caller's write or the bookkeeping cannot be committed.
+    /// Another process that holds the write lock past the five-second wait yields [`Error::Query`]
+    /// over `SQLITE_BUSY`; nothing was written, so the caller may retry.
     pub fn consume<T>(
         &mut self,
         consumer: ConsumerId,
@@ -156,8 +156,11 @@ impl Store {
         Ok(Processed::Applied(value))
     }
 
-    /// At most `max` commits of `stream` whose whole version range is at or after `from`, plus the
+    /// At most `max` commits of `stream` whose version range reaches past `from`, plus the
     /// stream's snapshot and version.
+    ///
+    /// A commit that straddles `from` comes back whole, so a caller filtering by version still
+    /// sees every event of the commit it resumed inside.
     ///
     /// # Errors
     ///
@@ -279,41 +282,13 @@ impl Store {
     }
 }
 
-/// Opening a file that two processes create at the same moment can fail. Switching a fresh file
-/// to WAL and the first `CREATE TABLE` both need a lock that SQLite will not queue for, so the
-/// loser answers `SQLITE_BUSY` at once rather than waiting for the winner to commit. Since the
-/// winner settles the file for every later opener, retrying a busy answer turns that race into a
-/// short wait. The bound stays finite so a file this process can never open still fails.
-fn open(path: &Path) -> Result<Connection, Error> {
-    const ATTEMPTS: u32 = 100;
-    const BACKOFF: Duration = Duration::from_millis(20);
-
-    let mut attempts = 0;
-    loop {
-        match Connection::open(path)
-            .map_err(Error::Open)
-            .and_then(|connection| prepare(&connection).map(|()| connection))
-        {
-            Ok(connection) => return Ok(connection),
-            Err(error) if attempts < ATTEMPTS && is_busy(&error) => {
-                attempts += 1;
-                thread::sleep(BACKOFF);
-            },
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn is_busy(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Open(rusqlite::Error::SqliteFailure(failure, _))
-            if failure.code == rusqlite::ErrorCode::DatabaseBusy
-    )
-}
-
 fn prepare(connection: &Connection) -> Result<(), Error> {
-    connection.execute_batch(PRAGMAS).map_err(Error::Open)?;
+    // Set before anything that can take a lock, because another process may hold one: a connection
+    // without a busy handler answers `SQLITE_BUSY` on the spot rather than waiting for the other
+    // process to commit.
+    connection
+        .execute_batch("PRAGMA busy_timeout = 5000;")
+        .map_err(Error::Open)?;
 
     let found: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -321,6 +296,16 @@ fn prepare(connection: &Connection) -> Result<(), Error> {
     if found != 0 && found != 1 {
         return Err(Error::Schema { found });
     }
+
+    // SQLite does not run the busy handler for the switch to WAL, so a process that loses the race
+    // to create the file is told `SQLITE_BUSY` at once, and the winner settles the mode for every
+    // later open. A failed switch is harmless: `synchronous = FULL` is what makes a commit
+    // durable, and it holds in either journal mode.
+    let _ = connection.execute_batch("PRAGMA journal_mode = WAL;");
+
+    connection
+        .execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")
+        .map_err(Error::Open)?;
 
     connection.execute_batch(SCHEMA).map_err(Error::Open)?;
     if found == 0 {
@@ -332,8 +317,34 @@ fn prepare(connection: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// The append program, which only makes sense against a transaction the caller still owns.
+/// Runs the append program inside a savepoint, so an error cannot leave a half-written append in
+/// whatever transaction the caller owns.
 pub fn append_in(
+    connection: &Connection,
+    append: &Append,
+) -> Result<Outcome, Error> {
+    connection
+        .execute_batch("SAVEPOINT append;")
+        .map_err(Error::Query)?;
+
+    match append_program(connection, append) {
+        Ok(outcome) => {
+            connection
+                .execute_batch("RELEASE append;")
+                .map_err(Error::Query)?;
+            Ok(outcome)
+        },
+        Err(error) => {
+            // A caller that drops this error still commits, so the transaction must not carry a
+            // half-written append out of here.
+            let _ = connection.execute_batch("ROLLBACK TO append; RELEASE append;");
+            Err(error)
+        },
+    }
+}
+
+/// The append program, which only makes sense against a transaction the caller still owns.
+fn append_program(
     connection: &Connection,
     append: &Append,
 ) -> Result<Outcome, Error> {
@@ -474,7 +485,6 @@ fn insert_outbox(
     Ok(())
 }
 
-/// The commit a command already produced, or `None`.
 pub fn recorded_in(
     connection: &Connection,
     command: CommandId,
@@ -567,7 +577,7 @@ pub fn history_in(
     for row in commit_rows(
         connection,
         "SELECT position, version FROM commit_log
-         WHERE stream = ?1 AND version - count >= ?2 ORDER BY position LIMIT ?3",
+         WHERE stream = ?1 AND version > ?2 ORDER BY position LIMIT ?3",
         params![
             stream.as_uuid().as_bytes().as_slice(),
             to_i64(from.get())?,
@@ -872,6 +882,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
 
     fn store() -> Store {
         Store::open(Path::new(":memory:")).unwrap()
@@ -1130,6 +1141,38 @@ mod tests {
     }
 
     #[test]
+    fn history_returns_a_commit_that_straddles_from_whole() {
+        let mut store = store();
+        let stream = StreamId::new();
+        committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+        committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::At(Version::new(1)), 2),
+        );
+        committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::At(Version::new(3)), 3),
+        );
+
+        let straddled = store.history(stream, Version::new(2), max(8)).unwrap();
+
+        assert_eq!(straddled.commits().len(), 2);
+        assert_eq!(
+            straddled.commits()[0]
+                .events()
+                .iter()
+                .map(|event| event.version().get())
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "the straddled commit comes back whole",
+        );
+        assert_eq!(straddled.events().count(), 5);
+    }
+
+    #[test]
     fn the_log_reads_commits_in_position_order() {
         let mut store = store();
         let a = StreamId::new();
@@ -1345,6 +1388,51 @@ mod tests {
         };
 
         assert!(matches!(error, Error::Schema { found: 7 }));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The instant a store would keep for `at`, which truncates to whole milliseconds.
+    fn floor_to_millis(at: SystemTime) -> SystemTime {
+        let millis = at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        SystemTime::UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).unwrap())
+    }
+
+    #[test]
+    fn an_appended_event_and_its_outbox_carry_the_commit_time() {
+        let mut store = store();
+        let stream = StreamId::new();
+        let append = append(CommandId::new(), stream, Expected::New, 1)
+            .outbox(OutboxMessage::new("turn.done", Payload::json(&1).unwrap()));
+
+        let before = SystemTime::now();
+        let commit = committed(&mut store, &append);
+        let after = SystemTime::now();
+        let floor = floor_to_millis(before);
+
+        let mut pending = store.pending_outbox(max(8)).unwrap();
+        let entry = pending.remove(0);
+
+        assert!(floor <= commit.events()[0].at());
+        assert!(commit.events()[0].at() <= after);
+        assert!(floor <= entry.at());
+        assert!(entry.at() <= after);
+    }
+
+    #[test]
+    fn a_fresh_store_stamps_the_file_with_user_version_one() {
+        let path = scratch();
+        Store::open(&path).unwrap();
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(version, 1);
         std::fs::remove_file(&path).unwrap();
     }
 }

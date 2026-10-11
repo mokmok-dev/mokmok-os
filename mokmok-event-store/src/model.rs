@@ -14,13 +14,11 @@ use uuid::Uuid;
 pub struct StreamId(Uuid);
 
 impl StreamId {
-    /// Mints a fresh identity.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Rebuilds an identity from a UUID the caller already holds.
     #[must_use]
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
@@ -63,13 +61,11 @@ impl FromStr for StreamId {
 pub struct ConsumerId(Uuid);
 
 impl ConsumerId {
-    /// Mints a fresh identity.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
-    /// Rebuilds an identity from a UUID the caller already holds.
     #[must_use]
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
@@ -119,7 +115,6 @@ impl CommandId {
         Self(Uuid::new_v4())
     }
 
-    /// Rebuilds an identity from a UUID the caller already holds.
     #[must_use]
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
@@ -154,7 +149,6 @@ impl FromStr for CommandId {
     }
 }
 
-/// Reports a string that is not the UUID an id needs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, thiserror::Error)]
 #[error("an id is a UUID")]
 pub struct InvalidId;

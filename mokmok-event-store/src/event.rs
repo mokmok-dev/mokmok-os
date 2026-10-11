@@ -49,7 +49,6 @@ impl FromStr for Kind {
     }
 }
 
-/// Reports a kind that carries no name.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, thiserror::Error)]
 #[error("an event kind is a non-empty name")]
 pub struct InvalidKind;

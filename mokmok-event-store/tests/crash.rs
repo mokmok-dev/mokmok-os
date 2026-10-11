@@ -23,7 +23,6 @@ mod tests {
     /// enough that a wedged one fails the suite instead of hanging it.
     const BOUND: Duration = Duration::from_secs(10);
 
-    /// A database directory of this test's own, removed when the test ends.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -102,9 +101,20 @@ mod tests {
                 .unwrap_or_else(|elapsed| panic!("no marker within {BOUND:?}: {elapsed}"))
         }
 
-        /// Waits for a helper that was given a bounded amount of work to finish on its own.
+        /// Waits for a helper that was given a bounded amount of work to finish on its own. A
+        /// writer that never finishes fails the test instead of hanging the suite.
         fn finished(&mut self) -> std::process::ExitStatus {
-            self.child.wait().unwrap()
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    return status;
+                }
+                assert!(
+                    start.elapsed() < BOUND,
+                    "the helper did not finish within {BOUND:?}",
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 

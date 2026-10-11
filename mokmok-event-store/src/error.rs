@@ -1,4 +1,3 @@
-/// Everything an event store operation can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("the event store could not be opened")]
