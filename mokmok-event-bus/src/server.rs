@@ -527,3 +527,20 @@ async fn close(
 fn millis(value: NonZeroU32) -> Duration {
     Duration::from_millis(u64::from(value.get()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_stale;
+    use std::io;
+
+    #[test]
+    fn a_missing_or_refused_socket_is_stale() {
+        assert!(is_stale(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(is_stale(&io::Error::from(io::ErrorKind::ConnectionRefused)));
+    }
+
+    #[test]
+    fn a_denied_socket_is_not_stale() {
+        assert!(!is_stale(&io::Error::from(io::ErrorKind::PermissionDenied)));
+    }
+}

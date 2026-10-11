@@ -174,4 +174,14 @@ mod tests {
         assert!(serde_json::from_str::<Topic>("\"session:nope\"").is_err());
         assert!(serde_json::from_str::<Topic>("7").is_err());
     }
+
+    #[test]
+    fn a_json_number_names_the_topic_grammar_in_the_error() {
+        let error = serde_json::from_str::<Topic>("7").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid type: integer `7`, expected a topic name at line 1 column 1",
+        );
+    }
 }
