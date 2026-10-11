@@ -16,20 +16,26 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 
-use crate::bus::{Bus, TopicEntry};
+use crate::bus::{Bus, OpenError, TopicEntry};
 use crate::config::{Config, Timeouts};
-use crate::event::{Position, Refusal, Window};
+use crate::event::{Cursor, Lapsed, Refusal, Seq, Window};
+use crate::payload::Payload;
+use crate::store::StoreError;
+use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
 use crate::wire::{self, Request, RequestFrame};
 
 const GOING_AWAY: u16 = 1001;
 const PROTOCOL_ERROR: u16 = 1002;
 const POLICY_VIOLATION: u16 = 1008;
+const INTERNAL_ERROR: u16 = 1011;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     #[error("another process is already serving this socket")]
     AlreadyRunning,
+    #[error("the event database could not be served")]
+    Store(#[source] StoreError),
     #[error("the socket could not be served: {0}")]
     Io(#[source] io::Error),
 }
@@ -38,14 +44,15 @@ pub enum ServeError {
 ///
 /// # Errors
 ///
-/// Returns [`ServeError::AlreadyRunning`] when a live peer answers on the socket, and
-/// [`ServeError::Io`] when the socket cannot be prepared or served.
+/// Returns [`ServeError::AlreadyRunning`] when a live peer answers on the socket,
+/// [`ServeError::Store`] when the database cannot be opened, and [`ServeError::Io`] when the
+/// socket cannot be prepared or served.
 pub async fn serve(
     config: Config,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
     let (socket, listener) = SocketFile::bind(&config.path).await?;
-    let bus = Bus::new(config.clone());
+    let bus = Bus::open(config.clone())?;
     let router = Router::new().route("/ws", get(upgrade)).with_state(Server {
         bus: Arc::clone(&bus),
         config,
@@ -63,8 +70,9 @@ pub async fn serve(
         .await;
 
     drop(socket);
-
-    served.map_err(ServeError::Io)
+    let stopped = bus.shutdown().await;
+    served.map_err(ServeError::Io)?;
+    stopped.map_err(ServeError::Store)
 }
 
 /// Resolves on SIGINT or SIGTERM.
@@ -166,17 +174,28 @@ async fn upgrade(
 
 enum Phase {
     Unopened,
-    Opened {
-        topic: Topic,
-        entry: Arc<TopicEntry>,
-    },
     Publisher {
         topic: Topic,
         entry: Arc<TopicEntry>,
     },
     Subscriber {
+        topic: Topic,
         entry: Arc<TopicEntry>,
+        subscriber: SubscriberId,
+        /// The next seq this session may hand out.
+        delivered: Seq,
+        /// The checkpoint, cached; the database is the truth.
+        acked: Seq,
     },
+}
+
+/// Why a pull that found nothing is waiting. Conflating the two either spins the bus on a commit
+/// that cannot help or floods a consumer whose credit is spent.
+enum Parked {
+    /// Caught up: the next event will come from a commit, so wait on the topic's watch.
+    CaughtUp { max: NonZeroUsize },
+    /// The credit is spent: only an `Ack` can free more, so a commit must not wake this.
+    Spent,
 }
 
 /// Carries the values a frame changed back out of the handler, because a `select!` arm holds its
@@ -186,11 +205,9 @@ enum Step {
         response: wire::Response,
         phase: Phase,
     },
-    /// `bus.batch` had nothing to hand over, so the session waits for the topic's window.
     Park {
         phase: Phase,
-        at: Position,
-        max: NonZeroUsize,
+        parked: Parked,
     },
     Watch {
         response: wire::Response,
@@ -203,7 +220,7 @@ enum Step {
 struct Session {
     phase: Phase,
     ticks: Option<watch::Receiver<Window>>,
-    parked: Option<(Position, NonZeroUsize)>,
+    parked: Option<Parked>,
     pinged: Option<tokio::time::Instant>,
 }
 
@@ -258,8 +275,8 @@ async fn session(
                     return;
                 }
             }
-            () = window_changed(&mut session.ticks), if session.parked.is_some() => {
-                if !recheck(&mut socket, &server.bus, &mut session, timeouts).await {
+            () = window_changed(&mut session.ticks), if matches!(session.parked, Some(Parked::CaughtUp { .. })) => {
+                if !recheck(&mut socket, &server, &mut session, timeouts).await {
                     return;
                 }
             }
@@ -293,7 +310,7 @@ async fn deliver(
                 watching.borrow_and_update();
             }
 
-            apply(socket, &server.bus, session, request, timeouts).await
+            apply(socket, server, session, request, timeouts).await
         },
         Message::Pong(_) => {
             session.pinged = None;
@@ -309,21 +326,21 @@ async fn deliver(
 
 async fn apply(
     socket: &mut WebSocket,
-    bus: &Bus,
+    server: &Server,
     session: &mut Session,
     request: Request,
     timeouts: Timeouts,
 ) -> bool {
-    match handle(bus, &session.phase, request) {
+    match handle(server, &session.phase, request).await {
         Step::Answer { response, phase } => {
             session.phase = phase;
             session.parked = None;
 
             send(socket, &response, timeouts).await
         },
-        Step::Park { phase, at, max } => {
+        Step::Park { phase, parked } => {
             session.phase = phase;
-            session.parked = Some((at, max));
+            session.parked = Some(parked);
 
             true
         },
@@ -349,22 +366,15 @@ async fn apply(
 /// A parked pull re-attempts once the topic's window changes; `false` means the session ends.
 async fn recheck(
     socket: &mut WebSocket,
-    bus: &Bus,
+    server: &Server,
     session: &mut Session,
     timeouts: Timeouts,
 ) -> bool {
-    let Some((position, max)) = session.parked else {
+    let Some(Parked::CaughtUp { max }) = session.parked else {
         return true;
     };
 
-    apply(
-        socket,
-        bus,
-        session,
-        Request::Pull { position, max },
-        timeouts,
-    )
-    .await
+    apply(socket, server, session, Request::Pull { max }, timeouts).await
 }
 
 /// `false` means the peer stopped answering and the session ends.
@@ -408,70 +418,286 @@ async fn window_changed(ticks: &mut Option<watch::Receiver<Window>>) {
     }
 }
 
-fn handle(
-    bus: &Bus,
+async fn handle(
+    server: &Server,
     phase: &Phase,
     request: Request,
 ) -> Step {
     match (phase, request) {
-        (Phase::Unopened, Request::Open { topic }) => match bus.open(topic) {
-            Ok((entry, ticks)) => {
-                let window = *ticks.borrow();
-
-                Step::Watch {
-                    response: wire::Response::Opened { window },
-                    phase: Phase::Opened { topic, entry },
-                    ticks,
-                }
-            },
-            Err(reason) => {
-                tracing::warn!(%topic, %reason, "refused a topic");
-
-                Step::Answer {
-                    response: wire::Response::Refused { reason },
-                    phase: Phase::Unopened,
-                }
-            },
+        (Phase::Unopened, Request::Open { topic, subscriber }) => {
+            open(server, topic, subscriber).await
+        },
+        (Phase::Publisher { topic, entry }, Request::Publish { payload }) => {
+            publish(*topic, entry, payload).await
         },
         (
-            Phase::Opened { topic, entry } | Phase::Publisher { topic, entry },
-            Request::Publish { payload },
-        ) => Step::Answer {
-            response: wire::Response::from(entry.append(*topic, payload)),
+            Phase::Subscriber {
+                topic,
+                entry,
+                subscriber,
+                delivered,
+                acked,
+            },
+            Request::Pull { max },
+        ) => pull(server, *topic, entry, *subscriber, *delivered, *acked, max).await,
+        (
+            Phase::Subscriber {
+                topic,
+                entry,
+                subscriber,
+                delivered,
+                acked,
+            },
+            Request::Ack { through },
+        ) => {
+            // Only the checkpoint moves here. Serving the freed backlog in the same breath would
+            // put two responses behind one request, and a client reads exactly one.
+            ack(
+                server,
+                *topic,
+                entry,
+                *subscriber,
+                *delivered,
+                *acked,
+                through,
+            )
+            .await
+        },
+        _ => Step::Close(PROTOCOL_ERROR),
+    }
+}
+
+async fn open(
+    server: &Server,
+    topic: Topic,
+    subscriber: Option<SubscriberId>,
+) -> Step {
+    let (entry, ticks) = match server.bus.open_topic(topic).await {
+        Ok(opened) => opened,
+        Err(OpenError::Refused(reason)) => {
+            tracing::warn!(%topic, %reason, "refused a topic");
+
+            return Step::Answer {
+                response: wire::Response::Refused { reason },
+                phase: Phase::Unopened,
+            };
+        },
+        Err(OpenError::Store(error)) => {
+            tracing::error!(%error, "the store could not open the topic");
+
+            return Step::Close(INTERNAL_ERROR);
+        },
+    };
+
+    let window = *ticks.borrow();
+    let phase = match subscriber {
+        None => Phase::Publisher { topic, entry },
+        Some(subscriber) => {
+            let acked = match server.bus.store().checkpoint(subscriber, topic).await {
+                Ok(None) => window.first(),
+                Ok(Some(cursor)) if cursor.epoch() == window.epoch() => cursor.seq(),
+                Ok(Some(_)) => {
+                    tracing::warn!(%topic, "refused a subscriber from another epoch");
+
+                    return Step::Answer {
+                        response: wire::Response::Refused {
+                            reason: Refusal::Unresumable { window },
+                        },
+                        phase: Phase::Unopened,
+                    };
+                },
+                Err(error) => {
+                    tracing::error!(%error, "the checkpoint could not be read");
+
+                    return Step::Close(INTERNAL_ERROR);
+                },
+            };
+
+            Phase::Subscriber {
+                topic,
+                entry,
+                subscriber,
+                delivered: acked,
+                acked,
+            }
+        },
+    };
+
+    Step::Watch {
+        response: wire::Response::Opened { window },
+        phase,
+        ticks,
+    }
+}
+
+async fn publish(
+    topic: Topic,
+    entry: &Arc<TopicEntry>,
+    payload: Payload,
+) -> Step {
+    match entry.append(topic, payload).await {
+        Ok(published) => Step::Answer {
+            response: wire::Response::from(published),
             phase: Phase::Publisher {
-                topic: *topic,
+                topic,
                 entry: Arc::clone(entry),
             },
         },
-        (
-            Phase::Opened { entry, .. } | Phase::Subscriber { entry },
-            Request::Pull { position, max },
-        ) => match bus.batch(entry, position, max) {
-            Ok(batch) if batch.is_empty() && batch.lapsed().is_none() => Step::Park {
-                phase: Phase::Subscriber {
-                    entry: Arc::clone(entry),
-                },
-                at: position,
-                max,
-            },
-            Ok(batch) => Step::Answer {
-                response: wire::Response::from(batch),
-                phase: Phase::Subscriber {
-                    entry: Arc::clone(entry),
-                },
-            },
-            Err(reason) => {
-                tracing::warn!(%reason, "refused a pull");
+        Err(error) => {
+            tracing::error!(%error, "the append failed");
 
-                Step::Answer {
-                    response: wire::Response::Refused { reason },
-                    phase: Phase::Subscriber {
-                        entry: Arc::clone(entry),
-                    },
-                }
+            Step::Close(INTERNAL_ERROR)
+        },
+    }
+}
+
+async fn pull(
+    server: &Server,
+    topic: Topic,
+    entry: &Arc<TopicEntry>,
+    subscriber: SubscriberId,
+    delivered: Seq,
+    acked: Seq,
+    max: NonZeroUsize,
+) -> Step {
+    let limits = server.config.limits;
+    let max = max.min(limits.batch);
+    let window = entry.window();
+
+    let from = Seq::new(delivered.get().max(window.first().get()));
+    let ceiling = acked.get().saturating_add(limits.in_flight.get() as u64);
+    let credit = usize::try_from(ceiling.saturating_sub(from.get())).unwrap_or(usize::MAX);
+    let count = max.get().min(credit);
+
+    if count == 0 {
+        if delivered < window.first() {
+            // The checkpoint is behind the retained floor, so the events it names can never be
+            // handed over. The gap travels on its own, with no event and no credit spent: the
+            // caller acks the lapse, which moves its checkpoint to the floor and frees the credit.
+            // Handing an event over instead would let a subscriber that never acks keep drawing
+            // them, because eviction raises the floor the credit is measured against.
+            return Step::Answer {
+                response: wire::Response::Batch {
+                    window,
+                    lapsed: Some(Lapsed::new(
+                        Cursor::new(window.epoch(), delivered),
+                        window.first(),
+                    )),
+                    events: Vec::new(),
+                },
+                phase: Phase::Subscriber {
+                    topic,
+                    entry: Arc::clone(entry),
+                    subscriber,
+                    delivered: window.first(),
+                    acked,
+                },
+            };
+        }
+
+        // Only an ack can free spent credit, so this park must not be woken by a commit.
+        return Step::Park {
+            phase: Phase::Subscriber {
+                topic,
+                entry: Arc::clone(entry),
+                subscriber,
+                delivered,
+                acked,
+            },
+            parked: Parked::Spent,
+        };
+    }
+
+    let count = NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN);
+
+    match server.bus.store().read(topic, from, count).await {
+        Ok((state, events)) if !events.is_empty() => {
+            let next = events
+                .last()
+                .map_or(from, |event| Seq::new(event.seq().get() + 1));
+            let window = Window::new(state.epoch, state.first, state.next);
+            let lapsed = (delivered < state.first)
+                .then(|| Lapsed::new(Cursor::new(state.epoch, delivered), state.first));
+
+            Step::Answer {
+                response: wire::Response::Batch {
+                    window,
+                    lapsed,
+                    events,
+                },
+                phase: Phase::Subscriber {
+                    topic,
+                    entry: Arc::clone(entry),
+                    subscriber,
+                    delivered: next,
+                    acked,
+                },
+            }
+        },
+        Ok(_) => Step::Park {
+            phase: Phase::Subscriber {
+                topic,
+                entry: Arc::clone(entry),
+                subscriber,
+                delivered,
+                acked,
+            },
+            parked: Parked::CaughtUp { max },
+        },
+        Err(error) => {
+            tracing::error!(%error, "the read failed");
+
+            Step::Close(INTERNAL_ERROR)
+        },
+    }
+}
+
+async fn ack(
+    server: &Server,
+    topic: Topic,
+    entry: &Arc<TopicEntry>,
+    subscriber: SubscriberId,
+    delivered: Seq,
+    acked: Seq,
+    through: Cursor,
+) -> Step {
+    let window = entry.window();
+
+    if through.epoch() != window.epoch() {
+        // A stale frame is answered with the stored cursor, so the caller can see nothing moved.
+        return Step::Answer {
+            response: wire::Response::Acked {
+                through: Cursor::new(window.epoch(), acked),
+            },
+            phase: Phase::Subscriber {
+                topic,
+                entry: Arc::clone(entry),
+                subscriber,
+                delivered,
+                acked,
+            },
+        };
+    }
+
+    let clamped = through.seq().get().min(delivered.get()).max(acked.get());
+    let through = Cursor::new(window.epoch(), Seq::new(clamped));
+
+    match server.bus.store().advance(subscriber, topic, through).await {
+        Ok(stored) => Step::Answer {
+            response: wire::Response::Acked { through: stored },
+            phase: Phase::Subscriber {
+                topic,
+                entry: Arc::clone(entry),
+                subscriber,
+                delivered,
+                acked: stored.seq(),
             },
         },
-        _ => Step::Close(PROTOCOL_ERROR),
+        Err(error) => {
+            tracing::error!(%error, "the checkpoint could not be advanced");
+
+            Step::Close(INTERNAL_ERROR)
+        },
     }
 }
 

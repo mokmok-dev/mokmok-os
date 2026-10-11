@@ -8,8 +8,9 @@ use tokio::net::UnixStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::event::{Batch, Position, Published, Refusal};
+use crate::event::{Batch, Cursor, Published, Refusal};
 use crate::payload::Payload;
+use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
 use crate::wire::{Request, Response, ResponseFrame};
 
@@ -38,7 +39,6 @@ pub struct Publisher {
 
 pub struct Subscriber {
     stream: WebSocketStream<UnixStream>,
-    position: Position,
 }
 
 impl Publisher {
@@ -53,7 +53,7 @@ impl Publisher {
         topic: Topic,
     ) -> Result<Self, Error> {
         Ok(Self {
-            stream: open(socket, topic).await?,
+            stream: open(socket, topic, None).await?,
         })
     }
 
@@ -80,63 +80,72 @@ impl Publisher {
 }
 
 impl Subscriber {
-    /// Opens a connection and reads the topic from `at`, which is also how a restart resumes.
+    /// Opens a connection and resumes `subscriber`'s checkpoint on `topic`. A fresh id starts at
+    /// the oldest retained event; an id whose checkpoint names another epoch is refused with
+    /// [`Refusal::Unresumable`].
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the socket cannot be reached, if the bus refuses the position,
+    /// Returns an [`Error`] if the socket cannot be reached, if the bus refuses the subscriber,
     /// or if the bus closes the connection.
     pub async fn open(
         socket: &Path,
         topic: Topic,
-        at: Position,
+        subscriber: SubscriberId,
     ) -> Result<Self, Error> {
         Ok(Self {
-            stream: open(socket, topic).await?,
-            position: at,
+            stream: open(socket, topic, Some(subscriber)).await?,
         })
     }
 
-    /// Reads the next delivery, waiting for one while the log has nothing newer to hand over.
+    /// Reads the next delivery, waiting for one while the topic has nothing newer to hand over.
+    ///
+    /// An answer that carries a [`Lapsed`](crate::Lapsed) and no events means the checkpoint fell
+    /// behind the retained window, so the events it named can no longer be read. Acking that
+    /// batch, which [`Batch::after`](crate::Batch::after) positions at the floor, moves the
+    /// checkpoint up and frees the credit.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the bus refuses the held position, closes the connection, or if
+    /// Returns an [`Error`] if the bus refuses the held checkpoint, closes the connection, or if
     /// the socket fails.
     pub async fn next(&mut self) -> Result<Batch, Error> {
         // Asking for as much as the bus will give keeps the client free of a second place that
-        // has to know the batch limit; the bus clamps the request to its own configuration.
+        // has to know the batch limit; the bus clamps the request to its own configuration and its
+        // in-flight ceiling.
         let max = NonZeroUsize::MAX;
 
-        let answered = exchange(
-            &mut self.stream,
-            &Request::Pull {
-                position: self.position,
-                max,
-            },
-        )
-        .await;
-
-        match answered? {
+        match exchange(&mut self.stream, &Request::Pull { max }).await? {
             Some(Response::Batch {
                 window,
                 lapsed,
                 events,
-            }) => {
-                let batch = Batch::new(window, lapsed, events);
-                self.position = batch.after();
-
-                Ok(batch)
-            },
+            }) => Ok(Batch::new(window, lapsed, events)),
             Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
             Some(_) => Err(Error::Protocol(UNEXPECTED)),
             None => Err(Error::Closed),
         }
     }
 
-    #[must_use]
-    pub const fn position(&self) -> Position {
-        self.position
+    /// Advances the checkpoint to `through`.
+    ///
+    /// Ack only after the effects of those events are durable. The checkpoint is advanced
+    /// server-side, and a crash before the ack replays the batch, so an ack that names work not
+    /// yet done turns a duplicate into a loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the bus closes the connection or if the socket fails.
+    pub async fn ack(
+        &mut self,
+        through: Cursor,
+    ) -> Result<(), Error> {
+        match exchange(&mut self.stream, &Request::Ack { through }).await? {
+            Some(Response::Acked { .. }) => Ok(()),
+            Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
+            Some(_) => Err(Error::Protocol(UNEXPECTED)),
+            None => Err(Error::Closed),
+        }
     }
 }
 
@@ -158,9 +167,10 @@ async fn connect(socket: &Path) -> Result<WebSocketStream<UnixStream>, Error> {
 async fn open(
     socket: &Path,
     topic: Topic,
+    subscriber: Option<SubscriberId>,
 ) -> Result<WebSocketStream<UnixStream>, Error> {
     let mut stream = connect(socket).await?;
-    let written = send(&mut stream, &Request::Open { topic }).await;
+    let written = send(&mut stream, &Request::Open { topic, subscriber }).await;
 
     let answered = match receive(&mut stream).await {
         Ok(answered) => answered,

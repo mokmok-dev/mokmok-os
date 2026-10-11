@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use mokmok_event_bus::{Config, Payload, Position, Publisher, Subscriber, Topic, serve};
+use mokmok_event_bus::{Config, Payload, Publisher, Subscriber, SubscriberId, Topic, serve};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -17,9 +17,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    let path = std::env::temp_dir().join(format!("mokmok-loopback-{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!("mokmok-loopback-{}", std::process::id()));
+    let path = scratch.join("bus.sock");
+    let store = scratch.join("bus.db");
     let config = Config {
         path: path.clone(),
+        store: store.clone(),
         ..Config::default()
     };
     let (stop, stopped) = oneshot::channel();
@@ -30,7 +33,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("bus serving on {}", path.display());
 
     let topic = Topic::Global;
-    let mut subscriber = Subscriber::open(&path, topic, Position::Beginning).await?;
+    let id = SubscriberId::new();
+    let mut subscriber = Subscriber::open(&path, topic, id).await?;
     let mut publisher = Publisher::open(&path, topic).await?;
 
     for turn in 1..=3 {
@@ -53,27 +57,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("read seq {} carrying turn {turn}", event.seq().get());
             seen.push(turn);
         }
+
+        // Acked before the effect is real here, but the example has no effect to await.
+        subscriber.ack(batch.after()).await?;
     }
     assert_eq!(seen, [1, 2, 3]);
     println!("read every published turn back, in order");
-
-    let saved = subscriber.position();
     drop(subscriber);
 
     let receipt = publisher.publish(Payload::json(&Turn { turn: 4 })?).await?;
     println!("published turn 4 as seq {}", receipt.seq().get());
 
-    let mut resumed = Subscriber::open(&path, topic, saved).await?;
+    let mut resumed = Subscriber::open(&path, topic, id).await?;
     let batch = resumed.next().await?;
 
     assert_eq!(batch.events().len(), 1);
     assert_eq!(batch.events()[0].payload().decode::<Turn>()?.turn, 4);
-    println!("resumed from the saved position and read turn 4 alone");
+    println!("resumed from the durable checkpoint and read turn 4 alone");
 
     let _ = stop.send(());
     serving.await??;
     assert!(!path.exists());
     println!("serve returned and unlinked {}", path.display());
+
+    let _ = std::fs::remove_file(&store);
+    let _ = std::fs::remove_dir_all(&scratch);
 
     Ok(())
 }

@@ -1,16 +1,22 @@
-//! A bounded append-only log per topic, served over WebSocket on a Unix socket.
+//! A durable, bounded append-only log per topic, served over WebSocket on a Unix socket.
 //!
 //! One process is the bus; publishers and subscribers are WebSocket clients of it. A connection
-//! names one topic in its first frame and then publishes or pulls from that topic. Each topic
-//! keeps a bounded log, so a subscriber that was absent, slow, or not yet started can catch up
-//! from a position it saved, and one that fell further behind than the log reaches is told what
-//! it missed instead of silently losing it.
+//! names one topic in its first frame and then publishes or pulls from that topic. Every event is
+//! committed to SQLite before any subscriber can receive it, and each subscriber resumes from a
+//! checkpoint the bus keeps for it, so a crash between commit and delivery loses nothing.
 //!
 //! ```no_run
 //! use mokmok_event_bus::{
-//!     Config, Payload, Position, Publisher, Subscriber, Topic, serve, signals,
+//!     Config, Payload, Publisher, Subscriber, SubscriberId, Topic, serve, signals,
 //! };
 //!
+//! # async fn handle(event: &mokmok_event_bus::Event) -> Result<(), Box<dyn std::error::Error>> {
+//! #     let _ = event;
+//! #     Ok(())
+//! # }
+//! # fn load_id() -> SubscriberId {
+//! #     SubscriberId::new()
+//! # }
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = Config::default();
 //! let socket = config.path.clone();
@@ -20,24 +26,20 @@
 //! let mut publisher = Publisher::open(&socket, topic).await?;
 //! publisher.publish(Payload::json(&"turn finished")?).await?;
 //!
-//! let mut subscriber = Subscriber::open(&socket, topic, load_position()).await?;
-//! let batch = subscriber.next().await?;
-//! for event in batch.events() {
-//!     println!("{}", event.payload().as_str());
+//! let mut subscriber = Subscriber::open(&socket, topic, load_id()).await?;
+//! loop {
+//!     let batch = subscriber.next().await?;   // parks until a commit lands
+//!     for event in batch.events() {
+//!         handle(event).await?;
+//!     }
+//!     subscriber.ack(batch.after()).await?;   // only after the effect is durable
 //! }
-//! save_position(subscriber.position());
-//! # Ok(())
-//! # }
-//! # fn load_position() -> Position {
-//! #     Position::Beginning
-//! # }
-//! # fn save_position(position: Position) {
-//! #     let _ = position;
 //! # }
 //! ```
 //!
-//! [`Subscriber::open`] takes the position to read from, so a cold start and a restart differ
-//! only in the value the caller saved.
+//! [`Subscriber::open`] takes the [`SubscriberId`] whose checkpoint resumes the read, so a cold
+//! start and a restart differ only in whether that id has been seen before. Delivery is
+//! at-least-once: a batch not yet acked is replayed, so a consumer must tolerate duplicates.
 
 // Internal types are `pub`, not `pub(crate)`: the workspace denies
 // `clippy::redundant_pub_crate`, and a private module already keeps them crate-local.
@@ -45,17 +47,17 @@ mod bus;
 mod client;
 mod config;
 mod event;
-mod log;
 mod payload;
 mod server;
+mod store;
+mod subscriber;
 mod topic;
 mod wire;
 
 pub use client::{Error, Publisher, Subscriber};
 pub use config::{Config, Limits, Retention, Timeouts};
-pub use event::{
-    Batch, Cursor, Event, Lapsed, LogEpoch, Position, Published, Refusal, Seq, Window,
-};
+pub use event::{Batch, Cursor, Event, Lapsed, LogEpoch, Published, Refusal, Seq, Window};
 pub use payload::{Payload, PayloadError};
 pub use server::{ServeError, serve, signals};
+pub use subscriber::{InvalidSubscriberId, SubscriberId};
 pub use topic::{InvalidTopic, Topic};
