@@ -1168,4 +1168,65 @@ mod tests {
                 .is_err(),
         );
     }
+
+    #[tokio::test]
+    async fn a_consumer_that_never_acks_is_handed_nothing_once_its_checkpoint_lapses() {
+        let bus = Bus::start(Config {
+            limits: Limits {
+                in_flight: NonZeroUsize::new(1).unwrap(),
+                ..Limits::default()
+            },
+            retention: Retention {
+                events: NonZeroUsize::new(1).unwrap(),
+                ..Retention::default()
+            },
+            ..config()
+        })
+        .await;
+        let topic = Topic::Global;
+        let id = SubscriberId::new();
+        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+            .await
+            .unwrap();
+
+        within("publish", publisher.publish(payload(&0)))
+            .await
+            .unwrap();
+        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let first = within("first next", subscriber.next()).await.unwrap();
+        assert_eq!(seqs(&first), [0]);
+        within("ack", subscriber.ack(first.after())).await.unwrap();
+        drop(subscriber);
+
+        // Two more appends between every pull keeps moving the retained floor past the checkpoint,
+        // which is what decides how far a subscriber may read. A consumer that never acks must
+        // still be handed no more than its credit.
+        let mut subscriber = within("reconnect", Subscriber::open(&bus.path, topic, id))
+            .await
+            .unwrap();
+        let mut handed = 0;
+
+        for turn in (1..=6).rev() {
+            for _ in 0..2 {
+                within("publish", publisher.publish(payload(&turn)))
+                    .await
+                    .unwrap();
+            }
+
+            let batch = within("next", subscriber.next()).await.unwrap();
+
+            handed += batch.events().len();
+            assert!(
+                batch.lapsed().is_some(),
+                "the lapse is reported on every pull behind the floor",
+            );
+        }
+
+        assert!(
+            handed <= 1,
+            "a subscriber that never acked was handed {handed} events against a credit of 1",
+        );
+    }
 }

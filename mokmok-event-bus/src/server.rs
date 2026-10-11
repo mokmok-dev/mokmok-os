@@ -567,23 +567,35 @@ async fn pull(
     let from = Seq::new(delivered.get().max(window.first().get()));
     let ceiling = acked.get().saturating_add(limits.in_flight.get() as u64);
     let credit = usize::try_from(ceiling.saturating_sub(from.get())).unwrap_or(usize::MAX);
-    let mut count = max.get().min(credit);
-
-    if count == 0 && delivered < window.first() && window.first() < window.next() {
-        // The checkpoint is behind the retained floor and the credit cannot cover the gap. The
-        // lapse is the only way forward, so hand over one event rather than park for a commit
-        // that could never free enough credit.
-        count = 1;
-    }
+    let count = max.get().min(credit);
 
     if count == 0 {
-        // A commit cannot free spent credit, so that park must not be woken by one.
-        let parked = if delivered.get() >= ceiling {
-            Parked::Spent
-        } else {
-            Parked::CaughtUp { max }
-        };
+        if delivered < window.first() {
+            // The checkpoint is behind the retained floor, so the events it names can never be
+            // handed over. The gap travels on its own, with no event and no credit spent: the
+            // caller acks the lapse, which moves its checkpoint to the floor and frees the credit.
+            // Handing an event over instead would let a subscriber that never acks keep drawing
+            // them, because eviction raises the floor the credit is measured against.
+            return Step::Answer {
+                response: wire::Response::Batch {
+                    window,
+                    lapsed: Some(Lapsed::new(
+                        Cursor::new(window.epoch(), delivered),
+                        window.first(),
+                    )),
+                    events: Vec::new(),
+                },
+                phase: Phase::Subscriber {
+                    topic,
+                    entry: Arc::clone(entry),
+                    subscriber,
+                    delivered: window.first(),
+                    acked,
+                },
+            };
+        }
 
+        // Only an ack can free spent credit, so this park must not be woken by a commit.
         return Step::Park {
             phase: Phase::Subscriber {
                 topic,
@@ -592,7 +604,7 @@ async fn pull(
                 delivered,
                 acked,
             },
-            parked,
+            parked: Parked::Spent,
         };
     }
 
