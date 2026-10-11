@@ -1,5 +1,6 @@
 use core::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mokmok_protocol::EventID;
@@ -14,10 +15,14 @@ use crate::model::{CommandId, CommitPosition, ConsumerId, StreamId, Version};
 use crate::payload::Payload;
 use crate::write::WriteTx;
 
+/// The wait is set before anything that can take a lock, because another process may hold one. It
+/// is not enough to have it somewhere in the batch: switching a fresh file to WAL needs an
+/// exclusive lock, and a connection without a busy handler answers `SQLITE_BUSY` on the spot
+/// rather than waiting for the other process to commit.
 const PRAGMAS: &str = "
+    PRAGMA busy_timeout = 5000;
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = FULL;
-    PRAGMA busy_timeout = 5000;
     PRAGMA foreign_keys = ON;
 ";
 
@@ -102,13 +107,16 @@ impl Store {
             std::fs::create_dir_all(parent).map_err(Error::Io)?;
         }
 
-        let connection = Connection::open(path).map_err(Error::Open)?;
-        prepare(&connection)?;
-
-        Ok(Self { connection })
+        Ok(Self {
+            connection: open(path)?,
+        })
     }
 
     /// Runs the append program in one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// A caller that retries after a [`Outcome::Conflicted`] can keep losing to a concurrent
+    /// writer, because each attempt compares against a version the last attempt read. Pass
+    /// [`Expected::Any`] when the append does not depend on the version that was read.
     ///
     /// # Errors
     ///
@@ -269,6 +277,39 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(Error::Query)
     }
+}
+
+/// Opening a file that two processes create at the same moment can fail. Switching a fresh file
+/// to WAL and the first `CREATE TABLE` both need a lock that SQLite will not queue for, so the
+/// loser answers `SQLITE_BUSY` at once rather than waiting for the winner to commit. Since the
+/// winner settles the file for every later opener, retrying a busy answer turns that race into a
+/// short wait. The bound stays finite so a file this process can never open still fails.
+fn open(path: &Path) -> Result<Connection, Error> {
+    const ATTEMPTS: u32 = 100;
+    const BACKOFF: Duration = Duration::from_millis(20);
+
+    let mut attempts = 0;
+    loop {
+        match Connection::open(path)
+            .map_err(Error::Open)
+            .and_then(|connection| prepare(&connection).map(|()| connection))
+        {
+            Ok(connection) => return Ok(connection),
+            Err(error) if attempts < ATTEMPTS && is_busy(&error) => {
+                attempts += 1;
+                thread::sleep(BACKOFF);
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_busy(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Open(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
 }
 
 fn prepare(connection: &Connection) -> Result<(), Error> {
