@@ -1,0 +1,11 @@
+[package]
+edition.workspace = true
+name = "mokmok-protocol"
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["fast-rng", "serde", "v7"] }
+
+[lints]
+workspace = true
