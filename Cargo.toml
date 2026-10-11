@@ -3,6 +3,7 @@ members = ["mokmok-protocol"]
 resolver = "3"
 
 [workspace.dependencies]
+proptest = "1.12.0"
 serde = { version = "1.0.229", default-features = false }
 uuid = { version = "1.28.0", default-features = false }
 
@@ -31,3 +32,9 @@ version = "0.0.0"
 
 [workspace.metadata.crane]
 name = "mokmok-os"
+
+# Not the default `test` profile: `cargo mutants` only ever rebuilds, so drop
+# debug info to speed up linking (see .cargo/mutants.toml).
+[profile.mutants]
+debug = "none"
+inherits = "test"

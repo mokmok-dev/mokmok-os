@@ -1,0 +1,13 @@
+# Configuration for cargo-mutants: <https://mutants.rs/config-file.html>
+#
+# Read automatically when `cargo mutants` runs from the repository root.
+# Results go to `mutants.out/`, which is gitignored.
+
+# Not left at the default `false`: the workspace denies some lints (see
+# [workspace.lints] in Cargo.toml), and a mutant that trips one would be counted
+# as "unviable" instead of being tested.
+cap_lints = true
+
+# Not left at the default `test` profile: mutation testing only ever rebuilds,
+# so we prefer link speed over debug info (see [profile.mutants] in Cargo.toml).
+profile = "mutants"

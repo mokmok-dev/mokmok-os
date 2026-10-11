@@ -74,6 +74,7 @@
                     src
                     cargoArtifacts
                     ;
+                  cargoNextestExtraArgs = "--no-tests=pass";
                 }
               );
             };
@@ -83,6 +84,7 @@
             packages =
               with pkgs;
               [
+                cargo-mutants
                 rustToolchain
                 sccache
               ]
