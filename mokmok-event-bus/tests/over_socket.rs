@@ -1,6 +1,3 @@
-//! Every test here runs against a real `serve` on a real Unix socket, spoken to by the crate's
-//! own WebSocket client.
-
 use mokmok_event_bus::{
     Batch, Config, Error, Limits, Payload, Position, Publisher, Refusal, Retention, ServeError,
     Subscriber, Timeouts, Topic, serve,
@@ -96,7 +93,6 @@ mod tests {
             panic!("the bus never bound {}", bus.path.display());
         }
 
-        /// Resolves once `serve` has returned.
         async fn shutdown(&mut self) -> Result<(), ServeError> {
             if let Some(stop) = self.stop.take() {
                 let _ = stop.send(());

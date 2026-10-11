@@ -23,11 +23,8 @@ use crate::event::{Position, Refusal, Window};
 use crate::topic::Topic;
 use crate::wire::{self, Request, RequestFrame};
 
-/// The bus is going away.
 const GOING_AWAY: u16 = 1001;
-/// The peer broke the frame protocol.
 const PROTOCOL_ERROR: u16 = 1002;
-/// The peer stopped answering pings.
 const POLICY_VIOLATION: u16 = 1008;
 
 #[derive(Debug)]
@@ -69,12 +66,8 @@ pub async fn serve(
     served.map_err(ServeError::Io)
 }
 
-pub fn signals() -> impl Future<Output = ()> {
-    interrupts()
-}
-
 /// Resolves on SIGINT or SIGTERM.
-async fn interrupts() {
+pub async fn signals() {
     let interrupt = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -208,28 +201,24 @@ enum Phase {
     },
 }
 
-/// What one frame asks the session to do next. The new values come back out of the frame
-/// handling rather than being mutated in place, which keeps the borrows the `select!` arms
-/// hold out of the handlers.
+/// Carries the values a frame changed back out of the handler, because a `select!` arm holds its
+/// borrows while its handler runs.
 enum Step {
-    /// Answer this frame now and continue in this phase.
     Answer {
         response: wire::Response,
         phase: Phase,
     },
-    /// A pull with nothing to hand over yet; park until the topic's window changes.
+    /// `bus.batch` had nothing to hand over, so the session waits for the topic's window.
     Park {
         phase: Phase,
         at: Position,
         max: NonZeroUsize,
     },
-    /// The frame named a topic, so this connection now watches its log.
     Watch {
         response: wire::Response,
         phase: Phase,
         ticks: watch::Receiver<Window>,
     },
-    /// Nothing can answer this frame. Close with the code.
     Close(u16),
 }
 
@@ -386,29 +375,21 @@ async fn recheck(
     session: &mut Session,
     timeouts: Timeouts,
 ) -> bool {
-    let Some((at, max)) = session.parked else {
-        return true;
-    };
-    let Phase::Subscriber { entry } = &session.phase else {
+    let Some((position, max)) = session.parked else {
         return true;
     };
 
-    match bus.batch(entry, at, max) {
-        Ok(batch) if batch.is_empty() && batch.lapsed().is_none() => true,
-        Ok(batch) => {
-            session.parked = None;
-
-            send(socket, &wire::Response::from(batch), timeouts).await
-        },
-        Err(reason) => {
-            session.parked = None;
-
-            send(socket, &wire::Response::Refused { reason }, timeouts).await
-        },
-    }
+    apply(
+        socket,
+        bus,
+        session,
+        Request::Pull { position, max },
+        timeouts,
+    )
+    .await
 }
 
-/// One heartbeat; `false` means the peer stopped answering and the session ends.
+/// `false` means the peer stopped answering and the session ends.
 async fn beat(
     socket: &mut WebSocket,
     session: &mut Session,
@@ -435,8 +416,11 @@ async fn beat(
     true
 }
 
-/// Waits until the watched topic's window changes. Stays pending while no topic is named, so
-/// the arm is inert until a pull parks the session.
+/// Waits until the watched topic's window changes.
+///
+/// The `None` branch cannot run, because only a parked session reaches this arm and a parked
+/// session always holds a receiver. It stays because the alternative is an `unwrap` the lint set
+/// denies.
 async fn window_changed(ticks: &mut Option<watch::Receiver<Window>>) {
     match ticks {
         Some(ticks) => {
@@ -474,20 +458,12 @@ fn handle(
         (
             Phase::Opened { topic, entry } | Phase::Publisher { topic, entry },
             Request::Publish { payload },
-        ) => {
-            let published = entry.append(*topic, payload);
-
-            Step::Answer {
-                response: wire::Response::Published {
-                    id: published.id(),
-                    seq: published.seq(),
-                    at: published.at(),
-                },
-                phase: Phase::Publisher {
-                    topic: *topic,
-                    entry: Arc::clone(entry),
-                },
-            }
+        ) => Step::Answer {
+            response: wire::Response::from(entry.append(*topic, payload)),
+            phase: Phase::Publisher {
+                topic: *topic,
+                entry: Arc::clone(entry),
+            },
         },
         (
             Phase::Opened { entry, .. } | Phase::Subscriber { entry },

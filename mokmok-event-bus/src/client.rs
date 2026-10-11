@@ -191,7 +191,6 @@ async fn send(
 }
 
 /// Reads the frame that answers the last request; `None` means the peer closed the connection.
-/// Anything that is not a response frame, the bus's pings included, is skipped.
 async fn receive(stream: &mut WebSocketStream<UnixStream>) -> Result<Option<Response>, Error> {
     loop {
         match stream.next().await {

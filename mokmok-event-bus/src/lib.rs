@@ -7,8 +7,6 @@
 //! it missed instead of silently losing it.
 //!
 //! ```no_run
-//! use std::path::PathBuf;
-//!
 //! use mokmok_event_bus::{
 //!     Config, Payload, Position, Publisher, Subscriber, Topic, serve, signals,
 //! };
@@ -35,9 +33,6 @@
 //! # }
 //! # fn save_position(position: Position) {
 //! #     let _ = position;
-//! # }
-//! # fn socket_path() -> PathBuf {
-//! #     Config::default().path
 //! # }
 //! ```
 //!

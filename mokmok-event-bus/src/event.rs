@@ -24,7 +24,7 @@ impl Seq {
     }
 
     #[must_use]
-    pub fn offset_from(
+    pub(crate) fn offset_from(
         self,
         base: Self,
     ) -> Option<usize> {
@@ -133,7 +133,8 @@ impl Lapsed {
 
     #[must_use]
     pub const fn missed(self) -> u64 {
-        self.from.get() - self.held.seq().get()
+        // Total rather than exact: a frame from a peer could carry a lapse that never happened.
+        self.from.get().saturating_sub(self.held.seq().get())
     }
 }
 

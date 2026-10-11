@@ -48,12 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         for event in batch.events() {
-            println!(
-                "read seq {} carrying turn {}",
-                event.seq().get(),
-                event.payload().decode::<Turn>()?.turn,
-            );
-            seen.push(event.payload().decode::<Turn>()?.turn);
+            let turn = event.payload().decode::<Turn>()?.turn;
+
+            println!("read seq {} carrying turn {turn}", event.seq().get());
+            seen.push(turn);
         }
     }
     assert_eq!(seen, [1, 2, 3]);

@@ -102,8 +102,8 @@ impl Bus {
         Ok((entry, ticks))
     }
 
-    /// One non-blocking read of the entry's log. A pull that finds nothing parks the session
-    /// and re-attempts here, so no await happens while the log lock is held.
+    /// A pull that finds nothing parks the session and re-attempts here, and nothing awaits while
+    /// the log lock is held.
     pub fn batch(
         &self,
         entry: &TopicEntry,
@@ -162,8 +162,6 @@ impl TopicEntry {
             (id, seq, log.window())
         };
 
-        // Publishing the window after the log's write guard is released is what lets a reader
-        // woken by the change observe the append; the other order would lose that guarantee.
         self.appended.send_replace(window);
 
         Published::new(id, seq, at)

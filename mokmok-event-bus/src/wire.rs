@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use mokmok_protocol::EventID;
 
-use crate::event::{Batch, Event, Lapsed, Position, Refusal, Seq, Window};
+use crate::event::{Batch, Event, Lapsed, Position, Published, Refusal, Seq, Window};
 use crate::payload::Payload;
 use crate::topic::Topic;
 
@@ -51,6 +51,16 @@ impl From<Batch> for Response {
             window: batch.window(),
             lapsed: batch.lapsed(),
             events: batch.events().to_vec(),
+        }
+    }
+}
+
+impl From<Published> for Response {
+    fn from(published: Published) -> Self {
+        Self::Published {
+            id: published.id(),
+            seq: published.seq(),
+            at: published.at(),
         }
     }
 }
@@ -112,7 +122,6 @@ pub struct ResponseFrame {
     reason: Option<Refusal>,
 }
 
-/// A frame whose named operation does not match the fields it carries.
 #[derive(Debug)]
 pub struct InvalidFrame;
 
@@ -128,8 +137,6 @@ impl fmt::Display for InvalidFrame {
 impl std::error::Error for InvalidFrame {}
 
 impl RequestFrame {
-    /// Parses an untrusted frame. A field the named operation does not carry and a field it
-    /// needs that is absent both fail the conversion below.
     pub fn decode(text: &str) -> Option<Request> {
         let frame: Self = serde_json::from_str(text).ok()?;
 

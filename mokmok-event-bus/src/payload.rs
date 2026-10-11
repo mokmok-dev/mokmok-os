@@ -47,7 +47,7 @@ impl fmt::Display for PayloadError {
         &self,
         formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        formatter.write_str("the payload is not JSON the requested type can read")
+        formatter.write_str("the value could not be converted to or from JSON")
     }
 }
 
@@ -89,7 +89,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "the payload is not JSON the requested type can read",
+            "the value could not be converted to or from JSON",
         );
         assert!(error.source().unwrap().is::<serde_json::Error>());
     }
@@ -100,7 +100,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "the payload is not JSON the requested type can read",
+            "the value could not be converted to or from JSON",
         );
     }
 }

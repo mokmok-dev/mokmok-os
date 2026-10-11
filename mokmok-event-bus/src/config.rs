@@ -74,16 +74,18 @@ impl Default for Timeouts {
     }
 }
 
-/// Total because the lint set forbids `unwrap`, even for a nonzero literal.
 const fn nonzero(value: usize) -> NonZeroUsize {
+    assert!(value > 0, "a limit is nonzero");
+
     match NonZeroUsize::new(value) {
         Some(value) => value,
         None => NonZeroUsize::MIN,
     }
 }
 
-/// Total for the same reason as [`nonzero`].
 const fn millis(value: u32) -> NonZeroU32 {
+    assert!(value > 0, "a duration is nonzero");
+
     match NonZeroU32::new(value) {
         Some(value) => value,
         None => NonZeroU32::MIN,
