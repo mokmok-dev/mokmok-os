@@ -530,8 +530,24 @@ fn millis(value: NonZeroU32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::is_stale;
+    use super::{ServeError, SocketFile, is_stale, signals};
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch(name: &str) -> PathBuf {
+        let unique = format!(
+            "mokmok-bind-{}-{}-{name}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+        );
+
+        std::env::temp_dir().join(unique)
+    }
 
     #[test]
     fn a_missing_or_refused_socket_is_stale() {
@@ -542,5 +558,67 @@ mod tests {
     #[test]
     fn a_denied_socket_is_not_stale() {
         assert!(!is_stale(&io::Error::from(io::ErrorKind::PermissionDenied)));
+    }
+
+    #[tokio::test]
+    async fn serving_creates_a_missing_parent_directory_private() {
+        let parent = scratch("private");
+        let path = parent.join("bus.sock");
+        assert!(!parent.exists(), "the parent starts missing");
+
+        let (socket, _listener) = SocketFile::bind(&path).await.unwrap();
+
+        assert!(parent.is_dir(), "the parent was created");
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the parent this process created stays private");
+
+        drop(socket);
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_directory_at_the_socket_path_is_reported() {
+        let path = scratch("directory");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let error = match SocketFile::bind(&path).await {
+            Err(ServeError::Io(error)) => error,
+            Ok(_) => panic!("a directory was accepted as a socket path"),
+            Err(other) => panic!("expected an io error for a directory, got {other:?}"),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_symlink_loop_at_the_socket_path_is_reported() {
+        let directory = scratch("loop");
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first");
+        let second = directory.join("second");
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+
+        let error = match SocketFile::bind(&first).await {
+            Err(ServeError::Io(error)) => error,
+            Ok(_) => panic!("a symlink loop was accepted as a socket path"),
+            Err(other) => panic!("expected an io error for a symlink loop, got {other:?}"),
+        };
+
+        // `ErrorKind::FilesystemLoop` is still unstable on the pinned toolchain, so the kind is
+        // compared by name rather than by variant.
+        assert_eq!(format!("{:?}", error.kind()), "FilesystemLoop");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn signals_stays_pending_until_a_signal_arrives() {
+        let resolved = tokio::time::timeout(Duration::from_millis(50), signals()).await;
+
+        assert!(
+            resolved.is_err(),
+            "the shutdown future resolved with no signal",
+        );
     }
 }
