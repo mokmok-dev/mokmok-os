@@ -27,7 +27,6 @@ const fn settlement_of(state: State) -> Option<Resolution> {
     }
 }
 
-/// The verdict for a settle fact against an execution that already recorded a settlement.
 fn settlement_verdict(
     current: Resolution,
     resolution: Resolution,
@@ -528,6 +527,7 @@ proptest! {
     fn replay_of_the_accepted_facts_equals_the_driven_state(facts in arbitrary_history()) {
         let (session, accepted) = fold(facts);
         prop_assert_eq!(accepted.first(), Some(&Fact::SessionOpened));
+        prop_assert_ne!(session.phase(), Phase::Unopened);
 
         prop_assert_eq!(Session::replay(session_id(), &accepted).unwrap(), session);
     }
@@ -536,6 +536,7 @@ proptest! {
     fn a_prefix_then_the_rest_equals_the_whole(facts in arbitrary_history()) {
         let (session, accepted) = fold(facts);
         prop_assert_eq!(accepted.first(), Some(&Fact::SessionOpened));
+        prop_assert_ne!(session.phase(), Phase::Unopened);
 
         for split in 0..=accepted.len() {
             let mut rebuilt = Session::replay(session_id(), &accepted[..split]).unwrap();

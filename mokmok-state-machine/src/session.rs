@@ -77,7 +77,6 @@ impl State {
         }
     }
 
-    /// Whether the result was already handed to its consumer.
     #[must_use]
     const fn is_applied(self) -> bool {
         matches!(self, Self::Applied { .. })
