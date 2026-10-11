@@ -744,10 +744,20 @@ fn millis(value: NonZeroU32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServeError, SocketFile, is_stale, signals};
+    use super::{Parked, Phase, ServeError, Server, SocketFile, Step, is_stale, pull, signals};
+    use crate::bus::Bus;
+    use crate::config::{Config, Limits, Retention};
+    use crate::event::{Cursor, Seq};
+    use crate::payload::Payload;
+    use crate::subscriber::SubscriberId;
+    use crate::topic::Topic;
+    use crate::wire::Response;
+    use proptest::prelude::*;
     use std::io;
+    use std::num::NonZeroUsize;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -761,6 +771,30 @@ mod tests {
         );
 
         std::env::temp_dir().join(unique)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn retention(
+        events: usize,
+        bytes: usize,
+    ) -> Retention {
+        Retention {
+            events: NonZeroUsize::new(events).unwrap(),
+            bytes: NonZeroUsize::new(bytes).unwrap(),
+            idle: Duration::from_secs(600),
+        }
+    }
+
+    /// A payload whose raw JSON encoding is exactly `bytes` long; a JSON string is its text plus
+    /// the two quotes around it.
+    fn payload(bytes: usize) -> Payload {
+        Payload::json(&"x".repeat(bytes - 2)).unwrap()
     }
 
     #[test]
@@ -834,5 +868,124 @@ mod tests {
             resolved.is_err(),
             "the shutdown future resolved with no signal",
         );
+    }
+
+    proptest! {
+        #[test]
+        fn a_pull_keeps_the_credit_and_lapse_contract(
+            events in 1_usize..=6,
+            bytes in 4_usize..=24,
+            sizes in prop::collection::vec(2_usize..=6, 0..=8),
+            acked in 0_u64..=12,
+            delivered in 0_u64..=12,
+            in_flight in 1_usize..=6,
+            max in 1_usize..=6,
+        ) {
+            runtime().block_on(async {
+                let config = Config {
+                    store: PathBuf::from(":memory:"),
+                    limits: Limits {
+                        in_flight: NonZeroUsize::new(in_flight).unwrap(),
+                        ..Limits::default()
+                    },
+                    retention: retention(events, bytes),
+                    ..Config::default()
+                };
+                let bus = Bus::open(config.clone()).unwrap();
+                let Ok((entry, _ticks)) = bus.open_topic(Topic::Global).await else {
+                    panic!("the topic could not be opened");
+                };
+                for size in &sizes {
+                    entry.append(Topic::Global, payload(*size)).await.unwrap();
+                }
+                let server = Server {
+                    bus: Arc::clone(&bus),
+                    config,
+                };
+                let subscriber = SubscriberId::new();
+                let max = NonZeroUsize::new(max).unwrap();
+                let ceiling = acked.saturating_add(in_flight as u64);
+
+                let step = pull(
+                    &server,
+                    Topic::Global,
+                    &entry,
+                    subscriber,
+                    Seq::new(delivered),
+                    Seq::new(acked),
+                    max,
+                )
+                .await;
+
+                match step {
+                    Step::Answer {
+                        response: Response::Batch { window, lapsed, events },
+                        phase,
+                    } => {
+                        prop_assert!(!events.is_empty());
+                        prop_assert!(events.len() <= max.get());
+                        for pair in events.windows(2) {
+                            prop_assert_eq!(pair[1].seq().get(), pair[0].seq().get() + 1);
+                        }
+
+                        let first = window.first().get();
+                        let from = delivered.max(first);
+                        prop_assert_eq!(lapsed.is_some(), delivered < first);
+                        if let Some(lapsed) = lapsed {
+                            prop_assert_eq!(
+                                lapsed.held(),
+                                Cursor::new(window.epoch(), Seq::new(delivered)),
+                            );
+                            prop_assert_eq!(lapsed.from(), window.first());
+                        }
+                        prop_assert_eq!(events.first().unwrap().seq().get(), from);
+
+                        let Phase::Subscriber { delivered: next, .. } = phase else {
+                            return Err(TestCaseError::fail(
+                                "a batch left the subscriber phase",
+                            ));
+                        };
+                        let last = events.last().unwrap().seq().get();
+                        prop_assert_eq!(next.get(), last + 1);
+                        prop_assert!(next.get() <= ceiling.max(first + 1));
+                        if next.get() > ceiling {
+                            // The lapse hand-over is the one deliberate overshoot of the credit
+                            // ceiling, and it happens only when the checkpoint is behind the floor.
+                            prop_assert!(delivered < first);
+                        }
+                    },
+                    Step::Answer { .. } => {
+                        return Err(TestCaseError::fail(
+                            "pull answered something other than a batch",
+                        ));
+                    },
+                    Step::Park { phase, parked } => {
+                        let window = entry.window();
+                        let from = delivered.max(window.first().get());
+                        prop_assert!(
+                            from >= window.next().get() || delivered >= ceiling,
+                            "pull parked although the read had events and credit remained",
+                        );
+                        // Spent is chosen exactly when the credit is gone, which is what keeps a
+                        // commit from waking this park: only an Ack can free credit.
+                        let spent = matches!(parked, Parked::Spent);
+                        prop_assert_eq!(spent, delivered >= ceiling);
+                        let still_subscribed = matches!(phase, Phase::Subscriber { .. });
+                        prop_assert!(still_subscribed);
+                    },
+                    Step::Close(code) => {
+                        return Err(TestCaseError::fail(format!(
+                            "pull closed the session with {code}",
+                        )));
+                    },
+                    Step::Watch { .. } => {
+                        return Err(TestCaseError::fail("pull returned the watch step"));
+                    },
+                }
+
+                bus.shutdown().await.unwrap();
+                Ok::<(), TestCaseError>(())
+            }).unwrap();
+        }
     }
 }

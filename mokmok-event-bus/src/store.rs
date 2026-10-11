@@ -751,7 +751,7 @@ mod tests {
     use proptest::prelude::*;
     use std::num::NonZeroUsize;
     use std::path::Path;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     fn retention(
@@ -811,6 +811,21 @@ mod tests {
             .1
             .iter()
             .map(|event| event.seq().get())
+            .collect()
+    }
+
+    async fn payloads(
+        store: &Store,
+        from: Seq,
+        count: usize,
+    ) -> Vec<usize> {
+        store
+            .read(Topic::Global, from, max(count))
+            .await
+            .unwrap()
+            .1
+            .iter()
+            .map(|event| event.payload().as_str().len())
             .collect()
     }
 
@@ -1133,6 +1148,82 @@ mod tests {
 
                 prop_assert!(!read.is_empty());
                 prop_assert_eq!(read, appended[start..].to_vec());
+
+                Ok::<(), TestCaseError>(())
+            }).unwrap();
+        }
+
+        #[test]
+        fn an_event_timestamp_survives_the_round_trip(
+            secs in 0_u64..=4_102_444_800,
+            nanos in 0_u32..1_000_000_000,
+        ) {
+            runtime().block_on(async {
+                let store = store(4, 1 << 20);
+                open(&store).await;
+                let at = UNIX_EPOCH + Duration::new(secs, nanos);
+
+                store.append(Topic::Global, payload(3), at).await.unwrap();
+
+                let state = store.open_topic(Topic::Global).await.unwrap().0;
+                let (_, events) = store
+                    .read(Topic::Global, Seq::new(0), max(1))
+                    .await
+                    .unwrap();
+                let millis =
+                    u64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
+                let truncated = UNIX_EPOCH + Duration::from_millis(millis);
+
+                prop_assert_eq!(events.len(), 1);
+                prop_assert_eq!(events[0].at(), at);
+                prop_assert_eq!(state.last_append, truncated);
+
+                Ok::<(), TestCaseError>(())
+            }).unwrap();
+        }
+
+        #[test]
+        fn the_store_is_a_log_over_appends_and_reads(
+            events in 1_usize..=6,
+            bytes in 4_usize..=24,
+            ops in prop::collection::vec(
+                (2_usize..=6, prop::option::of((0_u64..=12, 1_usize..=6))),
+                0..=12,
+            ),
+        ) {
+            runtime().block_on(async {
+                let store = store(events, bytes);
+                open(&store).await;
+                let mut model: Vec<usize> = Vec::new();
+
+                for (size, read) in &ops {
+                    append(&store, *size).await;
+                    model.push(*size);
+                    while model.len() > events
+                        || (model.len() > 1 && model.iter().sum::<usize>() > bytes)
+                    {
+                        model.remove(0);
+                    }
+
+                    let state = store.open_topic(Topic::Global).await.unwrap().0;
+                    let first = state.first.get();
+                    prop_assert_eq!(state.next.get() - first, model.len() as u64);
+                    prop_assert_eq!(state.bytes, model.iter().sum::<usize>() as u64);
+
+                    let retained = payloads(&store, state.first, 64).await;
+                    prop_assert_eq!(&retained, &model);
+                    let from_zero = payloads(&store, Seq::new(0), 64).await;
+                    prop_assert_eq!(&from_zero, &model);
+
+                    if let Some((position, width)) = read {
+                        let start = (*position).max(first);
+                        let skip = usize::try_from(start - first).unwrap();
+                        let expected: Vec<usize> =
+                            model.iter().skip(skip).take(*width).copied().collect();
+                        let got = payloads(&store, Seq::new(*position), *width).await;
+                        prop_assert_eq!(&got, &expected);
+                    }
+                }
 
                 Ok::<(), TestCaseError>(())
             }).unwrap();
