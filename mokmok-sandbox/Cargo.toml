@@ -1,0 +1,26 @@
+[package]
+edition.workspace = true
+name = "mokmok-sandbox"
+version.workspace = true
+
+[dependencies]
+landlock = { workspace = true }
+mokmok-protocol = { workspace = true }
+nix = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "process", "rt", "time"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mokmok-sandbox-confine"
+path = "src/bin/mokmok-sandbox-confine.rs"
