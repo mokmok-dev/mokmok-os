@@ -4,8 +4,9 @@ use std::time::SystemTime;
 
 use mokmok_protocol::EventID;
 
-use crate::event::{Batch, Event, Lapsed, Position, Published, Refusal, Seq, Window};
+use crate::event::{Batch, Cursor, Event, Lapsed, Published, Refusal, Seq, Window};
 use crate::payload::Payload;
+use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
 
 #[derive(serde::Serialize)]
@@ -13,13 +14,18 @@ use crate::topic::Topic;
 pub enum Request {
     Open {
         topic: Topic,
+        /// `None` names a publisher; `Some` names the subscriber whose checkpoint resumes it.
+        subscriber: Option<SubscriberId>,
     },
     Publish {
         payload: Payload,
     },
+    /// No position: the server is the authority on what this subscriber still needs.
     Pull {
-        position: Position,
         max: NonZeroUsize,
+    },
+    Ack {
+        through: Cursor,
     },
 }
 
@@ -38,6 +44,9 @@ pub enum Response {
         window: Window,
         lapsed: Option<Lapsed>,
         events: Vec<Arc<Event>>,
+    },
+    Acked {
+        through: Cursor,
     },
     Refused {
         reason: Refusal,
@@ -72,6 +81,7 @@ pub enum RequestOp {
     Open,
     Publish,
     Pull,
+    Ack,
 }
 
 #[derive(serde::Deserialize)]
@@ -80,6 +90,7 @@ pub enum ResponseOp {
     Opened,
     Published,
     Batch,
+    Acked,
     Refused,
 }
 
@@ -95,9 +106,11 @@ pub struct RequestFrame {
     #[serde(default)]
     payload: Option<Payload>,
     #[serde(default)]
-    position: Option<Position>,
-    #[serde(default)]
     max: Option<NonZeroUsize>,
+    #[serde(default)]
+    through: Option<Cursor>,
+    #[serde(default)]
+    subscriber: Option<SubscriberId>,
 }
 
 /// A parsed server frame. Unknown fields stay allowed so a newer server can add one without
@@ -117,6 +130,8 @@ pub struct ResponseFrame {
     lapsed: Option<Lapsed>,
     #[serde(default)]
     events: Option<Vec<Arc<Event>>>,
+    #[serde(default)]
+    through: Option<Cursor>,
     #[serde(default)]
     reason: Option<Refusal>,
 }
@@ -149,14 +164,18 @@ impl TryFrom<RequestFrame> for Request {
             frame.op,
             frame.topic,
             frame.payload,
-            frame.position,
             frame.max,
+            frame.through,
+            frame.subscriber,
         ) {
-            (RequestOp::Open, Some(topic), None, None, None) => Ok(Self::Open { topic }),
-            (RequestOp::Publish, None, Some(payload), None, None) => Ok(Self::Publish { payload }),
-            (RequestOp::Pull, None, None, Some(position), Some(max)) => {
-                Ok(Self::Pull { position, max })
+            (RequestOp::Open, Some(topic), None, None, None, subscriber) => {
+                Ok(Self::Open { topic, subscriber })
             },
+            (RequestOp::Publish, None, Some(payload), None, None, None) => {
+                Ok(Self::Publish { payload })
+            },
+            (RequestOp::Pull, None, None, Some(max), None, None) => Ok(Self::Pull { max }),
+            (RequestOp::Ack, None, None, None, Some(through), None) => Ok(Self::Ack { through }),
             _ => Err(InvalidFrame),
         }
     }
@@ -174,22 +193,42 @@ impl TryFrom<ResponseFrame> for Response {
             frame.at,
             frame.lapsed,
             frame.events,
+            frame.through,
             frame.reason,
         ) {
-            (ResponseOp::Opened, Some(window), None, None, None, None, None, None) => {
+            (ResponseOp::Opened, Some(window), None, None, None, None, None, None, None) => {
                 Ok(Self::Opened { window })
             },
-            (ResponseOp::Published, None, Some(id), Some(seq), Some(at), None, None, None) => {
-                Ok(Self::Published { id, seq, at })
+            (
+                ResponseOp::Published,
+                None,
+                Some(id),
+                Some(seq),
+                Some(at),
+                None,
+                None,
+                None,
+                None,
+            ) => Ok(Self::Published { id, seq, at }),
+            (
+                ResponseOp::Batch,
+                Some(window),
+                None,
+                None,
+                None,
+                lapsed,
+                Some(events),
+                None,
+                None,
+            ) => Ok(Self::Batch {
+                window,
+                lapsed,
+                events,
+            }),
+            (ResponseOp::Acked, None, None, None, None, None, None, Some(through), None) => {
+                Ok(Self::Acked { through })
             },
-            (ResponseOp::Batch, Some(window), None, None, None, lapsed, Some(events), None) => {
-                Ok(Self::Batch {
-                    window,
-                    lapsed,
-                    events,
-                })
-            },
-            (ResponseOp::Refused, None, None, None, None, None, None, Some(reason)) => {
+            (ResponseOp::Refused, None, None, None, None, None, None, None, Some(reason)) => {
                 Ok(Self::Refused { reason })
             },
             _ => Err(InvalidFrame),
