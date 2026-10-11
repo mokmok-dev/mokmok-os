@@ -9,10 +9,14 @@ cd "$(dirname "$0")/.."
 # gate's own sensitivity can be demonstrated without editing it.
 readonly TARGET="${MUTANTS_TARGET:-95}"
 
+# The crates whose logic the suite has to catch a mutation of. The event bus owns eviction and the
+# cursor arithmetic; the event store owns the version, position and checkpoint guards.
+readonly PACKAGES=(--package mokmok-event-bus --package mokmok-event-store)
+
 # Extra arguments pass through, so `./scripts/mutants.sh --list` shows what would run and
 # `--shard 1/4` splits a long run.
 status=0
-cargo mutants --package mokmok-event-bus "$@" || status=$?
+cargo mutants "${PACKAGES[@]}" "$@" || status=$?
 
 if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
   echo "cargo mutants failed with status $status" >&2
