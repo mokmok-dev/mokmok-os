@@ -22,14 +22,6 @@ impl Seq {
     pub const fn get(self) -> u64 {
         self.0
     }
-
-    #[must_use]
-    pub(crate) fn offset_from(
-        self,
-        base: Self,
-    ) -> Option<usize> {
-        usize::try_from(self.0.checked_sub(base.0)?).ok()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -39,6 +31,10 @@ pub struct LogEpoch(uuid::Uuid);
 impl LogEpoch {
     pub(crate) const fn new(value: uuid::Uuid) -> Self {
         Self(value)
+    }
+
+    pub(crate) const fn as_uuid(self) -> uuid::Uuid {
+        self.0
     }
 }
 
@@ -66,13 +62,6 @@ impl Cursor {
     pub const fn seq(self) -> Seq {
         self.seq
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Position {
-    Beginning,
-    After(Cursor),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -290,14 +279,25 @@ impl Batch {
         self.events.is_empty()
     }
 
+    /// The position after everything this batch carries, which is what a caller acks once the
+    /// effects of the whole batch are durable.
     #[must_use]
-    pub fn after(&self) -> Position {
+    pub fn after(&self) -> Cursor {
         let next = match (self.events.last(), self.lapsed) {
             (Some(event), _) => Seq::new(event.seq().get() + 1),
             (None, Some(lapsed)) => lapsed.from(),
             (None, None) => self.window.next(),
         };
 
-        Position::After(Cursor::new(self.window.epoch(), next))
+        Cursor::new(self.window.epoch(), next)
+    }
+
+    /// The position after one item of this batch, for a caller that commits per item.
+    #[must_use]
+    pub const fn after_event(
+        &self,
+        event: &Event,
+    ) -> Cursor {
+        Cursor::new(self.window.epoch(), Seq::new(event.seq().get() + 1))
     }
 }

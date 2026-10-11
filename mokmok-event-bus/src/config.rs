@@ -6,6 +6,10 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub path: PathBuf,
+    /// The database every event is committed to before a subscriber can see it. Kept apart from
+    /// `path`: the socket lives in `XDG_RUNTIME_DIR`, a tmpfs that loses everything on reboot,
+    /// which is exactly the loss durability must survive.
+    pub store: PathBuf,
     pub limits: Limits,
     pub retention: Retention,
     pub timeouts: Timeouts,
@@ -16,6 +20,9 @@ pub struct Limits {
     pub connections: NonZeroUsize,
     pub topics: NonZeroUsize,
     pub batch: NonZeroUsize,
+    /// The most events one subscriber may hold un-ACKed. A pull that reaches this ceiling parks
+    /// until an [`Ack`](crate::Subscriber::ack) frees credit.
+    pub in_flight: NonZeroUsize,
     pub frame_bytes: NonZeroUsize,
 }
 
@@ -38,6 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             path: default_socket_path(),
+            store: default_store_path(),
             limits: Limits::default(),
             retention: Retention::default(),
             timeouts: Timeouts::default(),
@@ -51,6 +59,7 @@ impl Default for Limits {
             connections: nonzero(512),
             topics: nonzero(1024),
             batch: nonzero(128),
+            in_flight: nonzero(256),
             frame_bytes: nonzero(1024 * 1024),
         }
     }
@@ -106,9 +115,36 @@ fn socket_path_for(xdg: Option<&OsStr>) -> PathBuf {
     )
 }
 
+fn default_store_path() -> PathBuf {
+    store_path_for(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Decides the database location from the two environment variables alone, for the same reason
+/// `socket_path_for` takes its directory as an argument.
+fn store_path_for(
+    xdg_data: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> PathBuf {
+    let home_fallback = || {
+        home.filter(|dir| !dir.is_empty()).map_or_else(
+            || PathBuf::from("/tmp/mokmok/bus.db"),
+            |dir| PathBuf::from(dir).join(".local/share/mokmok/bus.db"),
+        )
+    };
+
+    xdg_data
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(home_fallback, |dir| {
+            PathBuf::from(dir).join("mokmok/bus.db")
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{default_socket_path, socket_path_for};
+    use super::{default_socket_path, default_store_path, socket_path_for, store_path_for};
     use std::ffi::OsStr;
     use std::path::PathBuf;
 
@@ -136,5 +172,58 @@ mod tests {
     #[test]
     fn the_default_socket_path_names_the_bus() {
         assert!(default_socket_path().ends_with("mokmok/bus.sock"));
+    }
+
+    #[test]
+    fn the_data_directory_scopes_the_database() {
+        assert_eq!(
+            store_path_for(Some(OsStr::new("/home/user/.local/share")), None),
+            PathBuf::from("/home/user/.local/share/mokmok/bus.db"),
+        );
+    }
+
+    #[test]
+    fn the_data_directory_wins_over_the_home_directory() {
+        assert_eq!(
+            store_path_for(Some(OsStr::new("/data")), Some(OsStr::new("/home/user"))),
+            PathBuf::from("/data/mokmok/bus.db"),
+        );
+    }
+
+    #[test]
+    fn a_missing_data_directory_falls_back_to_the_home_directory() {
+        assert_eq!(
+            store_path_for(None, Some(OsStr::new("/home/user"))),
+            PathBuf::from("/home/user/.local/share/mokmok/bus.db"),
+        );
+    }
+
+    #[test]
+    fn an_empty_data_directory_falls_back_to_the_home_directory() {
+        assert_eq!(
+            store_path_for(Some(OsStr::new("")), Some(OsStr::new("/home/user"))),
+            PathBuf::from("/home/user/.local/share/mokmok/bus.db"),
+        );
+    }
+
+    #[test]
+    fn a_missing_home_directory_falls_back_to_tmp() {
+        assert_eq!(
+            store_path_for(None, None),
+            PathBuf::from("/tmp/mokmok/bus.db")
+        );
+    }
+
+    #[test]
+    fn an_empty_home_directory_falls_back_to_tmp() {
+        assert_eq!(
+            store_path_for(None, Some(OsStr::new(""))),
+            PathBuf::from("/tmp/mokmok/bus.db"),
+        );
+    }
+
+    #[test]
+    fn the_default_store_path_names_the_database() {
+        assert!(default_store_path().ends_with("mokmok/bus.db"));
     }
 }
