@@ -95,12 +95,19 @@ mod tests {
 
     /// The first non-control frame. The bus pings on its first heartbeat tick, so a raw peer sees
     /// that ping before the answer it is waiting for.
+    ///
+    /// The deadline covers the whole wait rather than each frame, because a bus that answers
+    /// nothing but pings would otherwise keep this loop alive forever.
     async fn next_frame(peer: &mut tokio_tungstenite::WebSocketStream<UnixStream>) -> Message {
+        let deadline = tokio::time::Instant::now() + BOUND;
+
         loop {
-            match within("next frame", peer.next()).await {
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {},
-                Some(Ok(frame)) => return frame,
-                other => panic!("expected a frame, got {other:?}"),
+            match tokio::time::timeout_at(deadline, peer.next()).await {
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {},
+                Ok(Some(Ok(frame))) => return frame,
+                Ok(Some(Err(error))) => panic!("expected a frame, got {error}"),
+                Ok(None) => panic!("the peer closed before sending a frame"),
+                Err(elapsed) => panic!("no data frame within {BOUND:?}: {elapsed}"),
             }
         }
     }
