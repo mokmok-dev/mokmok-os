@@ -299,11 +299,46 @@ mod tests {
         let second = Publisher::open(&bus.path, Topic::Global).await;
 
         assert!(
-            matches!(second, Err(Error::Refused(Refusal::TopicLimit))),
+            matches!(second, Err(Error::Refused(Refusal::ConnectionLimit))),
             "expected a refusal at the ceiling, got {:?}",
             second.err(),
         );
         assert!(Publisher::open(&bus.path, Topic::Global).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_parked_subscriber_frees_its_connection() {
+        let bus = Bus::start(Config {
+            path: socket_path(),
+            limits: Limits {
+                connections: NonZeroUsize::new(1).unwrap(),
+                ..Limits::default()
+            },
+            ..Config::default()
+        })
+        .await;
+
+        let mut subscriber = Subscriber::open(&bus.path, Topic::Global, Position::Beginning)
+            .await
+            .unwrap();
+        // Nothing has been published, so this pull parks the session; the timeout only bounds
+        // how long the test waits before abandoning the client.
+        let _ = tokio::time::timeout(Duration::from_millis(150), subscriber.next()).await;
+        drop(subscriber);
+
+        let mut accepted = None;
+        for _ in 0..100 {
+            if let Ok(publisher) = Publisher::open(&bus.path, Topic::Global).await {
+                accepted = Some(publisher);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            accepted.is_some(),
+            "a fresh connection was never accepted after the parked subscriber went away",
+        );
     }
 
     #[tokio::test]
@@ -334,8 +369,8 @@ mod tests {
 
         let refused = publisher.publish(payload(&oversized)).await;
 
-        // The bus closes an over-limit frame with no answer, so the outcome is genuinely unknown
-        // to the caller; what matters is that the bus is still there for everyone else.
+        // Tungstenite refuses the frame while assembling it and closes the connection, so the
+        // caller gets no answer; what matters is that the bus is still there for everyone else.
         assert!(
             matches!(refused, Err(Error::Indeterminate)),
             "expected the over-limit frame to be refused, got {refused:?}",
@@ -348,6 +383,61 @@ mod tests {
         fresh.publish(payload(&"small")).await.unwrap();
 
         assert_eq!(payloads(&subscriber.next().await.unwrap()), [r#""small""#]);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_from_a_reclaimed_topic_is_unresumable() {
+        let bus = Bus::start(Config {
+            path: socket_path(),
+            limits: Limits {
+                topics: NonZeroUsize::new(1).unwrap(),
+                ..Limits::default()
+            },
+            retention: Retention {
+                idle: Duration::ZERO,
+                ..Retention::default()
+            },
+            ..Config::default()
+        })
+        .await;
+
+        let mut publisher = Publisher::open(&bus.path, Topic::Global).await.unwrap();
+        publisher.publish(payload(&1)).await.unwrap();
+        let mut subscriber = Subscriber::open(&bus.path, Topic::Global, Position::Beginning)
+            .await
+            .unwrap();
+        assert_eq!(seqs(&subscriber.next().await.unwrap()), [0]);
+        let saved = subscriber.position();
+        drop(subscriber);
+        drop(publisher);
+
+        // The sweep only reclaims a topic nobody watches, so wait for the session to let go.
+        let mut second = None;
+        for _ in 0..100 {
+            if let Ok(opened) = Publisher::open(&bus.path, agent_topic()).await {
+                second = Some(opened);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut second = second.expect("the second topic was never accepted");
+        second.publish(payload(&2)).await.unwrap();
+        drop(second);
+
+        let mut resumed = Subscriber::open(&bus.path, Topic::Global, saved)
+            .await
+            .unwrap();
+        // The reopened log restarts its sequences at zero, so the stale cursor lands inside it.
+        let mut again = Publisher::open(&bus.path, Topic::Global).await.unwrap();
+        again.publish(payload(&3)).await.unwrap();
+        again.publish(payload(&4)).await.unwrap();
+
+        let answered = resumed.next().await;
+
+        assert!(
+            matches!(answered, Err(Error::Refused(Refusal::Unresumable { .. }))),
+            "expected an unresumable cursor from the reclaimed topic, got {answered:?}",
+        );
     }
 
     #[tokio::test]

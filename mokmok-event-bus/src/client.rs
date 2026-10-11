@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::event::{Batch, Position, Published, Refusal};
 use crate::payload::Payload;
 use crate::topic::Topic;
-use crate::wire::{Request, Response};
+use crate::wire::{Request, Response, ResponseFrame};
 
 /// The path `serve` routes; the host is ignored for a socket the client opened itself.
 const URL: &str = "ws://localhost/ws";
@@ -198,9 +198,13 @@ async fn receive(stream: &mut WebSocketStream<UnixStream>) -> Result<Option<Resp
             None | Some(Ok(Message::Close(_))) => return Ok(None),
             Some(Err(error)) => return Err(Error::Transport(Box::new(error))),
             Some(Ok(Message::Text(text))) => {
-                return serde_json::from_str(text.as_str())
-                    .map(Some)
-                    .map_err(|_| Error::Protocol("the bus sent a frame that is not a response"));
+                let Some(response) = ResponseFrame::decode(text.as_str()) else {
+                    return Err(Error::Protocol(
+                        "the bus sent a frame that is not a response",
+                    ));
+                };
+
+                return Ok(Some(response));
             },
             // A ping is answered by tungstenite's read loop, which flushes the queued pong on
             // the next read, so the client never has to write one itself.

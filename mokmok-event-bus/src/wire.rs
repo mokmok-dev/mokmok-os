@@ -4,14 +4,13 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use mokmok_protocol::EventID;
-use serde::de::{Error as _, MapAccess, Visitor};
 
 use crate::event::{Batch, Event, Lapsed, Position, Refusal, Seq, Window};
 use crate::payload::Payload;
 use crate::topic::Topic;
 
 #[derive(serde::Serialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Open {
         topic: Topic,
@@ -56,268 +55,148 @@ impl From<Batch> for Response {
     }
 }
 
-/// The fields a request frame may carry, for `unknown_field` diagnostics.
-const REQUEST_FIELDS: &[&str] = &["op", "topic", "payload", "position", "max"];
-
-/// The operations a request frame may name.
-const REQUEST_OPS: &[&str] = &["open", "publish", "pull"];
-
-/// The fields a response frame may carry, for `unknown_field` diagnostics.
-const RESPONSE_FIELDS: &[&str] = &[
-    "op", "window", "id", "seq", "at", "lapsed", "events", "reason",
-];
-
-/// The operations a response frame may name.
-const RESPONSE_OPS: &[&str] = &["opened", "published", "batch", "refused"];
-
-/// Rejects a field the named operation does not carry, which is the refusal
-/// `deny_unknown_fields` gives a derived frame.
-fn refuse<E: serde::de::Error>(
-    fields: &'static [&'static str],
-    present: &[(&'static str, bool)],
-    allowed: &[&str],
-) -> Result<(), E> {
-    for (name, is_present) in present {
-        if *is_present && !allowed.contains(name) {
-            return Err(E::unknown_field(name, fields));
-        }
-    }
-
-    Ok(())
+/// The operations a client may name. Separate from [`ResponseOp`] so a client cannot name a
+/// response operation.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOp {
+    Open,
+    Publish,
+    Pull,
 }
 
-struct RequestParts {
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseOp {
+    Opened,
+    Published,
+    Batch,
+    Refused,
+}
+
+/// A parsed client frame. Derived rather than an internally tagged enum because a struct reads
+/// each field straight from the map: an enum buffers the frame into `serde`'s content first, and
+/// the payload's `RawValue` bytes cannot survive that buffer.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestFrame {
+    op: RequestOp,
+    #[serde(default)]
     topic: Option<Topic>,
+    #[serde(default)]
     payload: Option<Payload>,
+    #[serde(default)]
     position: Option<Position>,
+    #[serde(default)]
     max: Option<NonZeroUsize>,
 }
 
-impl RequestParts {
-    fn refuse<E: serde::de::Error>(
-        &self,
-        allowed: &[&str],
-    ) -> Result<(), E> {
-        refuse::<E>(
-            REQUEST_FIELDS,
-            &[
-                ("topic", self.topic.is_some()),
-                ("payload", self.payload.is_some()),
-                ("position", self.position.is_some()),
-                ("max", self.max.is_some()),
-            ],
-            allowed,
-        )
-    }
-}
-
-// Deserialized by hand rather than derived: an internally tagged enum buffers the whole frame
-// into `serde`'s `Content` before it knows the variant, and `RawValue` cannot be recovered from
-// that buffer, so a derived frame would rewrite every payload it carried.
-impl<'de> serde::Deserialize<'de> for Request {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct RequestVisitor;
-
-        impl<'de> Visitor<'de> for RequestVisitor {
-            type Value = Request;
-
-            fn expecting(
-                &self,
-                formatter: &mut fmt::Formatter<'_>,
-            ) -> fmt::Result {
-                formatter.write_str("a request frame")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Request, A::Error> {
-                let mut op: Option<String> = None;
-                let mut parts = RequestParts {
-                    topic: None,
-                    payload: None,
-                    position: None,
-                    max: None,
-                };
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "op" => op = Some(map.next_value()?),
-                        "topic" => parts.topic = Some(map.next_value()?),
-                        "payload" => parts.payload = Some(map.next_value()?),
-                        "position" => parts.position = Some(map.next_value()?),
-                        "max" => parts.max = Some(map.next_value()?),
-                        other => return Err(A::Error::unknown_field(other, REQUEST_FIELDS)),
-                    }
-                }
-
-                match op.as_deref() {
-                    Some("open") => {
-                        parts.refuse(&["topic"])?;
-
-                        Ok(Request::Open {
-                            topic: parts
-                                .topic
-                                .ok_or_else(|| A::Error::missing_field("topic"))?,
-                        })
-                    },
-                    Some("publish") => {
-                        parts.refuse(&["payload"])?;
-
-                        Ok(Request::Publish {
-                            payload: parts
-                                .payload
-                                .ok_or_else(|| A::Error::missing_field("payload"))?,
-                        })
-                    },
-                    Some("pull") => {
-                        parts.refuse(&["position", "max"])?;
-
-                        Ok(Request::Pull {
-                            position: parts
-                                .position
-                                .ok_or_else(|| A::Error::missing_field("position"))?,
-                            max: parts.max.ok_or_else(|| A::Error::missing_field("max"))?,
-                        })
-                    },
-                    Some(other) => Err(A::Error::unknown_variant(other, REQUEST_OPS)),
-                    None => Err(A::Error::missing_field("op")),
-                }
-            }
-        }
-
-        deserializer.deserialize_map(RequestVisitor)
-    }
-}
-
-struct ResponseParts {
+/// A parsed server frame. Unknown fields stay allowed so a newer server can add one without
+/// breaking an older client.
+#[derive(serde::Deserialize)]
+pub struct ResponseFrame {
+    op: ResponseOp,
+    #[serde(default)]
     window: Option<Window>,
+    #[serde(default)]
     id: Option<EventID>,
+    #[serde(default)]
     seq: Option<Seq>,
+    #[serde(default)]
     at: Option<SystemTime>,
+    #[serde(default)]
     lapsed: Option<Lapsed>,
-    /// `lapsed` is optional, so its presence needs tracking of its own: a frame carrying a null
-    /// `lapsed` still carries a field the other variants may not have.
-    lapsed_present: bool,
+    #[serde(default)]
     events: Option<Vec<Arc<Event>>>,
+    #[serde(default)]
     reason: Option<Refusal>,
 }
 
-impl ResponseParts {
-    fn refuse<E: serde::de::Error>(
+/// A frame whose named operation does not match the fields it carries.
+#[derive(Debug)]
+pub struct InvalidFrame;
+
+impl fmt::Display for InvalidFrame {
+    fn fmt(
         &self,
-        allowed: &[&str],
-    ) -> Result<(), E> {
-        refuse::<E>(
-            RESPONSE_FIELDS,
-            &[
-                ("window", self.window.is_some()),
-                ("id", self.id.is_some()),
-                ("seq", self.seq.is_some()),
-                ("at", self.at.is_some()),
-                ("lapsed", self.lapsed_present),
-                ("events", self.events.is_some()),
-                ("reason", self.reason.is_some()),
-            ],
-            allowed,
-        )
+        formatter: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        formatter.write_str("the frame does not match the operation it names")
     }
 }
 
-impl<'de> serde::Deserialize<'de> for Response {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ResponseVisitor;
+impl std::error::Error for InvalidFrame {}
 
-        impl<'de> Visitor<'de> for ResponseVisitor {
-            type Value = Response;
+impl RequestFrame {
+    /// Parses an untrusted frame. A field the named operation does not carry and a field it
+    /// needs that is absent both fail the conversion below.
+    pub fn decode(text: &str) -> Option<Request> {
+        let frame: Self = serde_json::from_str(text).ok()?;
 
-            fn expecting(
-                &self,
-                formatter: &mut fmt::Formatter<'_>,
-            ) -> fmt::Result {
-                formatter.write_str("a response frame")
-            }
+        Request::try_from(frame).ok()
+    }
+}
 
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Response, A::Error> {
-                let mut op: Option<String> = None;
-                let mut parts = ResponseParts {
-                    window: None,
-                    id: None,
-                    seq: None,
-                    at: None,
-                    lapsed: None,
-                    lapsed_present: false,
-                    events: None,
-                    reason: None,
-                };
+impl ResponseFrame {
+    pub fn decode(text: &str) -> Option<Response> {
+        let frame: Self = serde_json::from_str(text).ok()?;
 
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "op" => op = Some(map.next_value()?),
-                        "window" => parts.window = Some(map.next_value()?),
-                        "id" => parts.id = Some(map.next_value()?),
-                        "seq" => parts.seq = Some(map.next_value()?),
-                        "at" => parts.at = Some(map.next_value()?),
-                        "lapsed" => {
-                            parts.lapsed_present = true;
-                            parts.lapsed = map.next_value::<Option<Lapsed>>()?;
-                        },
-                        "events" => parts.events = Some(map.next_value()?),
-                        "reason" => parts.reason = Some(map.next_value()?),
-                        other => return Err(A::Error::unknown_field(other, RESPONSE_FIELDS)),
-                    }
-                }
+        Response::try_from(frame).ok()
+    }
+}
 
-                match op.as_deref() {
-                    Some("opened") => {
-                        parts.refuse(&["window"])?;
+impl TryFrom<RequestFrame> for Request {
+    type Error = InvalidFrame;
 
-                        Ok(Response::Opened {
-                            window: parts
-                                .window
-                                .ok_or_else(|| A::Error::missing_field("window"))?,
-                        })
-                    },
-                    Some("published") => {
-                        parts.refuse(&["id", "seq", "at"])?;
-
-                        Ok(Response::Published {
-                            id: parts.id.ok_or_else(|| A::Error::missing_field("id"))?,
-                            seq: parts.seq.ok_or_else(|| A::Error::missing_field("seq"))?,
-                            at: parts.at.ok_or_else(|| A::Error::missing_field("at"))?,
-                        })
-                    },
-                    Some("batch") => {
-                        parts.refuse(&["window", "lapsed", "events"])?;
-
-                        Ok(Response::Batch {
-                            window: parts
-                                .window
-                                .ok_or_else(|| A::Error::missing_field("window"))?,
-                            lapsed: parts.lapsed,
-                            events: parts
-                                .events
-                                .ok_or_else(|| A::Error::missing_field("events"))?,
-                        })
-                    },
-                    Some("refused") => {
-                        parts.refuse(&["reason"])?;
-
-                        Ok(Response::Refused {
-                            reason: parts
-                                .reason
-                                .ok_or_else(|| A::Error::missing_field("reason"))?,
-                        })
-                    },
-                    Some(other) => Err(A::Error::unknown_variant(other, RESPONSE_OPS)),
-                    None => Err(A::Error::missing_field("op")),
-                }
-            }
+    fn try_from(frame: RequestFrame) -> Result<Self, Self::Error> {
+        match (
+            frame.op,
+            frame.topic,
+            frame.payload,
+            frame.position,
+            frame.max,
+        ) {
+            (RequestOp::Open, Some(topic), None, None, None) => Ok(Self::Open { topic }),
+            (RequestOp::Publish, None, Some(payload), None, None) => Ok(Self::Publish { payload }),
+            (RequestOp::Pull, None, None, Some(position), Some(max)) => {
+                Ok(Self::Pull { position, max })
+            },
+            _ => Err(InvalidFrame),
         }
+    }
+}
 
-        deserializer.deserialize_map(ResponseVisitor)
+impl TryFrom<ResponseFrame> for Response {
+    type Error = InvalidFrame;
+
+    fn try_from(frame: ResponseFrame) -> Result<Self, Self::Error> {
+        match (
+            frame.op,
+            frame.window,
+            frame.id,
+            frame.seq,
+            frame.at,
+            frame.lapsed,
+            frame.events,
+            frame.reason,
+        ) {
+            (ResponseOp::Opened, Some(window), None, None, None, None, None, None) => {
+                Ok(Self::Opened { window })
+            },
+            (ResponseOp::Published, None, Some(id), Some(seq), Some(at), None, None, None) => {
+                Ok(Self::Published { id, seq, at })
+            },
+            (ResponseOp::Batch, Some(window), None, None, None, lapsed, Some(events), None) => {
+                Ok(Self::Batch {
+                    window,
+                    lapsed,
+                    events,
+                })
+            },
+            (ResponseOp::Refused, None, None, None, None, None, None, Some(reason)) => {
+                Ok(Self::Refused { reason })
+            },
+            _ => Err(InvalidFrame),
+        }
     }
 }

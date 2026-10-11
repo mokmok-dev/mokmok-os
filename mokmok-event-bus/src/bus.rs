@@ -5,10 +5,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Instant, SystemTime};
 
 use tokio::sync::watch;
-use uuid::Uuid;
 
 use crate::config::Config;
-use crate::event::{Batch, LogEpoch, Position, Published, Refusal, Window};
+use crate::event::{Batch, Position, Published, Refusal, Window};
 use crate::log::Log;
 use crate::payload::Payload;
 use crate::topic::Topic;
@@ -19,7 +18,6 @@ pub struct Bus {
 
 struct BusInner {
     config: Config,
-    epoch: LogEpoch,
     topics: RwLock<HashMap<Topic, Arc<TopicEntry>>>,
     connections: AtomicUsize,
     stop: watch::Sender<bool>,
@@ -41,7 +39,6 @@ impl Bus {
         Arc::new(Self {
             inner: Arc::new(BusInner {
                 config,
-                epoch: LogEpoch::new(Uuid::new_v4()),
                 topics: RwLock::new(HashMap::new()),
                 connections: AtomicUsize::new(0),
                 stop,
@@ -97,10 +94,7 @@ impl Bus {
             return Err(Refusal::TopicLimit);
         }
 
-        let entry = Arc::new(TopicEntry::new(Log::new(
-            self.inner.epoch,
-            self.inner.config.retention,
-        )));
+        let entry = Arc::new(TopicEntry::new(Log::new(self.inner.config.retention)));
         let ticks = entry.appended.subscribe();
         topics.insert(topic, Arc::clone(&entry));
         drop(topics);
@@ -108,58 +102,18 @@ impl Bus {
         Ok((entry, ticks))
     }
 
-    pub fn append(
-        &self,
-        topic: Topic,
-        payload: Payload,
-    ) -> Result<Published, Refusal> {
-        let (entry, _ticks) = self.open(topic)?;
-        let at = SystemTime::now();
-
-        let (id, seq, window) = {
-            let mut log = entry.log.write().unwrap_or_else(PoisonError::into_inner);
-            let (id, seq) = log.append(topic, payload, at);
-            (id, seq, log.window())
-        };
-
-        // Publishing the window after the log's write guard is released is what lets a reader
-        // woken by the change observe the append; the other order would lose that guarantee.
-        entry.appended.send_replace(window);
-
-        Ok(Published::new(id, seq, at))
-    }
-
-    pub async fn pull(
+    /// One non-blocking read of the entry's log. A pull that finds nothing parks the session
+    /// and re-attempts here, so no await happens while the log lock is held.
+    pub fn batch(
         &self,
         entry: &TopicEntry,
-        ticks: &mut watch::Receiver<Window>,
         at: Position,
         max: NonZeroUsize,
-        stop: &mut watch::Receiver<bool>,
     ) -> Result<Batch, Refusal> {
         let max = max.min(self.inner.config.limits.batch);
 
-        loop {
-            ticks.borrow_and_update();
-
-            let batch = {
-                let log = entry.log.read().unwrap_or_else(PoisonError::into_inner);
-                log.take(at, max)?
-            };
-
-            if !batch.is_empty() || batch.lapsed().is_some() {
-                return Ok(batch);
-            }
-
-            tokio::select! {
-                result = ticks.changed() => {
-                    if result.is_err() {
-                        return Err(Refusal::ShuttingDown);
-                    }
-                }
-                _ = stop.changed() => return Err(Refusal::ShuttingDown),
-            }
-        }
+        let log = entry.log.read().unwrap_or_else(PoisonError::into_inner);
+        log.take(at, max)
     }
 
     pub fn try_connect(self: &Arc<Self>) -> Option<ConnectionPermit> {
@@ -190,6 +144,29 @@ impl TopicEntry {
             log: RwLock::new(log),
             appended,
         }
+    }
+
+    /// Appends to this entry's own log. The registry lock is not touched: the session already
+    /// holds the entry from the `Open` frame, so two publishers on different topics never
+    /// contend.
+    pub fn append(
+        &self,
+        topic: Topic,
+        payload: Payload,
+    ) -> Published {
+        let at = SystemTime::now();
+
+        let (id, seq, window) = {
+            let mut log = self.log.write().unwrap_or_else(PoisonError::into_inner);
+            let (id, seq) = log.append(topic, payload, at);
+            (id, seq, log.window())
+        };
+
+        // Publishing the window after the log's write guard is released is what lets a reader
+        // woken by the change observe the append; the other order would lose that guarantee.
+        self.appended.send_replace(window);
+
+        Published::new(id, seq, at)
     }
 }
 

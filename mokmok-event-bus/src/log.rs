@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use mokmok_protocol::EventID;
+use uuid::Uuid;
 use uuid::timestamp::{Timestamp, context::NoContext};
 
 use crate::config::Retention;
@@ -21,12 +22,11 @@ pub struct Log {
 }
 
 impl Log {
-    pub fn new(
-        epoch: LogEpoch,
-        retention: Retention,
-    ) -> Self {
+    /// Mints a fresh epoch per log: a reclaimed topic that is reopened is a different log, and
+    /// a cursor naming the old incarnation must not resolve against the new one.
+    pub fn new(retention: Retention) -> Self {
         Self {
-            epoch,
+            epoch: LogEpoch::new(Uuid::new_v4()),
             first: Seq::new(0),
             events: VecDeque::new(),
             bytes: 0,
@@ -130,8 +130,6 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
 
-    const EPOCH: Uuid = Uuid::from_u128(0x018f_2f3a_1b2c_7d3e_9f10_2233_4455_6677);
-
     fn retention(
         events: usize,
         bytes: usize,
@@ -152,10 +150,7 @@ mod tests {
         events: usize,
         bytes: usize,
     ) -> Log {
-        Log::new(
-            LogEpoch::new(EPOCH),
-            retention(events, bytes, Duration::from_secs(600)),
-        )
+        Log::new(retention(events, bytes, Duration::from_secs(600)))
     }
 
     /// A payload whose raw JSON encoding is exactly `bytes` long; a JSON string is its text
@@ -193,7 +188,7 @@ mod tests {
         assert!(batch.lapsed().is_none());
         assert_eq!(batch.window().first().get(), 0);
         assert_eq!(batch.window().next().get(), 2);
-        assert_eq!(batch.window().epoch(), LogEpoch::new(EPOCH));
+        assert_eq!(batch.window().epoch(), log.window().epoch());
     }
 
     #[test]
@@ -217,7 +212,7 @@ mod tests {
         for _ in 0..4 {
             append(&mut log, 3);
         }
-        let cursor = Cursor::new(LogEpoch::new(EPOCH), Seq::new(2));
+        let cursor = Cursor::new(log.window().epoch(), Seq::new(2));
 
         let batch = log.take(Position::After(cursor), max(8)).unwrap();
 
@@ -225,7 +220,7 @@ mod tests {
         assert!(batch.lapsed().is_none());
         assert_eq!(
             batch.after(),
-            Position::After(Cursor::new(LogEpoch::new(EPOCH), Seq::new(4)))
+            Position::After(Cursor::new(batch.window().epoch(), Seq::new(4)))
         );
     }
 
@@ -235,7 +230,7 @@ mod tests {
         for _ in 0..5 {
             append(&mut log, 3);
         }
-        let cursor = Cursor::new(LogEpoch::new(EPOCH), Seq::new(1));
+        let cursor = Cursor::new(log.window().epoch(), Seq::new(1));
 
         let batch = log.take(Position::After(cursor), max(8)).unwrap();
 
@@ -250,7 +245,7 @@ mod tests {
     fn a_cursor_from_a_foreign_epoch_is_unresumable() {
         let mut log = log(4, 1 << 20);
         append(&mut log, 3);
-        let cursor = Cursor::new(LogEpoch::new(Uuid::from_u128(2)), Seq::new(0));
+        let cursor = Cursor::new(LogEpoch::new(Uuid::new_v4()), Seq::new(0));
 
         let refusal = log.take(Position::After(cursor), max(8)).unwrap_err();
 
@@ -266,7 +261,7 @@ mod tests {
     fn a_cursor_ahead_of_the_log_is_unresumable() {
         let mut log = log(4, 1 << 20);
         append(&mut log, 3);
-        let cursor = Cursor::new(LogEpoch::new(EPOCH), Seq::new(2));
+        let cursor = Cursor::new(log.window().epoch(), Seq::new(2));
 
         let refusal = log.take(Position::After(cursor), max(8)).unwrap_err();
 
@@ -324,7 +319,7 @@ mod tests {
         assert_eq!(batch.window().first(), batch.window().next());
         assert_eq!(
             batch.after(),
-            Position::After(Cursor::new(LogEpoch::new(EPOCH), Seq::new(0))),
+            Position::After(Cursor::new(batch.window().epoch(), Seq::new(0))),
         );
         assert!(log.is_empty());
     }

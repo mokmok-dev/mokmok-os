@@ -142,6 +142,7 @@ impl Lapsed {
 pub enum Refusal {
     Unresumable { window: Window },
     TopicLimit,
+    ConnectionLimit,
     ShuttingDown,
 }
 
@@ -158,6 +159,7 @@ impl std::fmt::Display for Refusal {
                 window.next().get(),
             ),
             Self::TopicLimit => formatter.write_str("the bus has no room for another topic"),
+            Self::ConnectionLimit => formatter.write_str("the bus is at its connection ceiling"),
             Self::ShuttingDown => formatter.write_str("the bus is shutting down"),
         }
     }

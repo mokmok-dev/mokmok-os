@@ -1,7 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,9 +19,9 @@ use tokio::sync::watch;
 
 use crate::bus::{Bus, TopicEntry};
 use crate::config::{Config, Timeouts};
-use crate::event::{Refusal, Window};
+use crate::event::{Position, Refusal, Window};
 use crate::topic::Topic;
-use crate::wire::{self, Request};
+use crate::wire::{self, Request, RequestFrame};
 
 /// The bus is going away.
 const GOING_AWAY: u16 = 1001;
@@ -29,8 +29,6 @@ const GOING_AWAY: u16 = 1001;
 const PROTOCOL_ERROR: u16 = 1002;
 /// The peer stopped answering pings.
 const POLICY_VIOLATION: u16 = 1008;
-/// A frame the configured limit refuses.
-const MESSAGE_TOO_BIG: u16 = 1009;
 
 #[derive(Debug)]
 pub enum ServeError {
@@ -186,7 +184,13 @@ async fn upgrade(
     State(server): State<Server>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    upgrade.on_upgrade(move |socket| session(socket, server))
+    // Enforced as the frame is assembled: checking a complete `Message::Text` would let a peer
+    // make the always-on process allocate a frame of any size before the check ran.
+    let frame_bytes = server.config.limits.frame_bytes.get();
+
+    upgrade
+        .max_message_size(frame_bytes)
+        .on_upgrade(move |socket| session(socket, server))
 }
 
 enum Phase {
@@ -194,15 +198,46 @@ enum Phase {
     Opened {
         topic: Topic,
         entry: Arc<TopicEntry>,
-        ticks: watch::Receiver<Window>,
     },
     Publisher {
         topic: Topic,
+        entry: Arc<TopicEntry>,
     },
     Subscriber {
         entry: Arc<TopicEntry>,
+    },
+}
+
+/// What one frame asks the session to do next. The new values come back out of the frame
+/// handling rather than being mutated in place, which keeps the borrows the `select!` arms
+/// hold out of the handlers.
+enum Step {
+    /// Answer this frame now and continue in this phase.
+    Answer {
+        response: wire::Response,
+        phase: Phase,
+    },
+    /// A pull with nothing to hand over yet; park until the topic's window changes.
+    Park {
+        phase: Phase,
+        at: Position,
+        max: NonZeroUsize,
+    },
+    /// The frame named a topic, so this connection now watches its log.
+    Watch {
+        response: wire::Response,
+        phase: Phase,
         ticks: watch::Receiver<Window>,
     },
+    /// Nothing can answer this frame. Close with the code.
+    Close(u16),
+}
+
+struct Session {
+    phase: Phase,
+    ticks: Option<watch::Receiver<Window>>,
+    parked: Option<(Position, NonZeroUsize)>,
+    pinged: Option<tokio::time::Instant>,
 }
 
 async fn session(
@@ -212,7 +247,7 @@ async fn session(
     let Some(_permit) = server.bus.try_connect() else {
         tracing::warn!("refused a connection at the ceiling");
         let refused = wire::Response::Refused {
-            reason: Refusal::TopicLimit,
+            reason: Refusal::ConnectionLimit,
         };
         send(&mut socket, &refused, server.config.timeouts).await;
         close(
@@ -228,11 +263,14 @@ async fn session(
     tracing::debug!(connections = server.bus.connections(), "session opened");
 
     let timeouts = server.config.timeouts;
-    let frame_bytes = server.config.limits.frame_bytes.get();
     let mut stop = server.bus.stop_receiver();
     let mut heartbeat = tokio::time::interval(millis(timeouts.heartbeat));
-    let mut pinged: Option<tokio::time::Instant> = None;
-    let mut phase = Phase::Unopened;
+    let mut session = Session {
+        phase: Phase::Unopened,
+        ticks: None,
+        parked: None,
+        pinged: None,
+    };
 
     if *stop.borrow_and_update() {
         close(&mut socket, GOING_AWAY, "shutting down", timeouts).await;
@@ -244,54 +282,18 @@ async fn session(
             frame = socket.recv() => {
                 let Some(Ok(frame)) = frame else { return };
 
-                match frame {
-                    Message::Text(text) => {
-                        if text.len() > frame_bytes {
-                            tracing::warn!(
-                                bytes = text.len(),
-                                limit = frame_bytes,
-                                "refused an oversized frame",
-                            );
-                            close(&mut socket, MESSAGE_TOO_BIG, "frame over the limit", timeouts).await;
-                            return;
-                        }
-
-                        let Ok(request) = serde_json::from_str::<Request>(&text) else {
-                            close(&mut socket, PROTOCOL_ERROR, "not a request frame", timeouts).await;
-                            return;
-                        };
-
-                        match handle(&server.bus, phase, request, &mut stop).await {                            Ok((response, next)) => {
-                                phase = next;
-                                if !send(&mut socket, &response, timeouts).await {
-                                    return;
-                                }
-                            },
-                            Err(code) => {
-                                close(&mut socket, code, "frame out of turn", timeouts).await;
-                                return;
-                            },
-                        }
-                    },
-                    Message::Pong(_) => pinged = None,
-                    Message::Close(_) => return,
-                    // A ping needs no answer here: tungstenite replies while reading, and the
-                    // bus speaks nothing but text.
-                    Message::Ping(_) | Message::Binary(_) => {},
+                if !deliver(&mut socket, &server, &mut session, frame, timeouts).await {
+                    return;
                 }
             }
             _ = heartbeat.tick() => {
-                if pinged.is_some_and(|sent| sent.elapsed() >= millis(timeouts.deadline)) {
-                    tracing::warn!("closed a peer that stopped answering pings");
-                    close(&mut socket, POLICY_VIOLATION, "no answer to a ping", timeouts).await;
+                if !beat(&mut socket, &mut session, timeouts).await {
                     return;
                 }
-
-                if pinged.is_none() {
-                    if !write(&mut socket, Message::Ping(Bytes::new()), timeouts).await {
-                        return;
-                    }
-                    pinged = Some(tokio::time::Instant::now());
+            }
+            () = window_changed(&mut session.ticks), if session.parked.is_some() => {
+                if !recheck(&mut socket, &server.bus, &mut session, timeouts).await {
+                    return;
                 }
             }
             _ = stop.changed() => {
@@ -302,74 +304,220 @@ async fn session(
     }
 }
 
-async fn handle(
+/// Handles one received frame; `false` means the session ends here.
+async fn deliver(
+    socket: &mut WebSocket,
+    server: &Server,
+    session: &mut Session,
+    frame: Message,
+    timeouts: Timeouts,
+) -> bool {
+    match frame {
+        Message::Text(text) => {
+            let Some(request) = RequestFrame::decode(&text) else {
+                close(socket, PROTOCOL_ERROR, "not a request frame", timeouts).await;
+
+                return false;
+            };
+
+            // Snapshot before the log is read, so an append landing during the read is seen by
+            // the log rather than lost behind the park that follows an empty batch.
+            if let Some(watching) = session.ticks.as_mut() {
+                watching.borrow_and_update();
+            }
+
+            apply(socket, &server.bus, session, request, timeouts).await
+        },
+        Message::Pong(_) => {
+            session.pinged = None;
+
+            true
+        },
+        Message::Close(_) => false,
+        // A ping needs no answer here: tungstenite replies while reading, and the bus speaks
+        // nothing but text.
+        Message::Ping(_) | Message::Binary(_) => true,
+    }
+}
+
+async fn apply(
+    socket: &mut WebSocket,
     bus: &Bus,
-    phase: Phase,
+    session: &mut Session,
     request: Request,
-    stop: &mut watch::Receiver<bool>,
-) -> Result<(wire::Response, Phase), u16> {
+    timeouts: Timeouts,
+) -> bool {
+    match handle(bus, &session.phase, request) {
+        Step::Answer { response, phase } => {
+            session.phase = phase;
+            session.parked = None;
+
+            send(socket, &response, timeouts).await
+        },
+        Step::Park { phase, at, max } => {
+            session.phase = phase;
+            session.parked = Some((at, max));
+
+            true
+        },
+        Step::Watch {
+            response,
+            phase,
+            ticks,
+        } => {
+            session.phase = phase;
+            session.ticks = Some(ticks);
+            session.parked = None;
+
+            send(socket, &response, timeouts).await
+        },
+        Step::Close(code) => {
+            close(socket, code, "frame out of turn", timeouts).await;
+
+            false
+        },
+    }
+}
+
+/// A parked pull re-attempts once the topic's window changes; `false` means the session ends.
+async fn recheck(
+    socket: &mut WebSocket,
+    bus: &Bus,
+    session: &mut Session,
+    timeouts: Timeouts,
+) -> bool {
+    let Some((at, max)) = session.parked else {
+        return true;
+    };
+    let Phase::Subscriber { entry } = &session.phase else {
+        return true;
+    };
+
+    match bus.batch(entry, at, max) {
+        Ok(batch) if batch.is_empty() && batch.lapsed().is_none() => true,
+        Ok(batch) => {
+            session.parked = None;
+
+            send(socket, &wire::Response::from(batch), timeouts).await
+        },
+        Err(reason) => {
+            session.parked = None;
+
+            send(socket, &wire::Response::Refused { reason }, timeouts).await
+        },
+    }
+}
+
+/// One heartbeat; `false` means the peer stopped answering and the session ends.
+async fn beat(
+    socket: &mut WebSocket,
+    session: &mut Session,
+    timeouts: Timeouts,
+) -> bool {
+    if session
+        .pinged
+        .is_some_and(|sent| sent.elapsed() >= millis(timeouts.deadline))
+    {
+        tracing::warn!("closed a peer that stopped answering pings");
+        close(socket, POLICY_VIOLATION, "no answer to a ping", timeouts).await;
+
+        return false;
+    }
+
+    if session.pinged.is_none() {
+        if !write(socket, Message::Ping(Bytes::new()), timeouts).await {
+            return false;
+        }
+
+        session.pinged = Some(tokio::time::Instant::now());
+    }
+
+    true
+}
+
+/// Waits until the watched topic's window changes. Stays pending while no topic is named, so
+/// the arm is inert until a pull parks the session.
+async fn window_changed(ticks: &mut Option<watch::Receiver<Window>>) {
+    match ticks {
+        Some(ticks) => {
+            let _ = ticks.changed().await;
+        },
+        None => std::future::pending().await,
+    }
+}
+
+fn handle(
+    bus: &Bus,
+    phase: &Phase,
+    request: Request,
+) -> Step {
     match (phase, request) {
         (Phase::Unopened, Request::Open { topic }) => match bus.open(topic) {
             Ok((entry, ticks)) => {
                 let window = *ticks.borrow();
 
-                Ok((
-                    wire::Response::Opened { window },
-                    Phase::Opened {
-                        topic,
-                        entry,
-                        ticks,
-                    },
-                ))
+                Step::Watch {
+                    response: wire::Response::Opened { window },
+                    phase: Phase::Opened { topic, entry },
+                    ticks,
+                }
             },
             Err(reason) => {
                 tracing::warn!(%topic, %reason, "refused a topic");
 
-                Ok((wire::Response::Refused { reason }, Phase::Unopened))
+                Step::Answer {
+                    response: wire::Response::Refused { reason },
+                    phase: Phase::Unopened,
+                }
             },
         },
         (
-            Phase::Opened { topic, .. } | Phase::Publisher { topic },
+            Phase::Opened { topic, entry } | Phase::Publisher { topic, entry },
             Request::Publish { payload },
-        ) => match bus.append(topic, payload) {
-            Ok(published) => Ok((
-                wire::Response::Published {
+        ) => {
+            let published = entry.append(*topic, payload);
+
+            Step::Answer {
+                response: wire::Response::Published {
                     id: published.id(),
                     seq: published.seq(),
                     at: published.at(),
                 },
-                Phase::Publisher { topic },
-            )),
-            Err(reason) => {
-                tracing::warn!(%reason, "refused a publish");
-
-                Ok((
-                    wire::Response::Refused { reason },
-                    Phase::Publisher { topic },
-                ))
-            },
+                phase: Phase::Publisher {
+                    topic: *topic,
+                    entry: Arc::clone(entry),
+                },
+            }
         },
         (
-            Phase::Opened {
-                entry, mut ticks, ..
-            }
-            | Phase::Subscriber { entry, mut ticks },
+            Phase::Opened { entry, .. } | Phase::Subscriber { entry },
             Request::Pull { position, max },
-        ) => match bus.pull(&entry, &mut ticks, position, max, stop).await {
-            Ok(batch) => Ok((
-                wire::Response::from(batch),
-                Phase::Subscriber { entry, ticks },
-            )),
+        ) => match bus.batch(entry, position, max) {
+            Ok(batch) if batch.is_empty() && batch.lapsed().is_none() => Step::Park {
+                phase: Phase::Subscriber {
+                    entry: Arc::clone(entry),
+                },
+                at: position,
+                max,
+            },
+            Ok(batch) => Step::Answer {
+                response: wire::Response::from(batch),
+                phase: Phase::Subscriber {
+                    entry: Arc::clone(entry),
+                },
+            },
             Err(reason) => {
                 tracing::warn!(%reason, "refused a pull");
 
-                Ok((
-                    wire::Response::Refused { reason },
-                    Phase::Subscriber { entry, ticks },
-                ))
+                Step::Answer {
+                    response: wire::Response::Refused { reason },
+                    phase: Phase::Subscriber {
+                        entry: Arc::clone(entry),
+                    },
+                }
             },
         },
-        _ => Err(PROTOCOL_ERROR),
+        _ => Step::Close(PROTOCOL_ERROR),
     }
 }
 
