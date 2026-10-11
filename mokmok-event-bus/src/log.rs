@@ -126,6 +126,7 @@ mod tests {
     use crate::event::{Batch, Cursor, LogEpoch, Position, Refusal, Seq};
     use crate::payload::Payload;
     use crate::topic::Topic;
+    use proptest::prelude::*;
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant, SystemTime};
     use uuid::Uuid;
@@ -346,5 +347,85 @@ mod tests {
             Duration::from_secs(600)
         ));
         assert!(log.is_idle(appended, Duration::ZERO));
+    }
+
+    /// The start index the byte bound settles on: pop until the suffix fits, but never evict
+    /// the newest event, which is the one the log keeps no matter how large it is.
+    fn byte_bound_start(
+        sizes: &[usize],
+        bytes: usize,
+    ) -> usize {
+        let mut start = 0;
+
+        while start + 1 < sizes.len() && sizes[start..].iter().sum::<usize>() > bytes {
+            start += 1;
+        }
+
+        start
+    }
+
+    proptest! {
+        #[test]
+        fn eviction_keeps_exactly_the_count_the_event_retention_allows(
+            events in 1_usize..=8,
+            sizes in prop::collection::vec(3_usize..=6, 0..=12),
+        ) {
+            let mut log = log(events, 1 << 20);
+
+            let appended: Vec<u64> = sizes.iter().map(|size| append(&mut log, *size)).collect();
+            let expected = sizes.len().min(events);
+            let batch = log.take(Position::Beginning, max(64)).unwrap();
+
+            prop_assert_eq!(seqs(&batch), appended[appended.len() - expected..].to_vec());
+            prop_assert_eq!(batch.is_empty(), expected == 0);
+        }
+
+        #[test]
+        fn eviction_keeps_the_newest_events_that_fit_the_byte_retention(
+            bytes in 4_usize..=12,
+            sizes in prop::collection::vec(2_usize..=6, 1..=8),
+        ) {
+            let mut log = log(16, bytes);
+
+            let appended: Vec<u64> = sizes.iter().map(|size| append(&mut log, *size)).collect();
+            let start = byte_bound_start(&sizes, bytes);
+            let batch = log.take(Position::Beginning, max(64)).unwrap();
+
+            prop_assert_eq!(seqs(&batch), appended[start..].to_vec());
+            prop_assert!(!batch.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_cursor_at_the_window_next_reads_nothing_without_a_lapse() {
+        let mut log = log(2, 1 << 20);
+        for _ in 0..3 {
+            append(&mut log, 3);
+        }
+        let window = log.window();
+        assert_eq!(window.first().get(), 1, "the window must not start at zero");
+
+        let cursor = Cursor::new(window.epoch(), window.next());
+        let batch = log.take(Position::After(cursor), max(8)).unwrap();
+
+        assert!(batch.is_empty());
+        assert!(batch.lapsed().is_none());
+        assert_eq!(batch.window(), window);
+    }
+
+    #[test]
+    fn a_cursor_at_the_window_first_reads_from_first_without_a_lapse() {
+        let mut log = log(2, 1 << 20);
+        for _ in 0..5 {
+            append(&mut log, 3);
+        }
+        let window = log.window();
+        assert_eq!(window.first().get(), 3, "the window must not start at zero");
+
+        let cursor = Cursor::new(window.epoch(), window.first());
+        let batch = log.take(Position::After(cursor), max(8)).unwrap();
+
+        assert_eq!(seqs(&batch), [3, 4]);
+        assert!(batch.lapsed().is_none());
     }
 }

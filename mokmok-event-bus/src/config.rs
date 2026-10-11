@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -93,10 +94,47 @@ const fn millis(value: u32) -> NonZeroU32 {
 }
 
 fn default_socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map_or_else(
-            || PathBuf::from("/tmp/mokmok/bus.sock"),
-            |dir| PathBuf::from(dir).join("mokmok/bus.sock"),
-        )
+    socket_path_for(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
+}
+
+/// Decides the socket location from a runtime directory alone, so the fallback rules are
+/// reachable from a test even though `set_var` is unsafe and denied here.
+fn socket_path_for(xdg: Option<&OsStr>) -> PathBuf {
+    xdg.filter(|dir| !dir.is_empty()).map_or_else(
+        || PathBuf::from("/tmp/mokmok/bus.sock"),
+        |dir| PathBuf::from(dir).join("mokmok/bus.sock"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_socket_path, socket_path_for};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_runtime_directory_scopes_the_socket() {
+        assert_eq!(
+            socket_path_for(Some(OsStr::new("/run/user/1000"))),
+            PathBuf::from("/run/user/1000/mokmok/bus.sock"),
+        );
+    }
+
+    #[test]
+    fn an_empty_runtime_directory_falls_back_to_tmp() {
+        assert_eq!(
+            socket_path_for(Some(OsStr::new(""))),
+            PathBuf::from("/tmp/mokmok/bus.sock"),
+        );
+    }
+
+    #[test]
+    fn a_missing_runtime_directory_falls_back_to_tmp() {
+        assert_eq!(socket_path_for(None), PathBuf::from("/tmp/mokmok/bus.sock"));
+    }
+
+    #[test]
+    fn the_default_socket_path_names_the_bus() {
+        assert!(default_socket_path().ends_with("mokmok/bus.sock"));
+    }
 }

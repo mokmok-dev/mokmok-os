@@ -504,6 +504,7 @@ dependencies = [
  "axum",
  "futures-util",
  "mokmok-protocol",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",
