@@ -6,7 +6,9 @@ mod private {
     pub trait Sealed {}
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 #[serde(transparent)]
 pub struct ID<M: private::Sealed> {
     value: uuid::Uuid,
@@ -22,16 +24,51 @@ impl<M: private::Sealed> ID<M> {
             _marker: core::marker::PhantomData,
         }
     }
+
+    /// A caller that must rebuild an `ID` from a UUID it already holds cannot use [`ID::new`],
+    /// which mints a fresh value.
+    #[must_use]
+    pub const fn from_uuid(value: uuid::Uuid) -> Self {
+        Self {
+            value,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_uuid(&self) -> uuid::Uuid {
+        self.value
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ID;
+    use super::{AgentID, EventID, ID};
     use core::marker::PhantomData;
     use proptest::prelude::*;
     use uuid::{Uuid, timestamp::Timestamp};
 
-    #[derive(Debug, serde::Deserialize, serde::Serialize)]
+    const _: () = {
+        const fn assert_value_type<
+            T: Clone + Copy + core::fmt::Debug + Eq + core::hash::Hash + Ord,
+        >() {
+        }
+        assert_value_type::<AgentID>();
+        assert_value_type::<EventID>();
+    };
+
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        Eq,
+        Hash,
+        Ord,
+        PartialEq,
+        PartialOrd,
+        serde::Deserialize,
+        serde::Serialize,
+    )]
     struct Marker;
 
     impl super::private::Sealed for Marker {}
