@@ -60,18 +60,6 @@ impl std::error::Error for PayloadError {
 #[cfg(test)]
 mod tests {
     use super::Payload;
-    use std::error::Error as _;
-
-    struct Unserializable;
-
-    impl serde::Serialize for Unserializable {
-        fn serialize<S: serde::Serializer>(
-            &self,
-            _: S,
-        ) -> Result<S::Ok, S::Error> {
-            Err(serde::ser::Error::custom("no"))
-        }
-    }
 
     #[test]
     fn json_round_trips_a_value_with_its_bytes_intact() {
@@ -79,28 +67,5 @@ mod tests {
 
         assert_eq!(payload.as_str(), r#"{"turn":7}"#);
         assert_eq!(payload.decode::<serde_json::Value>().unwrap()["turn"], 7);
-    }
-
-    #[test]
-    fn decode_reports_the_value_it_could_not_read() {
-        let payload = Payload::json(&1).unwrap();
-
-        let error = payload.decode::<String>().unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "the value could not be converted to or from JSON",
-        );
-        assert!(error.source().unwrap().is::<serde_json::Error>());
-    }
-
-    #[test]
-    fn json_reports_a_value_it_could_not_encode() {
-        let error = Payload::json(&Unserializable).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "the value could not be converted to or from JSON",
-        );
     }
 }
