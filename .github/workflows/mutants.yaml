@@ -1,0 +1,29 @@
+name: mutants
+on:
+  pull_request:
+    paths:
+      - "mokmok-event-bus/**"
+      - "mokmok-protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/mutants.toml"
+      - "scripts/mutants.sh"
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-mutants
+  cancel-in-progress: true
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-nix
+      # Two jobs, not the runner's full core count: cargo-mutants copies the target directory per
+      # job, and the runner's disk is the binding constraint rather than its cores.
+      - run: nix develop -c ./scripts/mutants.sh --jobs 2
