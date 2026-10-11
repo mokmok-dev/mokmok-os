@@ -515,13 +515,13 @@ async fn close(
     code: u16,
     reason: &'static str,
     timeouts: Timeouts,
-) -> bool {
+) {
     let frame = CloseFrame {
         code,
         reason: reason.into(),
     };
 
-    write(socket, Message::Close(Some(frame)), timeouts).await
+    write(socket, Message::Close(Some(frame)), timeouts).await;
 }
 
 fn millis(value: NonZeroU32) -> Duration {
