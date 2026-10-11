@@ -1,11 +1,11 @@
-use std::fmt;
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct Payload(Box<serde_json::value::RawValue>);
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("the value could not be converted to or from JSON")]
 pub struct PayloadError {
+    #[source]
     inner: serde_json::Error,
 }
 
@@ -39,21 +39,6 @@ impl Payload {
 impl PayloadError {
     const fn new(inner: serde_json::Error) -> Self {
         Self { inner }
-    }
-}
-
-impl fmt::Display for PayloadError {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        formatter.write_str("the value could not be converted to or from JSON")
-    }
-}
-
-impl std::error::Error for PayloadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.inner)
     }
 }
 

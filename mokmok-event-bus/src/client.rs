@@ -18,11 +18,17 @@ const URL: &str = "ws://localhost/ws";
 
 const UNEXPECTED: &str = "the bus answered a request that was not made";
 
+#[derive(thiserror::Error)]
 pub enum Error {
-    Transport(Box<dyn std::error::Error + Send + Sync>),
+    #[error("the socket failed: {0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("{0}")]
     Protocol(&'static str),
+    #[error("the bus refused: {0}")]
     Refused(Refusal),
+    #[error("the bus closed the connection")]
     Closed,
+    #[error("the publish was written but the bus never answered")]
     Indeterminate,
 }
 
@@ -214,6 +220,8 @@ async fn receive(stream: &mut WebSocketStream<UnixStream>) -> Result<Option<Resp
     }
 }
 
+// Manual rather than derived so a failure prints through `Display`: the derive would render the
+// boxed source's internals, and `Refused` as its variant name instead of the bus's explanation.
 impl fmt::Debug for Error {
     fn fmt(
         &self,
@@ -225,32 +233,6 @@ impl fmt::Debug for Error {
             Self::Refused(reason) => write!(formatter, "Refused({reason})"),
             Self::Closed => formatter.write_str("Closed"),
             Self::Indeterminate => formatter.write_str("Indeterminate"),
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        match self {
-            Self::Transport(error) => write!(formatter, "the socket failed: {error}"),
-            Self::Protocol(message) => formatter.write_str(message),
-            Self::Refused(reason) => write!(formatter, "the bus refused: {reason}"),
-            Self::Closed => formatter.write_str("the bus closed the connection"),
-            Self::Indeterminate => {
-                formatter.write_str("the publish was written but the bus never answered")
-            },
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Transport(error) => Some(&**error),
-            Self::Protocol(_) | Self::Refused(_) | Self::Closed | Self::Indeterminate => None,
         }
     }
 }

@@ -1,4 +1,3 @@
-use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -122,19 +121,9 @@ pub struct ResponseFrame {
     reason: Option<Refusal>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("the frame does not match the operation it names")]
 pub struct InvalidFrame;
-
-impl fmt::Display for InvalidFrame {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        formatter.write_str("the frame does not match the operation it names")
-    }
-}
-
-impl std::error::Error for InvalidFrame {}
 
 impl RequestFrame {
     pub fn decode(text: &str) -> Option<Request> {

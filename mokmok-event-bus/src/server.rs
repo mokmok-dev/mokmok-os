@@ -1,4 +1,3 @@
-use std::fmt;
 use std::future::Future;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -27,10 +26,12 @@ const GOING_AWAY: u16 = 1001;
 const PROTOCOL_ERROR: u16 = 1002;
 const POLICY_VIOLATION: u16 = 1008;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    #[error("another process is already serving this socket")]
     AlreadyRunning,
-    Io(io::Error),
+    #[error("the socket could not be served: {0}")]
+    Io(#[source] io::Error),
 }
 
 /// Serves the bus on `config.path` until `shutdown` resolves, then unlinks the socket.
@@ -84,29 +85,6 @@ pub async fn signals() {
     tokio::select! {
         () = interrupt => {},
         () = terminate => {},
-    }
-}
-
-impl fmt::Display for ServeError {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        match self {
-            Self::AlreadyRunning => {
-                formatter.write_str("another process is already serving this socket")
-            },
-            Self::Io(error) => write!(formatter, "the socket could not be served: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for ServeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::AlreadyRunning => None,
-            Self::Io(error) => Some(error),
-        }
     }
 }
 

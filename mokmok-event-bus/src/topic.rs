@@ -11,7 +11,8 @@ pub enum Topic {
     Global,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, thiserror::Error)]
+#[error("a topic is `global` or `<kind>:<uuid>`")]
 pub struct InvalidTopic;
 
 impl fmt::Display for Topic {
@@ -89,17 +90,6 @@ impl<'de> serde::Deserialize<'de> for Topic {
         deserializer.deserialize_str(TopicVisitor)
     }
 }
-
-impl fmt::Display for InvalidTopic {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        formatter.write_str("a topic is `global` or `<kind>:<uuid>`")
-    }
-}
-
-impl std::error::Error for InvalidTopic {}
 
 #[cfg(test)]
 mod tests {
