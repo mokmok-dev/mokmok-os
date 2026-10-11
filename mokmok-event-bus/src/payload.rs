@@ -26,7 +26,6 @@ impl Payload {
         self.0.get()
     }
 
-    /// Wraps text read back from storage as a payload, without re-encoding it.
     pub(crate) fn from_stored(text: String) -> Result<Self, PayloadError> {
         serde_json::value::RawValue::from_string(text)
             .map(Self)

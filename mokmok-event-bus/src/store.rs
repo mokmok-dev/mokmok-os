@@ -64,7 +64,6 @@ pub enum StoreError {
     Corrupt,
 }
 
-/// The topic row, which is the retained range and the incarnation that names it.
 #[derive(Clone, Copy, Debug)]
 pub struct TopicState {
     pub epoch: LogEpoch,
@@ -77,8 +76,6 @@ pub struct TopicState {
 /// One SQLite connection, owned by one OS thread and reached over a bounded channel.
 ///
 /// Nothing blocking runs on the async runtime and no `rusqlite` type crosses an async signature.
-/// A read-only connection pool is the documented later optimization, not worth a second writer
-/// path now: WAL lets readers run beside the writer, but the writer is already serialized here.
 #[derive(Clone)]
 pub struct Store {
     commands: mpsc::Sender<Command>,
@@ -717,7 +714,6 @@ pub fn unix_millis(at: SystemTime) -> u64 {
     u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The last append the store knows of, for the sweep's idle test.
 pub struct AppendClock(AtomicU64);
 
 impl AppendClock {

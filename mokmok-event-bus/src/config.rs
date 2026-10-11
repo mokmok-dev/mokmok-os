@@ -122,8 +122,6 @@ fn default_store_path() -> PathBuf {
     )
 }
 
-/// Decides the database location from the two environment variables alone, for the same reason
-/// `socket_path_for` takes its directory as an argument.
 fn store_path_for(
     xdg_data: Option<&OsStr>,
     home: Option<&OsStr>,

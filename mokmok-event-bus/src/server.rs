@@ -205,7 +205,6 @@ enum Step {
         response: wire::Response,
         phase: Phase,
     },
-    /// The session has nothing to hand over yet, and `parked` says what it is waiting for.
     Park {
         phase: Phase,
         parked: Parked,
