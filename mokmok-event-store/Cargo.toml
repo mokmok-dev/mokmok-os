@@ -16,3 +16,7 @@ proptest = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "mokmok-event-store-crash"
+path = "src/bin/mokmok-event-store-crash.rs"
