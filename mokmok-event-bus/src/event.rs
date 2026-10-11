@@ -301,3 +301,54 @@ impl Batch {
         Cursor::new(self.window.epoch(), Seq::new(event.seq().get() + 1))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Batch, Event, LogEpoch, Seq, Window};
+    use crate::payload::Payload;
+    use crate::topic::Topic;
+    use mokmok_protocol::EventID;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use uuid::Uuid;
+
+    fn event(seq: u64) -> Arc<Event> {
+        Arc::new(Event::new(
+            EventID::from_uuid(Uuid::new_v4()),
+            Topic::Global,
+            Seq::new(seq),
+            SystemTime::UNIX_EPOCH,
+            Payload::json(&0).unwrap(),
+        ))
+    }
+
+    proptest! {
+        #[test]
+        fn a_batch_reports_the_position_it_covers(
+            first in 0_u64..=8,
+            count in 0_usize..=8,
+        ) {
+            let epoch = LogEpoch::new(Uuid::new_v4());
+            let events: Vec<Arc<Event>> =
+                (0..count).map(|index| event(first + index as u64)).collect();
+            let window = Window::new(epoch, Seq::new(first), Seq::new(first + count as u64));
+            let batch = Batch::new(window, None, events);
+
+            prop_assert_eq!(batch.is_empty(), count == 0);
+            if count > 0 {
+                let last = batch.events().last().unwrap();
+                prop_assert_eq!(batch.after_event(last), batch.after());
+
+                for pair in batch.events().windows(2) {
+                    prop_assert!(
+                        batch.after_event(&pair[0]).seq() < batch.after_event(&pair[1]).seq(),
+                    );
+                }
+                for item in batch.events() {
+                    prop_assert!(batch.after().seq() >= batch.after_event(item).seq());
+                }
+            }
+        }
+    }
+}

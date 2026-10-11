@@ -85,6 +85,7 @@
               with pkgs;
               [
                 cargo-mutants
+                jq
                 rustToolchain
                 sccache
               ]
