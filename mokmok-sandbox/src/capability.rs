@@ -26,6 +26,19 @@ impl Access {
     ) -> bool {
         self.0 & needed.0 == needed.0
     }
+
+    /// The rights in this set together with the rights in `other`.
+    ///
+    /// The caller that decides authority one right at a time needs to name what it decided as one
+    /// set, and the rights are a set: combining two of them is the operation its own gate is
+    /// written against.
+    #[must_use]
+    pub const fn union(
+        self,
+        other: Self,
+    ) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 // The wire form is the bit set. A plan that names no rights, or a right this version does not
@@ -201,6 +214,15 @@ mod tests {
         assert!(!Access::READ.covers(Access::READ_WRITE));
         assert!(!Access::READ_WRITE.covers(Access::READ_EXECUTE));
         assert!(!Access::READ.covers(Access::READ_EXECUTE));
+    }
+
+    #[test]
+    fn a_union_holds_exactly_the_rights_of_both() {
+        let combined = Access::READ_EXECUTE.union(Access::WRITE);
+
+        assert!(combined.covers(Access::READ_WRITE_EXECUTE));
+        assert_eq!(combined.union(Access::READ_EXECUTE), combined);
+        assert!(!Access::READ.union(Access::READ).covers(Access::WRITE));
     }
 
     #[test]
