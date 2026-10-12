@@ -14,6 +14,7 @@ use std::time::Duration;
 use mokmok_event_bus::{
     Config as BusConfig, Payload, Publisher, ServeError, Topic, serve as serve_bus, signals,
 };
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
@@ -33,6 +34,13 @@ const PROBE: Duration = Duration::from_secs(1);
 
 /// How long the loop waits between readiness probes.
 const RETRY: Duration = Duration::from_millis(10);
+
+/// How long one publish may take before its row is left pending for the next pass.
+///
+/// A peer that stops answering must cost one bound per notice rather than the bus's own deadline,
+/// which is longer than the unit's `TimeoutStopSec` and so would let a stop overrun what systemd
+/// waits for before it kills the process.
+const PUBLISH: Duration = Duration::from_secs(5);
 
 /// A pass interval when the relay serves rather than draining once.
 const PASS: Duration = Duration::from_millis(200);
@@ -63,7 +71,8 @@ impl Relay {
     ///
     /// Returns [`Error::Topic`] when a notice names a topic the bus does not have,
     /// [`Error::NotJson`] when a stored payload is not JSON, [`Error::BusPayload`] when a published
-    /// value cannot be encoded, [`Error::Bus`] when the bus refuses a connection or an append, and
+    /// value cannot be encoded, [`Error::Bus`] when the bus refuses a connection or an append,
+    /// [`Error::BusUnanswered`] when a publish goes unanswered for [`PUBLISH`], and
     /// [`Error::Store`] when the log cannot be read or the settled rows cannot be deleted.
     pub async fn once(
         &mut self,
@@ -90,14 +99,41 @@ impl Relay {
         Ok(published)
     }
 
+    /// Publishes one payload within [`PUBLISH`], reusing this run's publisher for the topic or
+    /// opening one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Relay::once`] does, and [`Error::BusUnanswered`] when the bus does not answer in time.
     async fn publish(
         &mut self,
         topic: Topic,
         payload: Payload,
     ) -> Result<(), Error> {
         let key = topic.to_string();
+        let socket = self.socket.clone();
+        // One bound per notice rather than one around the pass, so a stop is honoured after the
+        // publish that is already in flight rather than by cancelling it against a live bus.
+        let outcome = tokio::time::timeout(PUBLISH, self.deliver(&key, topic, payload)).await;
 
-        if let Some(publisher) = self.publishers.get_mut(&key) {
+        if let Ok(published) = outcome {
+            published
+        } else {
+            // The connection was dropped mid-exchange, so the answer to that frame may still be
+            // waiting; reusing it would make the next publish read that answer as its own.
+            self.publishers.remove(&key);
+
+            Err(Error::BusUnanswered(socket))
+        }
+    }
+
+    async fn deliver(
+        &mut self,
+        key: &str,
+        topic: Topic,
+        payload: Payload,
+    ) -> Result<(), Error> {
+        if let Some(publisher) = self.publishers.get_mut(key) {
             publisher.publish(payload).await?;
 
             return Ok(());
@@ -105,7 +141,7 @@ impl Relay {
 
         let mut publisher = Publisher::open(&self.socket, topic).await?;
         publisher.publish(payload).await?;
-        self.publishers.insert(key, publisher);
+        self.publishers.insert(key.to_owned(), publisher);
 
         Ok(())
     }
@@ -154,6 +190,18 @@ async fn serve_until_stopped(
 ) -> Result<usize, Error> {
     let socket = bus.path.clone();
 
+    // Installed before anything is opened. An async fn's body does not run until it is polled, so a
+    // `SIGTERM` that arrives while this function is still setting up would meet the default
+    // disposition and kill the process with its socket left behind.
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut shutdown = std::pin::pin!(async move {
+        tokio::select! {
+            _ = terminate.recv() => (),
+            _ = interrupt.recv() => (),
+        }
+    });
+
     // This loop owns the stop. A bus that listened for the signal itself would stop serving while
     // this loop went on relaying, which is the process that stays up with nothing behind it.
     let (stop, stopped) = oneshot::channel::<()>();
@@ -164,7 +212,6 @@ async fn serve_until_stopped(
     let mut relay = Relay::new(&socket);
     let mut db = Db::open(&config.events)?;
     let notifier = Notifier::from_env()?;
-    let mut shutdown = std::pin::pin!(signals());
     // The first tick waits a whole interval, so the bus has bound before the first pass rather
     // than failing on the rows a previous process left pending.
     let mut tick = tokio::time::interval_at(Instant::now() + PASS, PASS);

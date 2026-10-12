@@ -36,6 +36,10 @@ mod tests {
         SessionID::from_uuid(Uuid::parse_str(SESSION).expect("the session is a uuid"))
     }
 
+    fn session_of(seed: u128) -> SessionID {
+        SessionID::from_uuid(Uuid::from_u128(seed))
+    }
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -70,14 +74,25 @@ mod tests {
         }
     }
 
+    /// Writes `count` pending notices for the session, the durable state a previous instance left
+    /// in flight for the bus to relay.
     fn seed(
         data: &Path,
         first: u128,
         count: u128,
     ) {
+        seed_for(data, session(), first, count);
+    }
+
+    /// Writes `count` pending notices for `session`, whose topic the relay publishes to.
+    fn seed_for(
+        data: &Path,
+        session: SessionID,
+        first: u128,
+        count: u128,
+    ) {
         std::fs::create_dir_all(data).unwrap();
         let mut db = Db::open(&data.join("events.sqlite")).unwrap();
-        let session = session();
 
         for index in first..first + count {
             let command = CommandId::from_uuid(Uuid::from_u128(index));
@@ -690,6 +705,48 @@ mod tests {
         assert!(
             supervisor.read(Duration::from_millis(200)).is_none(),
             "a peer that never answered was never reported ready",
+        );
+    }
+
+    #[test]
+    fn a_stop_is_honoured_while_a_publish_goes_unanswered() {
+        let scratch = Scratch::new("wedged-publish");
+        seed(&scratch.data(), 0xa1, 1);
+
+        let supervisor = Supervisor::bind("wedged-publish");
+        let notify = supervisor.variable();
+        let daemon = Daemon::start(&scratch, &[("NOTIFY_SOCKET", notify.as_str())]);
+        supervisor.expect(Duration::from_secs(5), "READY=1\n");
+
+        // The path a later publish will dial: a peer that accepts and answers nothing, which is
+        // what the publish bound exists for.
+        std::fs::remove_file(scratch.socket()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(scratch.socket()).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+
+        // A topic this run has not published to, so the pass must dial rather than reuse the
+        // connection it already holds to the bus it started.
+        seed_for(&scratch.data(), session_of(0xa2), 0xa2, 1);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        daemon.signal("TERM");
+        let finished = daemon.finish(Duration::from_secs(15));
+
+        assert_eq!(finished.code, Some(0), "{}\n{}", finished.out, finished.err);
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the stop landed within PUBLISH plus one pass: {:?}",
+            started.elapsed(),
+        );
+        assert!(
+            !scratch.socket().exists(),
+            "the daemon's own bus unlinked the socket",
         );
     }
 }

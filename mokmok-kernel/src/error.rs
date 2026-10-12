@@ -32,7 +32,7 @@ pub enum Error {
     BusServe(#[from] mokmok_event_bus::ServeError),
     #[error("the bus stopped, so this process has nothing to serve")]
     BusStopped,
-    #[error("the bus never answered {0}, so no service is behind the socket")]
+    #[error("the bus never answered {0} while this process was willing to wait")]
     BusUnanswered(PathBuf),
     #[error("a notice's topic is not one the bus names")]
     Topic(#[from] mokmok_event_bus::InvalidTopic),
