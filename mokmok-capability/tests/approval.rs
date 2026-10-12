@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod tests {
     use mokmok_capability::{
-        Action, ApprovalError, Authority, Context, Decision, Denial, DenialReason, Name, Policy,
-        Request, Requirement, Resource, Rule,
+        Action, ActionSet, ApprovalError, Authority, Context, Decision, Denial, DenialReason, Name,
+        Permission, Policy, Principal, PrincipalKind, Request, Requirement, Resource, Rule,
     };
     use mokmok_protocol::{Moment, PrincipalID, SessionID};
     use uuid::Uuid;
@@ -68,11 +68,29 @@ mod tests {
         }
     }
 
+    /// Admits `id` as an approver. A held root grant is the only way an authority comes to hold a
+    /// principal, and the permission it carries is on an unrelated resource so the grant cannot
+    /// speak for the requests under test.
+    fn admit(
+        authority: &mut Authority,
+        id: PrincipalID,
+    ) {
+        let _ = authority.root(
+            Principal::new(id, PrincipalKind::Agent, Name::new("approver").unwrap()),
+            Permission::new(
+                Resource::Tool(Name::new("unrelated").unwrap()),
+                ActionSet::INVOKE,
+            ),
+            NOW,
+        );
+    }
+
     #[test]
     fn an_approval_authorizes_only_the_request_it_was_earned_for() {
         let approved = invoke(context(10));
         let mut authority = Authority::new(policy(context(10)), NOW);
         let requirement = requirement(&authority, &approved);
+        admit(&mut authority, principal(1));
 
         assert_eq!(
             authority.decide(&approved, NOW),
@@ -107,6 +125,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unadmitted_principal_cannot_approve() {
+        let requested = invoke(context(10));
+        let mut authority = Authority::new(policy(context(10)), NOW);
+        let requirement = requirement(&authority, &requested);
+
+        assert_eq!(
+            authority.approve(&requirement, principal(1), NOW),
+            Err(ApprovalError::UnknownApprover),
+        );
+    }
+
+    #[test]
+    fn an_admitted_principal_can_approve() {
+        let approved = invoke(context(10));
+        let mut authority = Authority::new(policy(context(10)), NOW);
+        let requirement = requirement(&authority, &approved);
+        admit(&mut authority, principal(1));
+
+        let grant = authority.approve(&requirement, principal(1), NOW).unwrap();
+
+        assert_eq!(authority.decide(&approved, NOW), Decision::Allow(grant));
+    }
+
+    #[test]
     fn an_approval_whose_window_closed_is_refused() {
         let closed = Moment::from_millis(1_500);
         let mut authority = Authority::new(
@@ -126,6 +168,7 @@ mod tests {
             NOW,
         );
         let requirement = requirement(&authority, &invoke(context(10)));
+        admit(&mut authority, principal(1));
 
         assert_eq!(requirement.not_after(), Some(closed));
 
