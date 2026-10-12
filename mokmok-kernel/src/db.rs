@@ -1,14 +1,16 @@
 //! The one serialized path into the event log, and the fact log it holds.
 //!
 //! One aggregate is one stream, and one session is one aggregate: its stream carries the session's
-//! own facts and its turns' facts, in the order the log recorded them, so the facts that must
-//! commit together do. A [`Fact`] is written as the payload of an event whose kind says which
-//! machine it belongs to, because the stored payload is the only durable form either machine has.
+//! own facts, its turns' facts, and the reference to what each execution produced, in the order
+//! the log recorded them, so everything that must commit together does. Each entry says which
+//! machine it belongs to in its event kind, because a stored payload is the only durable form any
+//! of those machines has.
 //!
 //! Every append goes through one `&mut self` here, which is the workspace's whole answer to
 //! concurrent writers: the caller serializes on the store, and the dedup row keyed on the command
 //! id is what makes a retried command a replay rather than a second execution.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -16,10 +18,11 @@ use mokmok_event_store::{
     Append, CommandId, Expected, Kind, NewEvent, OutboxMessage, Outcome, Payload, Store, StreamId,
     Version,
 };
-use mokmok_protocol::SessionID;
-use mokmok_state_machine::{Fact, Session};
+use mokmok_protocol::{ExecutionID, SessionID, TurnID};
+use mokmok_state_machine::{Fact, Session, Turn, TurnFact};
 
 use crate::error::Error;
+use crate::execution::ExecutionResult;
 
 /// How many commits one read of the log asks for.
 const PAGE: NonZeroUsize = match NonZeroUsize::new(64) {
@@ -29,6 +32,192 @@ const PAGE: NonZeroUsize = match NonZeroUsize::new(64) {
 
 /// The kind under which a session's own facts are logged.
 const SESSION_FACT: &str = "mokmok.session.fact";
+/// The kind under which one turn's facts are logged.
+const TURN_FACT: &str = "mokmok.turn.fact";
+/// The kind under which the reference to one execution's bytes is logged.
+const RESULT: &str = "mokmok.execution.result";
+
+/// One durable entry of a session's log.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    /// A fact of the session machine.
+    Session(Fact),
+    /// A fact of one turn's machine.
+    Turn(TurnID, TurnFact),
+    /// What one execution produced.
+    Result(ExecutionID, ExecutionResult),
+}
+
+impl Entry {
+    /// The event kind this entry is logged under.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Session(_) => SESSION_FACT,
+            Self::Turn(..) => TURN_FACT,
+            Self::Result(..) => RESULT,
+        }
+    }
+
+    fn event(&self) -> Result<NewEvent, Error> {
+        let kind = Kind::new(self.kind()).map_err(|_| Error::NotAName(self.kind()))?;
+        let payload = match self {
+            Self::Session(fact) => Payload::json(fact)?,
+            Self::Turn(turn, fact) => Payload::json(&TurnRecord {
+                turn: *turn,
+                fact: *fact,
+            })?,
+            Self::Result(execution, result) => Payload::json(&ResultRecord {
+                execution: *execution,
+                result: result.clone(),
+            })?,
+        };
+
+        Ok(NewEvent::new(kind, payload))
+    }
+}
+
+/// One turn's fact as the log holds it: the turn's identity, which the fact itself does not carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct TurnRecord {
+    pub turn: TurnID,
+    pub fact: TurnFact,
+}
+
+/// One execution's result as the log holds it: the execution's identity beside the reference.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ResultRecord {
+    pub execution: ExecutionID,
+    pub result: ExecutionResult,
+}
+
+/// Every entry a session's log holds, in the order it was recorded.
+#[derive(Clone, Debug, Default)]
+pub struct Log {
+    pub session: Vec<Fact>,
+    pub turns: Vec<TurnRecord>,
+    pub results: Vec<ResultRecord>,
+}
+
+impl Log {
+    /// The session state its own facts fold to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Rejected`] when the history is not one this build's rules admit.
+    pub fn state(
+        &self,
+        session: SessionID,
+    ) -> Result<Session, Error> {
+        Ok(Session::replay(session, &self.session)?)
+    }
+
+    /// One turn's state, folded from the facts logged under its identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Rejected`] when the turn's history is not one this build's rules admit.
+    pub fn turn(
+        &self,
+        turn: TurnID,
+    ) -> Result<Turn, Error> {
+        let facts = self
+            .turns
+            .iter()
+            .filter(|record| record.turn == turn)
+            .map(|record| record.fact)
+            .collect::<Vec<_>>();
+
+        Ok(Turn::replay(&facts)?)
+    }
+
+    /// The turns the log opened, in the order they first appear.
+    #[must_use]
+    pub fn turns_in_order(&self) -> Vec<TurnID> {
+        let mut seen = BTreeSet::new();
+        let mut order = Vec::new();
+        for record in &self.turns {
+            if seen.insert(record.turn) {
+                order.push(record.turn);
+            }
+        }
+
+        order
+    }
+
+    /// The last turn the log opened, which is the one the newest command ran under.
+    #[must_use]
+    pub fn last_turn(&self) -> Option<TurnID> {
+        self.turns_in_order().last().copied()
+    }
+
+    /// What one execution produced, when its result was recorded.
+    #[must_use]
+    pub fn result(
+        &self,
+        execution: ExecutionID,
+    ) -> Option<&ExecutionResult> {
+        self.results
+            .iter()
+            .find(|record| record.execution == execution)
+            .map(|record| &record.result)
+    }
+
+    /// The turn whose log requested `execution`.
+    #[must_use]
+    pub fn turn_of(
+        &self,
+        execution: ExecutionID,
+    ) -> Option<TurnID> {
+        self.turns
+            .iter()
+            .find(|record| {
+                matches!(
+                    record.fact,
+                    TurnFact::ToolRequested { execution: requested, .. } if requested == execution
+                )
+            })
+            .map(|record| record.turn)
+    }
+
+    /// Folds `entries` onto the state the log already holds, and refuses what the machines refuse.
+    ///
+    /// The kernel is the log's only writer, so this is where a mistake in its own reasoning is
+    /// caught before it becomes a history no reader can replay. A step the machines refuse is never
+    /// written at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Rejected`] when the log itself does not replay, and [`Error::WriteRefused`]
+    /// when one of `entries` is a step a machine refuses.
+    pub fn verify(
+        &self,
+        session: SessionID,
+        entries: &[Entry],
+    ) -> Result<(), Error> {
+        let mut state = self.state(session)?;
+        let mut turns = std::collections::BTreeMap::new();
+
+        for entry in entries {
+            match entry {
+                Entry::Session(fact) => {
+                    state.apply(*fact).map_err(Error::WriteRefused)?;
+                },
+                Entry::Turn(turn, fact) => {
+                    let mut held = match turns.remove(turn) {
+                        Some(held) => held,
+                        None => self.turn(*turn)?,
+                    };
+                    held.apply(*fact).map_err(Error::WriteRefused)?;
+                    turns.insert(*turn, held);
+                },
+                Entry::Result(..) => {},
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// The event log, owned and written by one caller at a time.
 pub struct Db {
@@ -69,7 +258,7 @@ impl Db {
             .version())
     }
 
-    /// Appends one step: the stream's facts in order, and the notifications to publish once the
+    /// Appends one step: the entries in order, and the notifications to publish once the
     /// transaction has committed.
     ///
     /// The notifications are taken by value because the store's own type is not cloneable: a
@@ -78,20 +267,21 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::Store`] when the transaction cannot be committed, [`Error::Empty`] when
-    /// there is nothing to append, and [`Error::NotAName`] when the log's own kind name is not one.
+    /// there is nothing to append, and [`Error::NotAName`] when an entry's own kind name is not
+    /// one.
     pub fn append(
         &mut self,
         command: CommandId,
         stream: StreamId,
         expected: Expected,
-        facts: &[Fact],
+        entries: &[Entry],
         notices: Vec<OutboxMessage>,
     ) -> Result<Outcome, Error> {
-        let (first, rest) = facts.split_first().ok_or(Error::Empty)?;
+        let (first, rest) = entries.split_first().ok_or(Error::Empty)?;
 
-        let mut append = Append::new(command, stream, expected, event(SESSION_FACT, first)?);
-        for fact in rest {
-            append = append.event(event(SESSION_FACT, fact)?);
+        let mut append = Append::new(command, stream, expected, first.event()?);
+        for entry in rest {
+            append = append.event(entry.event()?);
         }
         for notice in notices {
             append = append.outbox(notice);
@@ -100,81 +290,103 @@ impl Db {
         Ok(self.store.append(&append)?)
     }
 
-    /// Every session fact of `session`, in the order the log recorded them.
+    /// Everything the session's log holds, in the order the log recorded it.
     ///
-    /// A log entry of any other kind is an error rather than something skipped: a stream carries
-    /// the facts of one aggregate, so an entry that is not one means this build is reading a log
-    /// its own writer did not write, and guessing past that would replay the wrong history.
+    /// An entry of a kind this build does not know stops the read rather than being skipped: a
+    /// stream carries one aggregate's facts, so an unknown entry means this build is reading a log
+    /// its own writer did not write, and guessing past it would replay the wrong history.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Store`] when a commit cannot be read, [`Error::UnexpectedEntry`] for an
-    /// entry of another kind, and [`Error::Payload`] for a payload that is not a fact.
-    pub fn facts(
+    /// entry of another kind, and [`Error::Payload`] for a payload that is not the record its kind
+    /// names.
+    pub fn log(
         &self,
         session: SessionID,
-    ) -> Result<Vec<Fact>, Error> {
-        let expected_kind = Kind::new(SESSION_FACT).map_err(|_| Error::NotAName(SESSION_FACT))?;
-        let mut facts = Vec::new();
+    ) -> Result<Log, Error> {
+        let mut log = Log::default();
         let mut from = Version::INITIAL;
 
         loop {
             let slice = self.store.history(Self::stream(session), from, PAGE)?;
             let commits = slice.commits();
             if commits.is_empty() {
-                return Ok(facts);
+                return Ok(log);
             }
 
             for committed in commits {
                 for entry in committed.events() {
-                    if *entry.kind() != expected_kind {
-                        return Err(Error::UnexpectedEntry {
-                            position: entry.position().get(),
-                            expected: SESSION_FACT,
-                        });
-                    }
-                    facts.push(entry.payload().decode::<Fact>()?);
+                    log.push(entry.kind(), entry.payload(), entry.position().get())?;
                 }
                 from = committed.version();
             }
         }
     }
 
-    /// The session state its own log replays to.
+    /// How many notices are waiting for the relay.
     ///
     /// # Errors
     ///
-    /// As [`Db::facts`], plus [`Error::Rejected`] when the history is not a history this build's
-    /// rules admit.
-    pub fn session(
-        &self,
-        session: SessionID,
-    ) -> Result<Session, Error> {
-        Ok(Session::replay(session, &self.facts(session)?)?)
+    /// Returns [`Error::Store`] when the rows cannot be read.
+    pub fn pending(&self) -> Result<Vec<mokmok_event_store::OutboxEntry>, Error> {
+        Ok(self.store.pending_outbox(PAGE)?)
+    }
+
+    /// Drops every notice up to and including `through`, which the relay calls once the bus has
+    /// stored them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the rows cannot be deleted.
+    pub fn settle_notices(
+        &mut self,
+        through: mokmok_event_store::OutboxId,
+    ) -> Result<u64, Error> {
+        Ok(self.store.settle_outbox(through)?)
     }
 }
 
-fn event(
-    kind: &'static str,
-    fact: &Fact,
-) -> Result<NewEvent, Error> {
-    Ok(NewEvent::new(
-        Kind::new(kind).map_err(|_| Error::NotAName(kind))?,
-        Payload::json(fact)?,
-    ))
+impl Log {
+    fn push(
+        &mut self,
+        kind: &Kind,
+        payload: &Payload,
+        position: u64,
+    ) -> Result<(), Error> {
+        if *kind == named(SESSION_FACT)? {
+            self.session.push(payload.decode()?);
+        } else if *kind == named(TURN_FACT)? {
+            let record: TurnRecord = payload.decode()?;
+            self.turns.push(record);
+        } else if *kind == named(RESULT)? {
+            let record: ResultRecord = payload.decode()?;
+            self.results.push(record);
+        } else {
+            return Err(Error::UnexpectedEntry {
+                position,
+                expected: "session, turn, or result",
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn named(kind: &'static str) -> Result<Kind, Error> {
+    Kind::new(kind).map_err(|_| Error::NotAName(kind))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Db, SESSION_FACT};
-    use crate::error::Error;
-    use mokmok_event_store::{
-        CommandId, Expected, Kind, NewEvent, OutboxMessage, Outcome, Payload, Version,
-    };
-    use mokmok_protocol::SessionID;
-    use mokmok_state_machine::{Fact, Phase};
-    use std::num::NonZeroUsize;
+    use super::{Db, Entry};
+    use crate::execution::{Blob, ExecutionResult};
+    use mokmok_event_store::{CommandId, Expected, Outcome, Payload};
+    use mokmok_protocol::{ExecutionID, SessionID, TurnID};
+    use mokmok_state_machine::{Fact, Phase, Resolution, TurnFact, TurnNumber, TurnOutcome};
+
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     struct Scratch(PathBuf);
 
@@ -195,41 +407,107 @@ mod tests {
     }
 
     fn session() -> SessionID {
-        "018f2f1e-0000-7000-8000-000000000000"
-            .parse::<uuid::Uuid>()
-            .map(SessionID::from_uuid)
-            .unwrap()
+        SessionID::from_uuid(Uuid::from_u128(1))
+    }
+
+    fn turn() -> TurnID {
+        TurnID::from_uuid(Uuid::from_u128(2))
+    }
+
+    fn execution() -> ExecutionID {
+        ExecutionID::from_uuid(Uuid::from_u128(3))
+    }
+
+    fn result() -> ExecutionResult {
+        ExecutionResult {
+            code: Some(0),
+            signal: None,
+            attempted: true,
+            stdout: Blob {
+                hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+                bytes: 6,
+                truncated: false,
+            },
+            stderr: Blob {
+                hash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+                bytes: 0,
+                truncated: false,
+            },
+            artifacts: Vec::new(),
+        }
     }
 
     #[test]
-    fn a_session_replays_out_of_the_log_after_a_reopen() {
+    fn a_log_of_every_kind_replays_after_a_reopen() {
         let scratch = Scratch::new("replay");
         let path = scratch.0.join("events.sqlite");
+        let entries = [
+            Entry::Session(Fact::SessionOpened),
+            Entry::Turn(
+                turn(),
+                TurnFact::TurnOpened {
+                    number: TurnNumber::new(1),
+                },
+            ),
+            Entry::Turn(
+                turn(),
+                TurnFact::ModelRequested {
+                    attempt: mokmok_state_machine::Attempt::new(1),
+                },
+            ),
+            Entry::Turn(turn(), TurnFact::ModelAnswered),
+            Entry::Turn(
+                turn(),
+                TurnFact::ToolRequested {
+                    execution: execution(),
+                    deadline: mokmok_state_machine::Deadline::Bounded,
+                },
+            ),
+            Entry::Turn(
+                turn(),
+                TurnFact::ToolResolved {
+                    execution: execution(),
+                    resolution: Resolution::Finished { code: 0 },
+                },
+            ),
+            Entry::Turn(
+                turn(),
+                TurnFact::TurnSettled {
+                    outcome: TurnOutcome::Completed,
+                },
+            ),
+            Entry::Result(execution(), result()),
+        ];
 
         {
             let mut db = Db::open(&path).unwrap();
-            let facts = [Fact::SessionOpened, Fact::SessionClosed];
             let outcome = db
                 .append(
                     CommandId::new(),
                     Db::stream(session()),
                     Expected::New,
-                    &facts,
+                    &entries,
                     Vec::new(),
                 )
                 .unwrap();
-
             assert!(matches!(outcome, Outcome::Committed(_)));
         }
 
         let db = Db::open(&path).unwrap();
-        let replayed = db.session(session()).unwrap();
+        let log = db.log(session()).unwrap();
 
+        assert_eq!(log.session, vec![Fact::SessionOpened]);
+        assert_eq!(log.turns.len(), 6);
+        assert_eq!(log.results.len(), 1);
+        assert_eq!(log.turns_in_order(), vec![turn()]);
+        assert_eq!(log.last_turn(), Some(turn()));
+        assert_eq!(log.turn_of(execution()), Some(turn()));
+        assert_eq!(log.result(execution()).map(|r| r.code), Some(Some(0)));
         assert_eq!(
-            replayed.phase(),
-            Phase::Closed(mokmok_state_machine::Ending::Completed)
+            log.turn(turn()).unwrap().outcome(),
+            Some(TurnOutcome::Completed)
         );
-        assert_eq!(db.facts(session()).unwrap().len(), 2);
+        assert_eq!(log.state(session()).unwrap().phase(), Phase::Accepting);
     }
 
     #[test]
@@ -237,14 +515,14 @@ mod tests {
         let scratch = Scratch::new("dedup");
         let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
         let command = CommandId::new();
-        let facts = [Fact::SessionOpened];
+        let entries = [Entry::Session(Fact::SessionOpened)];
 
         let first = db
             .append(
                 command,
                 Db::stream(session()),
                 Expected::New,
-                &facts,
+                &entries,
                 Vec::new(),
             )
             .unwrap();
@@ -253,14 +531,17 @@ mod tests {
                 command,
                 Db::stream(session()),
                 Expected::New,
-                &facts,
+                &entries,
                 Vec::new(),
             )
             .unwrap();
 
         assert!(matches!(first, Outcome::Committed(_)));
         assert!(matches!(second, Outcome::Replayed(_)));
-        assert_eq!(db.facts(session()).unwrap(), vec![Fact::SessionOpened]);
+        assert_eq!(
+            db.log(session()).unwrap().session,
+            vec![Fact::SessionOpened]
+        );
     }
 
     #[test]
@@ -272,7 +553,7 @@ mod tests {
             CommandId::new(),
             Db::stream(session()),
             Expected::New,
-            &[Fact::SessionOpened],
+            &[Entry::Session(Fact::SessionOpened)],
             Vec::new(),
         )
         .unwrap();
@@ -281,20 +562,25 @@ mod tests {
                 CommandId::new(),
                 Db::stream(session()),
                 Expected::New,
-                &[Fact::SessionClosed],
+                &[Entry::Session(Fact::SessionClosed)],
                 Vec::new(),
             )
             .unwrap();
 
         assert!(matches!(again, Outcome::Conflicted { .. }));
-        assert_eq!(db.facts(session()).unwrap(), vec![Fact::SessionOpened]);
+        assert_eq!(
+            db.log(session()).unwrap().session,
+            vec![Fact::SessionOpened]
+        );
     }
 
     #[test]
     fn a_log_past_one_page_still_replays_whole() {
         let scratch = Scratch::new("paging");
         let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
-        let opened = (0..70).map(|_| Fact::SessionOpened).collect::<Vec<_>>();
+        let opened = (0..70)
+            .map(|_| Entry::Session(Fact::SessionOpened))
+            .collect::<Vec<_>>();
 
         db.append(
             CommandId::new(),
@@ -305,65 +591,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(db.facts(session()).unwrap().len(), 70);
-        assert_eq!(db.version(Db::stream(session())).unwrap(), Version::new(70),);
+        assert_eq!(db.log(session()).unwrap().session.len(), 70);
+        assert_eq!(db.version(Db::stream(session())).unwrap().get(), 70);
     }
 
     #[test]
-    fn an_entry_of_another_kind_stops_the_replay() {
+    fn an_entry_of_an_unknown_kind_stops_the_read() {
         let scratch = Scratch::new("other-kind");
         let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
-        let mut append = mokmok_event_store::Append::new(
-            CommandId::new(),
-            Db::stream(session()),
-            Expected::New,
-            NewEvent::new(
-                Kind::new("mokmok.other.fact").unwrap(),
-                Payload::json(&Fact::SessionOpened).unwrap(),
-            ),
-        );
-        append = append.event(NewEvent::new(
-            Kind::new(SESSION_FACT).unwrap(),
-            Payload::json(&Fact::SessionClosed).unwrap(),
-        ));
-        db.store.append(&append).unwrap();
-
-        assert!(matches!(
-            db.facts(session()),
-            Err(Error::UnexpectedEntry {
-                expected: "mokmok.session.fact",
-                ..
-            }),
-        ));
-    }
-
-    #[test]
-    fn a_notice_is_pending_until_it_is_settled() {
-        let scratch = Scratch::new("outbox");
-        let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
-        let notice = OutboxMessage::new("session.opened", Payload::json(&"opened").unwrap());
-
         db.append(
             CommandId::new(),
             Db::stream(session()),
             Expected::New,
-            &[Fact::SessionOpened],
-            vec![notice],
+            &[Entry::Session(Fact::SessionOpened)],
+            Vec::new(),
         )
         .unwrap();
 
-        let pending = db
-            .store
-            .pending_outbox(NonZeroUsize::new(8).unwrap())
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].topic(), "session.opened");
-        assert_eq!(db.store.settle_outbox(pending[0].id()).unwrap(), 1);
-        assert!(
-            db.store
-                .pending_outbox(NonZeroUsize::new(8).unwrap())
-                .unwrap()
-                .is_empty(),
-        );
+        let stray = mokmok_event_store::Append::new(
+            CommandId::new(),
+            Db::stream(session()),
+            Expected::Any,
+            mokmok_event_store::NewEvent::new(
+                mokmok_event_store::Kind::new("mokmok.stray.fact").unwrap(),
+                Payload::json(&Fact::SessionClosed).unwrap(),
+            ),
+        )
+        .event(mokmok_event_store::NewEvent::new(
+            mokmok_event_store::Kind::new("mokmok.session.fact").unwrap(),
+            Payload::json(&Fact::SessionClosed).unwrap(),
+        ));
+        db.store.append(&stray).unwrap();
+
+        assert!(matches!(
+            db.log(session()),
+            Err(crate::error::Error::UnexpectedEntry { .. }),
+        ));
     }
 }

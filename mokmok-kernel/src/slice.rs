@@ -1,0 +1,542 @@
+//! The first vertical slice: one command, one turn, one confined tool, one durable outcome.
+//!
+//! One `submit` walks the eight steps the architecture names. It resolves the command line into a
+//! session and an idempotency identity, commits the transition that records the turn and the tool
+//! it is about to run, asks the authority whether the workload may run at all, hands the sandbox
+//! the authority it was given, stores what the workload produced, and commits the settlement. A
+//! retried command commits nothing the second time and reports what the log recorded.
+//!
+//! The model in this slice is the operator's own command: it answers by requesting exactly the tool
+//! the command named. A real provider replaces that one step and nothing else, which is what makes
+//! this a slice of the system rather than of the provider.
+
+use std::ffi::OsString;
+use std::time::Duration;
+
+use mokmok_event_bus::Topic;
+use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome, Payload};
+use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+use mokmok_state_machine::{
+    Attempt, Deadline, Fact, Phase, Resolution, State, TurnFact, TurnNumber, TurnOutcome,
+};
+
+use crate::authority::Authority;
+use crate::config::{Config, CrashPoint, Submit};
+use crate::db::{Db, Entry, Log};
+use crate::error::Error;
+use crate::execution::{self, ExecutionResult, Plan, Ran};
+use crate::recovery;
+
+/// What one submit left behind, read back out of the log.
+#[derive(Debug)]
+pub struct Submitted {
+    pub session: SessionID,
+    /// Whether this command had already run, so the report is the earlier run's.
+    pub replayed: bool,
+    pub phase: Phase,
+    pub turn: Option<TurnID>,
+    pub number: Option<u64>,
+    pub outcome: Option<TurnOutcome>,
+    pub execution: Option<ExecutionID>,
+    pub resolution: Option<Resolution>,
+    pub result: Option<ExecutionResult>,
+}
+
+/// What the log records for one session.
+#[derive(Debug)]
+pub struct Report {
+    pub session: SessionID,
+    pub phase: Phase,
+    pub turns: Vec<(TurnID, Option<TurnOutcome>)>,
+    pub executions: Vec<(ExecutionID, State)>,
+    pub results: Vec<(ExecutionID, ExecutionResult)>,
+}
+
+/// A wakeup a subscriber can react to without reading the log.
+///
+/// The durable fact carries the change in full; this names it. It is written into the same
+/// transaction as the change, so a notice exists only after its history committed, and the relay
+/// publishes it afterwards.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct Notice {
+    pub session: SessionID,
+    /// The idempotency identity of the submit this notice belongs to.
+    pub command: CommandId,
+    pub turn: Option<TurnID>,
+    pub execution: Option<ExecutionID>,
+    pub resolution: Option<Resolution>,
+    pub at: Moment,
+}
+
+impl Notice {
+    /// The outbox row the relay publishes once the transaction that wrote it has committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Payload`] when the notice cannot be encoded.
+    pub fn outbox(&self) -> Result<OutboxMessage, Error> {
+        Ok(OutboxMessage::new(
+            Topic::Session(self.session).to_string(),
+            Payload::json(self)?,
+        ))
+    }
+}
+
+/// Runs one command: commit the intent, decide, execute, commit the outcome.
+///
+/// # Errors
+///
+/// Returns [`Error::Closed`] when the session admits no new turn, [`Error::Divergent`] when the
+/// idempotency identity belongs to another session, [`Error::Conflicted`] when another writer moved
+/// the stream, and the errors of the store, the authority's names, the artifact store, and the
+/// sandbox.
+pub async fn submit(
+    config: &Config,
+    submit: &Submit,
+    at: Moment,
+) -> Result<Submitted, Error> {
+    let session = SessionID::from_uuid(crate::config::uuid_of(&submit.session, "session")?);
+    let command = CommandId::from_uuid(crate::config::uuid_of(
+        &submit.idempotency_key,
+        "idempotency key",
+    )?);
+    let mut db = Db::open(&config.events)?;
+    let log = resume(&mut db, session, at)?;
+    let (turn, execution, number) = mint(at, &log);
+    let mut written = launch(&log, session, turn, execution, number);
+    log.verify(session, &written)?;
+
+    let launch = notice(session, command, turn, Some(execution), None, at)?;
+    match commit(&mut db, command, session, &written, vec![launch])? {
+        Outcome::Committed(_) => {},
+        Outcome::Replayed(_) => {
+            // The command ran before. If this session holds nothing, the identity belongs to another
+            // one, and reporting this session's empty log as "replayed" would be a lie.
+            if log.session.is_empty() {
+                return Err(Error::Divergent);
+            }
+
+            return report(&db, session, true);
+        },
+        Outcome::Conflicted { found, .. } => {
+            return Err(Error::Conflicted { found: found.get() });
+        },
+    }
+    crate::config::crash(config, CrashPoint::BeforeDispatch);
+
+    let (resolution, result) = run_tool(config, submit, execution, at).await?;
+
+    let settle = settled(turn, execution, resolution, result.as_ref());
+    written.extend(settle.iter().cloned());
+    log.verify(session, &written)?;
+
+    let notice = notice(
+        session,
+        command,
+        turn,
+        Some(execution),
+        Some(resolution),
+        at,
+    )?;
+    // The settlement is its own transaction, so it needs its own identity: the store's dedup row
+    // is keyed on the command id, and reusing this submit's id would make the second append a
+    // replay of the first.
+    match commit(&mut db, CommandId::new(), session, &settle, vec![notice])? {
+        Outcome::Committed(_) | Outcome::Replayed(_) => {},
+        Outcome::Conflicted { found, .. } => {
+            return Err(Error::Conflicted { found: found.get() });
+        },
+    }
+
+    report(&db, session, false)
+}
+
+/// Recovers whatever the last crash left in flight, then reads the log this submit starts from.
+fn resume(
+    db: &mut Db,
+    session: SessionID,
+    at: Moment,
+) -> Result<Log, Error> {
+    let log = db.log(session)?;
+    if !log.session.is_empty() {
+        recovery::recover(db, &log, session, at)?;
+    }
+
+    let log = db.log(session)?;
+    if let Phase::Draining | Phase::Closed(_) = phase_of(&log, session)? {
+        return Err(Error::Closed(match phase_of(&log, session)? {
+            Phase::Draining => "draining",
+            Phase::Closed(_) => "closed",
+            _ => "unopened",
+        }));
+    }
+
+    Ok(log)
+}
+
+fn phase_of(
+    log: &Log,
+    session: SessionID,
+) -> Result<Phase, Error> {
+    if log.session.is_empty() {
+        return Ok(Phase::Unopened);
+    }
+
+    Ok(log.state(session)?.phase())
+}
+
+/// The identities one attempt runs under, and the turn number it opens.
+///
+/// The turn number counts the turns the log already opened, so a retried command that opens no turn
+/// cannot advance it, and the number a subscriber sees is the log's own count.
+fn mint(
+    at: Moment,
+    log: &Log,
+) -> (TurnID, ExecutionID, TurnNumber) {
+    (
+        TurnID::new(timestamp(at)),
+        ExecutionID::new(timestamp(at)),
+        TurnNumber::new(
+            u64::try_from(log.turns_in_order().len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        ),
+    )
+}
+
+/// The transaction that records the intent: what is about to be run, before anything runs.
+fn launch(
+    log: &Log,
+    session: SessionID,
+    turn: TurnID,
+    execution: ExecutionID,
+    number: TurnNumber,
+) -> Vec<Entry> {
+    let _ = session;
+    let mut entries = Vec::new();
+    if log.session.is_empty() {
+        entries.push(Entry::Session(Fact::SessionOpened));
+    }
+
+    entries.push(Entry::Session(Fact::ExecutionLaunched {
+        execution,
+        deadline: Deadline::Bounded,
+    }));
+    entries.push(Entry::Turn(turn, TurnFact::TurnOpened { number }));
+    entries.push(Entry::Turn(
+        turn,
+        TurnFact::ModelRequested {
+            attempt: Attempt::new(1),
+        },
+    ));
+    entries.push(Entry::Turn(turn, TurnFact::ModelAnswered));
+    entries.push(Entry::Turn(
+        turn,
+        TurnFact::ToolRequested {
+            execution,
+            deadline: Deadline::Bounded,
+        },
+    ));
+
+    entries
+}
+
+/// The transaction that records the outcome, once it is known.
+fn settled(
+    turn: TurnID,
+    execution: ExecutionID,
+    resolution: Resolution,
+    result: Option<&ExecutionResult>,
+) -> Vec<Entry> {
+    let mut entries = vec![Entry::Session(Fact::ExecutionSettled {
+        execution,
+        resolution,
+    })];
+    // Only a finished workload produced a result to hand over: a refusal, a kill, a deadline, or an
+    // outcome nobody could prove has nothing to apply, and the session refuses the claim.
+    if matches!(resolution, Resolution::Finished { .. }) {
+        entries.push(Entry::Session(Fact::ResultApplied { execution }));
+    }
+    if let Some(result) = result {
+        entries.push(Entry::Result(execution, result.clone()));
+    }
+    entries.push(Entry::Turn(
+        turn,
+        TurnFact::ToolResolved {
+            execution,
+            resolution,
+        },
+    ));
+    entries.push(Entry::Turn(
+        turn,
+        TurnFact::TurnSettled {
+            outcome: outcome_of(resolution),
+        },
+    ));
+
+    entries
+}
+
+fn notice(
+    session: SessionID,
+    command: CommandId,
+    turn: TurnID,
+    execution: Option<ExecutionID>,
+    resolution: Option<Resolution>,
+    at: Moment,
+) -> Result<OutboxMessage, Error> {
+    Notice {
+        session,
+        command,
+        turn: Some(turn),
+        execution,
+        resolution,
+        at,
+    }
+    .outbox()
+}
+
+/// Decides, confines, runs, and stores what one tool produced.
+async fn run_tool(
+    config: &Config,
+    submit: &Submit,
+    execution: ExecutionID,
+    at: Moment,
+) -> Result<(Resolution, Option<ExecutionResult>), Error> {
+    let plan = Plan {
+        execution,
+        program: submit.program.clone(),
+        args: submit.args.iter().map(OsString::from).collect(),
+        deadline: Duration::from_secs(submit.deadline_seconds),
+        artifacts: submit
+            .artifacts
+            .iter()
+            .map(|path| crate::config::relative_path(path))
+            .collect::<Result<Vec<_>, _>>()?,
+        exposures: execution::exposures(config),
+    };
+    let sandbox = mokmok_sandbox::Confined::new(mokmok_sandbox::Config {
+        root: config.sandbox_root.clone(),
+        confiner: config.confiner.clone(),
+        ..mokmok_sandbox::Config::default()
+    })?;
+    let authority = Authority::new(config, at)?;
+
+    match execution::run(config, &sandbox, &authority, &plan, at).await? {
+        Ran::Settled { resolution, result } => Ok((resolution, Some(result))),
+        Ran::Refused(_) => Ok((Resolution::Refused, None)),
+    }
+}
+
+/// Everything the log records for one session.
+///
+/// # Errors
+///
+/// Returns [`Error::UnknownSession`] when the log holds nothing for it, and the errors of the
+/// replay that reads it.
+pub fn status(
+    config: &Config,
+    session: SessionID,
+) -> Result<Report, Error> {
+    let db = Db::open(&config.events)?;
+    let log = db.log(session)?;
+    if log.session.is_empty() {
+        return Err(Error::UnknownSession(session.as_uuid()));
+    }
+
+    let state = log.state(session)?;
+    let turns = log
+        .turns_in_order()
+        .into_iter()
+        .map(|turn| Ok((turn, log.turn(turn)?.outcome())))
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    Ok(Report {
+        session,
+        phase: state.phase(),
+        turns,
+        executions: state
+            .executions()
+            .map(|(execution, held)| (execution, held.state()))
+            .collect(),
+        results: log
+            .results
+            .iter()
+            .map(|record| (record.execution, record.result.clone()))
+            .collect(),
+    })
+}
+
+/// Records an unknown outcome for every execution one session left in flight.
+///
+/// # Errors
+///
+/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise as
+/// [`recovery::recover`] does.
+pub fn reconcile(
+    config: &Config,
+    session: SessionID,
+    at: Moment,
+) -> Result<Vec<ExecutionID>, Error> {
+    let mut db = Db::open(&config.events)?;
+    let log = db.log(session)?;
+    if log.session.is_empty() {
+        return Err(Error::UnknownSession(session.as_uuid()));
+    }
+
+    recovery::recover(&mut db, &log, session, at)
+}
+
+/// How a tool's end state reads as the turn's outcome.
+///
+/// A tool that ran to completion is the turn's goal. A refusal, a kill, a deadline, or an outcome
+/// nobody could prove is not, and a cancel is the turn's own ending rather than a failure.
+#[must_use]
+pub const fn outcome_of(resolution: Resolution) -> TurnOutcome {
+    match resolution {
+        Resolution::Finished { .. } => TurnOutcome::Completed,
+        Resolution::Cancelled => TurnOutcome::Cancelled,
+        Resolution::Killed { .. }
+        | Resolution::TimedOut
+        | Resolution::Refused
+        | Resolution::Unknown => TurnOutcome::Failed,
+    }
+}
+
+fn commit(
+    db: &mut Db,
+    command: CommandId,
+    session: SessionID,
+    entries: &[Entry],
+    notices: Vec<OutboxMessage>,
+) -> Result<Outcome, Error> {
+    let stream = Db::stream(session);
+    let expected = Expected::At(db.version(stream)?);
+
+    db.append(command, stream, expected, entries, notices)
+}
+
+fn report(
+    db: &Db,
+    session: SessionID,
+    replayed: bool,
+) -> Result<Submitted, Error> {
+    let log = db.log(session)?;
+    let state = log.state(session)?;
+    let turn = log.last_turn();
+    let mut number: Option<u64> = None;
+    let mut outcome: Option<TurnOutcome> = None;
+    let mut execution: Option<ExecutionID> = None;
+    let mut resolution: Option<Resolution> = None;
+
+    if let Some(turn) = turn {
+        let held = log.turn(turn)?;
+        number = held.number().map(TurnNumber::get);
+        outcome = held.outcome();
+        if let Some((id, tool)) = held.tools().last() {
+            execution = Some(id);
+            resolution = tool.resolution();
+        }
+    }
+
+    Ok(Submitted {
+        session,
+        replayed,
+        phase: state.phase(),
+        turn,
+        number,
+        outcome,
+        execution,
+        resolution,
+        result: execution.and_then(|execution| log.result(execution).cloned()),
+    })
+}
+
+/// A [`Moment`] as the version 7 timestamp the identifiers are minted from.
+fn timestamp(at: Moment) -> uuid::Timestamp {
+    uuid::Timestamp::from_unix_time(
+        at.as_millis() / 1_000,
+        u32::try_from((at.as_millis() % 1_000) * 1_000_000).unwrap_or(0),
+        0,
+        0,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Notice, outcome_of, timestamp};
+    use mokmok_event_store::CommandId;
+    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_state_machine::{Resolution, TurnOutcome};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_finished_tool_completes_the_turn_and_everything_else_fails_it() {
+        assert_eq!(
+            outcome_of(Resolution::Finished { code: 0 }),
+            TurnOutcome::Completed,
+        );
+        assert_eq!(
+            outcome_of(Resolution::Finished { code: 101 }),
+            TurnOutcome::Completed,
+        );
+        assert_eq!(outcome_of(Resolution::Refused), TurnOutcome::Failed);
+        assert_eq!(outcome_of(Resolution::Unknown), TurnOutcome::Failed);
+        assert_eq!(
+            outcome_of(Resolution::Killed { signal: 9 }),
+            TurnOutcome::Failed,
+        );
+        assert_eq!(outcome_of(Resolution::TimedOut), TurnOutcome::Failed);
+        assert_eq!(outcome_of(Resolution::Cancelled), TurnOutcome::Cancelled);
+    }
+
+    #[test]
+    fn a_moment_becomes_the_timestamp_the_identifiers_are_minted_from() {
+        let at = Moment::from_millis(1_700_000_000_500);
+        let stamp = timestamp(at);
+        let (seconds, nanos) = stamp.to_unix();
+
+        assert_eq!(seconds, 1_700_000_000);
+        assert_eq!(nanos, 500_000_000);
+    }
+
+    #[test]
+    fn a_notice_names_the_session_topic_and_carries_its_identity() {
+        use crate::db::Db;
+
+        let data =
+            std::env::temp_dir().join(format!("mokmok-kernel-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        let mut db = Db::open(&data.join("events.sqlite")).unwrap();
+        let session = SessionID::from_uuid(Uuid::from_u128(7));
+        let command = CommandId::from_uuid(Uuid::from_u128(8));
+        let notice = Notice {
+            session,
+            command,
+            turn: None,
+            execution: None,
+            resolution: Some(Resolution::Unknown),
+            at: Moment::from_millis(1),
+        };
+
+        db.append(
+            command,
+            Db::stream(session),
+            mokmok_event_store::Expected::New,
+            &[crate::db::Entry::Session(
+                mokmok_state_machine::Fact::SessionOpened,
+            )],
+            vec![notice.outbox().unwrap()],
+        )
+        .unwrap();
+
+        let pending = db.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic(), format!("session:{}", session.as_uuid()));
+        assert_eq!(
+            pending[0].payload().decode::<Notice>().unwrap().command,
+            command,
+        );
+        let _ = std::fs::remove_dir_all(&data);
+    }
+}

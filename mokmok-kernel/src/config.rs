@@ -38,6 +38,13 @@ pub struct Args {
     /// A directory the workload may read and execute in. Repeatable.
     #[arg(long = "allow-path", global = true, value_name = "DIR")]
     pub allow_path: Vec<PathBuf>,
+    /// A directory the workload may also write in. Repeatable.
+    #[arg(long = "allow-write", global = true, value_name = "DIR")]
+    pub allow_write: Vec<PathBuf>,
+    /// The confiner binary the sandbox supervises with. Defaults to the sibling of this
+    /// executable, which is where the workspace's own build puts it.
+    #[arg(long, global = true, value_name = "PATH", hide = true)]
+    pub confiner: Option<PathBuf>,
     /// Stop at this boundary instead of finishing, so recovery can be exercised.
     #[arg(long, value_enum, global = true, hide = true)]
     pub crash_after: Option<CrashPoint>,
@@ -92,6 +99,10 @@ pub struct Submit {
     /// the CLI useless for a shell, so the value after `--arg` is taken as it is written.
     #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
     pub args: Vec<String>,
+    /// A file the workload writes in its own workspace, to be kept as an artifact. Repeatable, and
+    /// relative to that workspace.
+    #[arg(long = "artifact", value_name = "PATH")]
+    pub artifacts: Vec<String>,
     /// Seconds the workload may run before the sandbox stops it.
     #[arg(long, default_value_t = 30, value_name = "SECONDS")]
     pub deadline_seconds: u64,
@@ -110,6 +121,10 @@ pub struct Config {
     pub allow_tool: Vec<PathBuf>,
     /// Directories the workload may read and execute in.
     pub allow_path: Vec<PathBuf>,
+    /// Directories the workload may also write in.
+    pub allow_write: Vec<PathBuf>,
+    /// The confiner the sandbox supervises with.
+    pub confiner: PathBuf,
     pub crash_after: Option<CrashPoint>,
 }
 
@@ -139,6 +154,15 @@ impl Config {
             .iter()
             .map(|path| reachable_directory(path))
             .collect::<Result<Vec<_>, _>>()?;
+        let allow_write = args
+            .allow_write
+            .iter()
+            .map(|path| reachable_directory(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let confiner = args
+            .confiner
+            .clone()
+            .unwrap_or_else(|| mokmok_sandbox::Config::default().confiner);
 
         Ok(Self {
             data_dir: args.data_dir.clone(),
@@ -147,6 +171,8 @@ impl Config {
             sandbox_root,
             allow_tool,
             allow_path,
+            allow_write,
+            confiner: runnable(&confiner)?,
             crash_after: args.crash_after,
         })
     }
@@ -155,6 +181,19 @@ impl Config {
     #[must_use]
     pub fn socket(&self) -> PathBuf {
         self.data_dir.join("bus.sock")
+    }
+}
+
+/// Stops the process at a boundary between two durable commits when the run asked for it.
+///
+/// The code is distinct so a test can tell a deliberate stop from a failure, and the process dies
+/// with no transaction open, which is what makes the boundary the one it names.
+pub fn crash(
+    config: &Config,
+    point: CrashPoint,
+) {
+    if config.crash_after == Some(point) {
+        std::process::exit(97);
     }
 }
 
@@ -172,6 +211,31 @@ pub fn uuid_of(
         what,
         value: value.to_owned(),
     })
+}
+
+/// Reads a value the command line carried as a path inside the workload's own workspace.
+///
+/// The sandbox registers an artifact only when it is a plain relative path, and it refuses the run
+/// otherwise, so a path that climbs out is stopped here rather than turning into a refusal of the
+/// whole execution halfway through.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::NotRelative`] when the value is absolute or names a parent directory.
+pub fn relative_path(value: &str) -> Result<PathBuf, ConfigError> {
+    let path = Path::new(value);
+    let climbs = path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    });
+
+    if path.is_absolute() || climbs || value.is_empty() {
+        return Err(ConfigError::NotRelative(value.to_owned()));
+    }
+
+    Ok(path.to_path_buf())
 }
 
 fn create_directory(path: &Path) -> Result<(), ConfigError> {
@@ -222,6 +286,8 @@ pub enum ConfigError {
     NotADirectory(PathBuf),
     #[error("{value} is not a uuid, so it cannot be the {what} it is meant to be")]
     NotAUuid { what: &'static str, value: String },
+    #[error("{0} is not a plain relative path inside the workload's workspace")]
+    NotRelative(String),
 }
 
 #[cfg(test)]
@@ -255,12 +321,15 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             allow_tool: vec![PathBuf::from("/bin/sh")],
             allow_path: vec![PathBuf::from("/bin")],
+            allow_write: Vec::new(),
+            confiner: Some(PathBuf::from("/bin/sh")),
             crash_after: None,
             command: Command::Submit(Submit {
                 session: "018f2f1e-0000-7000-8000-000000000000".to_owned(),
                 idempotency_key: "018f2f1e-0000-7000-8000-000000000001".to_owned(),
                 program: PathBuf::from("/bin/sh"),
                 args: vec!["-c".to_owned(), "true".to_owned()],
+                artifacts: vec!["out.txt".to_owned()],
                 deadline_seconds: 5,
             }),
         }
