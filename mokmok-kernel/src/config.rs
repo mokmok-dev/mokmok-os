@@ -1,0 +1,355 @@
+//! Reads the command line into the one configuration the kernel runs on.
+//!
+//! The command line is a system boundary, so every field is checked here and the rest of the
+//! kernel trusts [`Config`]. A program must be absolute and present, because the sandbox resolves
+//! a name before it gates and refuses what it cannot resolve. A directory named as reachable must
+//! be one. Nothing is allowed by default: an empty allow list yields an empty policy, and an empty
+//! policy denies every request.
+
+use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand, ValueEnum};
+use uuid::Uuid;
+
+/// Where a run stops short of finishing, so that recovery can be exercised against a real crash.
+///
+/// Each point sits between two durable commits, so the process dies with no transaction open and
+/// the log holds exactly what the boundary says it holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CrashPoint {
+    /// After the turn is committed and before authority is asked: the work is recorded and
+    /// nothing has run.
+    BeforeDispatch,
+    /// After authority allowed the execution and before its outcome is committed: the workload
+    /// may have run and no result is recorded.
+    AfterDispatch,
+}
+
+/// The CLI surface of `mokmokd`.
+#[derive(Debug, Parser)]
+#[command(name = "mokmokd", version, about = "the mokmok OS composition root")]
+pub struct Args {
+    /// Where the event log, the artifacts, and the bus socket live.
+    #[arg(long, global = true, value_name = "DIR", default_value = "mokmok-data")]
+    pub data_dir: PathBuf,
+    /// A tool program the agent principal may invoke. Repeatable; nothing is allowed by default.
+    #[arg(long = "allow-tool", global = true, value_name = "PROGRAM")]
+    pub allow_tool: Vec<PathBuf>,
+    /// A directory the workload may read and execute in. Repeatable.
+    #[arg(long = "allow-path", global = true, value_name = "DIR")]
+    pub allow_path: Vec<PathBuf>,
+    /// Stop at this boundary instead of finishing, so recovery can be exercised.
+    #[arg(long, value_enum, global = true, hide = true)]
+    pub crash_after: Option<CrashPoint>,
+    /// The command to run.
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// One invocation of the composition root.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Commit a turn and run one tool under the authority the policy issues.
+    Submit(Submit),
+    /// Report what the log records for one session.
+    Status {
+        /// The session to report on.
+        #[arg(long)]
+        session: String,
+    },
+    /// Record an unknown outcome for every execution the session left unsettled.
+    Reconcile {
+        /// The session to reconcile.
+        #[arg(long)]
+        session: String,
+    },
+    /// Serve the event bus and relay committed events to it.
+    Serve {
+        /// Where the bus listens. Defaults to a socket inside the data directory.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+        /// Relay what is pending and exit, instead of serving until interrupted.
+        #[arg(long)]
+        once: bool,
+    },
+}
+
+/// One `submit`.
+#[derive(Debug, clap::Args)]
+pub struct Submit {
+    /// The session to work in. Its first `submit` opens it.
+    #[arg(long)]
+    pub session: String,
+    /// The idempotency identity. Two submits that name the same key run the tool once.
+    #[arg(long)]
+    pub idempotency_key: String,
+    /// Absolute path of the program to run.
+    #[arg(long, value_name = "PROGRAM")]
+    pub program: PathBuf,
+    /// One argument of the program. Repeatable, in order.
+    ///
+    /// A workload's own arguments begin with `-` often enough that refusing them here would make
+    /// the CLI useless for a shell, so the value after `--arg` is taken as it is written.
+    #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub args: Vec<String>,
+    /// Seconds the workload may run before the sandbox stops it.
+    #[arg(long, default_value_t = 30, value_name = "SECONDS")]
+    pub deadline_seconds: u64,
+}
+
+/// The validated configuration of one run.
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub data_dir: PathBuf,
+    /// The event log: one SQLite file holding the commit log and everything the kernel records.
+    pub events: PathBuf,
+    pub artifacts: PathBuf,
+    /// Parent of the sandbox's execution directories.
+    pub sandbox_root: PathBuf,
+    /// Programs the agent principal may invoke.
+    pub allow_tool: Vec<PathBuf>,
+    /// Directories the workload may read and execute in.
+    pub allow_path: Vec<PathBuf>,
+    pub crash_after: Option<CrashPoint>,
+}
+
+impl Config {
+    /// Turns parsed arguments into a configuration, creating the directories it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] when a directory cannot be created, a program is not absolute or
+    /// not a runnable file, or a named path is not a directory.
+    pub fn resolve(args: &Args) -> Result<Self, ConfigError> {
+        create_directory(&args.data_dir)?;
+
+        let artifacts = args.data_dir.join("artifacts");
+        let sandbox_root = args.data_dir.join("sandbox");
+        for directory in [&artifacts, &sandbox_root] {
+            create_directory(directory)?;
+        }
+
+        let allow_tool = args
+            .allow_tool
+            .iter()
+            .map(|program| runnable(program))
+            .collect::<Result<Vec<_>, _>>()?;
+        let allow_path = args
+            .allow_path
+            .iter()
+            .map(|path| reachable_directory(path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            data_dir: args.data_dir.clone(),
+            events: args.data_dir.join("events.sqlite"),
+            artifacts,
+            sandbox_root,
+            allow_tool,
+            allow_path,
+            crash_after: args.crash_after,
+        })
+    }
+
+    /// The bus socket when the caller named none.
+    #[must_use]
+    pub fn socket(&self) -> PathBuf {
+        self.data_dir.join("bus.sock")
+    }
+}
+
+/// Reads a value the command line carried as a session, a turn, or an idempotency identity.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::NotAUuid`] when the value is not a UUID, because a name would not
+/// survive the trip through the log as an identity.
+pub fn uuid_of(
+    value: &str,
+    what: &'static str,
+) -> Result<Uuid, ConfigError> {
+    value.parse::<Uuid>().map_err(|_| ConfigError::NotAUuid {
+        what,
+        value: value.to_owned(),
+    })
+}
+
+fn create_directory(path: &Path) -> Result<(), ConfigError> {
+    std::fs::create_dir_all(path).map_err(|source| ConfigError::Data {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn runnable(program: &Path) -> Result<PathBuf, ConfigError> {
+    if !program.is_absolute() {
+        return Err(ConfigError::NotAbsolute(program.to_path_buf()));
+    }
+
+    if !program.is_file() {
+        return Err(ConfigError::NotRunnable(program.to_path_buf()));
+    }
+
+    Ok(program.to_path_buf())
+}
+
+fn reachable_directory(path: &Path) -> Result<PathBuf, ConfigError> {
+    if !path.is_absolute() {
+        return Err(ConfigError::NotAbsolute(path.to_path_buf()));
+    }
+
+    if !path.is_dir() {
+        return Err(ConfigError::NotADirectory(path.to_path_buf()));
+    }
+
+    Ok(path.to_path_buf())
+}
+
+/// A configuration the kernel refuses to run on.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("the data directory {path} could not be created")]
+    Data {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{0} is not absolute, and the sandbox resolves a path before it gates on it")]
+    NotAbsolute(PathBuf),
+    #[error("{0} is not a file a workload could run")]
+    NotRunnable(PathBuf),
+    #[error("{0} is not a directory a workload could read")]
+    NotADirectory(PathBuf),
+    #[error("{value} is not a uuid, so it cannot be the {what} it is meant to be")]
+    NotAUuid { what: &'static str, value: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, Command, Config, ConfigError, Submit, uuid_of};
+    use clap::Parser as _;
+    use std::path::{Path, PathBuf};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "mokmok-kernel-config-{name}-{}",
+                std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn args(data_dir: &Path) -> Args {
+        Args {
+            data_dir: data_dir.to_path_buf(),
+            allow_tool: vec![PathBuf::from("/bin/sh")],
+            allow_path: vec![PathBuf::from("/bin")],
+            crash_after: None,
+            command: Command::Submit(Submit {
+                session: "018f2f1e-0000-7000-8000-000000000000".to_owned(),
+                idempotency_key: "018f2f1e-0000-7000-8000-000000000001".to_owned(),
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_owned(), "true".to_owned()],
+                deadline_seconds: 5,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_resolved_configuration_creates_the_directories_it_names() {
+        let scratch = Scratch::new("resolve");
+        let config = Config::resolve(&args(&scratch.0)).unwrap();
+
+        assert!(config.data_dir.is_dir());
+        assert!(config.artifacts.is_dir());
+        assert!(config.sandbox_root.is_dir());
+        assert_eq!(config.events, config.data_dir.join("events.sqlite"));
+        assert_eq!(config.socket(), config.data_dir.join("bus.sock"));
+    }
+
+    #[test]
+    fn a_relative_program_is_refused() {
+        let scratch = Scratch::new("relative");
+        let mut args = args(&scratch.0);
+        args.allow_tool = vec![PathBuf::from("sh")];
+
+        assert!(matches!(
+            Config::resolve(&args),
+            Err(ConfigError::NotAbsolute(_)),
+        ));
+    }
+
+    #[test]
+    fn a_program_that_is_not_a_file_is_refused() {
+        let scratch = Scratch::new("absent");
+        let mut args = args(&scratch.0);
+        args.allow_tool = vec![PathBuf::from("/bin/no-such-tool-mokmok")];
+
+        assert!(matches!(
+            Config::resolve(&args),
+            Err(ConfigError::NotRunnable(_)),
+        ));
+    }
+
+    #[test]
+    fn a_reachable_path_that_is_not_a_directory_is_refused() {
+        let scratch = Scratch::new("file-path");
+        let mut args = args(&scratch.0);
+        args.allow_path = vec![PathBuf::from("/bin/sh")];
+
+        assert!(matches!(
+            Config::resolve(&args),
+            Err(ConfigError::NotADirectory(_)),
+        ));
+    }
+
+    #[test]
+    fn an_identity_that_is_not_a_uuid_is_refused() {
+        assert!(uuid_of("session-one", "session").is_err());
+        assert_eq!(
+            uuid_of("018f2f1e-0000-7000-8000-000000000000", "session").unwrap(),
+            uuid_of("018f2f1e-0000-7000-8000-000000000000", "session").unwrap(),
+        );
+    }
+
+    #[test]
+    fn the_parser_reads_the_shape_the_command_line_uses() {
+        let parsed = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            "/tmp/mokmok-kernel-parse",
+            "--allow-tool",
+            "/bin/sh",
+            "submit",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--idempotency-key",
+            "018f2f1e-0000-7000-8000-000000000001",
+            "--program",
+            "/bin/sh",
+            "--arg",
+            "-c",
+            "--arg",
+            "true",
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.allow_tool, vec![PathBuf::from("/bin/sh")]);
+        let Command::Submit(submit) = parsed.command else {
+            panic!("the command line named a submit");
+        };
+        assert_eq!(submit.args, vec!["-c".to_owned(), "true".to_owned()]);
+        assert_eq!(submit.deadline_seconds, 30);
+    }
+}
