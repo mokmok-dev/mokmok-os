@@ -78,6 +78,8 @@ impl fmt::Display for Denial {
     }
 }
 
+impl core::error::Error for Denial {}
+
 /// The rule a denial rests on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DenialReason {
