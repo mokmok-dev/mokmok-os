@@ -10,11 +10,15 @@
 //! validated. A name that answers differently on a second lookup cannot redirect the connection,
 //! and an alternate address the rules refuse was dropped before any connection was attempted.
 //!
+//! Validation and the connection each record what they decided to the [`AuditSink`] they are
+//! given, so the trail is emitted by the work rather than assembled by a caller.
+//!
 //! ```rust
 //! use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 //!
 //! use mokmok_egress::{
-//!     CallContext, Destination, PolicyClient, Refusal, Rules, Validated, parse_connect,
+//!     AuditRecord, AuditSink, CallContext, Destination, PolicyClient, Refusal, Rules, Validated,
+//!     parse_connect,
 //! };
 //! use mokmok_protocol::{ExecutionID, PrincipalID};
 //! use uuid::Uuid;
@@ -25,6 +29,12 @@
 //!     fn check(&self, _: &Destination, _: &CallContext) -> Result<(), Refusal> {
 //!         Ok(())
 //!     }
+//! }
+//!
+//! struct Discard;
+//!
+//! impl AuditSink for Discard {
+//!     fn record(&self, _: AuditRecord) {}
 //! }
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,6 +51,7 @@
 //!     &Rules::public_only(),
 //!     &Permit,
 //!     &context,
+//!     &Discard,
 //! )?;
 //!
 //! assert_eq!(validated.addresses().len(), 1);

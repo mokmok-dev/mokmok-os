@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 use tokio::net::TcpStream;
 
+use crate::audit::{AuditRecord, AuditSink, DecisionName, now};
 use crate::destination::{Destination, Rules, classify};
 use crate::policy_client::{CallContext, PolicyClient, Refusal};
 
@@ -17,13 +18,16 @@ use crate::policy_client::{CallContext, PolicyClient, Refusal};
 pub struct Validated {
     destination: Destination,
     addresses: Vec<SocketAddr>,
+    context: CallContext,
 }
 
 impl Validated {
-    /// Validates `destination` against `rules` and `policy`, before any socket exists.
+    /// Validates `destination` against `rules` and `policy`, before any socket exists, and records
+    /// the decision to `sink`.
     ///
     /// The returned value keeps only the addresses whose class the rules admit. When none of them
-    /// is admitted, or the policy declines, nothing is returned and no socket was opened.
+    /// is admitted, or the policy declines, nothing is returned, no socket was opened, and the
+    /// refusal is recorded with the reason it was refused for.
     ///
     /// # Errors
     ///
@@ -36,8 +40,18 @@ impl Validated {
         rules: &Rules,
         policy: &impl PolicyClient,
         context: &CallContext,
+        sink: &impl AuditSink,
     ) -> Result<Self, Refusal> {
-        policy.check(&destination, context)?;
+        if let Err(refusal) = policy.check(&destination, context) {
+            sink.record(record(
+                context,
+                &destination,
+                None,
+                DecisionName::Refused(refusal.clone()),
+            ));
+
+            return Err(refusal);
+        }
 
         let mut permitted = Vec::new();
         let mut refused = None;
@@ -46,17 +60,29 @@ impl Validated {
             if rules.allows(class) {
                 permitted.push(address);
             } else if refused.is_none() {
-                refused = Some(class);
+                refused = Some((address, class));
             }
         }
 
         if permitted.is_empty() {
-            return Err(refused.map_or(Refusal::Unresolved, Refusal::Forbidden));
+            let reason =
+                refused.map_or(Refusal::Unresolved, |(_, class)| Refusal::Forbidden(class));
+            sink.record(record(
+                context,
+                &destination,
+                refused.map(|(address, _)| address),
+                DecisionName::Refused(reason.clone()),
+            ));
+
+            return Err(reason);
         }
+
+        sink.record(record(context, &destination, None, DecisionName::Allowed));
 
         Ok(Self {
             destination,
             addresses: permitted,
+            context: *context,
         })
     }
 
@@ -72,21 +98,44 @@ impl Validated {
         &self.addresses
     }
 
-    /// Connects to the first validated address that answers.
+    /// Connects to the first validated address that answers, and records the attempt to `sink`
+    /// with the address the connection was made to.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Unreachable`] when no validated address could be reached.
-    pub async fn connect(&self) -> Result<TcpStream, Error> {
+    pub async fn connect(
+        &self,
+        sink: &impl AuditSink,
+    ) -> Result<TcpStream, Error> {
         // Every candidate comes from the validated list, so a fallback after a refused address is
         // still a validated address.
+        let mut attempted = None;
         let mut failure = None;
         for address in &self.addresses {
+            attempted = Some(*address);
             match TcpStream::connect(address).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    let connected = stream.peer_addr().unwrap_or(*address);
+                    sink.record(record(
+                        &self.context,
+                        &self.destination,
+                        Some(connected),
+                        DecisionName::Allowed,
+                    ));
+
+                    return Ok(stream);
+                },
                 Err(error) => failure = Some(error),
             }
         }
+
+        sink.record(record(
+            &self.context,
+            &self.destination,
+            attempted,
+            DecisionName::Unreachable,
+        ));
 
         Err(Error::Unreachable(failure.unwrap_or_else(|| {
             io::Error::new(
@@ -94,6 +143,22 @@ impl Validated {
                 "the destination has no validated address",
             )
         })))
+    }
+}
+
+fn record(
+    context: &CallContext,
+    destination: &Destination,
+    address: Option<SocketAddr>,
+    decision: DecisionName,
+) -> AuditRecord {
+    AuditRecord {
+        at: now(),
+        execution: context.execution,
+        principal: context.principal,
+        destination: destination.clone(),
+        address,
+        decision,
     }
 }
 
