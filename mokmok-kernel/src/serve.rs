@@ -14,6 +14,7 @@ use std::time::Duration;
 use mokmok_event_bus::{
     Config as BusConfig, Payload, Publisher, ServeError, Topic, serve as serve_bus, signals,
 };
+use mokmok_observability::{Config as LogConfig, Redaction, init};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -37,6 +38,13 @@ const RETRY: Duration = Duration::from_millis(10);
 
 /// A pass interval when the relay serves rather than draining once.
 const PASS: Duration = Duration::from_millis(200);
+
+/// The filter the daemon installs when the operator set no `RUST_LOG`.
+///
+/// Not `info`: `opened a topic` is an info event that fires once for every topic the relay opens,
+/// which is chatter in a journal. The writer is stderr, so the daemon's stdout stays the batch
+/// result its callers parse whatever this filter selects.
+const DEFAULT_LOG_FILTER: &str = "warn";
 
 /// The outbox relay: one open publisher per topic it has published to this run.
 pub struct Relay {
@@ -159,6 +167,10 @@ async fn serve_until_stopped(
     config: &Config,
     bus: BusConfig,
 ) -> Result<usize, Error> {
+    // Failing to install is reported and then ignored, because a process that cannot log still
+    // has to serve.
+    install_logging();
+
     let socket = bus.path.clone();
 
     // Installed before anything is opened. An async fn's body does not run until it is polled, so a
@@ -259,6 +271,15 @@ async fn serve_until_stopped(
     }
 
     Ok(published)
+}
+
+fn install_logging() {
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_owned());
+    let config = LogConfig::new(filter, Redaction::none());
+
+    if let Err(error) = init(&config) {
+        eprintln!("mokmokd: the log subscriber was not installed: {error}");
+    }
 }
 
 async fn wait_for_bus(socket: &Path) -> Result<(), Error> {

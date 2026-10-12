@@ -161,7 +161,8 @@ mod tests {
             ])
             .env_remove("NOTIFY_SOCKET")
             .env_remove("WATCHDOG_USEC")
-            .env_remove("WATCHDOG_PID");
+            .env_remove("WATCHDOG_PID")
+            .env_remove("RUST_LOG");
 
         command
     }
@@ -760,6 +761,80 @@ mod tests {
             finished.out,
             format!("published=0 socket={}\n", scratch.socket().display()),
             "nothing was acknowledged",
+        );
+    }
+
+    #[test]
+    fn the_bus_log_reaches_stderr_when_the_operator_turns_it_on() {
+        let scratch = Scratch::new("info-log");
+        seed(&scratch.data(), 0xb1, 1);
+
+        let daemon = Daemon::start(&scratch, &[("RUST_LOG", "info")]);
+        wait_for_socket(&scratch.socket(), Duration::from_secs(5));
+        let notices = collect(
+            &scratch.socket(),
+            Topic::Session(session()),
+            SubscriberId::new(),
+            1,
+        );
+        assert_eq!(
+            notices.len(),
+            1,
+            "the seeded notice was relayed, which is what opens the session's topic: {notices:#?}",
+        );
+
+        daemon.signal("TERM");
+        let finished = daemon.finish(Duration::from_secs(5));
+
+        assert_eq!(finished.code, Some(0), "{}", finished.err);
+        assert_eq!(
+            finished.out,
+            format!("published=1 socket={}\n", scratch.socket().display()),
+            "the writer keeps the daemon's stdout its batch result at any filter",
+        );
+        // The line is JSON whose target and topic vary with the bus's internals, so only the
+        // message field is asserted, not the whole line.
+        assert!(
+            finished.err.contains("opened a topic"),
+            "the bus's info line reached the daemon's stderr: {}",
+            finished.err,
+        );
+    }
+
+    #[test]
+    fn a_subscriber_that_cannot_be_installed_is_reported_without_failing_the_daemon() {
+        let scratch = Scratch::new("bad-log-filter");
+        seed(&scratch.data(), 0xc1, 1);
+
+        // A directive whose level is not a level is the one installation failure a test can
+        // reach, because a fresh process has no global subscriber to collide with.
+        let daemon = Daemon::start(&scratch, &[("RUST_LOG", "mokmok=nonsense")]);
+        wait_for_socket(&scratch.socket(), Duration::from_secs(5));
+        let notices = collect(
+            &scratch.socket(),
+            Topic::Session(session()),
+            SubscriberId::new(),
+            1,
+        );
+        assert_eq!(
+            notices.len(),
+            1,
+            "the daemon served despite the filter that could not be installed: {notices:#?}",
+        );
+
+        daemon.signal("TERM");
+        let finished = daemon.finish(Duration::from_secs(5));
+
+        assert_eq!(finished.code, Some(0), "{}", finished.err);
+        assert_eq!(
+            finished.out,
+            format!("published=1 socket={}\n", scratch.socket().display()),
+            "no subscriber means no bus line on the daemon's stdout",
+        );
+        assert!(
+            finished.err.contains("log subscriber was not installed"),
+            "the failure to install is reported on stderr: {}",
+            finished.err,
         );
     }
 }
