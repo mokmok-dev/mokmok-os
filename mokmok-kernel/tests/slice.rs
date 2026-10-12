@@ -20,6 +20,8 @@ mod tests {
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     /// The SHA-256 of `hello`, likewise.
     const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    /// The SHA-256 of `world`, which tells a second run's artifact from the first's.
+    const WORLD_SHA256: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7";
 
     const SESSION: &str = "018f2f1e-0000-7000-8000-000000000000";
     const KEY_A: &str = "018f2f1e-0000-7000-8000-0000000000a1";
@@ -214,12 +216,13 @@ mod tests {
         run(&args)
     }
 
-    /// One `submit` that writes `hello` into `out.txt` in the workload's own workspace.
-    fn submit(
+    /// The arguments one `submit` carries, writing `body` into `out.txt` in the workload's own
+    /// workspace.
+    fn submit_args(
         scratch: &Scratch,
         key: &str,
-        extra: &[&str],
-    ) -> Ran {
+        body: &str,
+    ) -> Vec<String> {
         let mut args = base(scratch, true);
         args.extend([
             "submit".to_owned(),
@@ -232,15 +235,35 @@ mod tests {
             "--arg".to_owned(),
             "-c".to_owned(),
             "--arg".to_owned(),
-            "printf hello > out.txt".to_owned(),
+            body.to_owned(),
             "--artifact".to_owned(),
             "out.txt".to_owned(),
             "--deadline-seconds".to_owned(),
             "30".to_owned(),
         ]);
+
+        args
+    }
+
+    /// One `submit` that writes `hello` into `out.txt` in the workload's own workspace.
+    fn submit(
+        scratch: &Scratch,
+        key: &str,
+        extra: &[&str],
+    ) -> Ran {
+        let mut args = submit_args(scratch, key, "printf hello > out.txt");
         args.extend(extra.iter().map(|value| (*value).to_owned()));
 
         run(&args)
+    }
+
+    /// One `submit` whose workload writes `body`, so two runs leave distinguishable artifacts.
+    fn submit_writing(
+        scratch: &Scratch,
+        key: &str,
+        body: &str,
+    ) -> Ran {
+        run(&submit_args(scratch, key, body))
     }
 
     #[test]
@@ -333,6 +356,79 @@ mod tests {
             1,
             "{}",
             report.out,
+        );
+    }
+
+    #[test]
+    fn a_retried_command_reports_its_own_turn_and_not_the_newest_one() {
+        let scratch = Scratch::new("own-turn");
+
+        let first = submit_writing(&scratch, KEY_A, "printf hello > out.txt");
+        assert!(first.ok, "{}\n{}", first.out, first.err);
+        let second = submit_writing(&scratch, KEY_B, "printf world > out.txt");
+        assert!(second.ok, "{}\n{}", second.out, second.err);
+
+        // Each run wrote its own bytes, so a reported hash says which run it came from.
+        assert!(
+            first
+                .out
+                .contains(&format!("artifact=out.txt hash={HELLO_SHA256} bytes=5")),
+            "{}",
+            first.out,
+        );
+        assert!(
+            second
+                .out
+                .contains(&format!("artifact=out.txt hash={WORLD_SHA256} bytes=5")),
+            "{}",
+            second.out,
+        );
+        assert_ne!(first.value("turn"), second.value("turn"));
+
+        let again = submit_writing(&scratch, KEY_A, "printf hello > out.txt");
+        let first_turn = first
+            .value("turn")
+            .expect("the first submit reported a turn");
+        let first_execution = first
+            .value("execution")
+            .expect("the first submit reported an execution");
+        let second_turn = second
+            .value("turn")
+            .expect("the second submit reported a turn");
+
+        assert!(again.ok, "{}\n{}", again.out, again.err);
+        assert_eq!(again.value("replayed").as_deref(), Some("true"));
+        assert_eq!(again.value("turn"), first.value("turn"));
+        assert_eq!(again.value("number").as_deref(), Some("1"));
+        assert_eq!(again.value("execution"), first.value("execution"));
+        assert!(
+            again
+                .out
+                .contains(&format!("artifact=out.txt hash={HELLO_SHA256} bytes=5")),
+            "the replay reports the first run's artifact:\n{}",
+            again.out,
+        );
+
+        let report = status(&scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        assert!(
+            report
+                .out
+                .contains(&format!("turn={second_turn} outcome=Some(Completed)")),
+            "the second key kept its own turn:\n{}",
+            report.out,
+        );
+        assert!(
+            report.out.contains(&format!(
+                "execution={first_execution} state=Applied {{ code: 0 }}"
+            )),
+            "{}",
+            report.out,
+        );
+        assert!(
+            report.out.contains(&format!("turn={first_turn} ")),
+            "{}",
+            report.out
         );
     }
 
@@ -446,6 +542,11 @@ mod tests {
             1,
             "{}",
             recovered.out,
+        );
+        assert_eq!(
+            scratch.started(),
+            1,
+            "recovery records the unknown outcome but leaves the crashed workspace to be collected",
         );
 
         let after = status(&scratch);

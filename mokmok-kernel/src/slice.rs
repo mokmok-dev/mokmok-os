@@ -60,7 +60,8 @@ pub struct Report {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Notice {
     pub session: SessionID,
-    /// The idempotency identity of the submit this notice belongs to.
+    /// The command whose transaction wrote this notice: a submit's is its own idempotency identity,
+    /// while recovery's is the identity it mints for the batch it writes, which no retry reuses.
     pub command: CommandId,
     pub turn: Option<TurnID>,
     pub execution: Option<ExecutionID>,
@@ -102,9 +103,14 @@ pub async fn submit(
     )?);
     let mut db = Db::open(&config.events)?;
     let log = resume(&mut db, session, at)?;
-    let (turn, execution, number) = mint(at, &log);
+    let (turn, execution, number) = mint(command, at, &log);
     let mut written = launch(&log, turn, execution, number);
-    log.verify(session, &written)?;
+    // A retried command already owns this turn, so the entries above describe a history the log
+    // holds. The append below is the store's dedup and writes nothing, and folding them onto that
+    // closed turn would refuse a write that never happens.
+    if !log.turns_in_order().contains(&turn) {
+        log.verify(session, &written)?;
+    }
 
     let launch = notice(session, command, turn, Some(execution), None, at)?;
     match commit(&mut db, command, session, &written, vec![launch])? {
@@ -116,7 +122,7 @@ pub async fn submit(
                 return Err(Error::Divergent);
             }
 
-            return report(&db, session, true);
+            return report(&db, session, command, true);
         },
         Outcome::Conflicted { found, .. } => {
             return Err(Error::Conflicted { found: found.get() });
@@ -148,7 +154,7 @@ pub async fn submit(
         },
     }
 
-    report(&db, session, false)
+    report(&db, session, command, false)
 }
 
 /// Recovers whatever the last crash left in flight, then reads the log this submit starts from.
@@ -187,14 +193,20 @@ fn phase_of(
 
 /// The identities one attempt runs under, and the turn number it opens.
 ///
+/// A turn takes its identity from the command that opened it, so a retried command derives the turn
+/// it already owns instead of minting a second one, and a replay can report that turn without
+/// searching the log for the newest. The execution is minted fresh: a new attempt is a new
+/// execution even when the command repeats.
+///
 /// The turn number counts the turns the log already opened, so a retried command that opens no turn
 /// cannot advance it, and the number a subscriber sees is the log's own count.
 fn mint(
+    command: CommandId,
     at: Moment,
     log: &Log,
 ) -> (TurnID, ExecutionID, TurnNumber) {
     (
-        TurnID::new(timestamp(at)),
+        TurnID::from_uuid(command.as_uuid()),
         ExecutionID::new(timestamp(at)),
         TurnNumber::new(
             u64::try_from(log.turns_in_order().len())
@@ -414,34 +426,32 @@ fn commit(
     db.append(command, stream, expected, entries, notices)
 }
 
+/// Reads back what the submitting command did.
+///
+/// The command names its own turn, so the report describes that command's run: a replay reports the
+/// earlier run rather than the session's newest turn.
 fn report(
     db: &Db,
     session: SessionID,
+    command: CommandId,
     replayed: bool,
 ) -> Result<Submitted, Error> {
     let log = db.log(session)?;
     let state = log.state(session)?;
-    let turn = log.last_turn();
-    let mut number: Option<u64> = None;
-    let mut outcome: Option<TurnOutcome> = None;
-    let mut execution: Option<ExecutionID> = None;
-    let mut resolution: Option<Resolution> = None;
-
-    if let Some(turn) = turn {
-        let held = log.turn(turn)?;
-        number = held.number().map(TurnNumber::get);
-        outcome = held.outcome();
-        if let Some((id, tool)) = held.tools().last() {
-            execution = Some(id);
-            resolution = tool.resolution();
-        }
-    }
+    let turn = TurnID::from_uuid(command.as_uuid());
+    let held = log.turn(turn)?;
+    let number = held.number().map(TurnNumber::get);
+    let outcome = held.outcome();
+    let (execution, resolution) = match held.tools().last() {
+        Some((id, tool)) => (Some(id), tool.resolution()),
+        None => (None, None),
+    };
 
     Ok(Submitted {
         session,
         replayed,
         phase: state.phase(),
-        turn,
+        turn: Some(turn),
         number,
         outcome,
         execution,
