@@ -1,8 +1,10 @@
-//! Validates the recorded history of one agent session and folds it back into [`Session`] state.
+//! Validates the recorded history of an agent session and of one turn within it, folding each back
+//! into its state.
 //!
 //! The crate is pure and deterministic. It reads no clock, no randomness, no filesystem, and no
-//! socket, and [`Session`] carries no serialization: the log of [`Fact`]s is the only durable form
-//! and [`Session::replay`] is the only way back to the state a driving path held.
+//! socket, and neither [`Session`] nor [`Turn`] carries serialization: the log of [`Fact`]s or
+//! [`TurnFact`]s is the only durable form and [`Session::replay`] or [`Turn::replay`] is the only
+//! way back to the state a driving path held.
 //!
 //! Six properties hold, each enforced by a rule in [`Session::apply`]:
 //!
@@ -37,6 +39,24 @@
 //!   caller can claim an outcome that was never proven. Reconciliation is the caller's duty, and
 //!   the unknown stays visible in the session's state until it happens.
 //!
+//! One turn folds under the same [`Ack`] and [`Rejection`] shape, with rules of its own:
+//!
+//! - **A tool needs a model answer.** [`TurnFact::ToolRequested`] is
+//!   [`Rejection::ModelNotAnswered`] until the turn holds a [`TurnFact::ModelAnswered`], and a
+//!   [`TurnFact::ModelAnswered`] with no [`TurnFact::ModelRequested`] outstanding is
+//!   [`Rejection::UnrequestedAnswer`].
+//! - **A turn settles once, then admits no new fact.** [`TurnFact::TurnSettled`] with the same
+//!   outcome is an [`Ack::Duplicate`], another outcome is [`Rejection::OutcomeConflict`], and any
+//!   other fact the turn does not already hold is [`Rejection::TurnOver`].
+//! - **A resolution names a requested execution.** A [`TurnFact::ToolResolved`] for an
+//!   [`ExecutionID`](mokmok_protocol::ExecutionID) the turn never requested is
+//!   [`Rejection::UnknownExecution`].
+//! - **An execution is resolved at most once.** The same resolution again is an [`Ack::Duplicate`]
+//!   and a different one is [`Rejection::ResolutionConflict`], so a redelivered outcome cannot
+//!   rewrite a recorded settlement.
+//! - **Replay reconstructs the driven state.** [`Turn::replay`] runs the same [`Turn::apply`] and
+//!   stops at the first refusal naming the offset into the log.
+//!
 //! # Examples
 //!
 //! ```
@@ -56,6 +76,39 @@
 //!     Ok(session),
 //! );
 //! ```
+//!
+//! A turn opens, gates its tools on the model, and settles once:
+//!
+//! ```
+//! use mokmok_protocol::ExecutionID;
+//! use mokmok_state_machine::{
+//!     Ack, Attempt, Deadline, Rejection, Turn, TurnFact, TurnNumber, TurnOutcome,
+//! };
+//! use uuid::Uuid;
+//!
+//! let mut turn = Turn::new();
+//! let execution = ExecutionID::from_uuid(Uuid::from_u128(7));
+//!
+//! assert_eq!(turn.apply(TurnFact::TurnOpened { number: TurnNumber::new(1) }), Ok(Ack::Applied));
+//! assert_eq!(
+//!     turn.apply(TurnFact::ToolRequested { execution, deadline: Deadline::Bounded }),
+//!     Err(Rejection::ModelNotAnswered),
+//! );
+//! assert_eq!(turn.apply(TurnFact::ModelRequested { attempt: Attempt::new(1) }), Ok(Ack::Applied));
+//! assert_eq!(turn.apply(TurnFact::ModelAnswered), Ok(Ack::Applied));
+//! assert_eq!(
+//!     turn.apply(TurnFact::ToolRequested { execution, deadline: Deadline::Bounded }),
+//!     Ok(Ack::Applied),
+//! );
+//! assert_eq!(
+//!     turn.apply(TurnFact::TurnSettled { outcome: TurnOutcome::Completed }),
+//!     Ok(Ack::Applied),
+//! );
+//! assert_eq!(
+//!     turn.apply(TurnFact::ToolRequested { execution, deadline: Deadline::Bounded }),
+//!     Ok(Ack::Duplicate),
+//! );
+//! ```
 
 #![no_std]
 
@@ -63,8 +116,10 @@ extern crate alloc;
 
 mod fact;
 mod session;
+mod turn;
 mod verdict;
 
 pub use fact::{Deadline, Fact, Resolution};
 pub use session::{Ending, Execution, Phase, Session, State};
+pub use turn::{Attempt, Tool, Turn, TurnFact, TurnNumber, TurnOutcome};
 pub use verdict::{Ack, Rejected, Rejection};
