@@ -49,4 +49,12 @@ pub enum Resolution {
     Cancelled,
     /// The workload never ran: the sandbox refused it, or confined it away before exec.
     Refused,
+    /// The executor could not prove what the workload did.
+    ///
+    /// This settles the execution like any other resolution, so it no longer blocks the close, but
+    /// it is not a result: [`Fact::ResultApplied`] for it is
+    /// [`Rejection::NoResult`](crate::Rejection::NoResult). Reconciliation therefore happens
+    /// outside this crate, and until it does the outcome stays unclaimed and visible in the
+    /// session's state.
+    Unknown,
 }
