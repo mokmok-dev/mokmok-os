@@ -7,6 +7,9 @@ StartLimitBurst=5
 # Do not add RestrictNamespaces=: mokmok-sandbox plans unshare(CLONE_NEWUSER | CLONE_NEWPID)
 # as its containment. ProtectHome=yes and ProtectSystem=strict are the same hazard for an
 # --allow-path under /home, which they make unreachable.
+# Do not add RestrictSUIDSGID= either: it makes openat2 fail with ENOSYS, and mokmok-sandbox
+# resolves a workload's path with openat2(RESOLVE_NO_SYMLINKS) and fails closed, so every submit
+# would end as "the sandbox refused the execution it was asked for".
 Type=notify
 NotifyAccess=main
 WatchdogSec=30s
@@ -28,7 +31,6 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectProc=invisible
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 ExecStart=@mokmokd@ --data-dir %S/mokmok serve --socket %t/mokmok/bus.sock
 
