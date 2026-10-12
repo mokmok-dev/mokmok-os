@@ -7,7 +7,7 @@
 //! enforces it.
 //!
 //! What one run does is [`submit`]: commit the intent, ask, execute under confinement, store what
-//! came out, and commit the settlement. What it costs to fail in the middle is [`recovery`]'s
+//! came out, and commit the settlement. What it costs to fail in the middle is [`reconcile`]'s
 //! question, and its answer is the explicit unknown outcome rather than a guess.
 
 mod authority;

@@ -369,8 +369,8 @@ pub fn status(
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise as
-/// [`recovery::recover`] does.
+/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise the
+/// errors a reconciliation of that log can raise.
 pub fn reconcile(
     config: &Config,
     session: SessionID,
