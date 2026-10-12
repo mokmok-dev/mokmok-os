@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bus_log_reaches_stdout_when_the_operator_turns_it_on() {
+    fn the_bus_log_reaches_stderr_when_the_operator_turns_it_on() {
         let scratch = Scratch::new("info-log");
         seed(&scratch.data(), 0xb1, 1);
 
@@ -787,12 +787,17 @@ mod tests {
         let finished = daemon.finish(Duration::from_secs(5));
 
         assert_eq!(finished.code, Some(0), "{}", finished.err);
+        assert_eq!(
+            finished.out,
+            format!("published=1 socket={}\n", scratch.socket().display()),
+            "the writer keeps the daemon's stdout its batch result at any filter",
+        );
         // The line is JSON whose target and topic vary with the bus's internals, so only the
         // message field is asserted, not the whole line.
         assert!(
-            finished.out.contains("opened a topic"),
-            "the bus's info line reached the daemon's stdout: {}",
-            finished.out,
+            finished.err.contains("opened a topic"),
+            "the bus's info line reached the daemon's stderr: {}",
+            finished.err,
         );
     }
 

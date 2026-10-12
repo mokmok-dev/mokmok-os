@@ -41,9 +41,9 @@ const PASS: Duration = Duration::from_millis(200);
 
 /// The filter the daemon installs when the operator set no `RUST_LOG`.
 ///
-/// It is not `info`. The bus logs `opened a topic` at `info`, which would put one line on the
-/// daemon's stdout for every topic the relay opens, and `tests/supervisor.rs` asserts that stdout
-/// byte for byte as `published=N socket=...`.
+/// Not `info`: `opened a topic` is an info event that fires once for every topic the relay opens,
+/// which is chatter in a journal. The writer is stderr, so the daemon's stdout stays the batch
+/// result its callers parse whatever this filter selects.
 const DEFAULT_LOG_FILTER: &str = "warn";
 
 /// The outbox relay: one open publisher per topic it has published to this run.

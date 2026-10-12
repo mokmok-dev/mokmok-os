@@ -76,6 +76,9 @@ pub fn init(config: &Config) -> Result<Guard, Error> {
         reload::Layer::new(EnvFilter::try_new(&config.filter).map_err(Error::Filter)?);
     let subscriber = tracing_subscriber::registry().with(filter).with(
         tracing_subscriber::fmt::layer()
+            // Log lines go to stderr, the stream a caller does not parse; stdout stays the
+            // program's own output. systemd captures both into the journal.
+            .with_writer(std::io::stderr)
             .event_format(RedactingFormat::new(config.redaction.clone())),
     );
 
