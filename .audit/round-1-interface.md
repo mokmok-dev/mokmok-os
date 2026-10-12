@@ -23,6 +23,13 @@ so and stop; do not widen the surface, and do not edit a file outside the crate.
 - A crate that tags a serde enum without pulling `std` needs `features = ["alloc", "derive"]`.
 - The mutation gate `scripts/mutants.sh` is per package. Match-heavy code scores nothing, so
   express a rule as a comparison that a mutant can flip.
+- `clippy::missing_const_for_fn` is denied, and it fires on a body that is const-evaluable. That
+  forces a workaround where the natural body is not const: `TryFrom` is not const yet, so scale a
+  `Duration` with `as_secs()`/`subsec_millis()` instead of `u128 as u64`. `mokmok-protocol`'s
+  `moment.rs` shows the shape.
+- A `#![no_std]` crate does not get `thiserror` here. Implement `core::fmt::Display` by hand and
+  `impl core::error::Error for X {}`, which is stable. `std` crates use `thiserror` as the landed
+  ones do.
 
 ## Comments
 
