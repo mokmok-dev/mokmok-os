@@ -86,7 +86,7 @@ pub fn init(config: &Config) -> Result<Guard, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, init};
+    use super::{Config, Guard, init};
     use crate::error::Error;
 
     #[test]
@@ -96,5 +96,18 @@ mod tests {
 
         assert!(guard.reconfigure("mokmok_observability=debug").is_ok());
         assert!(matches!(init(&config), Err(Error::Install(_))));
+    }
+
+    #[test]
+    fn directives_that_do_not_parse_are_reported_rather_than_reloaded() {
+        let (_layer, handle) = tracing_subscriber::reload::Layer::new(
+            tracing_subscriber::filter::EnvFilter::new("info"),
+        );
+        let guard = Guard { filter: handle };
+
+        assert!(matches!(
+            guard.reconfigure("mokmok_observability=nonsense"),
+            Err(Error::Filter(_))
+        ));
     }
 }
