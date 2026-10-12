@@ -161,7 +161,8 @@ mod tests {
             ])
             .env_remove("NOTIFY_SOCKET")
             .env_remove("WATCHDOG_USEC")
-            .env_remove("WATCHDOG_PID");
+            .env_remove("WATCHDOG_PID")
+            .env_remove("RUST_LOG");
 
         command
     }
