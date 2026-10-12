@@ -35,12 +35,14 @@ const PROBE: Duration = Duration::from_secs(1);
 /// How long the loop waits between readiness probes.
 const RETRY: Duration = Duration::from_millis(10);
 
-/// How long one publish may take before its row is left pending for the next pass.
+/// How long one relay pass may take before it is cut and its rows stay pending.
 ///
-/// A peer that stops answering must cost one bound per notice rather than the bus's own deadline,
-/// which is longer than the unit's `TimeoutStopSec` and so would let a stop overrun what systemd
-/// waits for before it kills the process.
-const PUBLISH: Duration = Duration::from_secs(5);
+/// Two constraints from outside sit above this number: the unit's `TimeoutStopSec` is 20s and
+/// bounds how long a stop can take, and the keep-alive is due at half `WatchdogSec`, 15s of the
+/// shipped 30s, so a pass that ends inside 10s keeps both. A bound per publish would not do,
+/// because a peer that answers slowly but correctly never fails one, and a pass then costs a bound
+/// per notice while the loop cannot observe the stop.
+const PASS_DEADLINE: Duration = Duration::from_secs(10);
 
 /// A pass interval when the relay serves rather than draining once.
 const PASS: Duration = Duration::from_millis(200);
@@ -71,8 +73,7 @@ impl Relay {
     ///
     /// Returns [`Error::Topic`] when a notice names a topic the bus does not have,
     /// [`Error::NotJson`] when a stored payload is not JSON, [`Error::BusPayload`] when a published
-    /// value cannot be encoded, [`Error::Bus`] when the bus refuses a connection or an append,
-    /// [`Error::BusUnanswered`] when a publish goes unanswered for [`PUBLISH`], and
+    /// value cannot be encoded, [`Error::Bus`] when the bus refuses a connection or an append, and
     /// [`Error::Store`] when the log cannot be read or the settled rows cannot be deleted.
     pub async fn once(
         &mut self,
@@ -99,41 +100,15 @@ impl Relay {
         Ok(published)
     }
 
-    /// Publishes one payload within [`PUBLISH`], reusing this run's publisher for the topic or
-    /// opening one.
-    ///
-    /// # Errors
-    ///
-    /// As [`Relay::once`] does, and [`Error::BusUnanswered`] when the bus does not answer in time.
+    /// Publishes one payload, reusing this run's publisher for the topic or opening one.
     async fn publish(
         &mut self,
         topic: Topic,
         payload: Payload,
     ) -> Result<(), Error> {
         let key = topic.to_string();
-        let socket = self.socket.clone();
-        // One bound per notice rather than one around the pass, so a stop is honoured after the
-        // publish that is already in flight rather than by cancelling it against a live bus.
-        let outcome = tokio::time::timeout(PUBLISH, self.deliver(&key, topic, payload)).await;
 
-        if let Ok(published) = outcome {
-            published
-        } else {
-            // The connection was dropped mid-exchange, so the answer to that frame may still be
-            // waiting; reusing it would make the next publish read that answer as its own.
-            self.publishers.remove(&key);
-
-            Err(Error::BusUnanswered(socket))
-        }
-    }
-
-    async fn deliver(
-        &mut self,
-        key: &str,
-        topic: Topic,
-        payload: Payload,
-    ) -> Result<(), Error> {
-        if let Some(publisher) = self.publishers.get_mut(key) {
+        if let Some(publisher) = self.publishers.get_mut(&key) {
             publisher.publish(payload).await?;
 
             return Ok(());
@@ -141,9 +116,17 @@ impl Relay {
 
         let mut publisher = Publisher::open(&self.socket, topic).await?;
         publisher.publish(payload).await?;
-        self.publishers.insert(key.to_owned(), publisher);
+        self.publishers.insert(key, publisher);
 
         Ok(())
+    }
+
+    /// Drops every open connection, so the next pass dials afresh.
+    ///
+    /// A cut pass may have left a frame in flight whose answer is still coming, and reusing that
+    /// connection would make the next publish read that answer as its own.
+    fn forget(&mut self) {
+        self.publishers.clear();
     }
 }
 
@@ -234,15 +217,25 @@ async fn serve_until_stopped(
             _ = tick.tick() => (),
         }
 
-        let drained = match relay.once(&mut db).await {
-            Ok(count) => {
+        let pass = tokio::time::timeout(PASS_DEADLINE, relay.once(&mut db)).await;
+        let drained = match pass {
+            Ok(Ok(count)) => {
                 published += count;
                 true
             },
             // The rows stay pending and the next pass tries them again, which is the at-least-once
             // delivery the outbox already buys; a failed pass is not a reason to end a daemon.
-            Err(error) => {
+            Ok(Err(error)) => {
                 eprintln!("mokmokd: relay pass failed: {error}");
+                false
+            },
+            // A cut pass is a failed pass: nothing was settled, so every row is still there for the
+            // next pass, and the loop is back in time to honour a stop.
+            Err(_) => {
+                eprintln!(
+                    "mokmokd: the relay pass ran past {PASS_DEADLINE:?}, so its rows stay pending"
+                );
+                relay.forget();
                 false
             },
         };

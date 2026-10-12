@@ -711,15 +711,13 @@ mod tests {
     #[test]
     fn a_stop_is_honoured_while_a_publish_goes_unanswered() {
         let scratch = Scratch::new("wedged-publish");
-        seed(&scratch.data(), 0xa1, 1);
-
         let supervisor = Supervisor::bind("wedged-publish");
         let notify = supervisor.variable();
         let daemon = Daemon::start(&scratch, &[("NOTIFY_SOCKET", notify.as_str())]);
         supervisor.expect(Duration::from_secs(5), "READY=1\n");
 
-        // The path a later publish will dial: a peer that accepts and answers nothing, which is
-        // what the publish bound exists for.
+        // The path every later pass will dial: a peer that accepts and answers nothing. The pass it
+        // is cut in is what the bound sits on.
         std::fs::remove_file(scratch.socket()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(scratch.socket()).unwrap();
         std::thread::spawn(move || {
@@ -729,9 +727,11 @@ mod tests {
             }
         });
 
-        // A topic this run has not published to, so the pass must dial rather than reuse the
-        // connection it already holds to the bus it started.
-        seed_for(&scratch.data(), session_of(0xa2), 0xa2, 1);
+        // One notice per topic, so a bound on each publish would have to pay several of them before
+        // the pass returned.
+        for index in 0..4 {
+            seed_for(&scratch.data(), session_of(0xb0 + index), 0xb0 + index, 1);
+        }
         std::thread::sleep(Duration::from_millis(300));
 
         let started = Instant::now();
@@ -740,13 +740,32 @@ mod tests {
 
         assert_eq!(finished.code, Some(0), "{}\n{}", finished.out, finished.err);
         assert!(
-            started.elapsed() < Duration::from_secs(15),
-            "the stop landed within PUBLISH plus one pass: {:?}",
+            started.elapsed() < Duration::from_secs(12),
+            "the stop landed within one pass deadline, not one bound per notice: {:?}",
             started.elapsed(),
+        );
+        assert!(
+            finished.err.contains("ran past 10s"),
+            "the pass deadline is what ended the pass: {}",
+            finished.err,
         );
         assert!(
             !scratch.socket().exists(),
             "the daemon's own bus unlinked the socket",
+        );
+        assert_eq!(
+            Db::open(&scratch.data().join("events.sqlite"))
+                .unwrap()
+                .pending()
+                .unwrap()
+                .len(),
+            4,
+            "a cut pass leaves every row pending rather than losing or settling it",
+        );
+        assert_eq!(
+            finished.out,
+            format!("published=0 socket={}\n", scratch.socket().display()),
+            "nothing was acknowledged",
         );
     }
 }
