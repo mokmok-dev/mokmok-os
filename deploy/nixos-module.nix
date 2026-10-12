@@ -6,6 +6,19 @@
 
 let
   cfg = config.services.mokmokd;
+
+  # nixpkgs defines a normal user's `group` and `isSystemUser` with `lib.mkDefault`, so a plain
+  # `lib.mkDefault` here ties with nixpkgs and fails the merge. 1100 sits between the option's
+  # own default and `lib.mkDefault`, so the module fills in an account it creates and yields to
+  # nixpkgs or the operator for one they define.
+  accountDefault = lib.mkOverride 1100;
+
+  # systemd parses ExecStart with its own rules, not a shell's. It expands `$VAR` and `%`
+  # specifiers and processes C escapes even inside single quotes, which only stop word
+  # splitting there. `lib.escapeShellArgs` alone therefore loses an operator's `$FOO` as a
+  # removed word and turns `%p` into a specifier, so each operator value is neutralised
+  # first. The module's own `%S` and `%t` fragments are passed through untouched.
+  systemdArg = value: lib.replaceStrings [ "%" "$" "\\" ] [ "%%" "$$" "\\\\" ] value;
 in
 {
   options.services.mokmokd = {
@@ -24,14 +37,17 @@ in
     };
 
     directory = lib.mkOption {
-      type = lib.types.str;
+      type = lib.types.strMatching "[A-Za-z0-9][A-Za-z0-9_.-]*";
       default = "mokmokd";
       description = ''
         Name of the systemd state and runtime directory. The unit passes
         `%S/` plus this name as the data directory and `%t/` plus this name plus
         `/bus.sock` as the socket, and declares the same name in
         `StateDirectory` and `RuntimeDirectory`, so systemd owns everything the
-        daemon writes.
+        daemon writes. The name must start with a letter or digit and may hold
+        only letters, digits, `_`, `.`, and `-`, because systemd rejects a
+        directory name with a `/` and the unit would otherwise hand a `%`, `$`,
+        or `\` to the parser that reads the command line.
       '';
     };
 
@@ -39,8 +55,13 @@ in
       type = lib.types.str;
       default = "mokmokd";
       description = ''
-        User the daemon runs as. Set it to `root` to run as root, in which case
-        this module creates no user.
+        User the daemon runs as. The module declares `users.users.<user>` to
+        fill in `isSystemUser`, `group`, and a description when nothing else
+        defines them, so an account the operator declares keeps every attribute
+        it sets, including the `group` and `isSystemUser` that nixpkgs derives
+        for an `isNormalUser` account. The module defines nothing else about the
+        account. Set it to `root` to run as root, in which case the module
+        declares no user at all.
       '';
     };
 
@@ -48,8 +69,10 @@ in
       type = lib.types.str;
       default = "mokmokd";
       description = ''
-        Group the daemon runs as. Set it to `root` to run in the root group, in
-        which case this module creates no group.
+        Group the daemon runs as. The module declares `users.groups.<group>`
+        when this is not `root` and defines nothing else about it, so the
+        operator's own definition of that group survives. Set it to `root` to
+        run in the root group, in which case the module declares no group.
       '';
     };
 
@@ -96,13 +119,16 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    users = lib.mkIf (cfg.user != "root") {
-      users.${cfg.user} = {
-        isSystemUser = true;
-        inherit (cfg) group;
-        description = "mokmok OS kernel daemon";
+    users.users = lib.mkIf (cfg.user != "root") {
+      ${cfg.user} = {
+        isSystemUser = accountDefault true;
+        group = accountDefault cfg.group;
+        description = accountDefault "mokmok OS kernel daemon";
       };
-      groups.${cfg.group} = { };
+    };
+
+    users.groups = lib.mkIf (cfg.group != "root") {
+      ${cfg.group} = { };
     };
 
     systemd.services.mokmokd = {
@@ -151,15 +177,15 @@ in
           ]
           ++ lib.concatMap (value: [
             "--allow-tool"
-            value
+            (systemdArg value)
           ]) cfg.allowTool
           ++ lib.concatMap (value: [
             "--allow-path"
-            value
+            (systemdArg value)
           ]) cfg.allowPath
           ++ lib.concatMap (value: [
             "--allow-write"
-            value
+            (systemdArg value)
           ]) cfg.allowWrite
           ++ [
             "serve"

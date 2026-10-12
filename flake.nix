@@ -141,14 +141,32 @@
                 install -Dm644 ${pkgs.writeText "mokmokd.service" unit} $out/mokmokd.service
 
                 grep -qF 'Type=notify' $out/mokmokd.service
+                grep -qF 'NotifyAccess=main' $out/mokmokd.service
                 grep -qF 'WatchdogSec=30s' $out/mokmokd.service
+                grep -qF 'TimeoutStartSec=30s' $out/mokmokd.service
+                grep -qF 'TimeoutStopSec=20s' $out/mokmokd.service
                 grep -qF 'Restart=always' $out/mokmokd.service
+                grep -qF 'RestartSec=1s' $out/mokmokd.service
+                grep -qF 'UMask=0077' $out/mokmokd.service
+                grep -qF 'User=mokmokd' $out/mokmokd.service
+                grep -qF 'Group=mokmokd' $out/mokmokd.service
                 grep -qF 'StateDirectory=mokmokd' $out/mokmokd.service
                 grep -qF 'RuntimeDirectory=mokmokd' $out/mokmokd.service
                 grep -qF 'NoNewPrivileges=true' $out/mokmokd.service
+                grep -qF 'StartLimitIntervalSec=60' $out/mokmokd.service
+                grep -qF 'StartLimitBurst=5' $out/mokmokd.service
+
+                # The ExecStart line is one string, so dropping an argument leaves the rest
+                # looking right, and no assertion on the whole line notices. Every argument
+                # is named on its own. --data-dir matters most: without it the daemon falls
+                # back to its relative `mokmok-data` default and writes outside the directory
+                # systemd created and owns.
                 grep -qF 'ExecStart=' $out/mokmokd.service
+                grep -qF -- '--data-dir %S/mokmokd' $out/mokmokd.service
                 grep -qF -- '--allow-tool /bin/sh' $out/mokmokd.service
-                grep -qE '^ExecStart=.*serve --socket %t/mokmokd/bus\.sock$' $out/mokmokd.service
+                grep -qF -- '--allow-path /nix/store' $out/mokmokd.service
+                grep -qF -- '--socket %t/mokmokd/bus.sock' $out/mokmokd.service
+                grep -qE '^ExecStart=[^ ]+ --data-dir %S/mokmokd( --allow-tool [^ ]+)*( --allow-path [^ ]+)*( --allow-write [^ ]+)* serve --socket %t/mokmokd/bus\.sock$' $out/mokmokd.service
               '';
           };
 
