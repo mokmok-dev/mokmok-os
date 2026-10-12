@@ -8,5 +8,9 @@
 //! a system boundary. Everything under it takes a `&Config` and trusts it.
 
 mod config;
+mod db;
+mod error;
 
 pub use config::{Args, Command, Config, ConfigError, CrashPoint, Submit, uuid_of};
+pub use db::Db;
+pub use error::Error;
