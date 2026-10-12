@@ -1,5 +1,7 @@
 use mokmok_protocol::{ExecutionID, SessionID};
-use mokmok_state_machine::{Ack, Deadline, Ending, Fact, Phase, Rejection, Resolution, Session};
+use mokmok_state_machine::{
+    Ack, Deadline, Ending, Fact, Phase, Rejection, Resolution, Session, State,
+};
 use uuid::Uuid;
 
 const fn execution(n: u128) -> ExecutionID {
@@ -340,6 +342,11 @@ fn accepting_result_rows() -> Vec<Row> {
             Fact::ResultApplied { execution: e() },
             Err(Rejection::NoResult(e())),
         ),
+        Row::other(
+            settled(Resolution::Unknown),
+            Fact::ResultApplied { execution: e() },
+            Err(Rejection::NoResult(e())),
+        ),
         Row::applied(
             opened(),
             Fact::SessionClosed,
@@ -352,6 +359,11 @@ fn accepting_result_rows() -> Vec<Row> {
         ),
         Row::applied(
             settled(Resolution::TimedOut),
+            Fact::SessionClosed,
+            Phase::Closed(Ending::Completed),
+        ),
+        Row::applied(
+            settled(Resolution::Unknown),
             Fact::SessionClosed,
             Phase::Closed(Ending::Completed),
         ),
@@ -446,6 +458,35 @@ fn draining_rows() -> Vec<Row> {
     ]
 }
 
+fn unknown_rows() -> Vec<Row> {
+    vec![
+        Row::applied(
+            launched(Deadline::Bounded),
+            Fact::ExecutionSettled {
+                execution: e(),
+                resolution: Resolution::Unknown,
+            },
+            Phase::Accepting,
+        ),
+        Row::other(
+            settled(Resolution::Unknown),
+            Fact::ExecutionSettled {
+                execution: e(),
+                resolution: Resolution::Unknown,
+            },
+            Ok(Ack::Duplicate),
+        ),
+        Row::other(
+            settled(Resolution::Unknown),
+            Fact::ExecutionSettled {
+                execution: e(),
+                resolution: finished(0),
+            },
+            Err(Rejection::ResolutionConflict(e())),
+        ),
+    ]
+}
+
 fn closed_rows() -> Vec<Row> {
     vec![
         Row::other(cancelled(), Fact::SessionOpened, Ok(Ack::Duplicate)),
@@ -517,10 +558,11 @@ fn the_verdict_matrix_holds_cell_by_cell() {
         .chain(accepting_launch_rows())
         .chain(accepting_result_rows())
         .chain(draining_rows())
+        .chain(unknown_rows())
         .chain(closed_rows())
         .collect();
 
-    assert_eq!(rows.len(), 56);
+    assert_eq!(rows.len(), 61);
 
     for (index, row) in rows.into_iter().enumerate() {
         let row_number = index + 1;
@@ -598,6 +640,55 @@ fn a_settle_redelivery_after_the_result_is_applied_is_a_duplicate() {
             resolution: Resolution::Refused,
         }),
         Err(Rejection::ResolutionConflict(e())),
+    );
+}
+
+#[test]
+fn a_result_after_an_unknown_settle_is_no_result() {
+    let mut session = settled(Resolution::Unknown);
+
+    assert_eq!(
+        session.apply(Fact::ResultApplied { execution: e() }),
+        Err(Rejection::NoResult(e())),
+    );
+    assert_eq!(
+        session.execution(e()).unwrap().state(),
+        State::Settled(Resolution::Unknown),
+    );
+}
+
+#[test]
+fn replay_of_a_history_holding_an_unknown_reconstructs_the_driven_state() {
+    let facts = [
+        Fact::SessionOpened,
+        Fact::ExecutionLaunched {
+            execution: e(),
+            deadline: Deadline::Bounded,
+        },
+        Fact::ExecutionSettled {
+            execution: e(),
+            resolution: Resolution::Unknown,
+        },
+        Fact::SessionClosed,
+    ];
+
+    let mut driven = Session::new(session_id());
+    for fact in facts {
+        assert_eq!(driven.apply(fact), Ok(Ack::Applied));
+    }
+
+    assert_eq!(Session::replay(session_id(), &facts), Ok(driven));
+}
+
+#[test]
+fn a_session_holding_an_unknown_still_reaches_completed() {
+    let mut session = settled(Resolution::Unknown);
+
+    assert_eq!(session.apply(Fact::SessionClosed), Ok(Ack::Applied));
+    assert_eq!(session.phase(), Phase::Closed(Ending::Completed));
+    assert_eq!(
+        session.execution(e()).unwrap().state(),
+        State::Settled(Resolution::Unknown),
     );
 }
 
@@ -691,6 +782,10 @@ fn the_fact_vocabulary_serde_as_the_contract_says() {
     assert_eq!(
         serde_json::to_string(&Resolution::TimedOut).unwrap(),
         r#""timed_out""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&Resolution::Unknown).unwrap(),
+        r#""unknown""#,
     );
     assert_eq!(
         serde_json::to_string(&Resolution::Finished { code: 0 }).unwrap(),

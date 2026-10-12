@@ -400,6 +400,10 @@ fn candidate_facts() -> Vec<Fact> {
                 execution,
                 resolution: Resolution::Refused,
             },
+            Fact::ExecutionSettled {
+                execution,
+                resolution: Resolution::Unknown,
+            },
             Fact::ResultApplied { execution },
         ]);
     }
@@ -407,7 +411,7 @@ fn candidate_facts() -> Vec<Fact> {
 }
 
 fn arbitrary_fact(ids: [ExecutionID; 4]) -> impl Strategy<Value = Fact> {
-    let execution = (0..4_usize, 0..9_usize).prop_map(move |(index, kind)| {
+    let execution = (0..4_usize, 0..10_usize).prop_map(move |(index, kind)| {
         let execution = ids[index];
         match kind {
             0 => Fact::ExecutionLaunched {
@@ -441,6 +445,10 @@ fn arbitrary_fact(ids: [ExecutionID; 4]) -> impl Strategy<Value = Fact> {
             7 => Fact::ExecutionSettled {
                 execution,
                 resolution: Resolution::Refused,
+            },
+            8 => Fact::ExecutionSettled {
+                execution,
+                resolution: Resolution::Unknown,
             },
             _ => Fact::ResultApplied { execution },
         }

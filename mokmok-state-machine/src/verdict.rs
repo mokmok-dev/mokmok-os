@@ -27,6 +27,14 @@ pub enum Rejection {
     UnrequestedCancel(ExecutionID),
     NoDeadline(ExecutionID),
     NoResult(ExecutionID),
+    /// A tool was requested before the model answered.
+    ModelNotAnswered,
+    /// A model answer arrived with no request outstanding.
+    UnrequestedAnswer,
+    /// The turn settled and admits no new fact.
+    TurnOver,
+    /// The turn already settled with a different outcome.
+    OutcomeConflict,
 }
 
 impl fmt::Display for Rejection {
@@ -71,6 +79,16 @@ impl fmt::Display for Rejection {
                 "execution {} has no unconsumed result",
                 execution.as_uuid(),
             ),
+            Self::ModelNotAnswered => {
+                formatter.write_str("the turn requested a tool before the model answered")
+            },
+            Self::UnrequestedAnswer => {
+                formatter.write_str("the turn has no model request for an answer")
+            },
+            Self::TurnOver => formatter.write_str("the turn is settled"),
+            Self::OutcomeConflict => {
+                formatter.write_str("the turn already settled with a different outcome")
+            },
         }
     }
 }
