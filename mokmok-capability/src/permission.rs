@@ -160,6 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn a_union_keeps_every_action_either_side_names() {
+        assert!(
+            ActionSet::READ
+                .union(ActionSet::READ)
+                .covers(ActionSet::READ)
+        );
+        assert!(ActionSet::ALL.union(ActionSet::READ).covers(ActionSet::ALL));
+
+        let read_write = ActionSet::READ.union(ActionSet::WRITE);
+
+        assert!(read_write.covers(ActionSet::READ));
+        assert!(read_write.covers(ActionSet::WRITE));
+        assert!(!read_write.covers(ActionSet::EXECUTE));
+    }
+
+    #[test]
     fn a_permission_covers_only_its_own_resource() {
         let path = Resource::Path(String::from("/data"));
         let other = Resource::Path(String::from("/other"));

@@ -214,4 +214,18 @@ mod tests {
         let reopened = Journal::open(&path).unwrap();
         assert_eq!(reopened.read(Moment::EPOCH).unwrap(), vec![entry]);
     }
+
+    #[test]
+    fn an_entry_reads_back_the_detail_it_was_given_and_none_when_it_was_not() {
+        let bare = AuditEntry::new(
+            Moment::from_millis(1_700_000_000_000),
+            actor(),
+            AuditKind::Egress,
+            Outcome::Denied,
+        );
+        let detailed = bare.clone().with_detail("connect api.example.com:443");
+
+        assert_eq!(bare.detail(), None);
+        assert_eq!(detailed.detail(), Some("connect api.example.com:443"));
+    }
 }

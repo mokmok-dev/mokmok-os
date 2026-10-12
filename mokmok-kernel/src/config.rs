@@ -45,7 +45,11 @@ pub struct Args {
     /// executable, which is where the workspace's own build puts it.
     #[arg(long, global = true, value_name = "PATH", hide = true)]
     pub confiner: Option<PathBuf>,
-    /// Stop at this boundary instead of finishing, so recovery can be exercised.
+    /// Stop at this boundary instead of finishing. It exists for the crash-injection tests.
+    ///
+    /// The flag alone does nothing: the environment must also carry `MOKMOKD_CRASH=1`, and that
+    /// second signal is what makes the stop deliberate, so an ordinary invocation cannot end the
+    /// daemon between two commits by passing it.
     #[arg(long, value_enum, global = true, hide = true)]
     pub crash_after: Option<CrashPoint>,
     /// The command to run.
@@ -186,15 +190,22 @@ impl Config {
 
 /// Stops the process at a boundary between two durable commits when the run asked for it.
 ///
-/// The code is distinct so a test can tell a deliberate stop from a failure, and the process dies
-/// with no transaction open, which is what makes the boundary the one it names.
+/// `--crash-after` alone is not enough: the environment must also carry `MOKMOKD_CRASH=1`, so only
+/// a caller that means to end the daemon between two commits gets a stop. The code is distinct so
+/// a test can tell a deliberate stop from a failure, and the process dies with no transaction
+/// open, which is what makes the boundary the one it names.
 pub fn crash(
     config: &Config,
     point: CrashPoint,
 ) {
-    if config.crash_after == Some(point) {
+    if config.crash_after == Some(point) && deliberate() {
         std::process::exit(97);
     }
+}
+
+/// Whether the crash knob was unlocked for this process.
+fn deliberate() -> bool {
+    std::env::var("MOKMOKD_CRASH").is_ok_and(|value| value == "1")
 }
 
 /// Reads a value the command line carried as a session, a turn, or an idempotency identity.

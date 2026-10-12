@@ -124,6 +124,14 @@ mod tests {
     }
 
     #[test]
+    fn as_millis_returns_the_count_the_moment_was_built_from() {
+        assert_eq!(
+            Moment::from_millis(1_700_000_000_123).as_millis(),
+            1_700_000_000_123,
+        );
+    }
+
+    #[test]
     fn a_subtraction_from_an_earlier_instant_is_zero() {
         assert_eq!(
             Moment::from_millis(10).since(Moment::from_millis(50)),

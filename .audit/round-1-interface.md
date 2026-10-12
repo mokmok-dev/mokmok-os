@@ -254,6 +254,10 @@ returned by `read` and never counted.
 
 ### `mokmok-egress` (new; std, tokio)
 
+The signatures below are as this brief froze them, but the crate moved past three of them during
+the round's review: `Validated::new` and `Validated::connect` take an `AuditSink`, and
+`AuditRecord.address` is optional. For those, the code is the record.
+
 Proxy decisions, destination enforcement, DNS/IP validation, network audit. Modules: `proxy`,
 `connect`, `dns`, `destination`, `policy_client`, `connection`, `rate_limit`, `audit`.
 
@@ -354,6 +358,11 @@ Composition root: config, bootstrap, services, lifecycle, recovery, shutdown, pl
 
 ## What this round deliberately does not do
 
+- `mokmok-agent-runtime` is registered as a member with an empty library. Its ports
+  (`ModelProvider`, `ToolExecutor`, a journal) and its orchestrator are not written, because this
+  round's slice drives the turn machine from the kernel directly and an orchestration layer with no
+  consumer would be a shape nobody had needed yet. Sections 5.5's invariants are therefore untested
+  in the tree.
 - `mokmok-approval`: the approval requirement lives in `mokmok-capability` until its lifecycle
   warrants a crate.
 - Cron schedules, `mokmok-event-bus` wire-frame unification with the protocol, network namespace

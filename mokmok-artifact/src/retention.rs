@@ -6,7 +6,8 @@ use core::time::Duration;
 ///
 /// `min_age` is the grace period a reference is published inside: a blob younger than `now -
 /// min_age` is not a candidate at all, so a reference that is still being written cannot lose a
-/// race with the sweep. `max_bytes` is a ceiling, not a target: the collector never evicts a
+/// race with the sweep. A blob exactly `min_age` old is not younger, so it is a candidate.
+/// `max_bytes` is a ceiling, not a target: the collector never evicts a
 /// referenced blob to reach it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Retention {

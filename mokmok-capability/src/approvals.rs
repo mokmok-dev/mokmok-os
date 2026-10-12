@@ -133,6 +133,8 @@ pub const fn authorized_operation(requirement: &Requirement) -> (PrincipalID, Ac
 pub enum ApprovalError {
     /// The principal that would receive the authority is the one approving it.
     SelfApproved,
+    /// The approver is not a principal this authority admitted.
+    UnknownApprover,
     /// The requirement's own window closed, so no approval can satisfy it.
     RequirementExpired,
 }
@@ -144,6 +146,7 @@ impl fmt::Display for ApprovalError {
     ) -> fmt::Result {
         formatter.write_str(match self {
             Self::SelfApproved => "a principal cannot approve the authority it requests",
+            Self::UnknownApprover => "the approver is not a principal this authority holds",
             Self::RequirementExpired => "the approval window has already closed",
         })
     }

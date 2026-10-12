@@ -55,6 +55,7 @@ mod tests {
             .unwrap();
         let asked = request(2);
 
+        assert_ne!(root.id(), child.id());
         assert_eq!(
             authority.decide(&asked, Moment::from_millis(1_999)),
             Decision::Allow(child),
@@ -81,6 +82,8 @@ mod tests {
             .issue(&child, principal(3), read(), None, NOW)
             .unwrap();
 
+        assert_ne!(root.id(), child.id());
+        assert_ne!(child.id(), grandchild.id());
         assert_eq!(
             authority.decide(&request(3), NOW),
             Decision::Allow(grandchild)
@@ -112,6 +115,7 @@ mod tests {
             .issue(&root, principal(2), read(), None, NOW)
             .unwrap();
 
+        assert_ne!(root.id(), child.id());
         assert_eq!(authority.decide(&request(2), NOW), Decision::Allow(child));
 
         authority.revoke_principal(principal(2), revoked_at);
@@ -137,5 +141,25 @@ mod tests {
         assert_eq!(authority.issued_at(root.id()), Some(issued));
         assert_eq!(authority.issued_at(GrantId::from_value(u64::MAX)), None);
         assert_eq!(authority.principal(principal(1)), Some(&agent(1)));
+    }
+
+    #[test]
+    fn revoking_one_grant_spares_the_grant_minted_after_it() {
+        let revoked_at = Moment::from_millis(3_000);
+        let mut authority = authority(NOW);
+        let first = authority.root(agent(1), read(), NOW);
+        let second = authority.root(agent(2), read(), NOW);
+
+        assert_ne!(first.id().value(), second.id().value());
+        assert!(authority.revoke(first.id(), revoked_at));
+
+        assert_eq!(
+            authority.decide(&request(1), revoked_at),
+            Decision::Deny(Denial::new(DenialReason::Revoked { at: revoked_at })),
+        );
+        assert_eq!(
+            authority.decide(&request(2), revoked_at),
+            Decision::Allow(second),
+        );
     }
 }

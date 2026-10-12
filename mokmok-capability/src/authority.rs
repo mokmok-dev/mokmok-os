@@ -180,13 +180,16 @@ impl Authority {
     /// Mints the authority a requirement asks for, naming the request it was earned for.
     ///
     /// Approving is a second principal's act, and the minted grant remembers the requirement, so
-    /// the approval authorizes exactly the request that was decided on and no other.
+    /// the approval authorizes exactly the request that was decided on and no other. The approver
+    /// must be a principal this authority admitted through [`Authority::root`], so an id that
+    /// never entered here cannot sign off on anything it holds no standing for.
     ///
     /// # Errors
     ///
     /// Returns [`ApprovalError::SelfApproved`] when `by` is the principal the approval would
-    /// authorize, and [`ApprovalError::RequirementExpired`] when the requirement's own window
-    /// closed at or before `now`.
+    /// authorize, [`ApprovalError::UnknownApprover`] when this authority never admitted `by`, and
+    /// [`ApprovalError::RequirementExpired`] when the requirement's own window closed at or
+    /// before `now`.
     pub fn approve(
         &mut self,
         requirement: &Requirement,
@@ -197,6 +200,10 @@ impl Authority {
 
         if by == principal {
             return Err(ApprovalError::SelfApproved);
+        }
+
+        if !self.principals.contains_key(&by) {
+            return Err(ApprovalError::UnknownApprover);
         }
 
         if requirement.not_after().is_some_and(|limit| limit <= now) {
