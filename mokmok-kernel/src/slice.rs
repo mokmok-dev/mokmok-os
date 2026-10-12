@@ -103,7 +103,7 @@ pub async fn submit(
     let mut db = Db::open(&config.events)?;
     let log = resume(&mut db, session, at)?;
     let (turn, execution, number) = mint(at, &log);
-    let mut written = launch(&log, session, turn, execution, number);
+    let mut written = launch(&log, turn, execution, number);
     log.verify(session, &written)?;
 
     let launch = notice(session, command, turn, Some(execution), None, at)?;
@@ -207,12 +207,10 @@ fn mint(
 /// The transaction that records the intent: what is about to be run, before anything runs.
 fn launch(
     log: &Log,
-    session: SessionID,
     turn: TurnID,
     execution: ExecutionID,
     number: TurnNumber,
 ) -> Vec<Entry> {
-    let _ = session;
     let mut entries = Vec::new();
     if log.session.is_empty() {
         entries.push(Entry::Session(Fact::SessionOpened));
