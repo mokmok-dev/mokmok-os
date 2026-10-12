@@ -2,12 +2,13 @@ mod common;
 
 #[cfg(test)]
 mod tests {
-    use crate::common::tests::{MemoryReferences, Scratch, after, now};
+    use crate::common::tests::{MemoryReferences, Scratch, after, artifact, now};
     use mokmok_artifact::{
-        BlobStore, Collector, ContentHash, Error, Reference, ReferenceStore, Retention,
+        BlobStore, Collector, ContentHash, Error, Reference, ReferenceStore, Report, Retention,
     };
+    use mokmok_protocol::Moment;
     use std::cell::Cell;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     const MIN_AGE: Duration = Duration::from_secs(1);
 
@@ -96,6 +97,115 @@ mod tests {
         assert!(matches!(store.read(oldest), Err(Error::NotFound { .. })));
         assert!(matches!(store.read(middle), Err(Error::NotFound { .. })));
         assert_eq!(store.read(newest).unwrap(), vec![b'c'; 1000]);
+    }
+
+    #[test]
+    fn a_store_exactly_at_max_bytes_evicts_nothing() {
+        let scratch = Scratch::new("at-budget");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let references = MemoryReferences::holding(Vec::new());
+
+        let oldest = store.put(&vec![b'a'; 1000]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let newest = store.put(&vec![b'b'; 1000]).unwrap();
+
+        let retention = Retention {
+            min_age: MIN_AGE,
+            max_bytes: 2000,
+        };
+        let report = Collector::new(&store, &references, retention)
+            .sweep(after(2))
+            .unwrap();
+
+        assert_eq!(
+            report,
+            Report {
+                collected: vec![oldest, newest],
+                temporaries: 0,
+                bytes: 0,
+                over_budget: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_sweep_reports_the_bytes_of_the_referenced_blob_it_kept() {
+        let scratch = Scratch::new("report");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let kept = store.put(&vec![b'k'; 2000]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let garbage = store.put(&vec![b'g'; 500]).unwrap();
+        let reference = Reference::new(&store, artifact(), kept, Moment::EPOCH).unwrap();
+        let references = MemoryReferences::holding(vec![reference]);
+
+        let retention = Retention {
+            min_age: MIN_AGE,
+            max_bytes: 1000,
+        };
+        let report = Collector::new(&store, &references, retention)
+            .sweep(after(2))
+            .unwrap();
+
+        assert_eq!(
+            report,
+            Report {
+                collected: vec![garbage],
+                temporaries: 0,
+                bytes: 2000,
+                over_budget: true,
+            }
+        );
+        assert!(matches!(store.read(garbage), Err(Error::NotFound { .. })));
+        assert_eq!(store.read(kept).unwrap(), vec![b'k'; 2000]);
+    }
+
+    #[test]
+    fn a_blob_exactly_at_min_age_is_a_candidate() {
+        let scratch = Scratch::new("boundary");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let hash = store.put(b"on the boundary").unwrap();
+        let published = std::fs::metadata(store.path(hash))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let since = published.duration_since(UNIX_EPOCH).unwrap();
+        let at =
+            Moment::from_millis(u64::try_from(since.as_millis()).unwrap()).saturating_add(MIN_AGE);
+        let references = MemoryReferences::holding(Vec::new());
+
+        let report = Collector::new(&store, &references, retention())
+            .sweep(at)
+            .unwrap();
+
+        assert_eq!(report.collected, vec![hash]);
+    }
+
+    #[test]
+    fn a_store_whose_root_vanished_reports_an_empty_sweep() {
+        let scratch = Scratch::new("vanished");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        std::fs::remove_dir_all(scratch.path()).unwrap();
+        let references = MemoryReferences::holding(Vec::new());
+
+        let report = Collector::new(&store, &references, retention())
+            .sweep(after(2))
+            .unwrap();
+
+        assert_eq!(report, Report::default());
+    }
+
+    #[test]
+    fn a_root_that_is_not_a_directory_is_an_io_error() {
+        let scratch = Scratch::new("not-a-directory");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        std::fs::remove_dir_all(scratch.path()).unwrap();
+        std::fs::write(scratch.path(), b"in the way").unwrap();
+        let references = MemoryReferences::holding(Vec::new());
+
+        let result = Collector::new(&store, &references, retention()).sweep(after(2));
+
+        std::fs::remove_file(scratch.path()).unwrap();
+        assert!(matches!(result, Err(Error::Io(_))));
     }
 
     /// Answers "no" the first time it is asked and "yes" afterwards: a reference that appears
