@@ -114,8 +114,13 @@ mod tests {
         }
 
         let reopened = Journal::open(&path).unwrap();
+        let entries = reopened.read(Moment::EPOCH).unwrap();
 
-        assert_eq!(reopened.read(Moment::EPOCH).unwrap(), vec![first, second]);
+        assert_eq!(entries, vec![first, second]);
+        assert_eq!(entries[0].at().as_millis(), 1_700_000_000_000);
+        assert_eq!(entries[0].actor(), principal);
+        assert_eq!(entries[1].at().as_millis(), 1_700_000_000_500);
+        assert_eq!(entries[1].actor(), principal);
     }
 
     #[test]
