@@ -94,6 +94,7 @@ mod tests {
     use alloc::string::ToString;
 
     use super::ProtocolError;
+    use crate::envelope::Envelope;
     use crate::version::SchemaVersion;
 
     #[test]
@@ -119,5 +120,36 @@ mod tests {
     #[test]
     fn two_different_variants_are_not_equal() {
         assert_ne!(ProtocolError::InvalidSource, ProtocolError::EmptyPayload);
+    }
+
+    #[test]
+    fn unsupported_version_errors_differ_when_either_version_differs() {
+        let error = ProtocolError::UnsupportedVersion {
+            seen: SchemaVersion::new(2, 0),
+            supported: SchemaVersion::new(1, 3),
+        };
+
+        assert_ne!(
+            error,
+            ProtocolError::UnsupportedVersion {
+                seen: SchemaVersion::new(2, 1),
+                supported: SchemaVersion::new(1, 3),
+            },
+        );
+        assert_ne!(
+            error,
+            ProtocolError::UnsupportedVersion {
+                seen: SchemaVersion::new(2, 0),
+                supported: SchemaVersion::new(1, 4),
+            },
+        );
+    }
+
+    #[test]
+    fn malformed_errors_compare_by_their_rendered_message() {
+        let truncated = Envelope::from_json(b"{").unwrap_err();
+
+        assert_eq!(truncated, Envelope::from_json(b"{").unwrap_err());
+        assert_ne!(truncated, Envelope::from_json(b"").unwrap_err());
     }
 }

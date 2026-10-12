@@ -573,6 +573,22 @@ mod tests {
     }
 
     #[test]
+    fn a_source_renders_as_its_value() {
+        assert_eq!(
+            Source::new("agent://planner").unwrap().to_string(),
+            "agent://planner",
+        );
+    }
+
+    #[test]
+    fn the_json_media_type_renders_as_its_value() {
+        assert_eq!(
+            MediaType::new("application/json").unwrap().to_string(),
+            "application/json",
+        );
+    }
+
+    #[test]
     fn a_newer_minor_envelope_is_refused_with_both_versions() {
         let mut value = serde_json::to_value(envelope()).unwrap();
         value["version"]["minor"] = json!(1);
