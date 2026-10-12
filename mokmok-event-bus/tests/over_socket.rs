@@ -964,6 +964,17 @@ mod tests {
     async fn a_frame_the_bus_cannot_answer_closes_the_session() {
         let bus = Bus::start(config()).await;
         let mut peer = connect(&bus.path).await;
+
+        // The bus pings on its first heartbeat tick, and tungstenite only queues the pong when it
+        // reads that ping. Reading the ping before this client sends anything lets the pong leave
+        // with the open frame, while the bus is alive; a pong still queued for the close below is
+        // flushed after the bus has gone, and its `BrokenPipe` hides the close frame.
+        let ping = within("first heartbeat ping", peer.next()).await;
+        assert!(
+            matches!(ping, Some(Ok(Message::Ping(_)))),
+            "expected the heartbeat ping before any answer, got {ping:?}",
+        );
+
         name_topic(&mut peer).await;
 
         // A second open is a valid frame the opened session cannot answer, so it reaches the
