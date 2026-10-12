@@ -242,7 +242,8 @@ async fn serve_until_stopped(
             // wedged in `once` stops reporting and the watchdog is what ends this process. A fence
             // then costs a resume from the last settled notice rather than a redelivery of the page
             // it was in. A timer that only slept would keep pinging a process that had stopped
-            // relaying.
+            // relaying. The bound cuts both ways: a pass lasts as long as `Db::pending` makes a page,
+            // so a `WatchdogSec` shorter than a full page's drain fences a working daemon.
             if cadence.due(Instant::now()) {
                 report(&notifier, Message::Alive);
             }
