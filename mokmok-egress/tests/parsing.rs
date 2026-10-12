@@ -120,6 +120,50 @@ fn connect_refuses_a_malformed_ipv6_bracket_form() {
 }
 
 #[test]
+fn connect_refuses_a_connect_line_outside_the_grammar() {
+    assert_eq!(
+        parse_connect("CONNECT example.com HTTP/1.0"),
+        Err(ParseError::MalformedRequest),
+    );
+    assert_eq!(
+        parse_connect("CONNECT example.com"),
+        Err(ParseError::MalformedRequest),
+    );
+}
+
+#[test]
+fn connect_refuses_a_uri_marker_without_a_slash() {
+    assert_eq!(
+        parse_authority("example.com?x=1:443"),
+        Err(ParseError::AbsoluteUri),
+    );
+    assert_eq!(
+        parse_authority("example.com#frag:443"),
+        Err(ParseError::AbsoluteUri),
+    );
+}
+
+#[test]
+fn connect_refuses_a_bracketed_literal_with_no_port() {
+    assert_eq!(
+        parse_authority("[2001:db8::1]"),
+        Err(ParseError::MissingPort),
+    );
+}
+
+#[test]
+fn classify_reads_the_documentation_v6_prefix_as_a_pair() {
+    assert_eq!(
+        classify("2001:4860:4860::8888".parse().unwrap()),
+        AddressClass::Public,
+    );
+    assert_eq!(
+        classify("2606:0db8::1".parse().unwrap()),
+        AddressClass::Public,
+    );
+}
+
+#[test]
 fn classify_names_every_address_class() {
     assert_eq!(
         classify(IpAddr::from([93, 184, 216, 34])),

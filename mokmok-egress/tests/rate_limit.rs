@@ -29,6 +29,17 @@ fn a_bucket_refills_only_at_the_instant_supplied() {
 }
 
 #[test]
+fn a_bucket_refills_whole_periods_after_a_long_idle() {
+    let mut limit = RateLimit::new(2, Duration::from_secs(1));
+    let caller = caller(1);
+
+    assert!(limit.acquire(caller, Moment::from_millis(0)));
+    assert!(limit.acquire(caller, Moment::from_millis(2_000)));
+    assert!(limit.acquire(caller, Moment::from_millis(2_000)));
+    assert!(!limit.acquire(caller, Moment::from_millis(2_000)));
+}
+
+#[test]
 fn a_bucket_is_spent_per_caller() {
     let mut limit = RateLimit::new(1, Duration::from_secs(1));
     let start = Moment::from_millis(1_000);
