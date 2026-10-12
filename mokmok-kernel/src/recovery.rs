@@ -4,10 +4,11 @@
 //! execution the last crash left in flight.
 //!
 //! Nothing in the log says whether a workload whose result was never recorded actually ran: the
-//! supervisor that could answer is gone with the process, and its per-execution workspace is gone
-//! with it. Assuming success would claim an effect nobody observed; assuming failure would re-run
-//! work that may already have happened. So this writes the state that says unknown, and the
-//! operator decides what to do with it.
+//! supervisor that could answer is gone with the process. Its execution directory under the sandbox
+//! root outlives the crash, and nothing here collects it: reclaiming that directory belongs to the
+//! sandbox's own unit, not to recovery. Assuming success would claim an effect nobody observed;
+//! assuming failure would re-run work that may already have happened. So this writes the state that
+//! says unknown, and the operator decides what to do with it.
 
 use mokmok_event_store::{CommandId, Expected, Outcome};
 use mokmok_protocol::{ExecutionID, Moment, SessionID};
@@ -97,4 +98,76 @@ pub fn recover(
     }
 
     Ok(recovered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recover;
+    use crate::db::{Db, Entry};
+    use crate::slice::Notice;
+    use mokmok_event_store::{CommandId, Expected};
+    use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+    use mokmok_state_machine::{Attempt, Deadline, Fact, TurnFact, TurnNumber};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_recovery_notice_names_recoverys_own_command_not_a_submits_key() {
+        let directory =
+            std::env::temp_dir().join(format!("mokmok-kernel-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let session = SessionID::from_uuid(Uuid::from_u128(1));
+        let turn = TurnID::from_uuid(Uuid::from_u128(2));
+        let execution = ExecutionID::from_uuid(Uuid::from_u128(3));
+        let command = CommandId::from_uuid(Uuid::from_u128(4));
+
+        let mut db = Db::open(&directory.join("events.sqlite")).unwrap();
+        db.append(
+            command,
+            Db::stream(session),
+            Expected::New,
+            &[
+                Entry::Session(Fact::SessionOpened),
+                Entry::Session(Fact::ExecutionLaunched {
+                    execution,
+                    deadline: Deadline::Bounded,
+                }),
+                Entry::Turn(
+                    turn,
+                    TurnFact::TurnOpened {
+                        number: TurnNumber::new(1),
+                    },
+                ),
+                Entry::Turn(
+                    turn,
+                    TurnFact::ModelRequested {
+                        attempt: Attempt::new(1),
+                    },
+                ),
+                Entry::Turn(turn, TurnFact::ModelAnswered),
+                Entry::Turn(
+                    turn,
+                    TurnFact::ToolRequested {
+                        execution,
+                        deadline: Deadline::Bounded,
+                    },
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let log = db.log(session).unwrap();
+        assert_eq!(
+            recover(&mut db, &log, session, Moment::from_millis(1)).unwrap(),
+            vec![execution],
+        );
+
+        let pending = db.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let notice = pending[0].payload().decode::<Notice>().unwrap();
+        assert_eq!(notice.execution, Some(execution));
+        assert_ne!(notice.command, command);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }
