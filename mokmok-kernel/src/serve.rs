@@ -9,12 +9,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mokmok_event_bus::{
     Config as BusConfig, Payload, Publisher, ServeError, Topic, serve as serve_bus, signals,
 };
 use mokmok_observability::{Config as LogConfig, Redaction, init};
+use mokmok_protocol::Moment;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -23,6 +24,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::error::Error;
 use crate::notify::{Cadence, Message, Notifier};
+use crate::recovery;
 
 /// How long the loop waits for the bus to answer a session before giving up.
 const BIND: Duration = Duration::from_secs(5);
@@ -194,6 +196,17 @@ async fn serve_until_stopped(
 
     let mut relay = Relay::new(&socket);
     let mut db = Db::open(&config.events)?;
+    // Required recovery runs before the loop can reach the branch that reports ready, so a
+    // dependent ordered after this unit never meets a log a crash left with an execution that has
+    // no outcome. The daemon is handed no instant the way a submitting command is, so it reads the
+    // clock once here for the notices recovery writes.
+    for (session, execution) in recovery::recover_unsettled(&mut db, now())? {
+        eprintln!(
+            "mokmokd: recovered session={} execution={} resolution=Unknown",
+            session.as_uuid(),
+            execution.as_uuid(),
+        );
+    }
     let notifier = Notifier::from_env()?;
     // The first tick waits a whole interval, so the bus has bound before the first pass rather
     // than failing on the rows a previous process left pending.
@@ -280,6 +293,17 @@ fn install_logging() {
     if let Err(error) = init(&config) {
         eprintln!("mokmokd: the log subscriber was not installed: {error}");
     }
+}
+
+/// The instant this daemon started.
+fn now() -> Moment {
+    Moment::from_millis(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            }),
+    )
 }
 
 async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
