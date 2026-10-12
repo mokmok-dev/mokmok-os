@@ -755,6 +755,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -776,6 +777,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -847,6 +849,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -883,6 +886,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

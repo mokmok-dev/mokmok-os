@@ -10,6 +10,7 @@ serde = { workspace = true, features = ["alloc", "derive"] }
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

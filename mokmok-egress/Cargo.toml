@@ -16,7 +16,13 @@ tokio = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "time",
+] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
