@@ -1,0 +1,45 @@
+[package]
+edition.workspace = true
+name = "mokmok-kernel"
+version.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+mokmok-agent-runtime = { workspace = true }
+mokmok-artifact = { workspace = true }
+mokmok-capability = { workspace = true }
+mokmok-egress = { workspace = true }
+mokmok-event-bus = { workspace = true }
+mokmok-event-store = { workspace = true }
+mokmok-observability = { workspace = true }
+mokmok-protocol = { workspace = true }
+mokmok-sandbox = { workspace = true }
+mokmok-scheduler = { workspace = true }
+mokmok-state-machine = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "fs",
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "mokmokd"
+path = "src/bin/mokmokd.rs"

@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+name = "mokmok-egress"
+version.workspace = true
+
+[dependencies]
+mokmok-protocol = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+  "io-util",
+  "net",
+  "rt",
+  "sync",
+  "time",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

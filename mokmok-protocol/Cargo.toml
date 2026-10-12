@@ -4,12 +4,15 @@ name = "mokmok-protocol"
 version.workspace = true
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["alloc", "derive"] }
+serde_json = { workspace = true, default-features = false, features = [
+  "alloc",
+] }
 uuid = { workspace = true, features = ["fast-rng", "serde", "v7"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

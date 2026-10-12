@@ -36,3 +36,40 @@ pub type TurnID = crate::id::ID<Turn>;
 pub type CommandID = crate::id::ID<Command>;
 pub type EventID = crate::id::ID<Event>;
 pub type ArtifactID = crate::id::ID<Artifact>;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Message {}
+impl Sealed for Message {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Correlation {}
+impl Sealed for Correlation {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Principal {}
+impl Sealed for Principal {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Worker {}
+impl Sealed for Worker {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Trace {}
+impl Sealed for Trace {}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Span {}
+impl Sealed for Span {}
+
+/// Names one produced message. Distinct from [`EventID`], which the store assigns at append: a
+/// command's identity survives the log entry it caused.
+pub type MessageID = crate::id::ID<Message>;
+/// Ties messages that belong to one logical request without claiming causation.
+pub type CorrelationID = crate::id::ID<Correlation>;
+pub type PrincipalID = crate::id::ID<Principal>;
+pub type WorkerID = crate::id::ID<Worker>;
+/// Names one distributed trace, the 16 bytes a W3C `traceparent` spends on its trace id.
+pub type TraceID = crate::id::ID<Trace>;
+/// Names one span within a trace. A W3C `traceparent` spends 8 bytes on it, so the value lives in
+/// the low half of the marker's UUID and the high half stays zero.
+pub type SpanID = crate::id::ID<Span>;

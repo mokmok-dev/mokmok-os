@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+name = "mokmok-agent-runtime"
+version.workspace = true
+
+[dependencies]
+mokmok-protocol = { workspace = true }
+mokmok-state-machine = { workspace = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

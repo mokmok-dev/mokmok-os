@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+name = "mokmok-capability"
+version.workspace = true
+
+[dependencies]
+mokmok-protocol = { workspace = true }
+serde = { workspace = true, features = ["alloc", "derive"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
