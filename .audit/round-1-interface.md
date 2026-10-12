@@ -254,6 +254,10 @@ returned by `read` and never counted.
 
 ### `mokmok-egress` (new; std, tokio)
 
+The signatures below are as this brief froze them, but the crate moved past three of them during
+the round's review: `Validated::new` and `Validated::connect` take an `AuditSink`, and
+`AuditRecord.address` is optional. For those, the code is the record.
+
 Proxy decisions, destination enforcement, DNS/IP validation, network audit. Modules: `proxy`,
 `connect`, `dns`, `destination`, `policy_client`, `connection`, `rate_limit`, `audit`.
 
