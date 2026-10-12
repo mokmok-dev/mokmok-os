@@ -716,8 +716,8 @@ mod tests {
         let daemon = Daemon::start(&scratch, &[("NOTIFY_SOCKET", notify.as_str())]);
         supervisor.expect(Duration::from_secs(5), "READY=1\n");
 
-        // The path every later pass will dial: a peer that accepts and answers nothing. The pass it
-        // is cut in is what the bound sits on.
+        // The path every later pass will dial: a peer that accepts and answers nothing, so the pass
+        // the stop lands in is a pass that cannot finish on its own.
         std::fs::remove_file(scratch.socket()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(scratch.socket()).unwrap();
         std::thread::spawn(move || {
@@ -727,8 +727,7 @@ mod tests {
             }
         });
 
-        // One notice per topic, so a bound on each publish would have to pay several of them before
-        // the pass returned.
+        // One notice per topic, so a pass that had to wait a bound per notice would be slow to cut.
         for index in 0..4 {
             seed_for(&scratch.data(), session_of(0xb0 + index), 0xb0 + index, 1);
         }
@@ -736,18 +735,13 @@ mod tests {
 
         let started = Instant::now();
         daemon.signal("TERM");
-        let finished = daemon.finish(Duration::from_secs(15));
+        let finished = daemon.finish(Duration::from_secs(10));
 
         assert_eq!(finished.code, Some(0), "{}\n{}", finished.out, finished.err);
         assert!(
-            started.elapsed() < Duration::from_secs(12),
-            "the stop landed within one pass deadline, not one bound per notice: {:?}",
+            started.elapsed() < Duration::from_secs(3),
+            "a stop cuts the pass in flight instead of waiting it out: {:?}",
             started.elapsed(),
-        );
-        assert!(
-            finished.err.contains("ran past 10s"),
-            "the pass deadline is what ended the pass: {}",
-            finished.err,
         );
         assert!(
             !scratch.socket().exists(),

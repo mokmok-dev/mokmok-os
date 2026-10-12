@@ -2,10 +2,10 @@
 //!
 //! A notice is written inside the transaction that records the change it names, so it exists only
 //! after that history committed. The relay runs afterwards, one publisher per topic, and settles
-//! the rows the bus acknowledged. A publish that fails leaves its row and every later row pending,
-//! so the next pass tries them again: delivery here is at-least-once, which is what a durable outbox
-//! buys and what makes a crash between the publish and the settle cost a redelivery rather than a
-//! lost event.
+//! each row as the bus acknowledges it. A publish that fails leaves its row and every later row
+//! pending, so the next pass tries them again: delivery here is at-least-once, which is what a
+//! durable outbox buys and what makes a crash between the publish and the settle cost a redelivery
+//! rather than a lost event.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,15 +35,6 @@ const PROBE: Duration = Duration::from_secs(1);
 /// How long the loop waits between readiness probes.
 const RETRY: Duration = Duration::from_millis(10);
 
-/// How long one relay pass may take before it is cut and its rows stay pending.
-///
-/// Two constraints from outside sit above this number: the unit's `TimeoutStopSec` is 20s and
-/// bounds how long a stop can take, and the keep-alive is due at half `WatchdogSec`, 15s of the
-/// shipped 30s, so a pass that ends inside 10s keeps both. A bound per publish would not do,
-/// because a peer that answers slowly but correctly never fails one, and a pass then costs a bound
-/// per notice while the loop cannot observe the stop.
-const PASS_DEADLINE: Duration = Duration::from_secs(10);
-
 /// A pass interval when the relay serves rather than draining once.
 const PASS: Duration = Duration::from_millis(200);
 
@@ -62,12 +53,14 @@ impl Relay {
         }
     }
 
-    /// Publishes every pending notice in the order it was written, then settles what was
-    /// acknowledged.
+    /// Publishes every pending notice in the order it was written, settling each one as the bus
+    /// acknowledges it.
     ///
-    /// The order matters: the store deletes every row at or below the id it is given, so stopping
-    /// at the first publish that fails is what keeps an unpublished notice from being settled by a
-    /// later one's success.
+    /// The order matters: the store deletes every row at or below the id it is given, so settling
+    /// only what was published is what keeps an unpublished notice from being settled by a later
+    /// one's success. It also makes the unit of durable progress the notice rather than the page:
+    /// whatever ends the pass, a stop, a crash, or a watchdog fence, resumes from the settled prefix
+    /// instead of redelivering the page it was part of.
     ///
     /// # Errors
     ///
@@ -80,7 +73,6 @@ impl Relay {
         db: &mut Db,
     ) -> Result<usize, Error> {
         let pending = db.pending()?;
-        let mut through = None;
         let mut published = 0;
 
         for entry in &pending {
@@ -89,12 +81,8 @@ impl Relay {
             let payload = Payload::json(&value)?;
             self.publish(topic, payload).await?;
 
-            through = Some(entry.id());
+            db.settle_notices(entry.id())?;
             published += 1;
-        }
-
-        if let Some(id) = through {
-            db.settle_notices(id)?;
         }
 
         Ok(published)
@@ -217,25 +205,27 @@ async fn serve_until_stopped(
             _ = tick.tick() => (),
         }
 
-        let pass = tokio::time::timeout(PASS_DEADLINE, relay.once(&mut db)).await;
+        let pass = tokio::select! {
+            // A stop cuts the pass in flight, so the process leaves now rather than after whatever
+            // the bus is taking. Only the notice whose publish was in flight is lost with it,
+            // because every earlier one was settled as it was acknowledged.
+            () = &mut shutdown => None,
+            result = relay.once(&mut db) => Some(result),
+        };
+        let Some(pass) = pass else {
+            relay.forget();
+            break;
+        };
+
         let drained = match pass {
-            Ok(Ok(count)) => {
+            Ok(count) => {
                 published += count;
                 true
             },
             // The rows stay pending and the next pass tries them again, which is the at-least-once
             // delivery the outbox already buys; a failed pass is not a reason to end a daemon.
-            Ok(Err(error)) => {
+            Err(error) => {
                 eprintln!("mokmokd: relay pass failed: {error}");
-                false
-            },
-            // A cut pass is a failed pass: nothing was settled, so every row is still there for the
-            // next pass, and the loop is back in time to honour a stop.
-            Err(_) => {
-                eprintln!(
-                    "mokmokd: the relay pass ran past {PASS_DEADLINE:?}, so its rows stay pending"
-                );
-                relay.forget();
                 false
             },
         };
@@ -249,8 +239,10 @@ async fn serve_until_stopped(
             ready = Some(Cadence::new(notifier.ping(), Instant::now()));
         } else if let Some(cadence) = &mut ready {
             // The keep-alive is sent from the pass rather than from a timer of its own, so a relay
-            // wedged in `once` stops reporting and the watchdog is what ends this process. A timer
-            // that only slept would keep pinging a process that had stopped relaying.
+            // wedged in `once` stops reporting and the watchdog is what ends this process. A fence
+            // then costs a resume from the last settled notice rather than a redelivery of the page
+            // it was in. A timer that only slept would keep pinging a process that had stopped
+            // relaying.
             if cadence.due(Instant::now()) {
                 report(&notifier, Message::Alive);
             }
@@ -309,5 +301,118 @@ fn report(
 ) {
     if let Err(error) = notifier.send(message) {
         eprintln!("mokmokd: the supervisor was not told {message:?}: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Relay;
+    use crate::db::{Db, Entry};
+    use mokmok_event_bus::{Config as BusConfig, Limits, Topic, serve as serve_bus};
+    use mokmok_event_store::{CommandId, Expected, OutboxMessage, Payload};
+    use mokmok_protocol::SessionID;
+    use mokmok_state_machine::Fact;
+    use std::num::NonZeroUsize;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    /// A directory of this test's own, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("mokmok-serve-{name}-{pid}"));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One pending outbox row for `session`, which is the topic the relay publishes to.
+    fn notice(session: SessionID) -> OutboxMessage {
+        OutboxMessage::new(
+            Topic::Session(session).to_string(),
+            Payload::json(&session.as_uuid().to_string()).unwrap(),
+        )
+    }
+
+    /// Writes one pending notice for a session of its own.
+    fn seed(
+        db: &mut Db,
+        session: SessionID,
+    ) {
+        let command = CommandId::from_uuid(session.as_uuid());
+        db.append(
+            command,
+            Db::stream(session),
+            Expected::Any,
+            &[Entry::Session(Fact::SessionOpened)],
+            vec![notice(session)],
+        )
+        .unwrap();
+    }
+
+    /// Waits for the bus to listen, bounded.
+    async fn wait_for_bus(socket: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        while !socket.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bus bound {} within five seconds",
+                socket.display(),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_fails_part_way_keeps_what_it_settled() {
+        let scratch = Scratch::new("partial");
+        let socket = scratch.0.join("bus.sock");
+        let first = SessionID::from_uuid(Uuid::from_u128(0x11));
+        let second = SessionID::from_uuid(Uuid::from_u128(0x22));
+
+        let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
+        seed(&mut db, first);
+        seed(&mut db, second);
+
+        let bus = BusConfig {
+            path: socket.clone(),
+            store: scratch.0.join("bus.sqlite"),
+            // One topic is all this bus will open, so the second session's topic is refused.
+            limits: Limits {
+                topics: NonZeroUsize::MIN,
+                ..Limits::default()
+            },
+            ..BusConfig::default()
+        };
+        let serving = tokio::spawn(serve_bus(bus, std::future::pending::<()>()));
+        wait_for_bus(&socket).await;
+
+        let mut relay = Relay::new(&socket);
+        assert!(
+            relay.once(&mut db).await.is_err(),
+            "the second topic was refused, so the pass failed part way",
+        );
+
+        let pending = db.pending().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the acknowledged notice was settled and the refused one was not",
+        );
+        assert_eq!(pending[0].topic(), Topic::Session(second).to_string());
+
+        serving.abort();
     }
 }
