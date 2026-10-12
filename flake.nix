@@ -164,11 +164,48 @@
                   {
                     services.mokmokd = {
                       enable = true;
-                      allowTool = [ "$FOO" ];
+                      allowTool = [
+                        "$FOO"
+                        "a\\b"
+                      ];
                       allowPath = [ "/nix/store/%p" ];
                     };
                   }
                 ];
+
+                # A unit render never raises a validation error, so the two option types are
+                # forced here: a value outside its type only shows as a failed evaluation.
+                typeCheck = expr: (builtins.tryEval expr).success;
+                newlineToolSuccess = typeCheck (
+                  unitOf (evaluated [
+                    {
+                      services.mokmokd = {
+                        enable = true;
+                        allowTool = [ "a\nb" ];
+                      };
+                    }
+                  ])
+                );
+                slashDirectorySuccess = typeCheck (
+                  unitOf (evaluated [
+                    {
+                      services.mokmokd = {
+                        enable = true;
+                        directory = "a/b";
+                      };
+                    }
+                  ])
+                );
+                tabToolSuccess = typeCheck (
+                  unitOf (evaluated [
+                    {
+                      services.mokmokd = {
+                        enable = true;
+                        allowTool = [ "a\tb" ];
+                      };
+                    }
+                  ])
+                );
               in
               pkgs.runCommand "mokmokd-nixos-unit" { } ''
                 install -Dm644 ${pkgs.writeText "mokmokd.service" (unitOf defaults)} $out/mokmokd.service
@@ -184,6 +221,15 @@
                   group = ${custom.config.users.users.custom.group}
                 ''} $out/custom-account.txt
 
+                # `tryEval` reports whether forcing the option value threw, which is where a
+                # type outside the restriction surfaces; grep the results so a widened type
+                # fails this check rather than passing unrendered.
+                install -Dm644 ${pkgs.writeText "mokmokd-type-checks.txt" ''
+                  allowToolNewlineSuccess = ${lib.boolToString newlineToolSuccess}
+                  directorySlashSuccess = ${lib.boolToString slashDirectorySuccess}
+                  allowToolTabSuccess = ${lib.boolToString tabToolSuccess}
+                ''} $out/type-checks.txt
+
                 # The defaults with the sample.
                 grep -qF 'Type=notify' $out/mokmokd.service
                 grep -qF 'NotifyAccess=main' $out/mokmokd.service
@@ -198,6 +244,17 @@
                 grep -qF 'StateDirectory=mokmokd' $out/mokmokd.service
                 grep -qF 'RuntimeDirectory=mokmokd' $out/mokmokd.service
                 grep -qF 'NoNewPrivileges=true' $out/mokmokd.service
+                # The hardening directives are the containment the unit records, and each is
+                # named so that dropping one from serviceConfig fails here.
+                grep -qF 'LockPersonality=true' $out/mokmokd.service
+                grep -qF 'ProtectClock=true' $out/mokmokd.service
+                grep -qF 'ProtectControlGroups=true' $out/mokmokd.service
+                grep -qF 'ProtectKernelLogs=true' $out/mokmokd.service
+                grep -qF 'ProtectKernelModules=true' $out/mokmokd.service
+                grep -qF 'ProtectKernelTunables=true' $out/mokmokd.service
+                grep -qF 'ProtectProc=invisible' $out/mokmokd.service
+                grep -qF 'RestrictRealtime=true' $out/mokmokd.service
+                grep -qF 'SystemCallArchitectures=native' $out/mokmokd.service
                 # An empty bounding set is what keeps a service that can run as root from
                 # holding any capability, and WantedBy is what enables the unit at boot.
                 grep -qE '^CapabilityBoundingSet=$' $out/mokmokd.service
@@ -238,11 +295,17 @@
                 grep -qF 'group = users' $out/custom-account.txt
 
                 # The values the parser rewrites. A dropped `systemdArg` is only visible here:
-                # without it `$FOO` leaves the line and `%p` becomes a specifier.
+                # without it `$FOO` leaves the line, `%p` becomes a specifier, and a backslash
+                # reaches systemd as an escape it turns into a control byte.
                 grep -qF -- "--allow-tool '\$\$FOO'" $out/adversarial.service
+                grep -qF -- "--allow-tool 'a\\\\b'" $out/adversarial.service
                 grep -qF -- '--allow-path /nix/store/%%p' $out/adversarial.service
                 grep -qF -- '--data-dir %S/mokmokd' $out/adversarial.service
                 grep -qF -- '--socket %t/mokmokd/bus.sock' $out/adversarial.service
+
+                grep -qF 'allowToolNewlineSuccess = false' $out/type-checks.txt
+                grep -qF 'directorySlashSuccess = false' $out/type-checks.txt
+                grep -qF 'allowToolTabSuccess = true' $out/type-checks.txt
               '';
           };
 
