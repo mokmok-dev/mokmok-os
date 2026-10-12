@@ -44,4 +44,15 @@ mod tests {
             Err(Error::NotFound { .. }),
         ));
     }
+
+    #[test]
+    fn a_reference_records_the_blob_length() {
+        let scratch = Scratch::new("size");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let hash = store.put(b"0123456789").unwrap();
+
+        let reference = Reference::new(&store, artifact(), hash, Moment::EPOCH).unwrap();
+
+        assert_eq!(reference.size(), 10);
+    }
 }

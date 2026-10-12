@@ -4,6 +4,7 @@ mod common;
 mod tests {
     use crate::common::tests::{MemoryReferences, Scratch, after};
     use mokmok_artifact::{BlobStore, Collector, ContentHash, Error, HexError, Retention};
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     #[test]
@@ -91,5 +92,41 @@ mod tests {
         assert_eq!(report.collected, Vec::<ContentHash>::new());
         assert_eq!(report.bytes, 0);
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn remove_reports_whether_the_blob_was_there() {
+        let scratch = Scratch::new("remove");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let hash = store.put(b"removable").unwrap();
+
+        assert!(store.remove(hash).unwrap());
+        assert!(!store.remove(hash).unwrap());
+    }
+
+    #[test]
+    fn remove_reports_an_io_error_when_the_path_is_not_a_file() {
+        let scratch = Scratch::new("remove-directory");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let hash = ContentHash::of(b"a directory stands here");
+        std::fs::create_dir_all(store.path(hash)).unwrap();
+
+        assert!(matches!(store.remove(hash), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn a_write_fails_when_the_blob_directory_cannot_be_synced() {
+        let scratch = Scratch::new("unsynced");
+        let store = BlobStore::open(scratch.path()).unwrap();
+        let bytes = b"cannot sync this directory";
+        let hash = ContentHash::of(bytes);
+        let directory = store.path(hash).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o333)).unwrap();
+
+        let result = store.put(bytes);
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(result, Err(Error::Io(_))));
     }
 }
