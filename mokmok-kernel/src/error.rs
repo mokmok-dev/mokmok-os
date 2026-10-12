@@ -1,5 +1,7 @@
 //! Everything the composition root can fail at, in the terms its caller reads.
 
+use std::path::PathBuf;
+
 use mokmok_event_store::{Error as StoreError, PayloadError};
 use mokmok_state_machine::{Rejected, Rejection};
 
@@ -26,8 +28,12 @@ pub enum Error {
     Sandbox(#[from] mokmok_sandbox::Error),
     #[error("the event bus refused the connection or the append")]
     Bus(#[from] mokmok_event_bus::Error),
-    #[error("the bus server failed")]
+    #[error("the bus server failed: {0}")]
     BusServe(#[from] mokmok_event_bus::ServeError),
+    #[error("the bus stopped, so this process has nothing to serve")]
+    BusStopped,
+    #[error("the bus never answered {0} while this process was willing to wait")]
+    BusUnanswered(PathBuf),
     #[error("a notice's topic is not one the bus names")]
     Topic(#[from] mokmok_event_bus::InvalidTopic),
     #[error("a committed payload is not the value it was written as")]

@@ -27,6 +27,14 @@
         let
           rustToolchain = pkgs.rust-bin.stable.latest.default;
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          src = pkgs.lib.cleanSourceWith { src = ./.; };
+
+          cargoCommonArgs = {
+            inherit src;
+            strictDeps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
         in
         {
           _module.args = {
@@ -36,48 +44,72 @@
             };
           };
 
-          checks =
-            let
-              src = pkgs.lib.cleanSourceWith { src = ./.; };
+          packages.default = craneLib.buildPackage (
+            cargoCommonArgs
+            // {
+              inherit cargoArtifacts;
+            }
+          );
 
-              # cargo
-              cargoCommonArgs = {
-                inherit src;
-                strictDeps = true;
-              };
-              cargoArtifacts = craneLib.buildDepsOnly cargoCommonArgs;
-            in
-            {
-              cargoClippy = craneLib.cargoClippy (
-                cargoCommonArgs
-                // {
-                  inherit
-                    src
-                    cargoArtifacts
-                    ;
-                  cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
-                }
-              );
-              cargoDocTest = craneLib.cargoDocTest (
-                cargoCommonArgs
-                // {
-                  inherit
-                    src
-                    cargoArtifacts
-                    ;
-                }
-              );
-              cargoTest = craneLib.cargoNextest (
-                cargoCommonArgs
-                // {
-                  inherit
-                    src
-                    cargoArtifacts
-                    ;
-                  cargoNextestExtraArgs = "--no-tests=pass";
-                }
-              );
-            };
+          checks = {
+            cargoClippy = craneLib.cargoClippy (
+              cargoCommonArgs
+              // {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+                cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
+              }
+            );
+            cargoDocTest = craneLib.cargoDocTest (
+              cargoCommonArgs
+              // {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+              }
+            );
+            cargoTest = craneLib.cargoNextest (
+              cargoCommonArgs
+              // {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+                cargoNextestExtraArgs = "--no-tests=pass";
+              }
+            );
+
+            mokmokdUnit =
+              let
+                mokmokd = config.packages.default;
+                unit = pkgs.replaceVars ./deploy/mokmokd.service {
+                  mokmokd = "${mokmokd}/bin/mokmokd";
+                };
+              in
+              pkgs.runCommand "mokmokd-unit" { } ''
+                # The daemon defaults --confiner to the sibling of its own executable and refuses
+                # a run it cannot resolve, so the ExecStart path has to land beside the confiner.
+                # `current_exe` resolves a symlink, so the pair has to be siblings in the crane
+                # output the ExecStart path names.
+                test -x ${mokmokd}/bin/mokmokd
+                test -x ${mokmokd}/bin/mokmok-sandbox-confine
+
+                install -Dm644 ${unit} $out/mokmokd.service
+
+                # `replaceVars` is what fails when a placeholder has no value, and this is what
+                # fails when the placeholder moved out of the ExecStart line while still
+                # substituting cleanly.
+                grep -qF "ExecStart=${mokmokd}/bin/mokmokd " $out/mokmokd.service
+
+                # One directory for the operator: the unit, and the binaries it starts.
+                install -d $out/bin
+                ln -s ${mokmokd}/bin/mokmokd $out/bin/mokmokd
+                ln -s ${mokmokd}/bin/mokmok-sandbox-confine $out/bin/mokmok-sandbox-confine
+              '';
+          };
 
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
