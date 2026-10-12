@@ -100,10 +100,22 @@ mod tests {
     }
 
     fn confiner() -> PathBuf {
-        binary()
+        let path = binary()
             .parent()
             .expect("the binary has a directory")
-            .join("mokmok-sandbox-confine")
+            .join("mokmok-sandbox-confine");
+        // The confiner belongs to another package, and cargo builds no target of another package
+        // for this one's tests. `cargo test --workspace` and the nix check both build it; a test run
+        // narrowed to this package in a fresh target directory does not, and the failure it caused
+        // would otherwise read as a misconfiguration rather than a missing build.
+        assert!(
+            path.is_file(),
+            "{} is missing: build the workspace (cargo build --workspace) before running this \
+             package's tests alone",
+            path.display(),
+        );
+
+        path
     }
 
     /// The first shell on `PATH`, which is where a confined workload can find one.

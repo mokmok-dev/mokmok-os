@@ -14,7 +14,7 @@ use crate::config::ConfigError;
 pub enum Error {
     #[error("the event log failed")]
     Store(#[from] StoreError),
-    #[error("the configuration is not usable")]
+    #[error("the configuration is not usable: {0}")]
     Config(#[from] ConfigError),
     #[error("the filesystem refused a write the run depends on")]
     Io(#[from] std::io::Error),
