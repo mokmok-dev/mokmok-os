@@ -126,20 +126,65 @@
 
             nixosModule =
               let
-                rendered = inputs.nixpkgs.lib.nixosSystem {
-                  inherit system;
-                  modules = [
-                    nixosModule
-                    ./deploy/nixos-example.nix
-                  ];
-                };
+                evaluated =
+                  extra:
+                  inputs.nixpkgs.lib.nixosSystem {
+                    inherit system;
+                    modules = [ nixosModule ] ++ extra;
+                  };
+
                 # nixpkgs renders a service into `systemd.units`; `services.<name>` has no `unit`
                 # attribute in this nixpkgs.
-                unit = rendered.config.systemd.units."mokmokd.service".text;
+                unitOf = config: config.config.systemd.units."mokmokd.service".text;
+
+                # The defaults with the sample.
+                defaults = evaluated [ ./deploy/nixos-example.nix ];
+
+                # Every option off its default, with an account the operator declares, so the
+                # merge the module joins is exercised rather than assumed.
+                custom = evaluated [
+                  {
+                    services.mokmokd = {
+                      enable = true;
+                      directory = "custom";
+                      user = "custom";
+                      group = "custom";
+                      watchdogSec = 45;
+                      allowWrite = [ "/tmp/w" ];
+                    };
+                    users.users.custom = {
+                      isNormalUser = true;
+                      group = "users";
+                    };
+                  }
+                ];
+
+                # Values that reach the systemd parser, so the escaping has a regression test.
+                adversarial = evaluated [
+                  {
+                    services.mokmokd = {
+                      enable = true;
+                      allowTool = [ "$FOO" ];
+                      allowPath = [ "/nix/store/%p" ];
+                    };
+                  }
+                ];
               in
               pkgs.runCommand "mokmokd-nixos-unit" { } ''
-                install -Dm644 ${pkgs.writeText "mokmokd.service" unit} $out/mokmokd.service
+                install -Dm644 ${pkgs.writeText "mokmokd.service" (unitOf defaults)} $out/mokmokd.service
+                install -Dm644 ${pkgs.writeText "mokmokd-custom.service" (unitOf custom)} $out/custom.service
+                install -Dm644 ${pkgs.writeText "mokmokd-adversarial.service" (unitOf adversarial)} $out/adversarial.service
 
+                # The unit text never reads the account, so a weakened merge of it would stay
+                # latent until activation. Writing the resolved options here, and asserting them,
+                # is what raises that merge error inside this check.
+                install -Dm644 ${pkgs.writeText "mokmokd-custom-account.txt" ''
+                  isSystemUser = ${lib.boolToString custom.config.users.users.custom.isSystemUser}
+                  isNormalUser = ${lib.boolToString custom.config.users.users.custom.isNormalUser}
+                  group = ${custom.config.users.users.custom.group}
+                ''} $out/custom-account.txt
+
+                # The defaults with the sample.
                 grep -qF 'Type=notify' $out/mokmokd.service
                 grep -qF 'NotifyAccess=main' $out/mokmokd.service
                 grep -qF 'WatchdogSec=30s' $out/mokmokd.service
@@ -153,6 +198,11 @@
                 grep -qF 'StateDirectory=mokmokd' $out/mokmokd.service
                 grep -qF 'RuntimeDirectory=mokmokd' $out/mokmokd.service
                 grep -qF 'NoNewPrivileges=true' $out/mokmokd.service
+                # An empty bounding set is what keeps a service that can run as root from
+                # holding any capability, and WantedBy is what enables the unit at boot.
+                grep -qE '^CapabilityBoundingSet=$' $out/mokmokd.service
+                grep -qE '^AmbientCapabilities=$' $out/mokmokd.service
+                grep -qF 'WantedBy=multi-user.target' $out/mokmokd.service
                 grep -qF 'StartLimitIntervalSec=60' $out/mokmokd.service
                 grep -qF 'StartLimitBurst=5' $out/mokmokd.service
 
@@ -165,8 +215,34 @@
                 grep -qF -- '--data-dir %S/mokmokd' $out/mokmokd.service
                 grep -qF -- '--allow-tool /bin/sh' $out/mokmokd.service
                 grep -qF -- '--allow-path /nix/store' $out/mokmokd.service
+                grep -qF -- '--allow-write /tmp' $out/mokmokd.service
                 grep -qF -- '--socket %t/mokmokd/bus.sock' $out/mokmokd.service
                 grep -qE '^ExecStart=[^ ]+ --data-dir %S/mokmokd( --allow-tool [^ ]+)*( --allow-path [^ ]+)*( --allow-write [^ ]+)* serve --socket %t/mokmokd/bus\.sock$' $out/mokmokd.service
+
+                # Every option off its default. A directive that stopped reading its option,
+                # or one hardcoded to the default name, is only visible here.
+                grep -qF 'StateDirectory=custom' $out/custom.service
+                grep -qF 'RuntimeDirectory=custom' $out/custom.service
+                grep -qF 'User=custom' $out/custom.service
+                grep -qF 'Group=custom' $out/custom.service
+                grep -qF 'WatchdogSec=45s' $out/custom.service
+                grep -qF -- '--data-dir %S/custom' $out/custom.service
+                grep -qF -- '--allow-write /tmp/w' $out/custom.service
+                grep -qF -- '--socket %t/custom/bus.sock' $out/custom.service
+                grep -qE '^ExecStart=[^ ]+ --data-dir %S/custom( --allow-tool [^ ]+)*( --allow-path [^ ]+)*( --allow-write [^ ]+)* serve --socket %t/custom/bus\.sock$' $out/custom.service
+
+                # The account the operator declared keeps nixpkgs' normal-user values rather
+                # than the module's defaults.
+                grep -qF 'isSystemUser = false' $out/custom-account.txt
+                grep -qF 'isNormalUser = true' $out/custom-account.txt
+                grep -qF 'group = users' $out/custom-account.txt
+
+                # The values the parser rewrites. A dropped `systemdArg` is only visible here:
+                # without it `$FOO` leaves the line and `%p` becomes a specifier.
+                grep -qF -- "--allow-tool '\$\$FOO'" $out/adversarial.service
+                grep -qF -- '--allow-path /nix/store/%%p' $out/adversarial.service
+                grep -qF -- '--data-dir %S/mokmokd' $out/adversarial.service
+                grep -qF -- '--socket %t/mokmokd/bus.sock' $out/adversarial.service
               '';
           };
 

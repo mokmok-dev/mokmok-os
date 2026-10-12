@@ -19,6 +19,11 @@ let
   # removed word and turns `%p` into a specifier, so each operator value is neutralised
   # first. The module's own `%S` and `%t` fragments are passed through untouched.
   systemdArg = value: lib.replaceStrings [ "%" "$" "\\" ] [ "%%" "$$" "\\\\" ] value;
+
+  # systemd keeps the command line as text in the unit file, so a newline ends the directive and
+  # leaves the quoting unbalanced, which refuses the whole unit. A tab cannot break a line, and
+  # arrives intact inside the quoting the argv gets.
+  allowValue = lib.types.strMatching "([^[:cntrl:]]|[[:blank:]])*";
 in
 {
   options.services.mokmokd = {
@@ -77,34 +82,41 @@ in
     };
 
     allowTool = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
+      type = lib.types.listOf allowValue;
       default = [ ];
       description = ''
         Tool programs the agent principal may invoke. Each value is an absolute
         path that has to exist at run time; the module passes it to the command
         line and copies no file into the store. Nothing is allowed by default,
-        and the daemon refuses a program it cannot resolve.
+        and the daemon refuses a program it cannot resolve. A value that carries
+        a control character other than a tab is refused, because systemd keeps
+        the command line as text and a newline would end the directive.
       '';
     };
 
     allowPath = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
+      type = lib.types.listOf allowValue;
       default = [ ];
       description = ''
         Directories a workload may read and execute in. Each value is an
         absolute path that has to exist at run time; the module passes it to the
         command line and copies no file into the store. Nothing is allowed by
-        default, and the daemon refuses a path it cannot resolve.
+        default, and the daemon refuses a path it cannot resolve. A value that
+        carries a control character other than a tab is refused, because systemd
+        keeps the command line as text and a newline would end the directive.
       '';
     };
 
     allowWrite = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
+      type = lib.types.listOf allowValue;
       default = [ ];
       description = ''
         Directories a workload may also write in. Each value is an absolute path
         that has to exist at run time; the module passes it to the command line
-        and copies no file into the store. Nothing is allowed by default.
+        and copies no file into the store. Nothing is allowed by default. A
+        value that carries a control character other than a tab is refused,
+        because systemd keeps the command line as text and a newline would end
+        the directive.
       '';
     };
 

@@ -14,12 +14,14 @@
 #     ];
 #   };
 #
-# The values below are examples. Both are absolute paths that have to exist at
-# run time; the module passes them to the daemon and writes no file itself.
+# The values below are examples. Each is an absolute path that has to exist at
+# run time; the module passes them to the daemon and writes no file itself. A
+# tool a workload runs lives in the store, and /tmp is where one may write.
 {
   services.mokmokd = {
     enable = true;
     allowTool = [ "/bin/sh" ];
     allowPath = [ "/nix/store" ];
+    allowWrite = [ "/tmp" ];
   };
 }
