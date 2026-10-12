@@ -587,6 +587,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mokmok-event-store"
+version = "0.0.0"
+dependencies = [
+ "mokmok-protocol",
+ "proptest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "mokmok-protocol"
 version = "0.0.0"
 dependencies = [

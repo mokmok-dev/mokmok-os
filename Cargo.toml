@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "mokmok-event-bus",
+  "mokmok-event-store",
   "mokmok-protocol",
   "mokmok-sandbox",
   "mokmok-state-machine",

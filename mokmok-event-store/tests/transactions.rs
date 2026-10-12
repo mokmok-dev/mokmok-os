@@ -1,0 +1,511 @@
+use mokmok_event_store::{
+    Append, CommandId, CommitPosition, Committed, ConsumerId, Error, Event, Expected, Kind,
+    NewEvent, Outcome, Payload, Processed, Store, StreamId, Version,
+};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+// The `cfg(test)` module is what tells the `allow-unwrap-in-tests`, `allow-expect-in-tests`, and
+// `allow-panic-in-tests` settings in `.clippy.toml` that this harness is test code.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+            Self(std::env::temp_dir().join(format!(
+                "mokmok-event-store-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            )))
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("store.sqlite")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn max(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).unwrap()
+    }
+
+    fn number(
+        connection: &rusqlite::Connection,
+        sql: &str,
+    ) -> i64 {
+        connection
+            .query_row(sql, rusqlite::params![], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn event(index: usize) -> NewEvent {
+        NewEvent::new(
+            Kind::new(format!("turn.{index}")).unwrap(),
+            Payload::json(&serde_json::json!({"n": index})).unwrap(),
+        )
+    }
+
+    fn append(
+        command: CommandId,
+        stream: StreamId,
+        expected: Expected,
+        count: usize,
+    ) -> Append {
+        let mut append = Append::new(command, stream, expected, event(0));
+        for index in 1..count {
+            append = append.event(event(index));
+        }
+
+        append
+    }
+
+    fn committed(
+        store: &mut Store,
+        append: &Append,
+    ) -> Committed {
+        match store.append(append).unwrap() {
+            Outcome::Committed(committed) => committed,
+            other => panic!("expected a commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_stores_race_one_expected_version_and_the_loser_retries() {
+        let scratch = Scratch::new("race");
+        let stream = StreamId::new();
+        let mut first = Store::open(&scratch.db()).unwrap();
+        let mut second = Store::open(&scratch.db()).unwrap();
+
+        let seeded = committed(
+            &mut first,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let winner = first
+            .append(&append(
+                CommandId::new(),
+                stream,
+                Expected::At(seeded.version()),
+                1,
+            ))
+            .unwrap();
+        let Outcome::Committed(winner) = winner else {
+            panic!("the first writer did not commit: {winner:?}");
+        };
+        assert_eq!(winner.version(), Version::new(2));
+
+        let loser = second
+            .append(&append(
+                CommandId::new(),
+                stream,
+                Expected::At(seeded.version()),
+                1,
+            ))
+            .unwrap();
+        let Outcome::Conflicted { expected, found } = loser else {
+            panic!("the second writer did not conflict: {loser:?}");
+        };
+        assert_eq!(expected, Expected::At(seeded.version()));
+        assert_eq!(found, winner.version());
+
+        let retried = second
+            .append(&append(CommandId::new(), stream, Expected::At(found), 1))
+            .unwrap();
+        let Outcome::Committed(retried) = retried else {
+            panic!("the retry did not commit: {retried:?}");
+        };
+        assert_eq!(retried.version(), Version::new(3));
+
+        let history = second.history(stream, Version::INITIAL, max(8)).unwrap();
+        assert_eq!(history.version(), Version::new(3));
+        assert_eq!(history.commits().len(), 3);
+    }
+
+    #[test]
+    fn a_failed_consume_rolls_back_every_write_from_a_second_connection() {
+        let scratch = Scratch::new("rollback");
+        let stream = StreamId::new();
+        let consumer = ConsumerId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let commit = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let failed = store.consume(consumer, &commit, |tx| {
+            tx.put_projection(
+                consumer,
+                "turn",
+                commit.events()[0].payload(),
+                commit.position(),
+            )?;
+            Err::<(), Error>(Error::Corrupt { what: "deliberate" })
+        });
+        assert!(failed.is_err(), "the failing closure propagated");
+
+        let mut witness = Store::open(&scratch.db()).unwrap();
+        assert_eq!(
+            witness.checkpoint(consumer).unwrap(),
+            None,
+            "the checkpoint rolled back",
+        );
+        assert_eq!(
+            witness
+                .history(stream, Version::INITIAL, max(8))
+                .unwrap()
+                .version(),
+            Version::new(1),
+            "the stream did not grow",
+        );
+
+        let seen = witness
+            .consume(consumer, &commit, |tx| tx.projection(consumer, "turn"))
+            .unwrap();
+        let Processed::Applied(projection) = seen else {
+            panic!("the rolled-back consume left an inbox row: {seen:?}");
+        };
+        assert!(projection.is_none(), "the projection rolled back");
+    }
+
+    #[test]
+    fn an_append_is_visible_to_a_store_opened_afterwards() {
+        let scratch = Scratch::new("visibility");
+        let stream = StreamId::new();
+        let mut first = Store::open(&scratch.db()).unwrap();
+        let commit = committed(
+            &mut first,
+            &append(CommandId::new(), stream, Expected::New, 2),
+        );
+
+        let second = Store::open(&scratch.db()).unwrap();
+        let log = second.log(CommitPosition::FIRST, max(8)).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].position(), commit.position());
+        assert_eq!(
+            log[0].events().iter().map(Event::id).collect::<Vec<_>>(),
+            commit.events().iter().map(Event::id).collect::<Vec<_>>(),
+            "the same events with the same ids",
+        );
+        assert_eq!(
+            log[0]
+                .events()
+                .iter()
+                .map(Event::position)
+                .collect::<Vec<_>>(),
+            commit
+                .events()
+                .iter()
+                .map(Event::position)
+                .collect::<Vec<_>>(),
+            "the same events at the same positions",
+        );
+    }
+
+    #[test]
+    fn a_rollback_triggered_inside_the_closure_leaves_no_bookkeeping() {
+        let scratch = Scratch::new("rollback-closure");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let outer = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON event
+             WHEN NEW.ordinal = 1
+             BEGIN SELECT RAISE(ROLLBACK, 'x'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let inner = append(CommandId::new(), stream, Expected::At(Version::new(1)), 2);
+        let result = store.consume(consumer, &outer, |tx| {
+            tx.put_projection(
+                consumer,
+                "turn",
+                outer.events()[0].payload(),
+                outer.position(),
+            )?;
+            let _ = tx.append(&inner);
+            Ok(())
+        });
+        assert!(
+            matches!(result, Err(Error::Aborted)),
+            "the ended transaction is refused: {result:?}",
+        );
+
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM inbox"),
+            0,
+            "no inbox row"
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM checkpoint"),
+            0,
+            "no checkpoint",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM projection"),
+            0,
+            "no projection",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM commit_log"),
+            1,
+            "only the outer commit",
+        );
+
+        raw.execute_batch("DROP TRIGGER boom;").unwrap();
+        let retried = store
+            .consume(consumer, &outer, |tx| {
+                tx.put_projection(
+                    consumer,
+                    "turn",
+                    outer.events()[0].payload(),
+                    outer.position(),
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(retried, Processed::Applied(())),
+            "the retry applies: {retried:?}",
+        );
+        assert_eq!(number(&raw, "SELECT COUNT(*) FROM inbox"), 1);
+        assert_eq!(number(&raw, "SELECT COUNT(*) FROM checkpoint"), 1);
+        assert_eq!(number(&raw, "SELECT COUNT(*) FROM projection"), 1);
+    }
+
+    #[test]
+    fn an_append_after_a_triggered_rollback_is_refused() {
+        let scratch = Scratch::new("append-after-rollback");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let outer = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON event
+             WHEN NEW.ordinal = 0
+             BEGIN SELECT RAISE(ROLLBACK, 'x'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let first = append(CommandId::new(), stream, Expected::At(outer.version()), 1);
+        let second = append(CommandId::new(), stream, Expected::At(outer.version()), 1);
+        let result = store.consume(consumer, &outer, |tx| {
+            let _ = tx.append(&first);
+            tx.append(&second)
+        });
+        assert!(
+            matches!(result, Err(Error::Aborted)),
+            "the append into the ended transaction is refused: {result:?}",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM commit_log"),
+            1,
+            "the rolled-back append left no commit row",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM inbox"),
+            0,
+            "the refused consume left no inbox row",
+        );
+
+        raw.execute_batch("DROP TRIGGER boom;").unwrap();
+        let retried = store
+            .append(&append(
+                CommandId::new(),
+                stream,
+                Expected::At(outer.version()),
+                1,
+            ))
+            .unwrap();
+        let Outcome::Committed(retried) = retried else {
+            panic!("the retry did not commit: {retried:?}");
+        };
+        assert_eq!(retried.version(), Version::new(2));
+    }
+
+    #[test]
+    fn a_projection_written_after_a_rollback_is_refused() {
+        let scratch = Scratch::new("projection-after-rollback");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let seeded = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON event
+             WHEN NEW.ordinal = 1
+             BEGIN SELECT RAISE(ROLLBACK, 'x'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let inner = append(CommandId::new(), stream, Expected::At(seeded.version()), 2);
+        let result = store.consume(consumer, &seeded, |tx| {
+            let _ = tx.append(&inner);
+            tx.put_projection(
+                consumer,
+                "turn",
+                seeded.events()[0].payload(),
+                seeded.position(),
+            )
+        });
+        assert!(
+            matches!(result, Err(Error::Aborted)),
+            "the second write is refused: {result:?}",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM projection"),
+            0,
+            "the projection never landed",
+        );
+    }
+
+    #[test]
+    fn a_dropped_inner_append_error_does_not_leave_a_torn_commit() {
+        let scratch = Scratch::new("torn-append");
+        let stream = StreamId::new();
+        let mut store = Store::open(&scratch.db()).unwrap();
+        let seeded = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        );
+        assert_eq!(seeded.version(), Version::new(1));
+
+        let raw = rusqlite::Connection::open(scratch.db()).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER refuse_second_event BEFORE INSERT ON event
+             WHEN NEW.ordinal = 1
+             BEGIN SELECT RAISE(ABORT, 'the second event is refused'); END;",
+        )
+        .unwrap();
+
+        let consumer = ConsumerId::new();
+        let inner = append(CommandId::new(), stream, Expected::At(Version::new(1)), 2);
+        let applied = store
+            .consume(consumer, &seeded, |tx| {
+                let _ = tx.append(&inner);
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(applied, Processed::Applied(())));
+
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM commit_log"),
+            1,
+            "the failed append left no commit row",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM event"),
+            1,
+            "the failed append left no event row",
+        );
+        assert_eq!(
+            number(&raw, "SELECT version FROM stream"),
+            1,
+            "the stream version did not move",
+        );
+        assert_eq!(
+            number(&raw, "SELECT COUNT(*) FROM outbox"),
+            0,
+            "the failed append left no outbox row",
+        );
+
+        let fresh = committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::At(Version::new(1)), 1),
+        );
+        assert_eq!(fresh.version(), Version::new(2));
+    }
+
+    #[test]
+    fn a_history_slice_agrees_with_itself_under_a_concurrent_writer() {
+        let scratch = Scratch::new("history-tear");
+        let stream = StreamId::new();
+        let stop = AtomicBool::new(false);
+
+        let mut writer = Store::open(&scratch.db()).unwrap();
+        let mut version = committed(
+            &mut writer,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        )
+        .version();
+        let reader = Store::open(&scratch.db()).unwrap();
+        let stop = &stop;
+
+        let (appends, reads, torn) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let mut count = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let append = append(CommandId::new(), stream, Expected::At(version), 1);
+                    let Outcome::Committed(commit) = writer.append(&append).unwrap() else {
+                        panic!("the writer conflicted with itself");
+                    };
+                    version = commit.version();
+                    count += 1;
+                }
+                count
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut reads = 0_usize;
+            let mut torn = None;
+            while torn.is_none() && Instant::now() < deadline {
+                let slice = reader.history(stream, Version::INITIAL, max(4096)).unwrap();
+                if let Some(last) = slice.commits().last()
+                    && slice.version() < last.version()
+                {
+                    torn = Some(format!(
+                        "slice version {} is behind commit {} over {} commits",
+                        slice.version().get(),
+                        last.version().get(),
+                        slice.commits().len(),
+                    ));
+                }
+                if let Some(event) = slice
+                    .events()
+                    .find(|event| event.version() >= slice.version())
+                {
+                    torn = Some(format!(
+                        "slice version {} hides event {}",
+                        slice.version().get(),
+                        event.version().get(),
+                    ));
+                }
+                reads += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+
+            (writer.join().unwrap(), reads, torn)
+        });
+
+        assert!(appends > 0, "the writer never committed");
+        assert!(reads > 0, "the reader never read");
+        if let Some(torn) = torn {
+            panic!("a history slice disagreed with itself: {torn}");
+        }
+    }
+}
