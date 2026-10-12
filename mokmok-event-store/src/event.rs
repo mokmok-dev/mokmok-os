@@ -160,7 +160,8 @@ impl Slice {
         }
     }
 
-    /// The stream's version after everything committed to it.
+    /// The stream's version after everything committed to it, read from the same snapshot as the
+    /// commits.
     #[must_use]
     pub const fn version(&self) -> Version {
         self.version

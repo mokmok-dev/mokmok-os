@@ -180,7 +180,14 @@ impl Store {
         from: Version,
         max: NonZeroUsize,
     ) -> Result<Slice, Error> {
-        history_in(&self.connection, stream, from, max)
+        // One snapshot for the version and the commits under it, so a writer that commits between
+        // two reads cannot hand back a slice that disagrees with itself.
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(Error::Query)?;
+
+        history_in(&transaction, stream, from, max)
     }
 
     /// Commits of the whole log at or after `from`, at most `max` commits, in position order.

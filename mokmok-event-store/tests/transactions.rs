@@ -4,7 +4,8 @@ use mokmok_event_store::{
 };
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 // The `cfg(test)` module is what tells the `allow-unwrap-in-tests`, `allow-expect-in-tests`, and
 // `allow-panic-in-tests` settings in `.clippy.toml` that this harness is test code.
@@ -438,5 +439,73 @@ mod tests {
             &append(CommandId::new(), stream, Expected::At(Version::new(1)), 1),
         );
         assert_eq!(fresh.version(), Version::new(2));
+    }
+
+    #[test]
+    fn a_history_slice_agrees_with_itself_under_a_concurrent_writer() {
+        let scratch = Scratch::new("history-tear");
+        let stream = StreamId::new();
+        let stop = AtomicBool::new(false);
+
+        let mut writer = Store::open(&scratch.db()).unwrap();
+        let mut version = committed(
+            &mut writer,
+            &append(CommandId::new(), stream, Expected::New, 1),
+        )
+        .version();
+        let reader = Store::open(&scratch.db()).unwrap();
+        let stop = &stop;
+
+        let (appends, reads, torn) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let mut count = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let append = append(CommandId::new(), stream, Expected::At(version), 1);
+                    let Outcome::Committed(commit) = writer.append(&append).unwrap() else {
+                        panic!("the writer conflicted with itself");
+                    };
+                    version = commit.version();
+                    count += 1;
+                }
+                count
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut reads = 0_usize;
+            let mut torn = None;
+            while torn.is_none() && Instant::now() < deadline {
+                let slice = reader.history(stream, Version::INITIAL, max(4096)).unwrap();
+                if let Some(last) = slice.commits().last()
+                    && slice.version() < last.version()
+                {
+                    torn = Some(format!(
+                        "slice version {} is behind commit {} over {} commits",
+                        slice.version().get(),
+                        last.version().get(),
+                        slice.commits().len(),
+                    ));
+                }
+                if let Some(event) = slice
+                    .events()
+                    .find(|event| event.version() >= slice.version())
+                {
+                    torn = Some(format!(
+                        "slice version {} hides event {}",
+                        slice.version().get(),
+                        event.version().get(),
+                    ));
+                }
+                reads += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+
+            (writer.join().unwrap(), reads, torn)
+        });
+
+        assert!(appends > 0, "the writer never committed");
+        assert!(reads > 0, "the reader never read");
+        if let Some(torn) = torn {
+            panic!("a history slice disagreed with itself: {torn}");
+        }
     }
 }
