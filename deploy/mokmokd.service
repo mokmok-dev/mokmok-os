@@ -1,0 +1,36 @@
+[Unit]
+Description=mokmok OS kernel daemon
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+# Do not add RestrictNamespaces=: mokmok-sandbox plans unshare(CLONE_NEWUSER | CLONE_NEWPID)
+# as its containment. ProtectHome=yes and ProtectSystem=strict are the same hazard for an
+# --allow-path under /home, which they make unreachable.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+Restart=always
+RestartSec=1s
+StateDirectory=mokmok
+RuntimeDirectory=mokmok
+NoNewPrivileges=yes
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+ExecStart=@mokmokd@ --data-dir %S/mokmok serve --socket %t/mokmok/bus.sock
+
+[Install]
+WantedBy=default.target
