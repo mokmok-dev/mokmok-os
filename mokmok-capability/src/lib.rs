@@ -27,7 +27,7 @@
 //! otherwise a grant issued before the revocation would carry revoked authority forward.
 //!
 //! This crate decides; it does not enforce. Whether a decision is consulted before an operation
-//! happens, and whether the approver is entitled to approve, belong to the caller.
+//! happens belongs to the caller.
 //!
 //! # Examples
 //!

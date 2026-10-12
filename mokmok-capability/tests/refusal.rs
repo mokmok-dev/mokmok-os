@@ -92,6 +92,7 @@ mod tests {
         let Decision::Approve(requirement) = authority.decide(&invoke(approved_in), NOW) else {
             panic!("the approval rule should have asked for one");
         };
+        let _ = authority.root(agent(1), read(), NOW);
         let _bound = authority.approve(&requirement, principal(1), NOW).unwrap();
         let root = authority.root(
             agent(2),

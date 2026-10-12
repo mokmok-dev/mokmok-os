@@ -178,18 +178,36 @@ mod tests {
         args
     }
 
-    fn run(args: &[String]) -> Ran {
-        let output = Command::new(binary())
-            .args(args)
-            .output()
-            .expect("the binary runs");
-
+    fn ran(output: &std::process::Output) -> Ran {
         Ran {
             ok: output.status.success(),
             code: output.status.code(),
             out: String::from_utf8_lossy(&output.stdout).into_owned(),
             err: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
+    }
+
+    fn run(args: &[String]) -> Ran {
+        // `config::crash` honours `--crash-after` only under `MOKMOKD_CRASH=1`, so the harness that
+        // passes the flag sets it; the invocations that never pass the flag ignore it.
+        let output = Command::new(binary())
+            .env("MOKMOKD_CRASH", "1")
+            .args(args)
+            .output()
+            .expect("the binary runs");
+
+        ran(&output)
+    }
+
+    /// Runs the binary as a caller that did not mean to crash the daemon does: with the crash knob
+    /// left locked.
+    fn run_locked(args: &[String]) -> Ran {
+        let output = Command::new(binary())
+            .args(args)
+            .output()
+            .expect("the binary runs");
+
+        ran(&output)
     }
 
     fn status(scratch: &Scratch) -> Ran {
@@ -214,12 +232,13 @@ mod tests {
         run(&args)
     }
 
-    /// One `submit` that writes `hello` into `out.txt` in the workload's own workspace.
-    fn submit(
+    /// The arguments of one `submit` that writes `hello` into `out.txt` in the workload's own
+    /// workspace.
+    fn submit_args(
         scratch: &Scratch,
         key: &str,
         extra: &[&str],
-    ) -> Ran {
+    ) -> Vec<String> {
         let mut args = base(scratch, true);
         args.extend([
             "submit".to_owned(),
@@ -240,7 +259,15 @@ mod tests {
         ]);
         args.extend(extra.iter().map(|value| (*value).to_owned()));
 
-        run(&args)
+        args
+    }
+
+    fn submit(
+        scratch: &Scratch,
+        key: &str,
+        extra: &[&str],
+    ) -> Ran {
+        run(&submit_args(scratch, key, extra))
     }
 
     #[test]
@@ -473,6 +500,26 @@ mod tests {
             "{}",
             again.out,
         );
+    }
+
+    #[test]
+    fn the_crash_knob_stays_shut_without_the_deliberate_signal() {
+        let scratch = Scratch::new("no-crash-signal");
+
+        let completed = run_locked(&submit_args(
+            &scratch,
+            KEY_A,
+            &["--crash-after", "before-dispatch"],
+        ));
+
+        assert_eq!(
+            completed.code,
+            Some(0),
+            "{}\n{}",
+            completed.out,
+            completed.err,
+        );
+        assert_eq!(completed.value("phase").as_deref(), Some("Accepting"));
     }
 
     /// The serving kernel, stopped when the test drops it.

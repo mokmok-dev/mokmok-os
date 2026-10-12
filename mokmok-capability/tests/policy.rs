@@ -265,6 +265,7 @@ mod tests {
         let Decision::Approve(requirement) = decision else {
             panic!("the approval rule should have spoken, got {decision:?}");
         };
+        let _ = authority.root(agent(2), read(data.clone()), NOW);
         let grant = authority.approve(&requirement, principal(2), NOW).unwrap();
 
         assert_eq!(

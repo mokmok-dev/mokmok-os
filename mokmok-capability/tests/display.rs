@@ -131,6 +131,10 @@ mod tests {
             "a principal cannot approve the authority it requests",
         );
         assert_eq!(
+            ApprovalError::UnknownApprover.to_string(),
+            "the approver is not a principal this authority holds",
+        );
+        assert_eq!(
             ApprovalError::RequirementExpired.to_string(),
             "the approval window has already closed",
         );
