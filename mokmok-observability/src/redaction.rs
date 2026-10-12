@@ -169,4 +169,32 @@ mod tests {
             0,
         );
     }
+
+    #[test]
+    fn a_rule_reports_the_pattern_and_replacement_it_was_built_with() {
+        let rule = Rule::replacing("hunter2", "***");
+
+        assert_eq!(rule.pattern(), "hunter2");
+        assert_eq!(rule.replacement(), "***");
+    }
+
+    #[test]
+    fn a_redaction_keeps_the_rules_it_was_passed_in_order_and_applies_them() {
+        let rules = vec![Rule::replacing("alpha", "A"), Rule::replacing("beta", "B")];
+        let redaction = Redaction::from_rules(rules.clone()).unwrap();
+
+        assert_eq!(redaction.rules(), rules.as_slice());
+        assert_eq!(redaction.apply("alpha beta gamma").as_ref(), "A B gamma");
+    }
+
+    #[test]
+    fn the_rejection_names_the_position_the_empty_pattern_held_in_the_list() {
+        let rejected = Redaction::from_rules(vec![
+            Rule::new("hunter2"),
+            Rule::new("swordfish"),
+            Rule::new(""),
+        ]);
+
+        assert_eq!(rejected.unwrap_err().index(), 2);
+    }
 }

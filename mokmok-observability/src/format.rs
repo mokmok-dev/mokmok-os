@@ -132,4 +132,35 @@ mod tests {
         assert!(line.contains(r#""presented":"[redacted]""#));
         assert!(!line.contains("hunter2"));
     }
+
+    #[test]
+    fn a_value_written_through_the_debug_sigil_is_redacted_before_it_is_written() {
+        let capture = Capture::new();
+        let redaction = Redaction::from_rules(vec![Rule::new("hunter2")]).unwrap();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .with_writer(capture.clone())
+                .event_format(RedactingFormat::new(redaction)),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(presented = ?Presented, "login");
+        });
+
+        let line = String::from_utf8(capture.bytes()).unwrap();
+
+        assert!(line.contains(r#""presented":"[redacted]""#));
+        assert!(!line.contains("hunter2"));
+    }
+
+    struct Presented;
+
+    impl std::fmt::Debug for Presented {
+        fn fmt(
+            &self,
+            formatter: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            formatter.write_str("hunter2")
+        }
+    }
 }
