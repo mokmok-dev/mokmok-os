@@ -120,6 +120,21 @@ fn rules_admit_only_what_they_permit() {
 }
 
 #[test]
+fn a_repeated_permit_or_forbid_leaves_the_rule_unchanged() {
+    assert!(
+        Rules::public_only()
+            .permit(AddressClass::Public)
+            .allows(AddressClass::Public)
+    );
+    assert!(
+        !Rules::public_only()
+            .forbid(AddressClass::Public)
+            .forbid(AddressClass::Public)
+            .allows(AddressClass::Public)
+    );
+}
+
+#[test]
 fn validation_keeps_only_the_addresses_the_rules_admit() {
     let destination = parse_connect("CONNECT example.com:443 HTTP/1.1").unwrap();
     let public = SocketAddr::from((PUBLIC, 443));
