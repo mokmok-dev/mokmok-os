@@ -15,6 +15,7 @@ mod config;
 mod db;
 mod error;
 mod execution;
+mod notify;
 mod recovery;
 mod serve;
 mod slice;
