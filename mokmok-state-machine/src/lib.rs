@@ -4,7 +4,7 @@
 //! socket, and [`Session`] carries no serialization: the log of [`Fact`]s is the only durable form
 //! and [`Session::replay`] is the only way back to the state a driving path held.
 //!
-//! Five properties hold, each enforced by a rule in [`Session::apply`]:
+//! Six properties hold, each enforced by a rule in [`Session::apply`]:
 //!
 //! - **A terminal session admits no fact that extends it.** Once the phase is [`Phase::Closed`], a
 //!   new [`Fact::ExecutionLaunched`] is a [`Rejection::SessionOver`], a [`Fact::CancelRequested`]
@@ -30,6 +30,12 @@
 //! - **Replay reconstructs the driven state.** [`Session::replay`] runs the same [`Session::apply`]
 //!   the driving path runs, fact by fact, and stops at the first refusal naming the offset into the
 //!   log, so the two paths cannot drift.
+//! - **An unknown outcome settles without a result.** [`Resolution::Unknown`] records that the
+//!   executor could not prove what it did. It leaves the execution like any other settlement, so a
+//!   session holding one reaches [`Ending::Completed`] under the ordinary close rule, but it never
+//!   becomes [`State::Applied`]: a [`Fact::ResultApplied`] for it is [`Rejection::NoResult`], so no
+//!   caller can claim an outcome that was never proven. Reconciliation is the caller's duty, and
+//!   the unknown stays visible in the session's state until it happens.
 //!
 //! # Examples
 //!
