@@ -378,3 +378,63 @@ fn a_snapshot_with_no_next_job_id_is_refused() {
     assert_eq!(refused.message(), "the next job id is never zero");
     assert_eq!(scheduler.add(Schedule::Once(START), START).value(), 1,);
 }
+
+#[test]
+fn each_add_mints_the_next_id() {
+    let mut scheduler = scheduler();
+
+    let first = scheduler.add(Schedule::Once(START), START);
+    let second = scheduler.add(Schedule::Once(START), START);
+
+    assert_eq!(first.value(), 1);
+    assert_eq!(second.value(), 2);
+}
+
+#[test]
+fn only_a_succeeded_or_dead_job_is_terminal() {
+    let mut scheduler = scheduler();
+
+    let pending = scheduler.add(Schedule::Once(Moment::from_millis(500_000)), START);
+    let leased = scheduler.add(Schedule::Once(START), START);
+    scheduler
+        .claim(leased, worker(1), TTL, START)
+        .expect("the job is due at its instant");
+    let succeeded = scheduler.add(Schedule::Once(START), START);
+    let lease = scheduler
+        .claim(succeeded, worker(1), TTL, START)
+        .expect("the job is due at its instant");
+    scheduler
+        .settle(&lease, Outcome::Succeeded, START)
+        .expect("the holder settles its own lease");
+    let failed = scheduler.add(Schedule::Once(START), START);
+    let lease = scheduler
+        .claim(failed, worker(1), TTL, START)
+        .expect("the job is due at its instant");
+    scheduler
+        .settle(&lease, Outcome::Failed, START)
+        .expect("the holder settles its own lease");
+    let dead = scheduler.add(Schedule::Once(START), START);
+    let mut at = START;
+    for _ in 0..3 {
+        let lease = scheduler
+            .claim(dead, worker(1), TTL, at)
+            .expect("the job is due at its instant or retry");
+        scheduler
+            .settle(&lease, Outcome::Failed, at)
+            .expect("the holder settles its own lease");
+        if let Some(next) = scheduler.job(dead).and_then(|job| job.next_at()) {
+            at = next;
+        }
+    }
+
+    let states = [pending, leased, succeeded, failed, dead].map(|id| {
+        scheduler
+            .job(id)
+            .expect("the job was added to this scheduler")
+            .state()
+    });
+    assert_eq!(
+        states.map(JobState::is_terminal),
+        [false, false, true, false, true],
+    );
+}
