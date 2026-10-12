@@ -10,11 +10,25 @@
 
   outputs =
     inputs:
+    let
+      # The published module. `inputs.self` is this flake's outputs, so the package default is the
+      # one this flake builds for the evaluated system.
+      nixosModule =
+        { lib, pkgs, ... }:
+        {
+          imports = [ ./deploy/nixos-module.nix ];
+          services.mokmokd.package =
+            lib.mkDefault
+              inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+    in
     inputs.flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         inputs.git-hooks.flakeModule
         inputs.treefmt-nix.flakeModule
       ];
+
+      flake.nixosModules.default = nixosModule;
 
       perSystem =
         {
@@ -108,6 +122,33 @@
                 install -d $out/bin
                 ln -s ${mokmokd}/bin/mokmokd $out/bin/mokmokd
                 ln -s ${mokmokd}/bin/mokmok-sandbox-confine $out/bin/mokmok-sandbox-confine
+              '';
+
+            nixosModule =
+              let
+                rendered = inputs.nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    nixosModule
+                    ./deploy/nixos-example.nix
+                  ];
+                };
+                # nixpkgs renders a service into `systemd.units`; `services.<name>` has no `unit`
+                # attribute in this nixpkgs.
+                unit = rendered.config.systemd.units."mokmokd.service".text;
+              in
+              pkgs.runCommand "mokmokd-nixos-unit" { } ''
+                install -Dm644 ${pkgs.writeText "mokmokd.service" unit} $out/mokmokd.service
+
+                grep -qF 'Type=notify' $out/mokmokd.service
+                grep -qF 'WatchdogSec=30s' $out/mokmokd.service
+                grep -qF 'Restart=always' $out/mokmokd.service
+                grep -qF 'StateDirectory=mokmokd' $out/mokmokd.service
+                grep -qF 'RuntimeDirectory=mokmokd' $out/mokmokd.service
+                grep -qF 'NoNewPrivileges=true' $out/mokmokd.service
+                grep -qF 'ExecStart=' $out/mokmokd.service
+                grep -qF -- '--allow-tool /bin/sh' $out/mokmokd.service
+                grep -qE '^ExecStart=.*serve --socket %t/mokmokd/bus\.sock$' $out/mokmokd.service
               '';
           };
 
