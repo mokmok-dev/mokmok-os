@@ -10,16 +10,16 @@
 //! concurrent writers: the caller serializes on the store, and the dedup row keyed on the command
 //! id is what makes a retried command a replay rather than a second execution.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
 use mokmok_event_store::{
-    Append, CommandId, Expected, Kind, NewEvent, OutboxMessage, Outcome, Payload, Store, StreamId,
-    Version,
+    Append, CommandId, CommitPosition, Expected, Kind, NewEvent, OutboxMessage, Outcome, Payload,
+    Store, StreamId, Version,
 };
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
-use mokmok_state_machine::{Fact, Session, Turn, TurnFact};
+use mokmok_state_machine::{Fact, Session, State, Turn, TurnFact};
 
 use crate::error::Error;
 use crate::execution::ExecutionResult;
@@ -322,6 +322,57 @@ impl Db {
                 from = committed.version();
             }
         }
+    }
+
+    /// The sessions whose log still holds an execution with no recorded outcome.
+    ///
+    /// Every event carries the stream that owns it, and a session's stream is its id, so the commit
+    /// log is already the index of sessions: one read over it reaches every one without a registry
+    /// to consult. A session with no outcome for an execution folds to [`State::InFlight`], which
+    /// is the state recovery exists to settle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the log cannot be read, [`Error::Payload`] for a session fact
+    /// that is not the record its kind names, and [`Error::Rejected`] when a session's facts do not
+    /// replay.
+    pub(crate) fn unsettled_sessions(&self) -> Result<Vec<SessionID>, Error> {
+        let session_fact = named(SESSION_FACT)?;
+        let mut facts: BTreeMap<StreamId, Vec<Fact>> = BTreeMap::new();
+        let mut from = CommitPosition::FIRST;
+
+        loop {
+            let commits = self.store.log(from, PAGE)?;
+            let Some(last) = commits.last() else {
+                break;
+            };
+
+            for committed in &commits {
+                for event in committed.events() {
+                    if *event.kind() == session_fact {
+                        facts
+                            .entry(event.stream())
+                            .or_default()
+                            .push(event.payload().decode()?);
+                    }
+                }
+            }
+
+            from = last.position().next();
+        }
+
+        let mut unsettled = Vec::new();
+        for (stream, held) in facts {
+            let session = SessionID::from_uuid(stream.as_uuid());
+            if Session::replay(session, &held)?
+                .executions()
+                .any(|(_, execution)| execution.state() == State::InFlight)
+            {
+                unsettled.push(session);
+            }
+        }
+
+        Ok(unsettled)
     }
 
     /// How many notices are waiting for the relay.
@@ -627,5 +678,103 @@ mod tests {
             db.log(session()),
             Err(crate::error::Error::UnexpectedEntry { .. }),
         ));
+    }
+
+    #[test]
+    fn only_a_session_with_an_execution_still_in_flight_is_unsettled() {
+        let scratch = Scratch::new("unsettled");
+        let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
+        let done = SessionID::from_uuid(Uuid::from_u128(0x10));
+        let done_turn = TurnID::from_uuid(Uuid::from_u128(0x20));
+        let done_execution = ExecutionID::from_uuid(Uuid::from_u128(0x30));
+
+        db.append(
+            CommandId::new(),
+            Db::stream(session()),
+            Expected::New,
+            &[
+                Entry::Session(Fact::SessionOpened),
+                Entry::Session(Fact::ExecutionLaunched {
+                    execution: execution(),
+                    deadline: mokmok_state_machine::Deadline::Bounded,
+                }),
+                Entry::Turn(
+                    turn(),
+                    TurnFact::TurnOpened {
+                        number: TurnNumber::new(1),
+                    },
+                ),
+                Entry::Turn(
+                    turn(),
+                    TurnFact::ModelRequested {
+                        attempt: mokmok_state_machine::Attempt::new(1),
+                    },
+                ),
+                Entry::Turn(turn(), TurnFact::ModelAnswered),
+                Entry::Turn(
+                    turn(),
+                    TurnFact::ToolRequested {
+                        execution: execution(),
+                        deadline: mokmok_state_machine::Deadline::Bounded,
+                    },
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        db.append(
+            CommandId::new(),
+            Db::stream(done),
+            Expected::New,
+            &[
+                Entry::Session(Fact::SessionOpened),
+                Entry::Session(Fact::ExecutionLaunched {
+                    execution: done_execution,
+                    deadline: mokmok_state_machine::Deadline::Bounded,
+                }),
+                Entry::Session(Fact::ExecutionSettled {
+                    execution: done_execution,
+                    resolution: Resolution::Unknown,
+                }),
+                Entry::Turn(
+                    done_turn,
+                    TurnFact::TurnOpened {
+                        number: TurnNumber::new(1),
+                    },
+                ),
+                Entry::Turn(
+                    done_turn,
+                    TurnFact::ModelRequested {
+                        attempt: mokmok_state_machine::Attempt::new(1),
+                    },
+                ),
+                Entry::Turn(done_turn, TurnFact::ModelAnswered),
+                Entry::Turn(
+                    done_turn,
+                    TurnFact::ToolRequested {
+                        execution: done_execution,
+                        deadline: mokmok_state_machine::Deadline::Bounded,
+                    },
+                ),
+                Entry::Turn(
+                    done_turn,
+                    TurnFact::ToolResolved {
+                        execution: done_execution,
+                        resolution: Resolution::Unknown,
+                    },
+                ),
+                Entry::Turn(
+                    done_turn,
+                    TurnFact::TurnSettled {
+                        outcome: TurnOutcome::Failed,
+                    },
+                ),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(db.unsettled_sessions().unwrap(), vec![session()]);
     }
 }

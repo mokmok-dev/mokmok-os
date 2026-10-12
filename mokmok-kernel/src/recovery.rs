@@ -100,6 +100,31 @@ pub fn recover(
     Ok(recovered)
 }
 
+/// Records the unknown outcome for every execution the log left unsettled, across every session.
+///
+/// The daemon runs this before it can report readiness, so a dependent that starts after this unit
+/// never reads a log a crash left with an execution that has no outcome. It drives the same
+/// [`recover`] a caller reaches one session at a time through `reconcile`.
+///
+/// # Errors
+///
+/// As [`recover`], plus the errors of [`Db::unsettled_sessions`].
+pub fn recover_unsettled(
+    db: &mut Db,
+    at: Moment,
+) -> Result<Vec<(SessionID, ExecutionID)>, Error> {
+    let mut recovered = Vec::new();
+
+    for session in db.unsettled_sessions()? {
+        let log = db.log(session)?;
+        for execution in recover(db, &log, session, at)? {
+            recovered.push((session, execution));
+        }
+    }
+
+    Ok(recovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::recover;

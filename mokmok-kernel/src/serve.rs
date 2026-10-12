@@ -15,6 +15,7 @@ use mokmok_event_bus::{
     Config as BusConfig, Payload, Publisher, ServeError, Topic, serve as serve_bus, signals,
 };
 use mokmok_observability::{Config as LogConfig, Redaction, init};
+use mokmok_protocol::Moment;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -23,6 +24,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::error::Error;
 use crate::notify::{Cadence, Message, Notifier};
+use crate::recovery;
 
 /// How long the loop waits for the bus to answer a session before giving up.
 const BIND: Duration = Duration::from_secs(5);
@@ -129,8 +131,12 @@ impl Relay {
 /// Serves the bus on `socket` and relays what the log has committed.
 ///
 /// With `once`, it drains the outbox as it stands and returns the number of notices the bus
-/// acknowledged. Otherwise it serves until the process is told to stop, reporting readiness once
-/// the bus answers and the outbox has drained, and returning the notices acknowledged over the run.
+/// acknowledged. Otherwise it records the unknown outcome for every execution a crash left
+/// unsettled, then serves until the process is told to stop, reporting readiness once the bus
+/// answers and the outbox has drained, and returning the notices acknowledged over the run.
+///
+/// `at` is the instant recovery stamps its notices with. Only the daemon path uses it: `--once`
+/// neither recovers nor reports readiness.
 ///
 /// # Errors
 ///
@@ -141,6 +147,7 @@ pub async fn serve(
     config: &Config,
     socket: &Path,
     once: bool,
+    at: Moment,
 ) -> Result<usize, Error> {
     let bus = BusConfig {
         path: socket.to_path_buf(),
@@ -160,12 +167,13 @@ pub async fn serve(
         return relay.once(&mut db).await;
     }
 
-    serve_until_stopped(config, bus).await
+    serve_until_stopped(config, bus, at).await
 }
 
 async fn serve_until_stopped(
     config: &Config,
     bus: BusConfig,
+    at: Moment,
 ) -> Result<usize, Error> {
     // Failing to install is reported and then ignored, because a process that cannot log still
     // has to serve.
@@ -194,6 +202,16 @@ async fn serve_until_stopped(
 
     let mut relay = Relay::new(&socket);
     let mut db = Db::open(&config.events)?;
+    // Required recovery runs before the loop can reach the branch that reports ready, so a
+    // dependent ordered after this unit never meets a log a crash left with an execution that has
+    // no outcome.
+    for (session, execution) in recovery::recover_unsettled(&mut db, at)? {
+        eprintln!(
+            "mokmokd: recovered session={} execution={} resolution=Unknown",
+            session.as_uuid(),
+            execution.as_uuid(),
+        );
+    }
     let notifier = Notifier::from_env()?;
     // The first tick waits a whole interval, so the bus has bound before the first pass rather
     // than failing on the rows a previous process left pending.
@@ -281,7 +299,6 @@ fn install_logging() {
         eprintln!("mokmokd: the log subscriber was not installed: {error}");
     }
 }
-
 async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
     let deadline = Instant::now() + BIND;
 

@@ -11,8 +11,12 @@
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use mokmok_event_bus::{Subscriber, SubscriberId, Topic};
 
@@ -696,6 +700,170 @@ mod tests {
         assert!(
             notices.iter().any(|notice| notice.contains("finished")),
             "the settlement notice names the outcome: {notices:#?}",
+        );
+    }
+
+    /// The daemon's standard error, read line by line off the pipe so a test can wait on it.
+    struct Reports(mpsc::Receiver<String>);
+
+    impl Reports {
+        fn of(child: &mut Child) -> Self {
+            let stderr = child.stderr.take().expect("the daemon's stderr is piped");
+            let (send, receive) = mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    if send.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            Self(receive)
+        }
+
+        /// The daemon's first line naming `needle`, or a panic when none arrives in `bound`.
+        fn wait_for(
+            &self,
+            needle: &str,
+            bound: Duration,
+        ) -> String {
+            let deadline = Instant::now() + bound;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.0.recv_timeout(left) {
+                    Ok(line) if line.contains(needle) => return line,
+                    Ok(_) => {},
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("no stderr line naming {needle:?} within {bound:?}");
+                    },
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("the daemon stopped before naming {needle:?}");
+                    },
+                }
+            }
+        }
+    }
+
+    /// The execution the log left with no outcome, read out of a report of it.
+    fn in_flight(report: &Ran) -> String {
+        report
+            .out
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("execution=")?
+                    .strip_suffix(" state=InFlight")
+            })
+            .expect("an execution is in flight")
+            .to_owned()
+    }
+
+    #[test]
+    fn the_daemon_records_the_unknown_outcome_of_an_execution_a_crash_left_unsettled() {
+        let scratch = Scratch::new("daemon-recovery");
+        let crashed = submit(
+            &scratch,
+            KEY_CRASH_LATE,
+            &["--crash-after", "after-dispatch"],
+        );
+        assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
+
+        let execution = in_flight(&status(&scratch));
+
+        let socket = scratch.0.join("bus.sock");
+        let mut child = Command::new(binary())
+            .args(base(&scratch, true))
+            .args([
+                "serve".to_owned(),
+                "--socket".to_owned(),
+                socket.display().to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the daemon starts");
+        let reports = Reports::of(&mut child);
+
+        assert_eq!(
+            reports.wait_for(&execution, Duration::from_secs(5)),
+            format!(
+                "mokmokd: recovered session={SESSION} execution={execution} resolution=Unknown"
+            ),
+            "the daemon names the execution recovery settled",
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let after = status(&scratch);
+        assert!(
+            after
+                .out
+                .contains(&format!("execution={execution} state=Settled(Unknown)")),
+            "the daemon recorded the unknown outcome instead of leaving it pending:\n{}",
+            after.out,
+        );
+        assert!(
+            !after.out.contains("state=InFlight"),
+            "nothing was left in flight:\n{}",
+            after.out,
+        );
+    }
+
+    #[test]
+    fn recovery_completes_before_the_daemon_can_report_ready() {
+        let scratch = Scratch::new("recovery-before-ready");
+        let crashed = submit(
+            &scratch,
+            KEY_CRASH_LATE,
+            &["--crash-after", "after-dispatch"],
+        );
+        assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
+
+        let execution = in_flight(&status(&scratch));
+
+        // A live peer holds the socket and answers nothing, so this daemon never binds its bus and
+        // never reaches the branch that reports ready. Recovery still runs, and that is the
+        // ordering evidence: recovery at or after that branch would run no code here at all.
+        let listener = UnixListener::bind(scratch.0.join("bus.sock")).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+
+        let mut args = base(&scratch, true);
+        args.extend([
+            "serve".to_owned(),
+            "--socket".to_owned(),
+            scratch.0.join("bus.sock").display().to_string(),
+        ]);
+        let refused = run_locked(&args);
+
+        assert_eq!(refused.code, Some(1), "{}\n{}", refused.out, refused.err);
+        assert!(
+            refused.err.contains("already serving"),
+            "the held socket kept the daemon from ever becoming ready:\n{}",
+            refused.err,
+        );
+        assert!(
+            refused.err.contains(&format!(
+                "mokmokd: recovered session={SESSION} execution={execution} resolution=Unknown"
+            )),
+            "recovery ran although readiness was never reachable:\n{}",
+            refused.err,
+        );
+
+        let after = status(&scratch);
+        assert!(
+            after
+                .out
+                .contains(&format!("execution={execution} state=Settled(Unknown)")),
+            "the durable unknown outcome is there although the daemon never served:\n{}",
+            after.out,
         );
     }
 

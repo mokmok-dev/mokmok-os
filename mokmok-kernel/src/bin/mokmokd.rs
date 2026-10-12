@@ -47,7 +47,7 @@ async fn run(args: Args) -> Result<(), Error> {
         },
         Command::Serve { socket, once } => {
             let socket = socket.clone().unwrap_or_else(|| config.socket());
-            let published = serve(&config, &socket, *once).await?;
+            let published = serve(&config, &socket, *once, at).await?;
             println!("published={published} socket={}", socket.display());
         },
     }
