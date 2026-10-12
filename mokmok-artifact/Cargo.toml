@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+uuid = { workspace = true, features = ["std", "v7"] }
 
 [lints]
 workspace = true
