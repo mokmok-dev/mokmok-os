@@ -1,0 +1,617 @@
+//! The bytes the model is handed: a system prompt, and the settled turns it may see.
+
+use crate::dialogue::Transcript;
+use crate::task::Task;
+use crate::tool::clip;
+use mokmok_state_machine::TurnNumber;
+
+/// The canonical prompt content for one model call.
+///
+/// It carries no attempt number, step id, or clock, so a re-ask after a crash rebuilds byte-for-byte
+/// the content the first attempt sent.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Context {
+    pub system: String,
+    pub turns: Vec<ContextTurn>,
+}
+
+/// One settled turn as the model sees it: the command and its observation.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ContextTurn {
+    pub number: TurnNumber,
+    pub command: String,
+    pub observation: String,
+}
+
+impl Context {
+    /// How many bytes this context spends, the measure [`Budget::context_bytes`] caps.
+    ///
+    /// [`Budget::context_bytes`]: crate::task::Budget::context_bytes
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.system.len()
+            + self
+                .turns
+                .iter()
+                .map(|turn| turn.command.len() + turn.observation.len() + 8)
+                .sum::<usize>()
+    }
+}
+
+/// The facts the model cannot infer, and the goal it was asked to reach.
+#[must_use]
+pub fn system_prompt(task: &Task) -> String {
+    format!(
+        "You are a coding agent working in a scratch checkout.\n\
+         Goal: {goal}\n\
+         You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n\
+         The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
+         There is no TCP network. Reach the checkout by absolute path, for example \
+         `cd {checkout} && ...`.\n\
+         The checkout grants allow what a command can reach: readable and executable paths are \
+         {readable}; writable paths are {writable}. A command that reaches outside them is refused \
+         rather than run, so work inside the grants.\n\
+         When the goal is met, answer without calling the tool.",
+        goal = task.goal,
+        checkout = task.setting.checkout.display(),
+        readable = paths(&task.setting.readable),
+        writable = paths(&task.setting.writable),
+    )
+}
+
+/// Names the call record a recovery never wrote, so a settled turn is shown rather than dropped.
+const MISSING_COMMAND: &str = "(the command was not recorded)";
+
+/// The prompt content for the next model call, built from the fold.
+///
+/// Only settled turns appear, so the turn currently in flight contributes nothing and an attempt
+/// repeated under a new number rebuilds the same bytes. A settled turn is rendered even without a
+/// call record, so a recovery settlement still carries the unproven-outcome warning into the next
+/// prompt. The newest
+/// [`Budget::context_turns`](crate::task::Budget::context_turns) are kept, clipped to
+/// [`Budget::observation_bytes`](crate::task::Budget::observation_bytes), and the oldest are
+/// dropped until the whole context fits [`Budget::context_bytes`](crate::task::Budget::context_bytes).
+#[must_use]
+pub fn context(transcript: &Transcript) -> Context {
+    let Some(task) = transcript.task.as_ref() else {
+        return Context {
+            system: String::new(),
+            turns: Vec::new(),
+        };
+    };
+
+    let mut turns: Vec<ContextTurn> = transcript
+        .turns_in_order()
+        .into_iter()
+        .filter(|(_, state)| state.outcome().is_some())
+        .map(|(turn, state)| {
+            let command = transcript
+                .call_of(turn)
+                .map_or_else(|| MISSING_COMMAND.to_owned(), |call| call.command.clone());
+            let observation = transcript
+                .observation(turn)
+                .map_or_else(String::new, |text| {
+                    clip(text.as_bytes(), bytes_of(task.budget.observation_bytes))
+                });
+            ContextTurn {
+                number: state.number().unwrap_or(TurnNumber::new(0)),
+                command,
+                observation,
+            }
+        })
+        .collect();
+
+    keep_newest(&mut turns, task.budget.context_turns as usize);
+
+    let mut context = Context {
+        system: system_prompt(task),
+        turns,
+    };
+    while context.bytes() > bytes_of(task.budget.context_bytes) && !context.turns.is_empty() {
+        context.turns.remove(0);
+    }
+
+    context
+}
+
+/// A byte budget as a `usize`, treating zero as "no limit".
+fn bytes_of(limit: u64) -> usize {
+    if limit == 0 {
+        usize::MAX
+    } else {
+        usize::try_from(limit).unwrap_or(usize::MAX)
+    }
+}
+
+fn keep_newest(
+    turns: &mut Vec<ContextTurn>,
+    keep: usize,
+) {
+    if keep != 0 && turns.len() > keep {
+        turns.drain(..turns.len() - keep);
+    }
+}
+
+fn paths(granted: &[std::path::PathBuf]) -> String {
+    if granted.is_empty() {
+        return "none".to_owned();
+    }
+
+    granted
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Context, ContextTurn, MISSING_COMMAND, bytes_of, context, keep_newest, paths, system_prompt,
+    };
+    use crate::dialogue::Transcript;
+    use crate::model::Action;
+    use crate::record::{CallRecord, Record};
+    use crate::test_support::{
+        act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
+        begin_records, execution_id, open_records, session, task, turn_id,
+    };
+    use crate::tool::{Exit, ToolReport, UNKNOWN_WARNING, observation};
+    use mokmok_protocol::{ExecutionID, TurnID};
+    use mokmok_state_machine::{
+        Attempt, Deadline, Fact, Resolution, TurnFact, TurnNumber, TurnOutcome,
+    };
+
+    fn turn_of(number: u64) -> ContextTurn {
+        ContextTurn {
+            number: TurnNumber::new(number),
+            command: format!("command-{number}"),
+            observation: format!("observation-{number}"),
+        }
+    }
+
+    /// A transcript with `count` settled turns, each showing a distinct command.
+    fn settled_turns(
+        task: &crate::task::Task,
+        count: u64,
+    ) -> Transcript {
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(task));
+        for number in 1..=count {
+            let turn = turn_id(number);
+            let execution = execution_id(turn);
+            let command = format!("command-{number}");
+            apply_all(&mut transcript, &open_records(turn, number, 1));
+            apply_all(
+                &mut transcript,
+                &answer_records(
+                    turn,
+                    1,
+                    Action::Command {
+                        command: command.clone(),
+                    },
+                ),
+            );
+            apply_all(
+                &mut transcript,
+                &act_intent_records(turn, execution, &command),
+            );
+            apply_all(
+                &mut transcript,
+                &act_outcome_records(turn, execution, Exit::Finished { code: 0 }, &[]),
+            );
+        }
+        transcript
+    }
+
+    /// The facts recovery writes for one interrupted execution, and nothing else.
+    fn recovery_facts(
+        turn: TurnID,
+        execution: ExecutionID,
+    ) -> Vec<Record> {
+        vec![
+            Record::Session {
+                fact: Fact::ExecutionSettled {
+                    execution,
+                    resolution: Resolution::Unknown,
+                },
+            },
+            Record::Turn {
+                turn,
+                fact: TurnFact::ToolResolved {
+                    execution,
+                    resolution: Resolution::Unknown,
+                },
+            },
+            Record::Turn {
+                turn,
+                fact: TurnFact::TurnSettled {
+                    outcome: TurnOutcome::Failed,
+                },
+            },
+        ]
+    }
+
+    /// The turn facts a crash leaves in flight, so a call names a requested execution.
+    fn in_flight_turn(
+        turn: TurnID,
+        execution: ExecutionID,
+    ) -> Vec<Record> {
+        vec![
+            Record::Turn {
+                turn,
+                fact: TurnFact::TurnOpened {
+                    number: TurnNumber::new(1),
+                },
+            },
+            Record::Turn {
+                turn,
+                fact: TurnFact::ModelRequested {
+                    attempt: Attempt::new(1),
+                },
+            },
+            Record::Turn {
+                turn,
+                fact: TurnFact::ModelAnswered,
+            },
+            Record::Session {
+                fact: Fact::ExecutionLaunched {
+                    execution,
+                    deadline: Deadline::Bounded,
+                },
+            },
+            Record::Turn {
+                turn,
+                fact: TurnFact::ToolRequested {
+                    execution,
+                    deadline: Deadline::Bounded,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn an_unknown_outcome_renders_the_warning() {
+        assert_eq!(observation(Resolution::Unknown, &[], &[]), UNKNOWN_WARNING);
+    }
+
+    #[test]
+    fn context_bytes_counts_the_system_and_every_turn() {
+        let built = Context {
+            system: "s".to_owned(),
+            turns: vec![turn_of(1)],
+        };
+
+        assert_eq!(
+            built.bytes(),
+            1 + ("command-1".len() + "observation-1".len() + 8)
+        );
+    }
+
+    #[test]
+    fn the_system_prompt_states_the_goal_the_grants_and_the_limits() {
+        let prompt = system_prompt(&task(4));
+
+        assert!(
+            prompt.contains("Goal: make the failing test pass"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("There is no TCP network"), "{prompt}");
+        assert!(prompt.contains("stdin is empty"), "{prompt}");
+        assert!(prompt.contains("/nix/store"), "{prompt}");
+    }
+
+    #[test]
+    fn paths_names_no_grants_and_joins_the_rest() {
+        assert_eq!(paths(&[]), "none");
+        assert_eq!(
+            paths(&["/nix/store".into(), "/srv/checkout".into()]),
+            "/nix/store, /srv/checkout",
+        );
+    }
+
+    #[test]
+    fn bytes_of_treats_zero_as_no_limit() {
+        assert_eq!(bytes_of(0), usize::MAX);
+        assert_eq!(bytes_of(7), 7);
+    }
+
+    #[test]
+    fn keep_newest_keeps_the_last_and_zero_keeps_all() {
+        let mut trimmed = vec![turn_of(1), turn_of(2), turn_of(3)];
+        keep_newest(&mut trimmed, 1);
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].command, "command-3");
+
+        let mut all = vec![turn_of(1), turn_of(2), turn_of(3)];
+        keep_newest(&mut all, 0);
+        // A `len > keep` widened to `len >= keep` is indistinguishable here: at `len == keep` the
+        // drain is `..0`, which removes nothing.
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn a_context_over_the_byte_budget_drops_the_oldest_turns() {
+        let task = task(4);
+        let mut transcript = settled_turns(&task, 3);
+        let full = context(&transcript);
+        assert_eq!(full.turns.len(), 3);
+
+        let limit = u64::try_from(full.bytes()).unwrap();
+        transcript.task.as_mut().unwrap().budget.context_bytes = limit - 1;
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 2);
+        assert_eq!(built.turns[0].command, "command-2");
+        assert_eq!(built.turns[1].command, "command-3");
+    }
+
+    #[test]
+    fn a_context_exactly_at_the_byte_budget_keeps_every_turn() {
+        let task = task(4);
+        let mut transcript = settled_turns(&task, 3);
+        let full = context(&transcript);
+
+        transcript.task.as_mut().unwrap().budget.context_bytes =
+            u64::try_from(full.bytes()).unwrap();
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 3);
+        assert_eq!(built.turns[0].command, "command-1");
+    }
+
+    #[test]
+    fn a_context_budget_below_the_system_prompt_drops_every_turn() {
+        let task = task(4);
+        let mut transcript = settled_turns(&task, 3);
+        transcript.task.as_mut().unwrap().budget.context_bytes = 1;
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns, Vec::new());
+        assert_eq!(built.system, system_prompt(&task));
+    }
+
+    #[test]
+    fn a_settled_turn_without_a_call_record_is_still_shown() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &in_flight_turn(turn, execution));
+        apply_all(&mut transcript, &recovery_facts(turn, execution));
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].command, MISSING_COMMAND);
+        assert_eq!(built.turns[0].observation, UNKNOWN_WARNING);
+    }
+
+    #[test]
+    fn a_recovery_shaped_history_carries_the_unknown_warning() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        // The task record predates the crash; seeding the fold for it keeps this history to machine
+        // facts plus the call, which is the shape recovery reads.
+        transcript.task = Some(task);
+
+        apply_all(
+            &mut transcript,
+            &[Record::Session {
+                fact: Fact::SessionOpened,
+            }],
+        );
+        apply_all(&mut transcript, &in_flight_turn(turn, execution));
+        apply_all(
+            &mut transcript,
+            &[Record::Call(CallRecord {
+                turn,
+                execution,
+                command: "cargo test".to_owned(),
+            })],
+        );
+        apply_all(&mut transcript, &recovery_facts(turn, execution));
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].command, "cargo test");
+        assert_eq!(built.turns[0].observation, UNKNOWN_WARNING);
+    }
+
+    #[test]
+    fn a_later_context_carries_the_unknown_warning() {
+        let task = task(4);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        let turn = turn_id(1);
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Command {
+                    command: "rm -rf build".to_owned(),
+                },
+            ),
+        );
+        let execution = execution_id(turn);
+        apply_all(
+            &mut transcript,
+            &act_intent_records(turn, execution, "rm -rf build"),
+        );
+        apply_all(
+            &mut transcript,
+            &act_outcome_records(turn, execution, Exit::Unknown, b""),
+        );
+
+        let built = context(&transcript);
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].observation, UNKNOWN_WARNING);
+    }
+
+    #[test]
+    fn a_recorded_report_observation_reaches_the_next_context_unchanged() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Command {
+                    command: "ls".to_owned(),
+                },
+            ),
+        );
+        apply_all(&mut transcript, &act_intent_records(turn, execution, "ls"));
+        // The rendering is deliberately not what the settlement facts alone would derive, so a fold
+        // that discarded the field and re-rendered would not produce it.
+        apply_all(
+            &mut transcript,
+            &[
+                Record::Session {
+                    fact: Fact::ExecutionSettled {
+                        execution,
+                        resolution: Resolution::Finished { code: 0 },
+                    },
+                },
+                Record::Session {
+                    fact: Fact::ResultApplied { execution },
+                },
+                Record::Result {
+                    execution,
+                    report: ToolReport {
+                        exit: Exit::Finished { code: 0 },
+                        attempted: true,
+                        stdout: artifact(0x01),
+                        stderr: artifact(0x02),
+                        observation: "the tool's own rendering".to_owned(),
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolResolved {
+                        execution,
+                        resolution: Resolution::Finished { code: 0 },
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::TurnSettled {
+                        outcome: TurnOutcome::Completed,
+                    },
+                },
+            ],
+        );
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].observation, "the tool's own rendering");
+    }
+
+    #[test]
+    fn a_settlement_without_a_report_renders_from_its_facts() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &in_flight_turn(turn, execution));
+        apply_all(
+            &mut transcript,
+            &[
+                Record::Session {
+                    fact: Fact::ExecutionSettled {
+                        execution,
+                        resolution: Resolution::Finished { code: 7 },
+                    },
+                },
+                Record::Session {
+                    fact: Fact::ResultApplied { execution },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolResolved {
+                        execution,
+                        resolution: Resolution::Finished { code: 7 },
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::TurnSettled {
+                        outcome: TurnOutcome::Completed,
+                    },
+                },
+            ],
+        );
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].observation, "exit code 7");
+    }
+
+    #[test]
+    fn a_context_for_a_reask_is_byte_identical() {
+        let task = task(4);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        let turn = turn_id(1);
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+
+        let first = context(&transcript);
+        apply_all(&mut transcript, &open_records(turn, 1, 2));
+        let second = context(&transcript);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_settled_turn_is_shown_and_the_turn_in_flight_is_not() {
+        let task = task(4);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        let first_turn = turn_id(1);
+        let execution = execution_id(first_turn);
+        apply_all(&mut transcript, &open_records(first_turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                first_turn,
+                1,
+                Action::Command {
+                    command: "ls".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &act_intent_records(first_turn, execution, "ls"),
+        );
+        apply_all(
+            &mut transcript,
+            &act_outcome_records(first_turn, execution, Exit::Finished { code: 0 }, b"a\nb"),
+        );
+        let second_turn = turn_id(2);
+        apply_all(&mut transcript, &open_records(second_turn, 2, 1));
+
+        let built: Context = context(&transcript);
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].command, "ls");
+    }
+}

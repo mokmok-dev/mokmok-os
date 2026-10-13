@@ -9,13 +9,13 @@ mokmok-state-machine = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["std", "v7"] }
+uuid = { workspace = true, features = ["serde", "std", "v5", "v7"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `sync` keeps the `.clippy.toml` guard types reachable; no test uses tokio::sync.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true
