@@ -211,7 +211,9 @@ pub enum Refusal {
     Program(PathBuf),
     #[error("the confiner {} is not an executable file", .0.display())]
     Confiner(PathBuf),
-    #[error("this kernel cannot enforce a Landlock V3 ruleset")]
+    #[error(
+        "this kernel cannot enforce the Landlock ruleset the confiner needs: Linux 6.7 or newer is required"
+    )]
     Kernel,
     #[error("{} could not be prepared: {source}", path.display())]
     Setup { path: PathBuf, source: io::Error },

@@ -6,8 +6,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access as _, AccessFs, BitFlags, CompatLevel, Compatible as _, PathBeneath, Ruleset,
-    RulesetAttr as _, RulesetCreated, RulesetCreatedAttr as _,
+    ABI, Access as _, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible as _, PathBeneath,
+    Ruleset, RulesetAttr as _, RulesetCreated, RulesetCreatedAttr as _,
 };
 use nix::fcntl::{AT_FDCWD, OFlag, OpenHow, ResolveFlag, openat2};
 use nix::sys::stat::Mode;
@@ -89,9 +89,14 @@ impl Plan {
 
 /// The ruleset the confiner restricts itself with.
 ///
-/// Landlock V3 is required because V3 mediates `TRUNCATE`, which V1 leaves as an escape. A kernel
-/// older than 6.2 fails to build this ruleset, which is the fail-closed direction and the reason
-/// [`LimitsOnly`](crate::LimitsOnly) exists.
+/// Landlock V3 is required because V3 mediates `TRUNCATE`, which V1 leaves as an escape. The same
+/// ruleset handles `AccessNet::from_all(ABI::V4)` and adds no network rule, so `BindTcp` and
+/// `ConnectTcp` are denied to every workload. `AccessNet` has no UDP right and no `AF_UNIX` right,
+/// so a workload can still send UDP to a literal address and reach a Unix socket.
+///
+/// The floor is Linux 6.7 (`ABI::V4`). `CompatLevel::HardRequirement` makes a kernel below it
+/// refuse to build the ruleset rather than silently drop the network restriction, which is the
+/// fail-closed direction and the reason [`LimitsOnly`](crate::LimitsOnly) exists.
 pub fn ruleset(plan: &Plan) -> Result<RulesetCreated, Failure> {
     let mut by_path: BTreeMap<PathBuf, BitFlags<AccessFs>> = BTreeMap::new();
 
@@ -114,6 +119,8 @@ pub fn ruleset(plan: &Plan) -> Result<RulesetCreated, Failure> {
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(ABI::V3))
+        .map_err(ruleset_failure)?
+        .handle_access(AccessNet::from_all(ABI::V4))
         .map_err(ruleset_failure)?
         .create()
         .map_err(ruleset_failure)?;
