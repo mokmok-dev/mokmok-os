@@ -463,9 +463,10 @@ Eight commits on `feat/agent-runtime` off trunk `ce579e7`, in this order.
 | `94432c7` | the real provider, its validated destination, and the credential file |
 | `b0491b9` | the operator harness, the deploy note, and the doc fixes |
 
-Three more commits close what a final audit of the round found, and are listed here as they land:
-the redirect policy, the credential's mode and its write grant, the default ceilings, the
-single-tool rule, and the scripted refusal test.
+A ninth commit, `372d85b`, closes what a final audit of the round found: the redirect policy, the
+credential's mode and its write grant, the default ceilings, the single-tool rule, the scripted
+refusal test, and the corrections to this record. It changes nothing outside `mokmok-kernel/` and
+this directory.
 
 The definition of done, item by item, and what proves it:
 
