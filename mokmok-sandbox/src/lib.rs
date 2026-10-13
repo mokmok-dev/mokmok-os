@@ -33,7 +33,7 @@
 //!
 //! use mokmok_protocol::ExecutionID;
 //! use mokmok_sandbox::{
-//!     Access, Capability, Completed, Config, Confined, Exposure, Request, Sandbox,
+//!     Access, Capability, Completed, Config, Confined, Environment, Exposure, Request, Sandbox,
 //! };
 //! use uuid::timestamp::{Timestamp, context::NoContext};
 //!
@@ -43,7 +43,7 @@
 //!
 //! let mut request = Request::new(execution, "/bin/sh");
 //! request.args = vec!["-c".into(), "printf hello > out.txt".into()];
-//! request.env = vec![("LANG".into(), "C".into())];
+//! request.environment = Environment::Extend(vec![("LANG".into(), "C".into())]);
 //! request.exposures = vec![
 //!     Exposure::read_execute("/nix/store"),
 //!     Exposure::read_write("/dev/null"),
@@ -93,6 +93,6 @@ pub use confine::run;
 pub use limits::Limits;
 pub use output::Captured;
 pub use plan::Reached;
-pub use request::Request;
+pub use request::{Environment, Request};
 pub use run::{Completed, Error, Failure, Outcome, Run, Signal, Started};
 pub use sandbox::{Confined, LimitsOnly, Refusal, Sandbox};

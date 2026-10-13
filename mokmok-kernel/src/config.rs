@@ -6,6 +6,7 @@
 //! be one. Nothing is allowed by default: an empty allow list yields an empty policy, and an empty
 //! policy denies every request.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -41,6 +42,12 @@ pub struct Args {
     /// A directory the workload may also write in. Repeatable.
     #[arg(long = "allow-write", global = true, value_name = "DIR")]
     pub allow_write: Vec<PathBuf>,
+    /// A `NAME=VALUE` pair the confined workload is given. Repeatable, in order.
+    ///
+    /// The workload's environment is exactly these pairs plus `PATH`, taken from this process, and
+    /// nothing else the daemon holds. A later pair naming a variable replaces an earlier one.
+    #[arg(long = "tool-env", global = true, value_name = "NAME=VALUE")]
+    pub tool_env: Vec<String>,
     /// The confiner binary the sandbox supervises with. Defaults to the sibling of this
     /// executable, which is where the workspace's own build puts it.
     #[arg(long, global = true, value_name = "PATH", hide = true)]
@@ -127,6 +134,9 @@ pub struct Config {
     pub allow_path: Vec<PathBuf>,
     /// Directories the workload may also write in.
     pub allow_write: Vec<PathBuf>,
+    /// The exact environment a confined tool is started with: `PATH` from this process, then each
+    /// `--tool-env` entry in order. It replaces the daemon's environment rather than adding to it.
+    pub tool_env: Vec<(OsString, OsString)>,
     /// The confiner the sandbox supervises with.
     pub confiner: PathBuf,
     pub crash_after: Option<CrashPoint>,
@@ -176,6 +186,7 @@ impl Config {
             allow_tool,
             allow_path,
             allow_write,
+            tool_env: environment(&args.tool_env)?,
             confiner: runnable(&confiner)?,
             crash_after: args.crash_after,
         })
@@ -280,6 +291,37 @@ fn reachable_directory(path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(path.to_path_buf())
 }
 
+/// The exact environment a confined tool is started with: `PATH` from this process's own
+/// environment, then each `--tool-env` entry in order, with a later entry replacing an earlier one
+/// of the same name.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::NotAnAssignment`] when an entry carries no `=`.
+fn environment(entries: &[String]) -> Result<Vec<(OsString, OsString)>, ConfigError> {
+    let mut environment: Vec<(OsString, OsString)> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        environment.push((OsString::from("PATH"), path));
+    }
+
+    for entry in entries {
+        let Some((name, value)) = entry.split_once('=') else {
+            return Err(ConfigError::NotAnAssignment(entry.clone()));
+        };
+        let name = OsString::from(name);
+
+        match environment
+            .iter_mut()
+            .find(|(existing, _)| existing.as_os_str() == name.as_os_str())
+        {
+            Some(slot) => slot.1 = OsString::from(value),
+            None => environment.push((name, OsString::from(value))),
+        }
+    }
+
+    Ok(environment)
+}
+
 /// A configuration the kernel refuses to run on.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -299,12 +341,15 @@ pub enum ConfigError {
     NotAUuid { what: &'static str, value: String },
     #[error("{0} is not a plain relative path inside the workload's workspace")]
     NotRelative(String),
+    #[error("{0} is not a NAME=VALUE pair, so it cannot set an environment variable")]
+    NotAnAssignment(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Args, Command, Config, ConfigError, Submit, uuid_of};
     use clap::Parser as _;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
     struct Scratch(PathBuf);
@@ -333,6 +378,7 @@ mod tests {
             allow_tool: vec![PathBuf::from("/bin/sh")],
             allow_path: vec![PathBuf::from("/bin")],
             allow_write: Vec::new(),
+            tool_env: Vec::new(),
             confiner: Some(PathBuf::from("/bin/sh")),
             crash_after: None,
             command: Command::Submit(Submit {
@@ -401,6 +447,54 @@ mod tests {
             uuid_of("018f2f1e-0000-7000-8000-000000000000", "session").unwrap(),
             uuid_of("018f2f1e-0000-7000-8000-000000000000", "session").unwrap(),
         );
+    }
+
+    #[test]
+    fn a_tool_environment_entry_that_is_not_an_assignment_is_refused() {
+        let scratch = Scratch::new("tool-env-shape");
+        let mut args = args(&scratch.0);
+        args.tool_env = vec!["LANG".to_owned()];
+
+        assert!(matches!(
+            Config::resolve(&args),
+            Err(ConfigError::NotAnAssignment(entry)) if entry == "LANG",
+        ));
+    }
+
+    #[test]
+    fn the_tool_environment_is_the_operators_entries_and_only_those() {
+        fn value(
+            environment: &[(OsString, OsString)],
+            name: &str,
+        ) -> Option<String> {
+            environment
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.to_string_lossy().into_owned())
+        }
+
+        let scratch = Scratch::new("tool-env-resolve");
+        let mut args = args(&scratch.0);
+        args.tool_env = vec!["LANG=C".to_owned(), "PATH=/operator".to_owned()];
+
+        let config = Config::resolve(&args).unwrap();
+
+        assert_eq!(value(&config.tool_env, "LANG").as_deref(), Some("C"));
+        assert_eq!(
+            value(&config.tool_env, "PATH").as_deref(),
+            Some("/operator")
+        );
+        assert_eq!(
+            config
+                .tool_env
+                .iter()
+                .filter(|(key, _)| key == "PATH")
+                .count(),
+            1,
+            "an entry naming PATH replaces the inherited one rather than joining it",
+        );
+        assert_eq!(value(&config.tool_env, "HOME"), None);
     }
 
     #[test]

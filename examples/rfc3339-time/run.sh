@@ -36,8 +36,9 @@ if [ -z "$data_dir" ]; then
 fi
 mkdir -p "$data_dir"
 
-# The workload inherits the daemon's environment, so its bare `date` resolves through the runner's
-# PATH; put the host coreutils directory there rather than trusting whatever PATH the caller had.
+# The workload's PATH is taken from the daemon's process environment, so its bare `date` resolves
+# through the runner's PATH; put the host coreutils directory there rather than trusting whatever
+# PATH the caller had.
 PATH="$(dirname "$(command -v date)"):$PATH"
 export PATH
 

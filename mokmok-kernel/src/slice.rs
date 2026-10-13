@@ -16,6 +16,7 @@ use std::time::Duration;
 use mokmok_event_bus::Topic;
 use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome, Payload};
 use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+use mokmok_sandbox::Environment;
 use mokmok_state_machine::{
     Attempt, Deadline, Fact, Phase, Resolution, State, TurnFact, TurnNumber, TurnOutcome,
 };
@@ -317,6 +318,7 @@ async fn run_tool(
         execution,
         program: submit.program.clone(),
         args: submit.args.iter().map(OsString::from).collect(),
+        environment: Environment::Exact(config.tool_env.clone()),
         deadline: Duration::from_secs(submit.deadline_seconds),
         artifacts: submit
             .artifacts
