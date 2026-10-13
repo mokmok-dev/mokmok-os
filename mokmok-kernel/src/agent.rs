@@ -25,7 +25,7 @@ use mokmok_sandbox::{Confined, Environment};
 use mokmok_state_machine::{Attempt, Ending, Fact, Resolution, Turn, TurnNumber};
 
 use crate::authority::Authority;
-use crate::config::{Config, ConfigError, CrashPoint, Run};
+use crate::config::{Config, ConfigError, CrashPoint, ProviderKind, Run};
 use crate::db::{Db, Entry, Log};
 use crate::error::Error;
 use crate::execution::{self, Blob, Plan, Ran};
@@ -438,6 +438,46 @@ impl From<Script> for Action {
     }
 }
 
+/// The provider one run selected.
+enum Model {
+    /// The no-network route, reading its answers from the script file.
+    Scripted(Scripted),
+    /// The real endpoint, over TLS.
+    Ollama(crate::provider::Ollama),
+}
+
+impl Provider for Model {
+    async fn complete(
+        &self,
+        context: &Context,
+    ) -> Result<Answer, AgentError> {
+        match self {
+            Self::Scripted(provider) => provider.complete(context).await,
+            Self::Ollama(provider) => provider.complete(context).await,
+        }
+    }
+}
+
+/// Builds the provider the configuration named.
+fn model(
+    config: &Config,
+    session: SessionID,
+) -> Result<Model, Error> {
+    match config.provider {
+        ProviderKind::Scripted => {
+            let path = config.script.as_deref().ok_or(ConfigError::NoScript)?;
+
+            Ok(Model::Scripted(Scripted::open(config, path)?))
+        },
+        ProviderKind::Ollama => {
+            let provider = crate::provider::Ollama::open(config, session)
+                .map_err(|error| Error::Agent(AgentError::Provider(Box::new(error))))?;
+
+            Ok(Model::Ollama(provider))
+        },
+    }
+}
+
 /// Why a scripted run stopped before it closed.
 #[derive(Debug, thiserror::Error)]
 #[error("the script holds no answer for this attempt")]
@@ -467,7 +507,7 @@ pub async fn run(
 ) -> Result<Report, Error> {
     let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
     let task = run.task(config)?;
-    let provider = Scripted::open(config, &run.script)?;
+    let provider = model(config, session)?;
     let shell = Shell::new(config, task.setting.program.clone(), at)?;
     let mut ledger = Ledger::open(config, session, Some(task), at)?;
     let mut report = Report {
@@ -721,6 +761,12 @@ mod tests {
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
+            provider: crate::config::ProviderKind::Scripted,
+            script: None,
+            model: None,
+            endpoint: "https://ollama.com/v1".to_owned(),
+            provider_credential_file: None,
+            max_answer_tokens: 4096,
         }
     }
 

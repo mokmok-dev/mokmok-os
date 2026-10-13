@@ -1,4 +1,4 @@
-//! The bytes the model is handed: a system prompt, and the settled turns it may see.
+//! The bytes the model is handed: a system prompt, the goal, and the settled turns it may see.
 
 use crate::dialogue::Transcript;
 use crate::task::Task;
@@ -12,6 +12,7 @@ use mokmok_state_machine::TurnNumber;
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Context {
     pub system: String,
+    pub goal: String,
     pub turns: Vec<ContextTurn>,
 }
 
@@ -30,6 +31,7 @@ impl Context {
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.system.len()
+            + self.goal.len()
             + self
                 .turns
                 .iter()
@@ -38,12 +40,14 @@ impl Context {
     }
 }
 
-/// The facts the model cannot infer, and the goal it was asked to reach.
+/// The facts the model cannot infer.
+///
+/// The goal is deliberately absent: the adapter hands it in the user message, because an endpoint
+/// measured here answers a body whose messages are the system prompt alone with nothing.
 #[must_use]
 pub fn system_prompt(task: &Task) -> String {
     format!(
         "You are a coding agent working in a scratch checkout.\n\
-         Goal: {goal}\n\
          You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n\
          The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
          There is no TCP network. Reach the checkout by absolute path, for example \
@@ -52,7 +56,6 @@ pub fn system_prompt(task: &Task) -> String {
          {readable}; writable paths are {writable}. A command that reaches outside them is refused \
          rather than run, so work inside the grants.\n\
          When the goal is met, answer without calling the tool.",
-        goal = task.goal,
         checkout = task.setting.checkout.display(),
         readable = paths(&task.setting.readable),
         writable = paths(&task.setting.writable),
@@ -76,6 +79,7 @@ pub fn context(transcript: &Transcript) -> Context {
     let Some(task) = transcript.task.as_ref() else {
         return Context {
             system: String::new(),
+            goal: String::new(),
             turns: Vec::new(),
         };
     };
@@ -105,6 +109,7 @@ pub fn context(transcript: &Transcript) -> Context {
 
     let mut context = Context {
         system: system_prompt(task),
+        goal: task.goal.clone(),
         turns,
     };
     while context.bytes() > bytes_of(task.budget.context_bytes) && !context.turns.is_empty() {
@@ -276,29 +281,40 @@ mod tests {
     }
 
     #[test]
-    fn context_bytes_counts_the_system_and_every_turn() {
+    fn context_bytes_counts_the_system_the_goal_and_every_turn() {
         let built = Context {
-            system: "s".to_owned(),
+            system: "sys".to_owned(),
+            goal: "goal!!".to_owned(),
             turns: vec![turn_of(1)],
         };
 
         assert_eq!(
             built.bytes(),
-            1 + ("command-1".len() + "observation-1".len() + 8)
+            3 + 6 + ("command-1".len() + "observation-1".len() + 8)
         );
     }
 
     #[test]
-    fn the_system_prompt_states_the_goal_the_grants_and_the_limits() {
+    fn the_system_prompt_states_the_role_the_grants_and_the_limits() {
         let prompt = system_prompt(&task(4));
 
-        assert!(
-            prompt.contains("Goal: make the failing test pass"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("coding agent"), "{prompt}");
+        assert!(prompt.contains("run_shell"), "{prompt}");
         assert!(prompt.contains("There is no TCP network"), "{prompt}");
         assert!(prompt.contains("stdin is empty"), "{prompt}");
         assert!(prompt.contains("/nix/store"), "{prompt}");
+    }
+
+    #[test]
+    fn the_goal_rides_the_context_and_not_the_system_prompt() {
+        let task = task(4);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+
+        let built = context(&transcript);
+
+        assert_eq!(built.goal, "make the failing test pass");
+        assert!(!built.system.contains("make the failing test pass"));
     }
 
     #[test]

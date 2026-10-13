@@ -26,6 +26,15 @@ pub enum CrashPoint {
     AfterDispatch,
 }
 
+/// Which provider answers a session's model calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ProviderKind {
+    /// Answers from a JSON file, so no network is reached.
+    Scripted,
+    /// Calls an OpenAI-compatible chat-completions endpoint over TLS.
+    Ollama,
+}
+
 /// The CLI surface of `mokmokd`.
 #[derive(Debug, Parser)]
 #[command(name = "mokmokd", version, about = "the mokmok OS composition root")]
@@ -59,6 +68,29 @@ pub struct Args {
     /// daemon between two commits by passing it.
     #[arg(long, value_enum, global = true, hide = true)]
     pub crash_after: Option<CrashPoint>,
+    /// Which provider answers a session's model calls.
+    #[arg(long, global = true, value_enum, default_value = "scripted")]
+    pub provider: ProviderKind,
+    /// The scripted provider's answers, as a JSON file.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub script: Option<PathBuf>,
+    /// The model id the endpoint is asked for. Required for `--provider ollama`.
+    #[arg(long, global = true, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// The OpenAI-compatible endpoint root.
+    #[arg(
+        long,
+        global = true,
+        default_value = "https://ollama.com/v1",
+        value_name = "URL"
+    )]
+    pub endpoint: String,
+    /// A file holding the endpoint credential, read at open and never from the environment.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub provider_credential_file: Option<PathBuf>,
+    /// How many answer tokens one model call may spend.
+    #[arg(long, global = true, default_value_t = 4096)]
+    pub max_answer_tokens: u64,
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
@@ -141,9 +173,6 @@ pub struct Run {
     /// How many steps this invocation performs before it returns.
     #[arg(long, default_value_t = 64)]
     pub steps: usize,
-    /// The scripted provider's answers, as a JSON file.
-    #[arg(long, value_name = "PATH")]
-    pub script: PathBuf,
 }
 
 /// One `submit`.
@@ -194,6 +223,18 @@ pub struct Config {
     /// The confiner the sandbox supervises with.
     pub confiner: PathBuf,
     pub crash_after: Option<CrashPoint>,
+    /// Which provider answers the model calls.
+    pub provider: ProviderKind,
+    /// The scripted provider's answers, when it is the one selected.
+    pub script: Option<PathBuf>,
+    /// The model id the provider asks for.
+    pub model: Option<String>,
+    /// The provider endpoint root.
+    pub endpoint: String,
+    /// The path of the credential file, never the credential itself.
+    pub provider_credential_file: Option<PathBuf>,
+    /// How many answer tokens one model call may spend.
+    pub max_answer_tokens: u64,
 }
 
 impl Config {
@@ -229,14 +270,31 @@ impl Config {
             .collect::<Result<Vec<_>, _>>()?;
         // The checkout is reached only through a write grant, so a run whose checkout no grant
         // covers would be refused by the sandbox halfway through; refusing it here names the path.
-        if let Command::Agent(Agent::Run(run)) = &args.command
-            && !allow_write
+        if let Command::Agent(Agent::Run(run)) = &args.command {
+            if !allow_write
                 .iter()
                 .any(|grant| run.checkout.starts_with(grant))
-        {
-            return Err(ConfigError::CheckoutUngranted {
-                checkout: run.checkout.clone(),
-            });
+            {
+                return Err(ConfigError::CheckoutUngranted {
+                    checkout: run.checkout.clone(),
+                });
+            }
+
+            match args.provider {
+                ProviderKind::Scripted => {
+                    if args.script.is_none() {
+                        return Err(ConfigError::NoScript);
+                    }
+                },
+                ProviderKind::Ollama => {
+                    if args.model.as_deref().unwrap_or_default().is_empty() {
+                        return Err(ConfigError::NoModel);
+                    }
+                    if args.provider_credential_file.is_none() {
+                        return Err(ConfigError::NoCredentialFile);
+                    }
+                },
+            }
         }
         let confiner = args
             .confiner
@@ -254,6 +312,12 @@ impl Config {
             tool_env: environment(&args.tool_env)?,
             confiner: runnable(&confiner)?,
             crash_after: args.crash_after,
+            provider: args.provider,
+            script: args.script.clone(),
+            model: args.model.clone(),
+            endpoint: args.endpoint.clone(),
+            provider_credential_file: args.provider_credential_file.clone(),
+            max_answer_tokens: args.max_answer_tokens,
         })
     }
 
@@ -412,11 +476,17 @@ pub enum ConfigError {
     CheckoutUngranted { checkout: PathBuf },
     #[error("no --allow-tool program is named, so the agent has nothing to run")]
     NoTool,
+    #[error("no --script file is named, and the scripted provider has nothing to answer with")]
+    NoScript,
+    #[error("no --model is named, and the ollama provider has nothing to ask")]
+    NoModel,
+    #[error("no --provider-credential-file is named, and the ollama provider has no credential")]
+    NoCredentialFile,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Agent, Args, Command, Config, ConfigError, Submit, uuid_of};
+    use super::{Agent, Args, Command, Config, ConfigError, ProviderKind, Submit, uuid_of};
     use clap::Parser as _;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -450,6 +520,12 @@ mod tests {
             tool_env: Vec::new(),
             confiner: Some(PathBuf::from("/bin/sh")),
             crash_after: None,
+            provider: ProviderKind::Scripted,
+            script: None,
+            model: None,
+            endpoint: "https://ollama.com/v1".to_owned(),
+            provider_credential_file: None,
+            max_answer_tokens: 4096,
             command: Command::Submit(Submit {
                 session: "018f2f1e-0000-7000-8000-000000000000".to_owned(),
                 idempotency_key: "018f2f1e-0000-7000-8000-000000000001".to_owned(),
@@ -627,7 +703,7 @@ mod tests {
         let scratch = Scratch::new("agent-parse");
         let parsed = agent_args(&scratch.0);
 
-        let Command::Agent(Agent::Run(run)) = parsed.command else {
+        let Command::Agent(Agent::Run(run)) = &parsed.command else {
             panic!("the command line named an agent run");
         };
         assert_eq!(run.goal, "goal");
@@ -635,6 +711,12 @@ mod tests {
         assert_eq!(run.max_turns, 8);
         assert_eq!(run.steps, 64);
         assert_eq!(run.tool_deadline_seconds, 120);
+        assert_eq!(parsed.provider, ProviderKind::Scripted);
+        assert_eq!(parsed.script, Some(PathBuf::from("/bin/sh")));
+        assert_eq!(parsed.endpoint, "https://ollama.com/v1");
+        assert_eq!(parsed.max_answer_tokens, 4096);
+        assert_eq!(parsed.model, None);
+        assert_eq!(parsed.provider_credential_file, None);
 
         let cancel = Args::try_parse_from([
             "mokmokd",
@@ -673,5 +755,80 @@ mod tests {
             "{refusal}",
         );
         assert!(refusal.to_string().contains("/srv/elsewhere"), "{refusal}");
+    }
+
+    /// The parsed shape of one `--provider ollama` run, with `extra` appended.
+    fn ollama_args(
+        data: &Path,
+        extra: &[&str],
+    ) -> Args {
+        let mut args = vec![
+            "mokmokd",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--allow-tool",
+            "/bin/sh",
+            "--allow-write",
+            "/bin",
+            "--confiner",
+            "/bin/sh",
+            "agent",
+            "run",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--goal",
+            "goal",
+            "--checkout",
+            "/bin",
+            "--provider",
+            "ollama",
+        ];
+        args.extend_from_slice(extra);
+
+        Args::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn a_scripted_run_without_a_script_is_refused() {
+        let scratch = Scratch::new("no-script");
+        let parsed = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            scratch.0.to_str().unwrap(),
+            "--allow-tool",
+            "/bin/sh",
+            "--allow-write",
+            "/bin",
+            "--confiner",
+            "/bin/sh",
+            "agent",
+            "run",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--goal",
+            "goal",
+            "--checkout",
+            "/bin",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            Config::resolve(&parsed),
+            Err(ConfigError::NoScript),
+        ));
+    }
+
+    #[test]
+    fn an_ollama_run_without_a_model_or_a_credential_is_refused() {
+        let scratch = Scratch::new("no-model");
+
+        assert!(matches!(
+            Config::resolve(&ollama_args(&scratch.0, &[])),
+            Err(ConfigError::NoModel),
+        ));
+        assert!(matches!(
+            Config::resolve(&ollama_args(&scratch.0, &["--model", "kimi-k2.7-code"])),
+            Err(ConfigError::NoCredentialFile),
+        ));
     }
 }
