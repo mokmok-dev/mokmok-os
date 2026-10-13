@@ -10,18 +10,22 @@
 //! came out, and commit the settlement. What it costs to fail in the middle is [`reconcile`]'s
 //! question, and its answer is the explicit unknown outcome rather than a guess.
 
+pub mod agent;
 mod authority;
 mod config;
 mod db;
 mod error;
 mod execution;
 mod notify;
+mod provider;
 mod recovery;
 mod serve;
 mod slice;
 
 pub use authority::{AGENT, Authority};
-pub use config::{Args, Command, Config, ConfigError, CrashPoint, Submit, relative_path, uuid_of};
+pub use config::{
+    Agent, Args, Command, Config, ConfigError, CrashPoint, Run, Submit, relative_path, uuid_of,
+};
 pub use db::{Db, Entry, Log, ResultRecord, TurnRecord};
 pub use error::Error;
 pub use execution::{Blob, ExecutionResult, Plan, Ran, Refused};

@@ -16,6 +16,7 @@ use std::time::Duration;
 use mokmok_event_bus::Topic;
 use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome, Payload};
 use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+use mokmok_sandbox::Environment;
 use mokmok_state_machine::{
     Attempt, Deadline, Fact, Phase, Resolution, State, TurnFact, TurnNumber, TurnOutcome,
 };
@@ -50,6 +51,8 @@ pub struct Report {
     pub turns: Vec<(TurnID, Option<TurnOutcome>)>,
     pub executions: Vec<(ExecutionID, State)>,
     pub results: Vec<(ExecutionID, ExecutionResult)>,
+    /// The agent records the session holds, one line each, in log order.
+    pub transcript: Vec<String>,
 }
 
 /// A wakeup a subscriber can react to without reading the log.
@@ -317,6 +320,7 @@ async fn run_tool(
         execution,
         program: submit.program.clone(),
         args: submit.args.iter().map(OsString::from).collect(),
+        environment: Environment::Exact(config.tool_env.clone()),
         deadline: Duration::from_secs(submit.deadline_seconds),
         artifacts: submit
             .artifacts
@@ -360,6 +364,16 @@ pub fn status(
         .into_iter()
         .map(|turn| Ok((turn, log.turn(turn)?.outcome())))
         .collect::<Result<Vec<_>, Error>>()?;
+    let numbers = log
+        .turns_in_order()
+        .into_iter()
+        .map(|turn| Ok((turn, log.turn(turn)?.number())))
+        .collect::<Result<std::collections::BTreeMap<_, _>, Error>>()?;
+    let transcript = log
+        .ordered
+        .iter()
+        .filter_map(|record| transcript_line(record, &numbers))
+        .collect();
 
     Ok(Report {
         session,
@@ -374,15 +388,65 @@ pub fn status(
             .iter()
             .map(|record| (record.execution, record.result.clone()))
             .collect(),
+        transcript,
     })
+}
+
+/// One agent record as the single line `status` prints for it.
+fn transcript_line(
+    record: &mokmok_agent_runtime::Record,
+    numbers: &std::collections::BTreeMap<TurnID, Option<TurnNumber>>,
+) -> Option<String> {
+    let number = |turn: TurnID| {
+        numbers
+            .get(&turn)
+            .copied()
+            .flatten()
+            .map_or(0, TurnNumber::get)
+    };
+
+    match record {
+        mokmok_agent_runtime::Record::Task(task) => Some(format!("task goal={:?}", task.task.goal)),
+        mokmok_agent_runtime::Record::Prompt(prompt) => Some(format!(
+            "prompt turn={} number={} attempt={} hash={} bytes={}",
+            prompt.turn.as_uuid(),
+            number(prompt.turn),
+            prompt.attempt.get(),
+            prompt.context.hash,
+            prompt.context.bytes,
+        )),
+        mokmok_agent_runtime::Record::Answer(answer) => Some(format!(
+            "answer turn={} number={} attempt={} action={:?} model={}",
+            answer.turn.as_uuid(),
+            number(answer.turn),
+            answer.attempt.get(),
+            answer.action,
+            answer.model,
+        )),
+        mokmok_agent_runtime::Record::Call(call) => Some(format!(
+            "call turn={} number={} execution={} command={:?}",
+            call.turn.as_uuid(),
+            number(call.turn),
+            call.execution.as_uuid(),
+            call.command,
+        )),
+        mokmok_agent_runtime::Record::Result { execution, report } => Some(format!(
+            "result execution={} exit={:?} observation={:?}",
+            execution.as_uuid(),
+            report.exit,
+            report.observation,
+        )),
+        mokmok_agent_runtime::Record::Session { .. }
+        | mokmok_agent_runtime::Record::Turn { .. } => None,
+    }
 }
 
 /// Records an unknown outcome for every execution one session left in flight.
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise as
-/// [`recovery::recover`] does.
+/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise the
+/// errors of the recovery pass it drives.
 pub fn reconcile(
     config: &Config,
     session: SessionID,

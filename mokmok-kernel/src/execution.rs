@@ -17,8 +17,8 @@ use mokmok_artifact::BlobStore;
 use mokmok_capability::{Denial, Name};
 use mokmok_protocol::{ExecutionID, Moment};
 use mokmok_sandbox::{
-    Capability, Completed, Confined, Error as SandboxError, Exposure, Failure, Outcome, Refusal,
-    Request, Sandbox, Started,
+    Capability, Completed, Confined, Environment, Error as SandboxError, Exposure, Failure,
+    Outcome, Refusal, Request, Sandbox, Started,
 };
 use mokmok_state_machine::Resolution;
 
@@ -60,6 +60,9 @@ pub struct Plan {
     pub execution: ExecutionID,
     pub program: PathBuf,
     pub args: Vec<OsString>,
+    /// How the workload's environment is built; `Exact` is what the tool path uses, so the daemon's
+    /// own variables do not reach a model-driven shell.
+    pub environment: Environment,
     pub deadline: Duration,
     /// Workspace-relative paths to register after the run, when they exist.
     pub artifacts: Vec<PathBuf>,
@@ -123,6 +126,7 @@ pub async fn run(
 
     let mut request = Request::new(plan.execution, &plan.program);
     request.args.clone_from(&plan.args);
+    request.environment.clone_from(&plan.environment);
     request.exposures = exposures;
     request.deadline = Some(plan.deadline);
     request.artifacts.clone_from(&plan.artifacts);

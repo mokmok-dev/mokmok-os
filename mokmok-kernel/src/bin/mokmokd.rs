@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser as _;
 use mokmok_kernel::{
-    Args, Command, Config, Error, ExecutionResult, Report, Submitted, reconcile, serve, status,
-    submit,
+    Agent, Args, Command, Config, Error, ExecutionResult, Report, Submitted, agent, reconcile,
+    serve, status, submit,
 };
 use mokmok_protocol::{Moment, SessionID};
 
@@ -50,9 +50,29 @@ async fn run(args: Args) -> Result<(), Error> {
             let published = serve(&config, &socket, *once, at).await?;
             println!("published={published} socket={}", socket.display());
         },
+        Command::Agent(Agent::Run(run)) => print_agent(&agent::run(&config, run, at).await?),
+        Command::Agent(Agent::Cancel { session }) => {
+            let session = session_id(session)?;
+            agent::cancel(&config, session, at)?;
+            println!("cancelled session={}", session.as_uuid());
+        },
     }
 
     Ok(())
+}
+
+/// What one agent invocation did, step by step.
+fn print_agent(report: &agent::Report) {
+    println!("session={}", report.session.as_uuid());
+    for line in &report.steps {
+        println!("{line}");
+    }
+    if let Some(ending) = report.ending {
+        println!("phase=Closed({ending:?})");
+    }
+    if let Some(halt) = report.halt {
+        println!("halt={halt:?}");
+    }
 }
 
 /// The one clock reading in the workspace.
@@ -110,6 +130,9 @@ fn print_report(report: &Report) {
     for (execution, result) in &report.results {
         println!("result execution={}", execution.as_uuid());
         print_result(result);
+    }
+    for line in &report.transcript {
+        println!("{line}");
     }
 }
 

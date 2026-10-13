@@ -11,7 +11,7 @@ use crate::capability::{self, Capability, Exposure, uncovered_index};
 use crate::config::Config;
 use crate::limits::Limits;
 use crate::plan;
-use crate::request::Request;
+use crate::request::{Environment, Request};
 use crate::run::{Reporting, Run};
 use crate::workspace::Workspace;
 
@@ -34,8 +34,8 @@ pub trait Sandbox {
     /// An `Ok` means the workload possibly started; only such a confinement failure means it did
     /// not run.
     ///
-    /// The workload's working directory is its workspace, its stdin is `/dev/null`, and
-    /// [`Request::env`] is added to the inherited environment.
+    /// The workload's working directory is its workspace, its stdin is `/dev/null`, and its
+    /// environment is built as [`Request::environment`] says.
     ///
     /// # Errors
     ///
@@ -211,7 +211,9 @@ pub enum Refusal {
     Program(PathBuf),
     #[error("the confiner {} is not an executable file", .0.display())]
     Confiner(PathBuf),
-    #[error("this kernel cannot enforce a Landlock V3 ruleset")]
+    #[error(
+        "this kernel cannot enforce the Landlock ruleset the confiner needs: Linux 6.7 or newer is required"
+    )]
     Kernel,
     #[error("{} could not be prepared: {source}", path.display())]
     Setup { path: PathBuf, source: io::Error },
@@ -324,15 +326,18 @@ fn configure(
 ) {
     command
         .current_dir(workspace.work())
-        .envs(
-            request
-                .env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone())),
-        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    match &request.environment {
+        Environment::Extend(variables) => {
+            command.envs(variables.iter().cloned());
+        },
+        Environment::Exact(variables) => {
+            command.env_clear().envs(variables.iter().cloned());
+        },
+    }
 }
 
 /// The shell the degraded backend runs a request through, in `ulimit` arguments.

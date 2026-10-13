@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+use mokmok_agent_runtime::{Record, Refusal, Transcript};
 use mokmok_event_store::{
     Append, CommandId, CommitPosition, Expected, Kind, NewEvent, OutboxMessage, Outcome, Payload,
     Store, StreamId, Version,
@@ -36,6 +37,8 @@ const SESSION_FACT: &str = "mokmok.session.fact";
 const TURN_FACT: &str = "mokmok.turn.fact";
 /// The kind under which the reference to one execution's bytes is logged.
 const RESULT: &str = "mokmok.execution.result";
+/// The kind under which the agent runtime's own records are logged.
+const AGENT: &str = "mokmok.agent.record";
 
 /// One durable entry of a session's log.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +49,8 @@ pub enum Entry {
     Turn(TurnID, TurnFact),
     /// What one execution produced.
     Result(ExecutionID, ExecutionResult),
+    /// One record of the agent runtime's own vocabulary.
+    Agent(Record),
 }
 
 impl Entry {
@@ -56,6 +61,7 @@ impl Entry {
             Self::Session(_) => SESSION_FACT,
             Self::Turn(..) => TURN_FACT,
             Self::Result(..) => RESULT,
+            Self::Agent(_) => AGENT,
         }
     }
 
@@ -71,6 +77,7 @@ impl Entry {
                 execution: *execution,
                 result: result.clone(),
             })?,
+            Self::Agent(record) => Payload::json(record)?,
         };
 
         Ok(NewEvent::new(kind, payload))
@@ -97,6 +104,13 @@ pub struct Log {
     pub session: Vec<Fact>,
     pub turns: Vec<TurnRecord>,
     pub results: Vec<ResultRecord>,
+    /// Every record the runtime's fold reads, in log order.
+    ///
+    /// The fold needs the interleaving of the machines' facts with the runtime's own content
+    /// records, which one `Vec` per kind cannot express. A slice-era [`Entry::Result`] is left out:
+    /// it names bytes rather than a report, and the fold renders that settlement from its own
+    /// facts.
+    pub ordered: Vec<Record>,
 }
 
 impl Log {
@@ -188,34 +202,73 @@ impl Log {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Rejected`] when the log itself does not replay, and [`Error::WriteRefused`]
-    /// when one of `entries` is a step a machine refuses.
+    /// Returns [`Error::Rejected`] when the log itself does not replay, [`Error::Fold`] when the
+    /// runtime's fold refuses a record in neither of those ways, and [`Error::WriteRefused`] when
+    /// one of `entries` is a step a machine refuses.
     pub fn verify(
         &self,
         session: SessionID,
         entries: &[Entry],
     ) -> Result<(), Error> {
-        let mut state = self.state(session)?;
-        let mut turns = std::collections::BTreeMap::new();
+        let mut transcript = Transcript::replay(session, &self.ordered).map_err(Error::Fold)?;
 
         for entry in entries {
-            match entry {
-                Entry::Session(fact) => {
-                    state.apply(*fact).map_err(Error::WriteRefused)?;
+            let record = match entry {
+                Entry::Session(fact) => Record::Session { fact: *fact },
+                Entry::Turn(turn, fact) => Record::Turn {
+                    turn: *turn,
+                    fact: *fact,
                 },
-                Entry::Turn(turn, fact) => {
-                    let mut held = match turns.remove(turn) {
-                        Some(held) => held,
-                        None => self.turn(*turn)?,
-                    };
-                    held.apply(*fact).map_err(Error::WriteRefused)?;
-                    turns.insert(*turn, held);
-                },
-                Entry::Result(..) => {},
-            }
+                Entry::Agent(record) => record.clone(),
+                // A slice-era result carries references, not the report the fold checks, and the
+                // settlement it names was verified where it entered.
+                Entry::Result(..) => continue,
+            };
+            transcript.apply(&record).map_err(write_refused)?;
         }
 
         Ok(())
+    }
+
+    /// Folds committed entries onto this log without reading them back.
+    ///
+    /// A writer that just committed a batch keeps its own fold current, so the next
+    /// [`verify`](Self::verify) replays the history that includes it.
+    pub fn absorb(
+        &mut self,
+        entries: &[Entry],
+    ) {
+        for entry in entries {
+            match entry {
+                Entry::Session(fact) => {
+                    self.session.push(*fact);
+                    self.ordered.push(Record::Session { fact: *fact });
+                },
+                Entry::Turn(turn, fact) => {
+                    self.turns.push(TurnRecord {
+                        turn: *turn,
+                        fact: *fact,
+                    });
+                    self.ordered.push(Record::Turn {
+                        turn: *turn,
+                        fact: *fact,
+                    });
+                },
+                Entry::Result(execution, result) => self.results.push(ResultRecord {
+                    execution: *execution,
+                    result: result.clone(),
+                }),
+                Entry::Agent(record) => self.ordered.push(record.clone()),
+            }
+        }
+    }
+}
+
+/// Reads a fold refusal of one of the entries a writer is about to commit.
+fn write_refused(refusal: Refusal) -> Error {
+    match refusal {
+        Refusal::Rejected(rejection) => Error::WriteRefused(rejection),
+        other => Error::Fold(other),
     }
 }
 
@@ -406,17 +459,25 @@ impl Log {
         position: u64,
     ) -> Result<(), Error> {
         if *kind == named(SESSION_FACT)? {
-            self.session.push(payload.decode()?);
+            let fact: Fact = payload.decode()?;
+            self.session.push(fact);
+            self.ordered.push(Record::Session { fact });
         } else if *kind == named(TURN_FACT)? {
             let record: TurnRecord = payload.decode()?;
             self.turns.push(record);
+            self.ordered.push(Record::Turn {
+                turn: record.turn,
+                fact: record.fact,
+            });
         } else if *kind == named(RESULT)? {
             let record: ResultRecord = payload.decode()?;
             self.results.push(record);
+        } else if *kind == named(AGENT)? {
+            self.ordered.push(payload.decode()?);
         } else {
             return Err(Error::UnexpectedEntry {
                 position,
-                expected: "session, turn, or result",
+                expected: "session, turn, result, or agent",
             });
         }
 
@@ -432,6 +493,7 @@ fn named(kind: &'static str) -> Result<Kind, Error> {
 mod tests {
     use super::{Db, Entry};
     use crate::execution::{Blob, ExecutionResult};
+    use mokmok_agent_runtime::Record;
     use mokmok_event_store::{CommandId, Expected, Outcome, Payload};
     use mokmok_protocol::{ExecutionID, SessionID, TurnID};
     use mokmok_state_machine::{Fact, Phase, Resolution, TurnFact, TurnNumber, TurnOutcome};
@@ -559,6 +621,19 @@ mod tests {
             Some(TurnOutcome::Completed)
         );
         assert_eq!(log.state(session()).unwrap().phase(), Phase::Accepting);
+        // The fold reads the machines' facts in log order, and a slice-era result names bytes
+        // rather than a report, so it is left out.
+        assert_eq!(
+            log.ordered.len(),
+            7,
+            "the result entry is not a foldable record"
+        );
+        assert!(matches!(
+            log.ordered.first(),
+            Some(Record::Session {
+                fact: Fact::SessionOpened
+            }),
+        ));
     }
 
     #[test]

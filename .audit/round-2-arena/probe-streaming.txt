@@ -1,0 +1,54 @@
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"We"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" need"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" answer"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" user"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":":"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" count"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" to"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" three"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" Need"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" likely"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" count"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" to"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" three"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" in"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" words"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" This"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" is"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" trivial"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":"."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" We"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" should"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"","reasoning":" respond"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-45","object":"chat.completion.chunk","created":1791862175,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+

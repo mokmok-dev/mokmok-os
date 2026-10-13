@@ -24,6 +24,12 @@
 //! directory swapped into a path between the supervisor's resolution and the confiner's open is
 //! outside this contract: closing it would need a file descriptor pinned across the two processes.
 //!
+//! A confined workload has no TCP. The ruleset handles the network access set and adds no network
+//! rule, so `BindTcp` and `ConnectTcp` are denied to everything the workload runs. `AccessNet` has
+//! no UDP right and no `AF_UNIX` right, so a workload can still send UDP to a literal address and
+//! reach a Unix socket. The floor is Linux 6.7: on an older kernel the sandbox refuses rather than
+//! confine a workload that could still dial out.
+//!
 //! Resource limits are the sandbox's own per-execution [`Limits`] and [`Request::deadline`]. The
 //! agent's execution budget is a different responsibility and lives with the agent runtime.
 //!
@@ -33,7 +39,7 @@
 //!
 //! use mokmok_protocol::ExecutionID;
 //! use mokmok_sandbox::{
-//!     Access, Capability, Completed, Config, Confined, Exposure, Request, Sandbox,
+//!     Access, Capability, Completed, Config, Confined, Environment, Exposure, Request, Sandbox,
 //! };
 //! use uuid::timestamp::{Timestamp, context::NoContext};
 //!
@@ -43,7 +49,7 @@
 //!
 //! let mut request = Request::new(execution, "/bin/sh");
 //! request.args = vec!["-c".into(), "printf hello > out.txt".into()];
-//! request.env = vec![("LANG".into(), "C".into())];
+//! request.environment = Environment::Extend(vec![("LANG".into(), "C".into())]);
 //! request.exposures = vec![
 //!     Exposure::read_execute("/nix/store"),
 //!     Exposure::read_write("/dev/null"),
@@ -93,6 +99,6 @@ pub use confine::run;
 pub use limits::Limits;
 pub use output::Captured;
 pub use plan::Reached;
-pub use request::Request;
+pub use request::{Environment, Request};
 pub use run::{Completed, Error, Failure, Outcome, Run, Signal, Started};
 pub use sandbox::{Confined, LimitsOnly, Refusal, Sandbox};
