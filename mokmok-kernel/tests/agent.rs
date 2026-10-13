@@ -148,6 +148,21 @@ mod tests {
         args
     }
 
+    /// The shared prefix with no read or execute grant: the granted program is named, and nothing
+    /// it must load to start is inside what the workload may reach.
+    fn without_path_grants(scratch: &Scratch) -> Vec<String> {
+        vec![
+            "--data-dir".to_owned(),
+            scratch.data().display().to_string(),
+            "--confiner".to_owned(),
+            confiner().display().to_string(),
+            "--allow-tool".to_owned(),
+            shell().display().to_string(),
+            "--allow-write".to_owned(),
+            scratch.checkout().display().to_string(),
+        ]
+    }
+
     fn ran(output: &Output) -> Ran {
         Ran {
             ok: output.status.success(),
@@ -338,5 +353,53 @@ mod tests {
             status(&scratch).value("phase").as_deref(),
             Some("Closed(Cancelled)"),
         );
+    }
+
+    #[test]
+    fn a_command_no_grant_reaches_is_refused_rather_than_run() {
+        let scratch = Scratch::new("refused");
+        let path = scratch.0.join("script.json");
+        let command = format!(
+            "cd {} && printf ran > marker.txt",
+            scratch.checkout().display(),
+        );
+        script(
+            &path,
+            &[
+                json!({"action": "command", "command": command}),
+                json!({"action": "final"}),
+            ],
+        );
+
+        let mut args = without_path_grants(&scratch);
+        args.extend([
+            "agent".to_owned(),
+            "run".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+            "--goal".to_owned(),
+            "write marker.txt".to_owned(),
+            "--checkout".to_owned(),
+            scratch.checkout().display().to_string(),
+            "--script".to_owned(),
+            path.display().to_string(),
+            "--max-turns".to_owned(),
+            "4".to_owned(),
+        ]);
+
+        let ran = run(&args);
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert!(
+            !scratch.checkout().join("marker.txt").exists(),
+            "a refused command must not have run:\n{}",
+            ran.out,
+        );
+
+        let report = status(&scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        let result = report
+            .phrase("result ")
+            .unwrap_or_else(|| panic!("no result line:\n{}", report.out));
+        assert!(result.contains("exit=Refused"), "{result}");
     }
 }

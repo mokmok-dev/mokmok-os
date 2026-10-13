@@ -7,6 +7,7 @@
 //! policy denies every request.
 
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -156,16 +157,16 @@ pub struct Run {
     #[arg(long, default_value_t = 8)]
     pub max_turns: u32,
     /// How many tokens the session may spend; zero means unbounded.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 400_000)]
     pub token_budget: u64,
     /// How many bytes of context the model is shown in total; zero means unbounded.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 131_072)]
     pub context_bytes: u64,
     /// How many bytes of one observation the model is shown; zero means unbounded.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 4096)]
     pub observation_bytes: u64,
     /// How many settled turns the model is shown; zero means all of them.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 16)]
     pub context_turns: u32,
     /// Seconds one command may run before the sandbox stops it.
     #[arg(long, default_value_t = 120)]
@@ -271,6 +272,13 @@ impl Config {
         // The checkout is reached only through a write grant, so a run whose checkout no grant
         // covers would be refused by the sandbox halfway through; refusing it here names the path.
         if let Command::Agent(Agent::Run(run)) = &args.command {
+            // A second grant would be dropped rather than becoming a second tool, which is the
+            // kind of silent narrowing an operator will not notice.
+            if allow_tool.len() > 1 {
+                return Err(ConfigError::MultipleTools {
+                    count: allow_tool.len(),
+                });
+            }
             if !allow_write
                 .iter()
                 .any(|grant| run.checkout.starts_with(grant))
@@ -290,9 +298,10 @@ impl Config {
                     if args.model.as_deref().unwrap_or_default().is_empty() {
                         return Err(ConfigError::NoModel);
                     }
-                    if args.provider_credential_file.is_none() {
+                    let Some(credential) = args.provider_credential_file.as_deref() else {
                         return Err(ConfigError::NoCredentialFile);
-                    }
+                    };
+                    private_credential(credential, &allow_write)?;
                 },
             }
         }
@@ -396,6 +405,36 @@ fn create_directory(path: &Path) -> Result<(), ConfigError> {
     })
 }
 
+/// Refuses a credential file the interface promises is a `0600` file: its mode must admit no group
+/// or other access, and no `--allow-write` grant may cover it, because a model run inside such a
+/// grant could rewrite the file the next invocation reads.
+fn private_credential(
+    path: &Path,
+    writable: &[PathBuf],
+) -> Result<(), ConfigError> {
+    let metadata = std::fs::metadata(path).map_err(|source| ConfigError::CredentialUnreadable {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+
+    if mode & 0o077 != 0 {
+        return Err(ConfigError::CredentialNotPrivate {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+
+    if let Some(grant) = writable.iter().find(|grant| path.starts_with(grant)) {
+        return Err(ConfigError::CredentialInWriteGrant {
+            path: path.to_path_buf(),
+            grant: grant.clone(),
+        });
+    }
+
+    Ok(())
+}
+
 fn runnable(program: &Path) -> Result<PathBuf, ConfigError> {
     if !program.is_absolute() {
         return Err(ConfigError::NotAbsolute(program.to_path_buf()));
@@ -482,6 +521,24 @@ pub enum ConfigError {
     NoModel,
     #[error("no --provider-credential-file is named, and the ollama provider has no credential")]
     NoCredentialFile,
+    #[error("the credential file {path} could not be examined")]
+    CredentialUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "the credential file {path} is mode {mode:o}, which lets group or others read it, and the \
+         credential must be 0600"
+    )]
+    CredentialNotPrivate { path: PathBuf, mode: u32 },
+    #[error(
+        "the credential file {path} lies inside the --allow-write grant {grant}, so an earlier \
+         model run could rewrite it before the next invocation reads it"
+    )]
+    CredentialInWriteGrant { path: PathBuf, grant: PathBuf },
+    #[error("the agent runs one program, but {count} --allow-tool grants are named")]
+    MultipleTools { count: usize },
 }
 
 #[cfg(test)]
@@ -489,6 +546,7 @@ mod tests {
     use super::{Agent, Args, Command, Config, ConfigError, ProviderKind, Submit, uuid_of};
     use clap::Parser as _;
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
     struct Scratch(PathBuf);
@@ -711,6 +769,10 @@ mod tests {
         assert_eq!(run.max_turns, 8);
         assert_eq!(run.steps, 64);
         assert_eq!(run.tool_deadline_seconds, 120);
+        assert_eq!(run.token_budget, 400_000);
+        assert_eq!(run.context_turns, 16);
+        assert_eq!(run.context_bytes, 131_072);
+        assert_eq!(run.observation_bytes, 4096);
         assert_eq!(parsed.provider, ProviderKind::Scripted);
         assert_eq!(parsed.script, Some(PathBuf::from("/bin/sh")));
         assert_eq!(parsed.endpoint, "https://ollama.com/v1");
@@ -829,6 +891,142 @@ mod tests {
         assert!(matches!(
             Config::resolve(&ollama_args(&scratch.0, &["--model", "kimi-k2.7-code"])),
             Err(ConfigError::NoCredentialFile),
+        ));
+    }
+
+    /// Writes a credential file with `mode`, returning the path it landed at.
+    fn credential(
+        path: &Path,
+        mode: u32,
+    ) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "s3cr3t").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn a_credential_file_group_or_others_can_read_is_refused_by_path_and_mode() {
+        let scratch = Scratch::new("cred-mode");
+        let path = credential(&scratch.0.join("credential"), 0o644);
+
+        let refusal = Config::resolve(&ollama_args(
+            &scratch.0,
+            &[
+                "--model",
+                "kimi-k2.7-code",
+                "--provider-credential-file",
+                path.to_str().unwrap(),
+            ],
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::CredentialNotPrivate { path: held, mode }
+                    if held == &path && *mode == 0o644,
+            ),
+            "{refusal}",
+        );
+        assert!(
+            refusal.to_string().contains(&path.display().to_string()),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("644"), "{refusal}");
+    }
+
+    #[test]
+    fn a_credential_file_inside_a_write_grant_is_refused_by_both_names() {
+        let scratch = Scratch::new("cred-write-grant");
+        let data = scratch.0.join("data");
+        let granted = scratch.0.join("granted");
+        let checkout = scratch.0.join("checkout");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let path = credential(&granted.join("credential"), 0o600);
+
+        let parsed = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--allow-tool",
+            "/bin/sh",
+            "--allow-write",
+            granted.to_str().unwrap(),
+            "--allow-write",
+            checkout.to_str().unwrap(),
+            "--confiner",
+            "/bin/sh",
+            "agent",
+            "run",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--goal",
+            "goal",
+            "--checkout",
+            checkout.to_str().unwrap(),
+            "--provider",
+            "ollama",
+            "--model",
+            "kimi-k2.7-code",
+            "--provider-credential-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let refusal = Config::resolve(&parsed).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::CredentialInWriteGrant { path: held, grant }
+                    if held == &path && grant == &granted,
+            ),
+            "{refusal}",
+        );
+        assert!(
+            refusal.to_string().contains(&path.display().to_string()),
+            "{refusal}",
+        );
+        assert!(
+            refusal.to_string().contains(&granted.display().to_string()),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn an_agent_run_with_more_than_one_tool_grant_is_refused() {
+        let scratch = Scratch::new("many-tools");
+        let parsed = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            scratch.0.to_str().unwrap(),
+            "--allow-tool",
+            "/bin/sh",
+            "--allow-tool",
+            "/bin/sh",
+            "--allow-write",
+            "/bin",
+            "--confiner",
+            "/bin/sh",
+            "agent",
+            "run",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--goal",
+            "goal",
+            "--checkout",
+            "/bin",
+            "--script",
+            "/bin/sh",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            Config::resolve(&parsed),
+            Err(ConfigError::MultipleTools { count: 2 }),
         ));
     }
 }

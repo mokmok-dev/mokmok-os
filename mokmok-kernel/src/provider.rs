@@ -497,6 +497,10 @@ impl Ollama {
             &sink,
         )?;
         let client = reqwest::ClientBuilder::new()
+            // A followed redirect would leave the destination this request was validated and
+            // pinned for and re-send the goal and the whole transcript to a host mokmok-egress
+            // never saw; the pinned address is the only one a redirect may reach.
+            .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&endpoint.host, validated.addresses())
             .build()
             .map_err(Error::Client)?;
@@ -743,12 +747,23 @@ fn token(
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Credential, Error, Usage, parse_answer, parse_endpoint, request_body};
+    use super::{
+        Action, Credential, Error, Ollama, Usage, parse_answer, parse_endpoint, request_body,
+    };
+    use crate::config::{Config, ProviderKind};
     use clap::Parser as _;
     use mokmok_agent_runtime::{Context, ContextTurn, Provider as _};
     use mokmok_egress::{AddressClass, Rules, Scheme};
+    use mokmok_protocol::SessionID;
     use mokmok_state_machine::TurnNumber;
-    use std::path::PathBuf;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use uuid::Uuid;
 
     /// The measured tool-call response, kept as the fixture it is rather than re-encoded.
     const TOOL_CALLS: &str = include_str!("../../.audit/round-2-arena/probe-tool-calls.json");
@@ -1033,6 +1048,7 @@ mod tests {
         std::fs::create_dir_all(&checkout).unwrap();
         let credential = directory.join("credential");
         std::fs::write(&credential, key).unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let args = crate::config::Args::try_parse_from([
             "mokmokd",
@@ -1076,6 +1092,104 @@ mod tests {
             answer.action,
             Action::Command { .. } | Action::Final,
         ));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Writes a `0600` credential file in `directory`, returning its path.
+    fn credential_file(directory: &Path) -> PathBuf {
+        let path = directory.join("credential");
+        std::fs::write(&path, "s3cr3t").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        path
+    }
+
+    /// A provider configuration over `directory`, pointing at `endpoint`.
+    fn provider_config(
+        directory: &Path,
+        endpoint: &str,
+        credential: &Path,
+    ) -> Config {
+        let data = directory.join("data");
+        let artifacts = data.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+
+        Config {
+            data_dir: data.clone(),
+            events: data.join("events.sqlite"),
+            artifacts,
+            sandbox_root: data.join("sandbox"),
+            allow_tool: Vec::new(),
+            allow_path: Vec::new(),
+            allow_write: Vec::new(),
+            tool_env: Vec::new(),
+            confiner: PathBuf::from("/bin/sh"),
+            crash_after: None,
+            provider: ProviderKind::Ollama,
+            script: None,
+            model: Some("m".to_owned()),
+            endpoint: endpoint.to_owned(),
+            provider_credential_file: Some(credential.to_path_buf()),
+            max_answer_tokens: 16,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_off_the_validated_destination() {
+        let directory = scratch("redirect");
+        let credential = credential_file(&directory);
+
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let followed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&followed);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = target.accept() else {
+                return;
+            };
+            flag.store(true, Ordering::SeqCst);
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buffer = [0_u8; 1024];
+            while stream.read(&mut buffer).is_ok_and(|read| read > 0) {}
+            let body = br#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = origin.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buffer = [0_u8; 1024];
+            while stream.read(&mut buffer).is_ok_and(|read| read > 0) {}
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{target_port}/v1/chat/completions\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let config = provider_config(
+            &directory,
+            &format!("http://127.0.0.1:{origin_port}/v1"),
+            &credential,
+        );
+        let provider = Ollama::open(&config, SessionID::from_uuid(Uuid::nil())).unwrap();
+
+        let refused = provider.complete(&context()).await.unwrap_err();
+
+        assert!(refused.to_string().contains("307"), "{refused}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !followed.load(Ordering::SeqCst),
+            "a redirect opened a second connection the destination was never validated for",
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

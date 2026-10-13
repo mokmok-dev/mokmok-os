@@ -28,10 +28,10 @@ A falsifiable predicate, checked in the gate and on the operator's machine separ
 2. **On the operator's machine, with the real provider, in a scratch checkout:** one
    `mokmokd agent run` invocation calls the model at least twice (once for a command, once to
    finish), runs that command under the sandbox, and leaves the task's effect on disk.
-   `examples/coding-agent/run.sh` asserts three things, not one: the artifact exists with the
-   expected content, `mokmokd status <session>` replays at least two turns each with a durable
-   `Prompt` and `Answer` record, and a command that reaches outside the grant reports a refusal
-   rather than an effect.
+   `examples/coding-agent/run.sh` asserts the artifact and the loop: `out.txt` holds the values the
+   goal named, and `mokmokd status <session>` replays at least two prompts, two answers, and one
+   result, so the run cannot have reached the goal in a single ask. The refusal path is proven in
+   the gate instead, by a scripted run with no tool granted whose transcript reports the refusal.
 3. **On the operator's machine, a crash mid-loop:** the killed run's next invocation settles the
    in-flight tool as `Unknown`, and the next `Prompt` record — read back out of the artifact store
    — contains the warning that the previous command's outcome is unproven and its effect must not
@@ -77,7 +77,9 @@ cancelled rather than leaving the machine's cancellation vocabulary dead.
 Call sites:
 
 ```rust
-// mokmok-kernel/src/bin/mokmokd.rs — the CLI arm; the only clock read is the one already there.
+// mokmok-kernel/src/bin/mokmokd.rs — the CLI arm. The kernel reads no wall clock itself; one read
+// in this binary fills the `Moment` every arm takes, and the provider's destination validation is
+// the one place outside it that stamps an audit with a clock of its own.
 Command::Agent(Agent::Run(run)) => print_agent(&agent::run(&config, run, at).await?),
 Command::Agent(Agent::Cancel(session)) => print_cancel(&agent::cancel(&config, session, at)?),
 
@@ -163,9 +165,11 @@ pub enum Receipt { Written, Replayed }
 the attempt: `uuid5(session, "ask-intent:{n}:{attempt}")`. Two invocations that reach the same move
 on the same session therefore derive the same id and the second append replays.
 
-The tool's **result** rides the existing `Entry::Result` unchanged, and the observation the model
-sees is *derived* from the run's durable facts rather than stored, in one function
-`tool::observation(resolution, result) -> String`:
+The tool's **result** rides the agent's own kind, `mokmok.agent.record`, as
+`Record::Result { execution, report }`. The existing `mokmok.execution.result` kind stays with the
+`submit` slice, so a slice-era log reads unchanged and no old payload shape moves. The report
+carries the bounded rendering the model was shown, produced by whoever held the bytes; the bytes
+themselves stay in the artifact store behind the two references:
 
 - `Finished{code}` / `Killed{signal}` / `TimedOut` / `Refused` with a result: the exit code and the
   head-and-tail-clipped stdout and stderr, the full bytes staying addressable by hash;
@@ -422,10 +426,18 @@ package's binary); unit 3's pure core is the scorable half of this round.
 - **UDP is not closed by unit 2** (see above). Neither is `AF_UNIX`, and the sandbox's own
   documented limit stands: a workload that calls `setsid` itself escapes the process group every
   signal reaches.
-- **The transcript is not byte-exact across an upgrade.** The observation is derived from the
-  result, so a changed clip changes what a *future* turn is shown of a *past* result. The full bytes
-  stay addressable by hash, and the prompt that was sent is durable, so the record of what the model
-  was handed is exact while the rendering of old results is not.
+- **The `Receipt::Replayed` guard is proven at the port and by the command-id bridge, not end to end
+  through the tool path.** The kernel's `Ledger::open` recovers before the first step, so a tool an
+  interrupted run left in flight is settled `Unknown` and never re-dispatched by the loop; the guard
+  covers a second invocation racing the first, which no deterministic test drives yet.
+- **Unit 7, the growing pass, did not happen.** The agent has run one real task, and the recorded
+  task set, its pass/fail score, and the token cost per task are still open. The first three things
+  it would measure are the context mapping (one user message carrying the goal and the transcript),
+  the clip's size against a real failure, and whether the shell alone is enough.
+- **The transcript is byte-exact across an upgrade.** The rendering the model was shown is recorded
+  with the result, so a changed clip cannot rewrite what a past turn is said to have seen. The full
+  bytes stay addressable by hash, and the prompt that was sent is durable. A settlement with no
+  recorded report, which is the shape recovery writes, is the one case rendered from its facts.
 - **A budget-exhausted run closes the session `Completed`.** `Ending` has two values and neither
   means "gave up", so `Halt::Budget`/`Halt::Tokens` are reported by the CLI and the session closes
   as completed. Adding an ending is a state-machine change this round does not make.
@@ -438,7 +450,7 @@ package's binary); unit 3's pure core is the scorable half of this round.
 
 ## Landed, and where it differs from this sketch
 
-Six commits on `feat/agent-runtime` off trunk `ce579e7`, in this order.
+Eight commits on `feat/agent-runtime` off trunk `ce579e7`, in this order.
 
 | commit | what it is |
 | --- | --- |
@@ -448,7 +460,12 @@ Six commits on `feat/agent-runtime` off trunk `ce579e7`, in this order.
 | `c7797e8` | no TCP for a workload |
 | `f7e518e` | the runtime's pure loop |
 | `c3d69d1` | the kernel's adapters, the CLI, and the transcript |
-| `39f592a` | the real provider, its validated destination, and the credential file |
+| `94432c7` | the real provider, its validated destination, and the credential file |
+| `b0491b9` | the operator harness, the deploy note, and the doc fixes |
+
+Three more commits close what a final audit of the round found, and are listed here as they land:
+the redirect policy, the credential's mode and its write grant, the default ceilings, the
+single-tool rule, and the scripted refusal test.
 
 The definition of done, item by item, and what proves it:
 

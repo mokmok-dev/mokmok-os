@@ -60,8 +60,14 @@ checkout="$scratch/checkout"
 data="$scratch/data"
 mkdir -p "$checkout"
 
+# The session's own files are the evidence for this run, so they outlive it. `MOKMOK_CLEAN=1`
+# removes them, which is what a scripted harness wants and what an operator does after reading them.
 cleanup() {
-  rm -rf "$scratch"
+  if [ -n "${MOKMOK_CLEAN:-}" ]; then
+    rm -rf "$scratch"
+  else
+    echo "run.sh: the session's data directory is $data" >&2
+  fi
 }
 trap cleanup EXIT
 
@@ -103,6 +109,16 @@ printf '%s\n' "$status"
 
 printf '%s\n' "$status" | grep -q 'phase=Closed(Completed)' \
   || fail "the session did not close completed; the transcript is above"
+
+# The transcript has to show the model being asked more than once, each ask with a durable prompt
+# and a durable answer: one turn that ran a command and one that finished. A run that closed after
+# a single ask reached the goal by luck or by a shortcut, and the run is not evidence of a loop.
+prompts="$(printf '%s\n' "$status" | grep -c '^prompt ' || true)"
+answers="$(printf '%s\n' "$status" | grep -c '^answer ' || true)"
+results="$(printf '%s\n' "$status" | grep -c '^result ' || true)"
+if [ "$prompts" -lt 2 ] || [ "$answers" -lt 2 ] || [ "$results" -lt 1 ]; then
+  fail "the transcript holds prompts=$prompts answers=$answers results=$results; a loop needs two asks, one of them a command"
+fi
 
 [ -f "$checkout/out.txt" ] || fail "the task's file is not there; the transcript is above"
 actual="$(cat "$checkout/out.txt")"
