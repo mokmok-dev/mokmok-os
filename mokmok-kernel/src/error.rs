@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use mokmok_agent_runtime::{Error as AgentError, Refusal};
 use mokmok_event_store::{Error as StoreError, PayloadError};
 use mokmok_state_machine::{Rejected, Rejection};
 
@@ -67,4 +68,8 @@ pub enum Error {
     UnknownSession(uuid::Uuid),
     #[error("{0} is not a name a principal or a tool can carry")]
     InvalidName(#[from] mokmok_capability::InvalidName),
+    #[error("the agent history is not one this build can fold: {0}")]
+    Fold(#[from] Refusal),
+    #[error("the agent runtime failed: {0}")]
+    Agent(#[from] AgentError),
 }

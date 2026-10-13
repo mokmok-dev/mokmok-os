@@ -90,6 +90,60 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Drive a session with a model, one bounded step at a time.
+    #[command(subcommand)]
+    Agent(Agent),
+}
+
+/// One agent invocation.
+#[derive(Debug, Subcommand)]
+pub enum Agent {
+    /// Run the loop until the session closes or reaches a limit.
+    Run(Run),
+    /// Record a cancel, so the next run closes the session cancelled.
+    Cancel {
+        /// The session to cancel.
+        #[arg(long)]
+        session: String,
+    },
+}
+
+/// One `agent run`.
+#[derive(Debug, clap::Args)]
+pub struct Run {
+    /// The session to work in. Its first run opens it.
+    #[arg(long)]
+    pub session: String,
+    /// What the agent is asked to do.
+    #[arg(long)]
+    pub goal: String,
+    /// The scratch checkout the goal lives in. A `--allow-write` grant must cover it.
+    #[arg(long, value_name = "DIR")]
+    pub checkout: PathBuf,
+    /// How many turns the session may open.
+    #[arg(long, default_value_t = 8)]
+    pub max_turns: u32,
+    /// How many tokens the session may spend; zero means unbounded.
+    #[arg(long, default_value_t = 0)]
+    pub token_budget: u64,
+    /// How many bytes of context the model is shown in total; zero means unbounded.
+    #[arg(long, default_value_t = 0)]
+    pub context_bytes: u64,
+    /// How many bytes of one observation the model is shown; zero means unbounded.
+    #[arg(long, default_value_t = 0)]
+    pub observation_bytes: u64,
+    /// How many settled turns the model is shown; zero means all of them.
+    #[arg(long, default_value_t = 0)]
+    pub context_turns: u32,
+    /// Seconds one command may run before the sandbox stops it.
+    #[arg(long, default_value_t = 120)]
+    pub tool_deadline_seconds: u64,
+    /// How many steps this invocation performs before it returns.
+    #[arg(long, default_value_t = 64)]
+    pub steps: usize,
+    /// The scripted provider's answers, as a JSON file.
+    #[arg(long, value_name = "PATH")]
+    pub script: PathBuf,
 }
 
 /// One `submit`.
@@ -173,6 +227,17 @@ impl Config {
             .iter()
             .map(|path| reachable_directory(path))
             .collect::<Result<Vec<_>, _>>()?;
+        // The checkout is reached only through a write grant, so a run whose checkout no grant
+        // covers would be refused by the sandbox halfway through; refusing it here names the path.
+        if let Command::Agent(Agent::Run(run)) = &args.command
+            && !allow_write
+                .iter()
+                .any(|grant| run.checkout.starts_with(grant))
+        {
+            return Err(ConfigError::CheckoutUngranted {
+                checkout: run.checkout.clone(),
+            });
+        }
         let confiner = args
             .confiner
             .clone()
@@ -343,11 +408,15 @@ pub enum ConfigError {
     NotRelative(String),
     #[error("{0} is not a NAME=VALUE pair, so it cannot set an environment variable")]
     NotAnAssignment(String),
+    #[error("the checkout {checkout} is not covered by any --allow-write grant")]
+    CheckoutUngranted { checkout: PathBuf },
+    #[error("no --allow-tool program is named, so the agent has nothing to run")]
+    NoTool,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, Command, Config, ConfigError, Submit, uuid_of};
+    use super::{Agent, Args, Command, Config, ConfigError, Submit, uuid_of};
     use clap::Parser as _;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
@@ -525,5 +594,84 @@ mod tests {
         };
         assert_eq!(submit.args, vec!["-c".to_owned(), "true".to_owned()]);
         assert_eq!(submit.deadline_seconds, 30);
+    }
+
+    /// The parsed shape of one `agent run`, over the scratch directories.
+    fn agent_args(data: &Path) -> Args {
+        Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--allow-tool",
+            "/bin/sh",
+            "--allow-path",
+            "/bin",
+            "--allow-write",
+            "/bin",
+            "agent",
+            "run",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--goal",
+            "goal",
+            "--checkout",
+            "/bin",
+            "--script",
+            "/bin/sh",
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn the_parser_reads_an_agent_run_and_its_cancel() {
+        let scratch = Scratch::new("agent-parse");
+        let parsed = agent_args(&scratch.0);
+
+        let Command::Agent(Agent::Run(run)) = parsed.command else {
+            panic!("the command line named an agent run");
+        };
+        assert_eq!(run.goal, "goal");
+        assert_eq!(run.checkout, PathBuf::from("/bin"));
+        assert_eq!(run.max_turns, 8);
+        assert_eq!(run.steps, 64);
+        assert_eq!(run.tool_deadline_seconds, 120);
+
+        let cancel = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            scratch.0.to_str().unwrap(),
+            "agent",
+            "cancel",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cancel.command,
+            Command::Agent(Agent::Cancel { ref session })
+                if session == "018f2f1e-0000-7000-8000-000000000000",
+        ));
+    }
+
+    #[test]
+    fn a_checkout_no_write_grant_covers_is_refused_by_name() {
+        let scratch = Scratch::new("checkout");
+        let mut parsed = agent_args(&scratch.0);
+        let Command::Agent(Agent::Run(run)) = &mut parsed.command else {
+            panic!("the command line named an agent run");
+        };
+        run.checkout = PathBuf::from("/srv/elsewhere");
+
+        let refusal = Config::resolve(&parsed).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::CheckoutUngranted { checkout }
+                    if checkout == &PathBuf::from("/srv/elsewhere"),
+            ),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("/srv/elsewhere"), "{refusal}");
     }
 }
