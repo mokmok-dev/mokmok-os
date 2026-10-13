@@ -88,8 +88,8 @@ impl Ledger {
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Db::open`], [`Db::log`], [`recovery::recover`], and
-    /// [`BlobStore::open`].
+    /// Returns the errors of [`Db::open`], [`Db::log`], the recovery pass behind
+    /// [`reconcile`](crate::reconcile), and [`BlobStore::open`].
     pub fn open(
         config: &Config,
         session: SessionID,

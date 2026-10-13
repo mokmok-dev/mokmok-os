@@ -435,3 +435,72 @@ package's binary); unit 3's pure core is the scorable half of this round.
 - **`mokmok-event-bus` still has no consumer.** The runtime runs as a `mokmokd` invocation against
   the same data directory, the shape `submit` already has. A long-lived agent service consuming
   `session:<id>` is a later round, and the bus's `Subscriber` is what it would use.
+
+## Landed, and where it differs from this sketch
+
+Six commits on `feat/agent-runtime` off trunk `ce579e7`, in this order.
+
+| commit | what it is |
+| --- | --- |
+| `ed6fc7b` | this brief, the arena, and the trail |
+| `ac3b584` | the daemon recovers the log before the bus accepts a peer |
+| `507a0dc` | `Request::environment`, and the tool path on `Exact(PATH + --tool-env)` |
+| `c7797e8` | no TCP for a workload |
+| `f7e518e` | the runtime's pure loop |
+| `c3d69d1` | the kernel's adapters, the CLI, and the transcript |
+| `39f592a` | the real provider, its validated destination, and the credential file |
+
+The definition of done, item by item, and what proves it:
+
+1. The gate runs the whole loop with a scripted provider and no network, and proves the resume
+   neither re-executes a tool nor claims an unproven outcome:
+   `mokmok-kernel/tests/agent.rs::a_crash_before_dispatch_resumes_without_running_the_command`,
+   where the effect is measured by the file the command would have written and the warning is read
+   back out of the artifact store by hash.
+2. `examples/coding-agent/run.sh` against the live endpoint: the model wrote `fib.sh`, the sandbox
+   ran it, `out.txt` holds the ten values the goal named, and the run closed `Completed`. Run on
+   2026-10-13 with `kimi-k2.7-code` through `https://ollama.com/v1`.
+3. The same test as item 1, second assertion: the next turn's durable prompt carries
+   `UNKNOWN_WARNING` and still names the command.
+4. `mokmokd status --session` replays the session as its transcript: the task, each prompt with its
+   content hash, each answer with its action, each call with its command, each result with its
+   exit and the observation the model saw.
+
+Deviations from the sketch above, each with its reason:
+
+- **`Record` is the whole vocabulary, not four records beside the kernel's entries.** One step must
+  drive both machines and the result, and the fold's tie rule is "in the fold or in the same step",
+  so the runtime's `Record` carries `Session`, `Turn`, and `Result` as well as `Task`, `Prompt`,
+  `Answer`, and `Call`. The kind count is what this brief froze: one new kind,
+  `mokmok.agent.record`, and `Entry::Result` is still skipped when reading, so a slice-era log reads
+  unchanged.
+- **The command rides both the answer and the call**, and a `Call` whose command disagrees with the
+  answer for its turn is `Refusal::CommandMismatch`. The brief's "the command string lives only in
+  `CallRecord`" was wrong: a crash between the answer and the call would lose what to dispatch.
+- **`Context` gained `goal`.** Measured: a body whose messages are a single system message is
+  answered `finish_reason: "load"` with zero tokens and no tool call, so the adapter now always
+  sends a user message carrying the goal, with the settled turns appended to it.
+- **The result record carries the bounded rendering, not the bytes** (`ToolReport.observation`).
+  `ToolResult` and `Journal::bytes` are gone. The bytes stay in the artifact store behind their
+  references, which is what the kernel's own note requires, and the transcript is exact forever.
+- **`Setting` gained `deadline`**, wired from `--tool-deadline-seconds` (default 120 s), because the
+  task is durable and the deadline is a property of the task.
+- **The durability bridge is the command id.** `Journal::append` commits each step under
+  `CommandId::from_uuid(step.id.as_uuid())`, so the event store's own dedup answers a repeated step
+  with `Outcome::Replayed` and the port answers `Receipt::Replayed`. The brief left this implicit,
+  and an independent verifier named it as the one thing that made the durability claim unproven.
+- **`Close` derives two ids**, `close:{n}` for the turn's settlement and `close:{n}:session` for the
+  session's close, because the brief's one key made the second a replay and the session never closed.
+- **The provider flags live on the global `Args` and on `Config`** rather than on `Agent::Run`,
+  because the variant crossed clippy's `large_enum_variant` threshold and clap cannot box it. Only
+  the credential *path* is carried; the secret is read at open into a type whose `Debug` is
+  `REDACTED`.
+- **HTTP is allowed only for a loopback host**, which takes the rules that admit
+  `AddressClass::Loopback`. The brief promised a local endpoint and did not say how.
+- **The audit identity is `uuid5(session, "model")`**, not per turn and attempt: the destination is
+  validated and pinned when the provider opens, before any turn exists. `Validated::new` stamps its
+  audit record with `SystemTime::now()`, which is the one wall-clock read outside `mokmokd.rs`.
+- **The journal and the tool are two adapters**, `Ledger` and `Shell`. `Db` is not `Sync` and the
+  runtime's `Tools` port requires it, so one value cannot be both.
+- `status` prints a `task` line as well as the four the brief named.
+

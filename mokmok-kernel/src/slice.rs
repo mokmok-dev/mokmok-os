@@ -445,8 +445,8 @@ fn transcript_line(
 ///
 /// # Errors
 ///
-/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise as
-/// [`recovery::recover`] does.
+/// Returns [`Error::UnknownSession`] when the log holds nothing for the session, and otherwise the
+/// errors of the recovery pass it drives.
 pub fn reconcile(
     config: &Config,
     session: SessionID,
