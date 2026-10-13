@@ -193,6 +193,19 @@ async fn serve_until_stopped(
         }
     });
 
+    let mut db = Db::open(&config.events)?;
+    // Required recovery runs before the bus accepts a client, not merely before the branch that
+    // reports ready. A peer that connects the moment the socket exists would otherwise submit into
+    // the session this pass is unwinding, and the two settlements of one execution leave a history
+    // no reader can replay.
+    for (session, execution) in recovery::recover_unsettled(&mut db, at)? {
+        eprintln!(
+            "mokmokd: recovered session={} execution={} resolution=Unknown",
+            session.as_uuid(),
+            execution.as_uuid(),
+        );
+    }
+
     // This loop owns the stop. A bus that listened for the signal itself would stop serving while
     // this loop went on relaying, which is the process that stays up with nothing behind it.
     let (stop, stopped) = oneshot::channel::<()>();
@@ -201,17 +214,6 @@ async fn serve_until_stopped(
     }));
 
     let mut relay = Relay::new(&socket);
-    let mut db = Db::open(&config.events)?;
-    // Required recovery runs before the loop can reach the branch that reports ready, so a
-    // dependent ordered after this unit never meets a log a crash left with an execution that has
-    // no outcome.
-    for (session, execution) in recovery::recover_unsettled(&mut db, at)? {
-        eprintln!(
-            "mokmokd: recovered session={} execution={} resolution=Unknown",
-            session.as_uuid(),
-            execution.as_uuid(),
-        );
-    }
     let notifier = Notifier::from_env()?;
     // The first tick waits a whole interval, so the bus has bound before the first pass rather
     // than failing on the rows a previous process left pending.
