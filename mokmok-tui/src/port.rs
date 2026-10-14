@@ -1,0 +1,418 @@
+//! The two ports: what the core needs from the world, and where a frame goes.
+
+use std::future::Future;
+
+use mokmok_agent_runtime::{Progress, Transcript};
+use mokmok_protocol::SessionID;
+
+use crate::Error;
+
+/// Everything the core needs from the world: the session's past, one human line, one bounded step.
+///
+/// The port speaks the domain's language — a [`Transcript`], a [`Progress`] — so an implementation
+/// supplies the world and decides nothing. It hands out values rather than borrows, because the fold
+/// it hands over must outlive the mutable step that follows it.
+pub trait Engine {
+    /// The session's whole durable past, folded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's failure when the history cannot be read or does not fold.
+    fn fold(&self) -> Result<Transcript, Error>;
+
+    /// Commits one human line as the input of the session's next turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's failure, and its refusal when the session is not waiting for a line.
+    fn speak(
+        &mut self,
+        line: &str,
+    ) -> Result<(), Error>;
+
+    /// Performs at most one bounded step of the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's, the provider's, or the tools' own failure.
+    fn step(&mut self) -> impl Future<Output = Result<Progress, Error>> + Send;
+
+    /// Re-opens the session, settling what a dead process left in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's failure when the session cannot be re-opened.
+    fn reopen(&mut self) -> Result<(), Error>;
+}
+
+/// Where the conversation is drawn and where keys come from.
+///
+/// Synchronous on purpose: while the screen waits for a key the driver has nothing to do, and a step
+/// in flight is never interrupted, so there is nothing to select between.
+pub trait Screen {
+    /// Waits for the one thing the terminal reported next.
+    ///
+    /// # Errors
+    ///
+    /// Returns the terminal's failure when the event cannot be read.
+    fn event(&mut self) -> Result<Event, Error>;
+
+    /// Draws one frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns the terminal's failure when the frame cannot be drawn.
+    fn draw(
+        &mut self,
+        view: &View,
+    ) -> Result<(), Error>;
+}
+
+/// What the conversation listens for. The adapter drops every key not named here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Key {
+    /// One character typed into the line.
+    Char(char),
+    /// The line is submitted.
+    Enter,
+    /// The last character of the line is removed.
+    Backspace,
+    /// The transcript scrolls one line back.
+    Up,
+    /// The transcript scrolls one line forward.
+    Down,
+    /// The human leaves, with the session as it stands.
+    Interrupt,
+}
+
+/// One thing the terminal reported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Event {
+    /// A key was pressed.
+    Key(Key),
+    /// The terminal was resized, so the frame is redrawn.
+    Resize,
+}
+
+/// One line of the conversation.
+///
+/// The three cases are the three things a turn can hold, so a renderer cannot invent a fourth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Line {
+    /// What the human said.
+    Human(String),
+    /// What the agent said.
+    Agent(String),
+    /// The one command the agent ran, and what came of it.
+    Work {
+        /// The command string the agent asked to run.
+        command: String,
+        /// What the command produced, as the model was shown it.
+        observation: String,
+    },
+}
+
+const HUMAN_GUTTER: &str = "you    ";
+
+const AGENT_GUTTER: &str = "agent  ";
+
+// Seven columns, so a continuation row aligns under the first row's text.
+const CONTINUATION_PREFIX: &str = "       ";
+
+impl std::fmt::Display for Line {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str(&rows_of(self).join("\n"))
+    }
+}
+
+fn rows_of(line: &Line) -> Vec<String> {
+    match line {
+        Line::Human(text) => prose_rows(HUMAN_GUTTER, text),
+        Line::Agent(text) => prose_rows(AGENT_GUTTER, text),
+        Line::Work {
+            command,
+            observation,
+        } => {
+            let mut rows = vec![format!("  $ {}", escaped(command))];
+
+            if let Some(outcome) = observation.lines().next().filter(|first| !first.is_empty()) {
+                rows.push(format!("    {}", escaped(outcome)));
+            }
+
+            rows
+        },
+    }
+}
+
+/// One speaker's text as rows: the gutter leads the first line, seven spaces each later one.
+///
+/// A single trailing line break ends the last line rather than opening an empty one, so it draws
+/// no blank row.
+fn prose_rows(
+    gutter: &str,
+    text: &str,
+) -> Vec<String> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+
+    body.split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                gutter
+            } else {
+                CONTINUATION_PREFIX
+            };
+            // A carriage return before a line break is part of the break, not a character to draw.
+            let line = line.strip_suffix('\r').unwrap_or(line);
+
+            format!("{prefix}{}", escaped(line))
+        })
+        .collect()
+}
+
+/// Replaces every control character so a drawn row holds the text the shell received.
+///
+/// A terminal row cannot hold a control character and the renderer drops the ones it cannot place,
+/// so a raw newline would join a program's lines and show the human a command that never ran.
+fn escaped(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+
+    for character in text.chars() {
+        match character {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_control() => escaped.push('?'),
+            other => escaped.push(other),
+        }
+    }
+
+    escaped
+}
+
+/// One frame, as data: the renderer lays it out and decides nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct View {
+    /// The session's name, so the human can read the conversation back with `mokmokd status`.
+    pub session: SessionID,
+    /// Every line of the conversation, oldest first.
+    pub lines: Vec<Line>,
+    /// The line being typed.
+    pub input: String,
+    /// One phrase for the session's state and whose turn it is.
+    pub status: String,
+    /// How many lines back from the newest the transcript is scrolled.
+    pub scroll: u16,
+}
+
+impl View {
+    /// The rows a transcript `height` rows tall shows, newest last.
+    ///
+    /// A pure function of the view and the one thing the adapter knows, so which rows are on screen
+    /// is decided here and tested without a terminal.
+    ///
+    /// The pane's width is not among the arguments, so a row wider than the pane is left to the
+    /// renderer, which truncates it with no marker; measuring or wrapping a row would require the
+    /// width in the signature.
+    #[must_use]
+    pub fn visible(
+        &self,
+        height: usize,
+    ) -> Vec<String> {
+        let rows: Vec<String> = self.lines.iter().flat_map(rows_of).collect();
+        let end = rows.len().saturating_sub(usize::from(self.scroll));
+        let start = end.saturating_sub(height);
+
+        rows[start..end].to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::{Line, View};
+    use mokmok_protocol::SessionID;
+
+    fn view(
+        lines: Vec<Line>,
+        scroll: u16,
+    ) -> View {
+        View {
+            session: SessionID::from_uuid(Uuid::from_u128(1)),
+            lines,
+            input: String::new(),
+            status: String::new(),
+            scroll,
+        }
+    }
+
+    #[test]
+    fn visible_draws_the_gutter_and_the_work_outcome() {
+        let view = view(
+            vec![
+                Line::Human("hello".to_owned()),
+                Line::Work {
+                    command: "ls".to_owned(),
+                    observation: "out.txt\nmore\n".to_owned(),
+                },
+                Line::Agent("bye".to_owned()),
+            ],
+            0,
+        );
+
+        assert_eq!(
+            view.visible(10),
+            vec![
+                "you    hello".to_owned(),
+                "  $ ls".to_owned(),
+                "    out.txt".to_owned(),
+                "agent  bye".to_owned(),
+            ],
+        );
+        assert_eq!(view.visible(0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_reply_with_line_breaks_draws_one_row_per_line() {
+        let view = view(
+            vec![Line::Agent(
+                "fib.txt holds:\n1, 1, 2, 3, 5\nAnything else?".to_owned(),
+            )],
+            0,
+        );
+
+        assert_eq!(
+            view.visible(3),
+            vec![
+                "agent  fib.txt holds:".to_owned(),
+                "       1, 1, 2, 3, 5".to_owned(),
+                "       Anything else?".to_owned(),
+            ],
+            "each line of the reply is its own row, the later rows aligned under the gutter",
+        );
+        assert_eq!(
+            view.visible(2),
+            vec![
+                "       1, 1, 2, 3, 5".to_owned(),
+                "       Anything else?".to_owned(),
+            ],
+            "the window arithmetic counts the reply's three rows, not its one line",
+        );
+    }
+
+    #[test]
+    fn a_reply_of_one_line_stays_one_row() {
+        let one = view(vec![Line::Agent("one line".to_owned())], 0);
+
+        assert_eq!(one.visible(1), vec!["agent  one line".to_owned()]);
+
+        let ended = view(vec![Line::Agent("one line\n".to_owned())], 0);
+
+        assert_eq!(
+            ended.visible(2),
+            vec!["agent  one line".to_owned()],
+            "the trailing line break ends the line instead of drawing a blank row after it",
+        );
+    }
+
+    #[test]
+    fn a_human_line_with_line_breaks_is_drawn_the_same_way() {
+        let view = view(
+            vec![Line::Human(
+                "fib.txt holds:\n1, 1, 2, 3, 5\nAnything else?".to_owned(),
+            )],
+            0,
+        );
+
+        assert_eq!(
+            view.visible(3),
+            vec![
+                "you    fib.txt holds:".to_owned(),
+                "       1, 1, 2, 3, 5".to_owned(),
+                "       Anything else?".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn visible_keeps_the_newest_rows_and_windows_by_rows() {
+        let view = view(
+            vec![
+                Line::Human("first".to_owned()),
+                Line::Work {
+                    command: "ls".to_owned(),
+                    observation: "out.txt".to_owned(),
+                },
+                Line::Agent("one\ntwo\nthree".to_owned()),
+            ],
+            0,
+        );
+
+        assert_eq!(
+            view.visible(4),
+            vec![
+                "    out.txt".to_owned(),
+                "agent  one".to_owned(),
+                "       two".to_owned(),
+                "       three".to_owned(),
+            ],
+            "a reply's continuation rows count toward a window shorter than the transcript",
+        );
+        assert_eq!(
+            view.visible(2),
+            vec!["       two".to_owned(), "       three".to_owned()],
+        );
+    }
+
+    #[test]
+    fn the_frame_and_the_replay_use_the_same_gutters() {
+        for (line, gutter) in [
+            (Line::Human("first\nsecond".to_owned()), "you    "),
+            (Line::Agent("first\nsecond".to_owned()), "agent  "),
+        ] {
+            let drawn = view(vec![line.clone()], 0).visible(2);
+            let replayed: Vec<String> = format!("{line}").lines().map(str::to_owned).collect();
+
+            assert_eq!(drawn.len(), 2, "a two-line {line:?} must draw two rows");
+            assert!(
+                drawn[0].starts_with(gutter),
+                "the drawn first row {drawn:?} must carry the gutter {gutter:?}",
+            );
+            assert!(
+                replayed[0].starts_with(gutter),
+                "the replayed first row {replayed:?} must carry the same gutter {gutter:?}",
+            );
+            assert!(
+                drawn[1].starts_with("       "),
+                "the drawn continuation row {drawn:?} must carry the seven-space prefix",
+            );
+            assert!(
+                replayed[1].starts_with("       "),
+                "the replayed continuation row {replayed:?} must carry the seven-space prefix",
+            );
+        }
+    }
+
+    #[test]
+    fn a_carriage_return_before_a_line_break_is_one_break() {
+        let crlf = view(vec![Line::Agent("one\r\ntwo".to_owned())], 0);
+
+        assert_eq!(
+            crlf.visible(2),
+            vec!["agent  one".to_owned(), "       two".to_owned()],
+            "a carriage return before a line break is part of the break, not a drawn character",
+        );
+
+        let lone = view(vec![Line::Agent("a\rb".to_owned())], 0);
+
+        assert_eq!(
+            lone.visible(1),
+            vec!["agent  a\\rb".to_owned()],
+            "a carriage return inside a line is still shown as the escape",
+        );
+    }
+}

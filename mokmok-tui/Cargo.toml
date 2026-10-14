@@ -1,0 +1,22 @@
+[package]
+edition.workspace = true
+name = "mokmok-tui"
+version.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+mokmok-agent-runtime = { workspace = true }
+mokmok-kernel = { workspace = true }
+mokmok-protocol = { workspace = true }
+mokmok-state-machine = { workspace = true }
+ratatui = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+mokmok-artifact = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true
