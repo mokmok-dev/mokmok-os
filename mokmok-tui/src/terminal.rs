@@ -3,7 +3,9 @@
 use std::io::IsTerminal;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -64,22 +66,7 @@ impl Screen for Terminal {
         loop {
             match event::read().map_err(Error::Terminal)? {
                 CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('c')
-                    {
-                        return Ok(Event::Key(Key::Interrupt));
-                    }
-
-                    let mapped = match key.code {
-                        KeyCode::Char(character) => Some(Key::Char(character)),
-                        KeyCode::Enter => Some(Key::Enter),
-                        KeyCode::Backspace => Some(Key::Backspace),
-                        KeyCode::Up => Some(Key::Up),
-                        KeyCode::Down => Some(Key::Down),
-                        _ => None,
-                    };
-
-                    if let Some(key) = mapped {
+                    if let Some(key) = mapped(&key) {
                         return Ok(Event::Key(key));
                     }
                 },
@@ -98,6 +85,30 @@ impl Screen for Terminal {
             .map_err(Error::Terminal)?;
 
         Ok(())
+    }
+}
+
+/// The conversation's key for a reported key event, when it listens for it.
+///
+/// A control or alt chord that is not the mapped `Ctrl-C` is dropped rather than typed as its
+/// letter, so a human reaching for a key the program does not bind finds no stray character in the
+/// line; a shifted character still types itself.
+fn mapped(key: &KeyEvent) -> Option<Key> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(Key::Interrupt);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char(character) => Some(Key::Char(character)),
+        KeyCode::Enter => Some(Key::Enter),
+        KeyCode::Backspace => Some(Key::Backspace),
+        KeyCode::Up => Some(Key::Up),
+        KeyCode::Down => Some(Key::Down),
+        _ => None,
     }
 }
 
@@ -139,12 +150,46 @@ mod tests {
     use ratatui::Terminal as RtTerminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Position;
     use uuid::Uuid;
 
-    use super::render;
-    use crate::port::{Line, View};
+    use super::{mapped, render};
+    use crate::port::{Key, Line, View};
     use mokmok_protocol::SessionID;
+
+    #[test]
+    fn a_control_key_is_dropped_and_a_shifted_character_types_itself() {
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl-A must not type an 'a'",
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT)),
+            None,
+            "Alt-A must not type an 'a'",
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Key::Interrupt),
+            "Ctrl-C is the one mapped control key",
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(Key::Char('a')),
+            "an unmodified character still types itself",
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            Some(Key::Char('A')),
+            "a shifted character still types itself",
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Key::Enter),
+        );
+    }
 
     fn row(
         buffer: &Buffer,

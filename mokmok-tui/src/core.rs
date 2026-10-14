@@ -27,6 +27,7 @@ enum Mode {
 }
 
 /// What one keystroke asked the shell to do.
+#[derive(Debug, Eq, PartialEq)]
 enum Reaction {
     /// Nothing beyond a redraw.
     Idle,
@@ -119,8 +120,10 @@ impl Ui {
                 Reaction::Idle
             },
             Key::Enter => match mode {
-                Mode::Waiting => Reaction::Speak(mem::take(&mut self.input)),
-                Mode::Working | Mode::Ended(_) => Reaction::Idle,
+                Mode::Waiting if !self.input.trim().is_empty() => {
+                    Reaction::Speak(mem::take(&mut self.input))
+                },
+                Mode::Waiting | Mode::Working | Mode::Ended(_) => Reaction::Idle,
             },
             Key::Up => {
                 self.scroll = self.scroll.saturating_add(1);
@@ -209,5 +212,46 @@ pub async fn run(
                 });
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mode, Reaction, Ui};
+    use crate::port::Key;
+
+    #[test]
+    fn an_empty_line_is_not_sent() {
+        let mut empty = Ui::default();
+        assert_eq!(
+            empty.react(Key::Enter, Mode::Waiting),
+            Reaction::Idle,
+            "an empty line must not open a turn",
+        );
+        assert_eq!(empty.input, "", "the input is left as the human typed it");
+
+        let mut spaces = Ui {
+            input: "   ".to_owned(),
+            ..Ui::default()
+        };
+        assert_eq!(
+            spaces.react(Key::Enter, Mode::Waiting),
+            Reaction::Idle,
+            "a line of spaces holds nothing to say",
+        );
+        assert_eq!(
+            spaces.input, "   ",
+            "the input is left as the human typed it"
+        );
+
+        let mut one = Ui {
+            input: "x".to_owned(),
+            ..Ui::default()
+        };
+        assert_eq!(
+            one.react(Key::Enter, Mode::Waiting),
+            Reaction::Speak("x".to_owned()),
+            "a line with one character still holds something to say",
+        );
     }
 }

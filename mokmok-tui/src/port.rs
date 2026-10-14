@@ -119,12 +119,31 @@ const AGENT_GUTTER: &str = "agent  ";
 // Seven columns, so a continuation row aligns under the first row's text.
 const CONTINUATION_PREFIX: &str = "       ";
 
+const COMMAND_PREFIX: &str = "  $ ";
+
+const OBSERVATION_PREFIX: &str = "    ";
+
 impl std::fmt::Display for Line {
     fn fmt(
         &self,
         formatter: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        formatter.write_str(&rows_of(self).join("\n"))
+        let rows: Vec<String> = match self {
+            // The replay is plain text written after the terminal is handed back, with no row limit,
+            // and it is the record the human takes away, so it carries every observation row the
+            // frame trims to its four-row budget.
+            Self::Work {
+                command,
+                observation,
+            } => {
+                let mut rows = vec![command_row(command)];
+                rows.extend(observation.lines().map(observation_row));
+                rows
+            },
+            other => rows_of(other),
+        };
+
+        formatter.write_str(&rows.join("\n"))
     }
 }
 
@@ -136,15 +155,25 @@ fn rows_of(line: &Line) -> Vec<String> {
             command,
             observation,
         } => {
-            let mut rows = vec![format!("  $ {}", escaped(command))];
+            let mut rows = vec![command_row(command)];
 
+            // Four fixed rows is the frame's whole budget, so the first observation line is all it
+            // can spare for the reason a command failed.
             if let Some(outcome) = observation.lines().next().filter(|first| !first.is_empty()) {
-                rows.push(format!("    {}", escaped(outcome)));
+                rows.push(observation_row(outcome));
             }
 
             rows
         },
     }
+}
+
+fn command_row(command: &str) -> String {
+    format!("{COMMAND_PREFIX}{}", escaped(command))
+}
+
+fn observation_row(line: &str) -> String {
+    format!("{OBSERVATION_PREFIX}{}", escaped(line))
 }
 
 /// One speaker's text as rows: the gutter leads the first line, seven spaces each later one.
@@ -365,6 +394,29 @@ mod tests {
         assert_eq!(
             view.visible(2),
             vec!["       two".to_owned(), "       three".to_owned()],
+        );
+    }
+
+    #[test]
+    fn the_replay_carries_the_whole_observation_and_the_frame_carries_the_first_line() {
+        let line = Line::Work {
+            command: "cat /etc/passwd".to_owned(),
+            observation: "exit code 1\nstderr: denied\n".to_owned(),
+        };
+
+        let replayed = format!("{line}");
+        assert!(
+            replayed.contains("exit code 1") && replayed.contains("stderr: denied"),
+            "the replay must carry every line of the observation: {replayed:?}",
+        );
+
+        assert_eq!(
+            view(vec![line], 0).visible(2),
+            vec![
+                "  $ cat /etc/passwd".to_owned(),
+                "    exit code 1".to_owned(),
+            ],
+            "the frame must keep the command row and the observation's first line",
         );
     }
 
