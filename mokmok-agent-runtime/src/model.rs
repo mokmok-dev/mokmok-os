@@ -26,6 +26,13 @@ pub enum Action {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Answer {
     pub action: Action,
+    /// What the model said, clipped to [`MAX_PROSE_BYTES`].
+    ///
+    /// The raw body is `text`; these are the words a human reads and the next prompt shows, so the
+    /// loop's record of the answer carries them rather than a reference only a store could resolve.
+    ///
+    /// [`MAX_PROSE_BYTES`]: crate::record::MAX_PROSE_BYTES
+    pub prose: String,
     pub text: ArtifactRef,
     pub model: String,
     pub usage: Usage,

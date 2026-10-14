@@ -416,12 +416,13 @@ fn transcript_line(
             prompt.context.bytes,
         )),
         mokmok_agent_runtime::Record::Answer(answer) => Some(format!(
-            "answer turn={} number={} attempt={} action={:?} model={}",
+            "answer turn={} number={} attempt={} action={:?} model={} say={:?}",
             answer.turn.as_uuid(),
             number(answer.turn),
             answer.attempt.get(),
             answer.action,
             answer.model,
+            answer.prose,
         )),
         mokmok_agent_runtime::Record::Call(call) => Some(format!(
             "call turn={} number={} execution={} command={:?}",
@@ -435,6 +436,12 @@ fn transcript_line(
             execution.as_uuid(),
             report.exit,
             report.observation,
+        )),
+        mokmok_agent_runtime::Record::Speech(speech) => Some(format!(
+            "speech turn={} number={} text={:?}",
+            speech.turn.as_uuid(),
+            number(speech.turn),
+            speech.text,
         )),
         mokmok_agent_runtime::Record::Session { .. }
         | mokmok_agent_runtime::Record::Turn { .. } => None,

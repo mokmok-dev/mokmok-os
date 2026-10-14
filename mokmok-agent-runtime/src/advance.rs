@@ -42,6 +42,11 @@ pub enum Move {
         outcome: TurnOutcome,
         ending: Option<Ending>,
     },
+    /// Wait for the human's next line.
+    ///
+    /// The session holds a human line and the agent is not mid-work, so nothing moves until the human
+    /// says something. The step performs no effect.
+    Await,
     /// Stop, for a reason no move can carry out.
     Halt(Halt),
 }
@@ -68,6 +73,8 @@ pub enum Progress {
     Advanced(Move),
     /// The move's intent replayed, so no effect was performed.
     Yielded,
+    /// The move was [`Move::Await`]: the conversation belongs to the human.
+    Awaiting,
     /// The session had already ended when the step began.
     Terminal(Ending),
 }
@@ -120,6 +127,13 @@ pub async fn advance(
     let decision = next(&transcript);
     match &decision {
         Move::Halt(Halt::Closed(ending)) => return Ok(Progress::Terminal(*ending)),
+        Move::Halt(Halt::Attempts) if transcript.holds_speech() => {
+            // A spent attempt ceiling in a conversation settles the turn failed but leaves the
+            // session open for the human, rather than closing the whole conversation on a
+            // transient provider failure.
+            journal.append(halt_settle(session, &transcript, Halt::Attempts.outcome()))?;
+            return Ok(Progress::Awaiting);
+        },
         Move::Halt(halt) => {
             if *halt != Halt::Draining {
                 journal.append(halt_close(session, &transcript, halt.outcome()))?;
@@ -175,6 +189,7 @@ pub async fn advance(
                 return Ok(Progress::Yielded);
             }
         },
+        Move::Await => return Ok(Progress::Awaiting),
     }
 
     Ok(Progress::Advanced(decision))
@@ -234,10 +249,23 @@ fn accepting(transcript: &Transcript) -> Move {
     let number = state.number().map_or(0, TurnNumber::get);
 
     if state.outcome().is_some() {
+        // Gating on `holds_speech` alone would stop the conversation after every tool call, so an
+        // agent could never run two commands in one exchange. Only a command it asked for leaves
+        // the agent mid-work.
+        let awaiting_human = transcript.holds_speech()
+            && !transcript.newest_answer(turn).is_some_and(|answer| {
+                matches!(&answer.action, crate::model::Action::Command { .. })
+            });
+        if awaiting_human {
+            return Move::Await;
+        }
+
         if transcript
             .newest_answer(turn)
             .is_some_and(|answer| answer.action == crate::model::Action::Final)
         {
+            // A goal run writes no speech, so this gate leaves `mokmokd agent run` closing on a
+            // final answer exactly as it did before the amendment.
             return Move::Close {
                 turn,
                 outcome: TurnOutcome::Completed,
@@ -428,6 +456,7 @@ fn ask_outcome(
             turn,
             attempt,
             action: answer.action,
+            prose: answer.prose,
             text: answer.text,
             model: answer.model,
             usage: answer.usage,
@@ -587,6 +616,37 @@ fn halt_close(
     )
 }
 
+fn halt_settle(
+    session: SessionID,
+    transcript: &Transcript,
+    outcome: TurnOutcome,
+) -> Step {
+    let mut records = Vec::new();
+    let number = match transcript.newest_turn() {
+        Some((turn, state)) => {
+            if state.outcome().is_none() {
+                records.push(Record::Turn {
+                    turn,
+                    fact: TurnFact::TurnSettled { outcome },
+                });
+            }
+            state.number().map_or(0, TurnNumber::get)
+        },
+        None => 0,
+    };
+    Step::new(
+        StepId::derive(
+            session,
+            StepKey::Close {
+                turn: number,
+                session: false,
+            },
+        ),
+        session,
+        records,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Halt, Move, Progress, advance, next};
@@ -594,11 +654,12 @@ mod tests {
     use crate::dialogue::Transcript;
     use crate::error::Error;
     use crate::model::{Action, Answer, Journal, Provider, Usage};
-    use crate::record::{ArtifactRef, Receipt, Record, Step, StepId, StepKey};
+    use crate::record::{ArtifactRef, MAX_SPEECH_BYTES, Receipt, Record, Step, StepId, StepKey};
+    use crate::speech::speak;
     use crate::task::Task;
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
-        begin_records, execution_id, open_records, report, session, task, turn_id,
+        begin_records, execution_id, open_records, report, session, speech_records, task, turn_id,
     };
     use crate::tool::{Exit, ToolCall, ToolReport, Tools};
     use mokmok_protocol::{Moment, SessionID};
@@ -858,6 +919,7 @@ mod tests {
     fn answer(action: Action) -> Answer {
         Answer {
             action,
+            prose: String::new(),
             text: artifact(0xbb),
             model: "test".to_owned(),
             usage: Usage {
@@ -1273,6 +1335,225 @@ mod tests {
         assert_eq!(
             journal.transcript(session).unwrap().session.phase(),
             Phase::Closed(Ending::Completed),
+        );
+    }
+
+    /// A conversation whose newest turn settled on a final answer.
+    fn waiting_transcript(
+        task: &Task,
+        with_speech: bool,
+    ) -> Transcript {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(task));
+        if with_speech {
+            apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+        }
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(&mut transcript, &answer_records(turn, 1, Action::Final));
+        apply_all(
+            &mut transcript,
+            &crate::test_support::close_records(turn, false, None),
+        );
+
+        transcript
+    }
+
+    #[test]
+    fn a_final_answer_waits_when_the_session_holds_a_line() {
+        let task = task(4);
+
+        assert_eq!(next(&waiting_transcript(&task, true)), Move::Await);
+    }
+
+    #[test]
+    fn a_final_answer_still_closes_a_goal_run() {
+        let task = task(4);
+        let turn = turn_id(1);
+
+        assert_eq!(
+            next(&waiting_transcript(&task, false)),
+            Move::Close {
+                turn,
+                outcome: TurnOutcome::Completed,
+                ending: Some(Ending::Completed),
+            },
+        );
+    }
+
+    #[test]
+    fn a_tool_call_keeps_the_agent_working_in_a_conversation() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Command {
+                    command: "ls".to_owned(),
+                },
+            ),
+        );
+        apply_all(&mut transcript, &act_intent_records(turn, execution, "ls"));
+        apply_all(
+            &mut transcript,
+            &act_outcome_records(turn, execution, Exit::Finished { code: 0 }, b"ok"),
+        );
+
+        assert!(
+            matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2)),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attempt_ceiling_leaves_a_conversation_open() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&speech_records(turn, 1, "hello"));
+        for attempt in 1..=3 {
+            journal.seed(&open_records(turn, 1, attempt));
+        }
+
+        let provider = ScriptedProvider::of([]);
+        let tools = FakeTools::of([]);
+        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
+            .await
+            .unwrap();
+
+        assert_eq!(progress, Progress::Awaiting);
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(transcript.session.phase(), Phase::Accepting);
+        let (_, state) = transcript.newest_turn().unwrap();
+        assert_eq!(state.outcome(), Some(TurnOutcome::Failed));
+
+        assert_eq!(next(&transcript), Move::Await);
+        assert_eq!(
+            speak(&mut journal, session, "try again").unwrap(),
+            Receipt::Written,
+        );
+        let extended = journal.transcript(session).unwrap();
+        let second = turn_id(2);
+        assert_eq!(extended.newest_turn().unwrap().0, second);
+        assert_eq!(extended.speech(second), Some("try again"));
+        assert_eq!(extended.session.phase(), Phase::Accepting);
+    }
+
+    #[test]
+    fn a_repeated_line_opens_a_new_turn() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&speech_records(turn, 1, "hello"));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(turn, 1, Action::Final));
+        journal.seed(&crate::test_support::close_records(turn, false, None));
+        assert_eq!(next(&journal.transcript(session).unwrap()), Move::Await);
+
+        assert_eq!(
+            speak(&mut journal, session, "hello").unwrap(),
+            Receipt::Written,
+        );
+        let extended = journal.transcript(session).unwrap();
+        assert_eq!(extended.newest_turn().unwrap().0, turn_id(2));
+        assert_eq!(extended.speech(turn_id(2)), Some("hello"));
+    }
+
+    #[test]
+    fn a_landed_line_that_has_asked_nothing_is_not_speaked_again() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&speech_records(turn, 1, "hello"));
+
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(
+            next(&transcript),
+            Move::Ask {
+                turn,
+                number: TurnNumber::new(1),
+                attempt: Attempt::new(1),
+                context: crate::context::context(&transcript),
+            },
+        );
+
+        let refused = speak(&mut journal, session, "hello").unwrap_err();
+        assert!(matches!(refused, Error::NotAwaiting), "{refused}");
+    }
+
+    #[test]
+    fn speak_opens_a_conversation_then_extends_it() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+
+        assert_eq!(
+            speak(&mut journal, session, "hello").unwrap(),
+            Receipt::Written,
+        );
+        let opened = journal.transcript(session).unwrap();
+        assert_eq!(opened.session.phase(), Phase::Accepting);
+        assert_eq!(opened.task.as_ref(), Some(&task));
+        assert_eq!(opened.newest_turn().unwrap().0, turn);
+        assert_eq!(opened.speech(turn), Some("hello"));
+
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(turn, 1, Action::Final));
+        journal.seed(&crate::test_support::close_records(turn, false, None));
+        assert_eq!(next(&journal.transcript(session).unwrap()), Move::Await);
+
+        assert_eq!(
+            speak(&mut journal, session, "again").unwrap(),
+            Receipt::Written,
+        );
+        let extended = journal.transcript(session).unwrap();
+        assert_eq!(extended.newest_turn().unwrap().0, turn_id(2));
+        assert_eq!(extended.speech(turn_id(2)), Some("again"));
+
+        let refused = speak(&mut journal, session, "again").unwrap_err();
+        assert!(matches!(refused, Error::NotAwaiting), "{refused}");
+    }
+
+    #[test]
+    fn speak_is_refused_while_a_turn_is_in_flight() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&speech_records(turn_id(1), 1, "hello"));
+        journal.seed(&open_records(turn_id(1), 1, 1));
+
+        let refused = speak(&mut journal, session, "another").unwrap_err();
+
+        assert!(matches!(refused, Error::NotAwaiting), "{refused}");
+    }
+
+    #[test]
+    fn a_line_longer_than_the_log_holds_is_refused() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task);
+        let line = "x".repeat(MAX_SPEECH_BYTES + 1);
+
+        let refused = speak(&mut journal, session, &line).unwrap_err();
+
+        assert!(
+            matches!(refused, Error::TooMuch { limit, found }
+                if limit == MAX_SPEECH_BYTES && found == MAX_SPEECH_BYTES + 1),
+            "{refused}",
         );
     }
 }

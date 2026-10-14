@@ -1,9 +1,10 @@
-//! The bytes the model is handed: a system prompt, the goal, and the settled turns it may see.
+//! The bytes the model is handed: a system prompt, the goal, and the turns it may see.
 
 use crate::dialogue::Transcript;
 use crate::task::Task;
 use crate::tool::clip;
-use mokmok_state_machine::TurnNumber;
+use mokmok_protocol::TurnID;
+use mokmok_state_machine::{Turn, TurnNumber};
 
 /// The canonical prompt content for one model call.
 ///
@@ -16,12 +17,33 @@ pub struct Context {
     pub turns: Vec<ContextTurn>,
 }
 
-/// One settled turn as the model sees it: the command and its observation.
+/// One turn the model may see: what opened it and what the agent did with it.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ContextTurn {
     pub number: TurnNumber,
-    pub command: String,
-    pub observation: String,
+    /// What the human said to open this turn, when a human opened it.
+    ///
+    /// Absent on a turn the agent opened itself — the ask that follows a tool call in the same
+    /// exchange — so a reader can tell a new human message from a continuation of the agent's work.
+    pub speech: Option<String>,
+    /// What the agent did in this turn, once the turn settled.
+    ///
+    /// Absent on the turn being asked now, which is how the human's newest line reaches the model:
+    /// the line opens the very turn that answers it, so that turn is unsettled while it is asked.
+    pub act: Option<ContextAct>,
+}
+
+/// What the agent did in one settled turn.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "act", rename_all = "snake_case")]
+pub enum ContextAct {
+    /// The agent asked for the one tool, and it ran.
+    Ran {
+        command: String,
+        observation: String,
+    },
+    /// The agent answered without the tool.
+    Said { reply: String },
 }
 
 impl Context {
@@ -35,7 +57,18 @@ impl Context {
             + self
                 .turns
                 .iter()
-                .map(|turn| turn.command.len() + turn.observation.len() + 8)
+                .map(|turn| {
+                    turn.speech.as_ref().map_or(0, String::len)
+                        + match &turn.act {
+                            Some(ContextAct::Ran {
+                                command,
+                                observation,
+                            }) => command.len() + observation.len(),
+                            Some(ContextAct::Said { reply }) => reply.len(),
+                            None => 0,
+                        }
+                        + 8
+                })
                 .sum::<usize>()
     }
 }
@@ -65,14 +98,75 @@ pub fn system_prompt(task: &Task) -> String {
 /// Names the call record a recovery never wrote, so a settled turn is shown rather than dropped.
 const MISSING_COMMAND: &str = "(the command was not recorded)";
 
+impl Transcript {
+    /// Every turn the model may see, oldest first: a settled turn, or one holding the human line it
+    /// is being asked to answer.
+    ///
+    /// A turn in flight with no speech contributes nothing, so a re-ask after a crash rebuilds the
+    /// bytes the first attempt sent. A settled turn with no call record still appears, carrying the
+    /// rendering the recovery settlement gives it, so an interrupted command stays visible.
+    #[must_use]
+    pub fn shown(&self) -> Vec<ContextTurn> {
+        self.turns_in_order()
+            .into_iter()
+            .filter(|(turn, state)| state.outcome().is_some() || self.speeches.contains_key(turn))
+            .map(|(turn, state)| ContextTurn {
+                number: state.number().unwrap_or(TurnNumber::new(0)),
+                speech: self.speech(turn).map(str::to_owned),
+                act: self.act_of(turn, state),
+            })
+            .collect()
+    }
+
+    /// What the agent did in one turn, as the model sees it, or nothing while the turn is asked.
+    fn act_of(
+        &self,
+        turn: TurnID,
+        state: &Turn,
+    ) -> Option<ContextAct> {
+        state.outcome()?;
+
+        if let Some(call) = self.call_of(turn) {
+            return Some(ContextAct::Ran {
+                command: call.command.clone(),
+                observation: self.shown_observation(turn),
+            });
+        }
+
+        if let Some(answer) = self.newest_answer(turn)
+            && answer.action == crate::model::Action::Final
+        {
+            return Some(ContextAct::Said {
+                reply: answer.prose.clone(),
+            });
+        }
+
+        Some(ContextAct::Ran {
+            command: MISSING_COMMAND.to_owned(),
+            observation: self.shown_observation(turn),
+        })
+    }
+
+    fn shown_observation(
+        &self,
+        turn: TurnID,
+    ) -> String {
+        let limit = self
+            .task
+            .as_ref()
+            .map_or(0, |task| task.budget.observation_bytes);
+
+        self.observation(turn)
+            .map_or_else(String::new, |text| clip(text.as_bytes(), bytes_of(limit)))
+    }
+}
+
 /// The prompt content for the next model call, built from the fold.
 ///
-/// Only settled turns appear, so the turn currently in flight contributes nothing and an attempt
-/// repeated under a new number rebuilds the same bytes. A settled turn is rendered even without a
-/// call record, so a recovery settlement still carries the unproven-outcome warning into the next
-/// prompt. The newest
-/// [`Budget::context_turns`](crate::task::Budget::context_turns) are kept, clipped to
-/// [`Budget::observation_bytes`](crate::task::Budget::observation_bytes), and the oldest are
+/// A settled turn appears, and so does the turn holding the human's newest line while it is being
+/// asked, so the line that opened a turn reaches the model as the prompt for that turn. An attempt
+/// repeated under a new number rebuilds the same bytes. The newest
+/// [`Budget::context_turns`](crate::task::Budget::context_turns) are kept, and the oldest are
 /// dropped until the whole context fits [`Budget::context_bytes`](crate::task::Budget::context_bytes).
 #[must_use]
 pub fn context(transcript: &Transcript) -> Context {
@@ -84,27 +178,7 @@ pub fn context(transcript: &Transcript) -> Context {
         };
     };
 
-    let mut turns: Vec<ContextTurn> = transcript
-        .turns_in_order()
-        .into_iter()
-        .filter(|(_, state)| state.outcome().is_some())
-        .map(|(turn, state)| {
-            let command = transcript
-                .call_of(turn)
-                .map_or_else(|| MISSING_COMMAND.to_owned(), |call| call.command.clone());
-            let observation = transcript
-                .observation(turn)
-                .map_or_else(String::new, |text| {
-                    clip(text.as_bytes(), bytes_of(task.budget.observation_bytes))
-                });
-            ContextTurn {
-                number: state.number().unwrap_or(TurnNumber::new(0)),
-                command,
-                observation,
-            }
-        })
-        .collect();
-
+    let mut turns = transcript.shown();
     keep_newest(&mut turns, task.budget.context_turns as usize);
 
     let mut context = Context {
@@ -152,14 +226,15 @@ fn paths(granted: &[std::path::PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Context, ContextTurn, MISSING_COMMAND, bytes_of, context, keep_newest, paths, system_prompt,
+        Context, ContextAct, ContextTurn, MISSING_COMMAND, bytes_of, context, keep_newest, paths,
+        system_prompt,
     };
     use crate::dialogue::Transcript;
     use crate::model::Action;
     use crate::record::{CallRecord, Record};
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
-        begin_records, execution_id, open_records, session, task, turn_id,
+        begin_records, execution_id, open_records, session, speech_records, task, turn_id,
     };
     use crate::tool::{Exit, ToolReport, UNKNOWN_WARNING, observation};
     use mokmok_protocol::{ExecutionID, TurnID};
@@ -170,8 +245,25 @@ mod tests {
     fn turn_of(number: u64) -> ContextTurn {
         ContextTurn {
             number: TurnNumber::new(number),
-            command: format!("command-{number}"),
-            observation: format!("observation-{number}"),
+            speech: None,
+            act: Some(ContextAct::Ran {
+                command: format!("command-{number}"),
+                observation: format!("observation-{number}"),
+            }),
+        }
+    }
+
+    fn ran_command(turn: &ContextTurn) -> &str {
+        match &turn.act {
+            Some(ContextAct::Ran { command, .. }) => command,
+            other => panic!("expected a ran act, got {other:?}"),
+        }
+    }
+
+    fn ran_observation(turn: &ContextTurn) -> &str {
+        match &turn.act {
+            Some(ContextAct::Ran { observation, .. }) => observation,
+            other => panic!("expected a ran act, got {other:?}"),
         }
     }
 
@@ -337,7 +429,7 @@ mod tests {
         let mut trimmed = vec![turn_of(1), turn_of(2), turn_of(3)];
         keep_newest(&mut trimmed, 1);
         assert_eq!(trimmed.len(), 1);
-        assert_eq!(trimmed[0].command, "command-3");
+        assert_eq!(ran_command(&trimmed[0]), "command-3");
 
         let mut all = vec![turn_of(1), turn_of(2), turn_of(3)];
         keep_newest(&mut all, 0);
@@ -358,8 +450,8 @@ mod tests {
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 2);
-        assert_eq!(built.turns[0].command, "command-2");
-        assert_eq!(built.turns[1].command, "command-3");
+        assert_eq!(ran_command(&built.turns[0]), "command-2");
+        assert_eq!(ran_command(&built.turns[1]), "command-3");
     }
 
     #[test]
@@ -373,7 +465,7 @@ mod tests {
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 3);
-        assert_eq!(built.turns[0].command, "command-1");
+        assert_eq!(ran_command(&built.turns[0]), "command-1");
     }
 
     #[test]
@@ -401,8 +493,8 @@ mod tests {
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 1);
-        assert_eq!(built.turns[0].command, MISSING_COMMAND);
-        assert_eq!(built.turns[0].observation, UNKNOWN_WARNING);
+        assert_eq!(ran_command(&built.turns[0]), MISSING_COMMAND);
+        assert_eq!(ran_observation(&built.turns[0]), UNKNOWN_WARNING);
     }
 
     #[test]
@@ -435,8 +527,8 @@ mod tests {
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 1);
-        assert_eq!(built.turns[0].command, "cargo test");
-        assert_eq!(built.turns[0].observation, UNKNOWN_WARNING);
+        assert_eq!(ran_command(&built.turns[0]), "cargo test");
+        assert_eq!(ran_observation(&built.turns[0]), UNKNOWN_WARNING);
     }
 
     #[test]
@@ -468,7 +560,7 @@ mod tests {
 
         let built = context(&transcript);
         assert_eq!(built.turns.len(), 1);
-        assert_eq!(built.turns[0].observation, UNKNOWN_WARNING);
+        assert_eq!(ran_observation(&built.turns[0]), UNKNOWN_WARNING);
     }
 
     #[test]
@@ -533,7 +625,7 @@ mod tests {
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 1);
-        assert_eq!(built.turns[0].observation, "the tool's own rendering");
+        assert_eq!(ran_observation(&built.turns[0]), "the tool's own rendering");
     }
 
     #[test]
@@ -575,7 +667,7 @@ mod tests {
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 1);
-        assert_eq!(built.turns[0].observation, "exit code 7");
+        assert_eq!(ran_observation(&built.turns[0]), "exit code 7");
     }
 
     #[test]
@@ -628,6 +720,73 @@ mod tests {
 
         let built: Context = context(&transcript);
         assert_eq!(built.turns.len(), 1);
-        assert_eq!(built.turns[0].command, "ls");
+        assert_eq!(ran_command(&built.turns[0]), "ls");
+    }
+
+    #[test]
+    fn the_turn_a_line_opened_is_shown_to_the_model_while_it_is_asked() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].number, TurnNumber::new(1));
+        assert_eq!(built.turns[0].speech.as_deref(), Some("hello"));
+        assert_eq!(built.turns[0].act, None);
+    }
+
+    #[test]
+    fn a_re_ask_with_a_line_still_rebuilds_the_bytes_the_first_attempt_sent() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+
+        let first = context(&transcript);
+        assert_eq!(first.turns[0].speech.as_deref(), Some("hello"));
+
+        apply_all(&mut transcript, &open_records(turn, 1, 2));
+        let second = context(&transcript);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::to_vec(&first).unwrap(),
+            serde_json::to_vec(&second).unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_malformed_answer_still_renders_its_turn() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Malformed {
+                    reason: "the tool arguments are not json".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &crate::test_support::close_records(turn, false, None),
+        );
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns.len(), 1);
+        assert_eq!(built.turns[0].speech, None);
+        assert_eq!(ran_command(&built.turns[0]), MISSING_COMMAND);
     }
 }

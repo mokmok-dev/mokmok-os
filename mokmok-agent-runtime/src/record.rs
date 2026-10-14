@@ -7,6 +7,19 @@ use crate::model::{Action, Usage};
 use crate::task::Task;
 use crate::tool::ToolReport;
 
+/// How many bytes of one human line the log may hold.
+///
+/// The log is folded whole on every step and replayed on every launch, so a record stays bounded.
+/// The runtime refuses a longer line rather than truncating it, because a truncated sentence is a
+/// different sentence.
+pub const MAX_SPEECH_BYTES: usize = 4 * 1024;
+
+/// How many bytes of the model's own words one answer record may hold.
+///
+/// The whole body stays in the artifact store, under the reference `AnswerRecord::text` names, so
+/// the clip costs a reader nothing: the record holds only what the next prompt and a screen need.
+pub const MAX_PROSE_BYTES: usize = 8 * 1024;
+
 /// Bytes outside the log, named by their content hash.
 ///
 /// The reference is what the log keeps; the bytes live in the artifact store and are written
@@ -39,9 +52,22 @@ pub struct AnswerRecord {
     pub turn: TurnID,
     pub attempt: Attempt,
     pub action: Action,
+    /// The model's own words, clipped; empty when the provider had none to give.
+    ///
+    /// `default` keeps a log written before this field readable: an older answer folds with no prose
+    /// rather than refusing to decode.
+    #[serde(default)]
+    pub prose: String,
     pub text: ArtifactRef,
     pub model: String,
     pub usage: Usage,
+}
+
+/// One human line, as the input that opened one turn.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SpeechRecord {
+    pub turn: TurnID,
+    pub text: String,
 }
 
 /// The command about to be dispatched.
@@ -78,6 +104,8 @@ pub enum Record {
     Answer(AnswerRecord),
     /// The command about to be dispatched.
     Call(CallRecord),
+    /// A human's line, which opened this turn.
+    Speech(SpeechRecord),
 }
 
 /// The identity of one durable commitment.
@@ -109,6 +137,8 @@ pub enum StepKey {
     /// the session — so the closing step carries its own key; one id for both would make the
     /// second a replay of the first and the session would never close.
     Close { turn: u64, session: bool },
+    /// A human's line, written under the turn it opens.
+    Speech { turn: u64 },
 }
 
 impl StepId {
@@ -146,6 +176,7 @@ impl StepKey {
                 turn,
                 session: true,
             } => format!("close:{turn}:session"),
+            Self::Speech { turn } => format!("speech:{turn}"),
         }
     }
 }
@@ -190,6 +221,7 @@ pub enum RecordKey {
     Answer { turn: TurnID, attempt: Attempt },
     Call(ExecutionID),
     Result(ExecutionID),
+    Speech { turn: TurnID },
 }
 
 /// Why the fold refused a record.
@@ -203,6 +235,8 @@ pub enum Refusal {
     Conflict(RecordKey),
     /// A content record whose admitting machine fact the fold does not hold.
     Floating(RecordKey),
+    /// A content record whose admitting fact the fold holds, arriving after a record it must precede.
+    Late(RecordKey),
     /// A machine fact the fold refused.
     Rejected(Rejection),
     /// A call whose command the answer recorded for the same turn did not name.
@@ -223,6 +257,9 @@ impl std::fmt::Display for Refusal {
                 write!(formatter, "{key} already recorded with different content")
             },
             Self::Floating(key) => write!(formatter, "no machine fact admits {key}"),
+            Self::Late(key) => {
+                write!(formatter, "{key} arrived after a record it must precede")
+            },
             Self::Rejected(rejection) => write!(formatter, "{rejection}"),
             Self::CommandMismatch { turn, answer, call } => write!(
                 formatter,
@@ -259,6 +296,9 @@ impl std::fmt::Display for RecordKey {
             },
             Self::Result(execution) => {
                 write!(formatter, "the result of execution {}", execution.as_uuid())
+            },
+            Self::Speech { turn } => {
+                write!(formatter, "the speech for turn {}", turn.as_uuid())
             },
         }
     }
