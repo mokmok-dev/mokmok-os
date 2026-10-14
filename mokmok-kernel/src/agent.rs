@@ -154,6 +154,7 @@ impl Ledger {
                     execution = Some(*done);
                     resolution = Some(report.exit.resolution());
                 },
+                Record::Speech(speech) => turn = Some(speech.turn),
                 Record::Task(_)
                 | Record::Prompt(_)
                 | Record::Answer(_)
@@ -377,10 +378,14 @@ impl Scripted {
         let mut answers = VecDeque::new();
 
         for answer in script {
+            let prose = answer
+                .say()
+                .map_or_else(String::new, crate::provider::clip_prose);
             let text = serde_json::to_vec(&answer)?;
             let hash = store.put(&text)?;
             answers.push_back(Answer {
                 action: answer.into(),
+                prose,
                 text: ArtifactRef {
                     hash: hash.to_string(),
                     bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
@@ -421,19 +426,43 @@ impl Provider for Scripted {
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Script {
     /// The model asked for the one tool.
-    Command { command: String },
+    Command {
+        command: String,
+        /// The model's own words, when the script supplies them, so an offline run shows prose.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
     /// The model is done.
-    Final,
+    Final {
+        /// The model's own words, when the script supplies them, so an offline run shows prose.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
     /// The model's arguments could not be decoded.
-    Malformed { reason: String },
+    Malformed {
+        reason: String,
+        /// The model's own words, when the script supplies them, so an offline run shows prose.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
+}
+
+impl Script {
+    fn say(&self) -> Option<&str> {
+        match self {
+            Self::Command { say, .. } | Self::Final { say } | Self::Malformed { say, .. } => {
+                say.as_deref()
+            },
+        }
+    }
 }
 
 impl From<Script> for Action {
     fn from(script: Script) -> Self {
         match script {
-            Script::Command { command } => Self::Command { command },
-            Script::Final => Self::Final,
-            Script::Malformed { reason } => Self::Malformed { reason },
+            Script::Command { command, .. } => Self::Command { command },
+            Script::Final { .. } => Self::Final,
+            Script::Malformed { reason, .. } => Self::Malformed { reason },
         }
     }
 }
@@ -495,6 +524,109 @@ pub struct Report {
     pub steps: Vec<String>,
 }
 
+/// One session's world, assembled the way the kernel assembles it: the event log and the artifact
+/// store as the journal, the authority and the sandbox as the tool, and the provider the
+/// configuration named.
+///
+/// It exists so a second front end drives the same loop without assembling a second world or
+/// re-deciding which provider a configuration means. A step is one bounded step of the same
+/// [`advance`] `agent run` calls.
+pub struct Driver {
+    ledger: Ledger,
+    shell: Shell,
+    provider: Model,
+    config: Config,
+    session: SessionID,
+    task: Task,
+    at: Moment,
+}
+
+impl Driver {
+    /// Opens the session's world: its ledger, its tool, and the provider the configuration named.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Run::task`], the provider the configuration named, the tool, and the
+    /// ledger.
+    pub fn open(
+        config: &Config,
+        run: &Run,
+        at: Moment,
+    ) -> Result<Self, Error> {
+        let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
+        let task = run.task(config)?;
+        let provider = model(config, session)?;
+        let shell = Shell::new(config, task.setting.program.clone(), at)?;
+        let ledger = Ledger::open(config, session, Some(task.clone()), at)?;
+
+        Ok(Self {
+            ledger,
+            shell,
+            provider,
+            config: config.clone(),
+            session,
+            task,
+            at,
+        })
+    }
+
+    /// The session this driver works in.
+    #[must_use]
+    pub const fn session(&self) -> SessionID {
+        self.session
+    }
+
+    /// The fold of everything the session has committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's failure when the history cannot be read or does not fold.
+    pub fn transcript(&self) -> Result<Transcript, AgentError> {
+        self.ledger.transcript(self.session)
+    }
+
+    /// Commits one human line as the input of the session's next turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotAwaiting` when the session is not waiting for a line, `TooMuch` when the line is
+    /// too long, and the journal's own failures.
+    pub fn speak(
+        &mut self,
+        line: &str,
+    ) -> Result<Receipt, AgentError> {
+        mokmok_agent_runtime::speak(&mut self.ledger, self.session, line)
+    }
+
+    /// Performs at most one bounded step of the same [`advance`] `agent run` calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runtime's own failures.
+    pub async fn step(&mut self) -> Result<Progress, AgentError> {
+        advance(
+            &mut self.ledger,
+            &self.provider,
+            &self.shell,
+            self.session,
+            self.at,
+        )
+        .await
+    }
+
+    /// Re-opens the ledger, running the session's idempotent recovery, so a caller can settle what
+    /// a dead process left in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Ledger::open`].
+    pub fn reopen(&mut self) -> Result<(), Error> {
+        self.ledger = Ledger::open(&self.config, self.session, Some(self.task.clone()), self.at)?;
+
+        Ok(())
+    }
+}
+
 /// Drives one session for at most `run.steps` bounded steps.
 ///
 /// # Errors
@@ -505,20 +637,16 @@ pub async fn run(
     run: &Run,
     at: Moment,
 ) -> Result<Report, Error> {
-    let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
-    let task = run.task(config)?;
-    let provider = model(config, session)?;
-    let shell = Shell::new(config, task.setting.program.clone(), at)?;
-    let mut ledger = Ledger::open(config, session, Some(task), at)?;
+    let mut driver = Driver::open(config, run, at)?;
     let mut report = Report {
-        session,
+        session: driver.session(),
         ending: None,
         halt: None,
         steps: Vec::new(),
     };
 
     for _ in 0..run.steps {
-        match advance(&mut ledger, &provider, &shell, session, at).await? {
+        match driver.step().await? {
             Progress::Terminal(ending) => {
                 report.ending = Some(ending);
                 report
@@ -527,9 +655,16 @@ pub async fn run(
 
                 return Ok(report);
             },
+            Progress::Awaiting => {
+                report.steps.push("awaiting".to_owned());
+
+                return Ok(report);
+            },
             Progress::Yielded => report.steps.push("move=yielded".to_owned()),
             Progress::Advanced(mv) => {
-                report.steps.push(step_line(&ledger, session, &mv));
+                report
+                    .steps
+                    .push(step_line(&driver.ledger, driver.session(), &mv));
                 match mv {
                     Move::Halt(halt) => {
                         report.halt = Some(halt);
@@ -666,6 +801,7 @@ fn step_line(
             "move=close turn={} outcome={outcome:?} ending={ending:?}",
             number_of(ledger, session, *turn),
         ),
+        Move::Await => "move=await".to_owned(),
         Move::Halt(halt) => format!("move=halt {halt:?}"),
     }
 }

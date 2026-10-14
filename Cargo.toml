@@ -12,6 +12,7 @@ members = [
   "mokmok-sandbox",
   "mokmok-scheduler",
   "mokmok-state-machine",
+  "mokmok-tui",
 ]
 resolver = "3"
 
@@ -26,6 +27,7 @@ mokmok-capability = { path = "mokmok-capability" }
 mokmok-egress = { path = "mokmok-egress" }
 mokmok-event-bus = { path = "mokmok-event-bus" }
 mokmok-event-store = { path = "mokmok-event-store" }
+mokmok-kernel = { path = "mokmok-kernel" }
 mokmok-observability = { path = "mokmok-observability" }
 mokmok-protocol = { path = "mokmok-protocol" }
 mokmok-sandbox = { path = "mokmok-sandbox" }
@@ -39,6 +41,7 @@ nix = { version = "0.31", default-features = false, features = [
 ] }
 proptest = "1.12.0"
 proptest-state-machine = "0.9.0"
+ratatui = "0.30.2"
 reqwest = { version = "0.12.28", default-features = false, features = [
   "rustls-tls",
 ] }

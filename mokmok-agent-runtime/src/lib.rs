@@ -18,6 +18,7 @@ mod dialogue;
 mod error;
 mod model;
 mod record;
+mod speech;
 mod task;
 mod tool;
 
@@ -25,14 +26,15 @@ mod tool;
 mod test_support;
 
 pub use advance::{Halt, Move, Progress, advance, execution_id, next, turn_id};
-pub use context::{Context, ContextTurn, context, system_prompt};
+pub use context::{Context, ContextAct, ContextTurn, context, system_prompt};
 pub use dialogue::Transcript;
 pub use error::{Error, Source};
 pub use model::{Action, Answer, Journal, Provider, Usage};
 pub use record::{
-    AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Receipt, Record, RecordKey, Refusal, Step,
-    StepId, StepKey, TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, MAX_PROSE_BYTES, MAX_SPEECH_BYTES, PromptRecord,
+    Receipt, Record, RecordKey, Refusal, SpeechRecord, Step, StepId, StepKey, TaskRecord,
 };
+pub use speech::speak;
 pub use task::{Budget, Setting, Task};
 pub use tool::{
     DEFAULT_DEADLINE, Exit, ToolCall, ToolReport, Tools, UNKNOWN_WARNING, clip, observation,

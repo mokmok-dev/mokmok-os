@@ -10,8 +10,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
-    use mokmok_agent_runtime::UNKNOWN_WARNING;
+    use clap::Parser as _;
+    use mokmok_agent_runtime::{Action, Progress, Record, UNKNOWN_WARNING, turn_id};
     use mokmok_artifact::{BlobStore, ContentHash};
+    use mokmok_kernel::agent::Driver;
+    use mokmok_kernel::{Config, Db, Run, uuid_of};
+    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_state_machine::{Phase, TurnOutcome};
     use serde_json::json;
 
     const SESSION: &str = "018f2f1e-0000-7000-8000-000000000000";
@@ -401,5 +406,177 @@ mod tests {
             .phrase("result ")
             .unwrap_or_else(|| panic!("no result line:\n{}", report.out));
         assert!(result.contains("exit=Refused"), "{result}");
+    }
+
+    #[test]
+    fn a_scripted_final_answer_records_its_prose() {
+        let scratch = Scratch::new("prose");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({
+                    "action": "command",
+                    "command": format!("cd {} && printf hello > out.txt", scratch.checkout().display()),
+                }),
+                json!({"action": "final", "say": "the file is written"}),
+            ],
+        );
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+
+        let db = Db::open(&scratch.data().join("events.sqlite")).expect("the log opens");
+        let session =
+            SessionID::from_uuid(uuid_of(SESSION, "session").expect("the session is a uuid"));
+        let log = db.log(session).expect("the log reads");
+        let prose = log.ordered.iter().find_map(|record| match record {
+            Record::Answer(answer) if answer.action == Action::Final => Some(answer.prose.as_str()),
+            _ => None,
+        });
+
+        assert_eq!(prose, Some("the file is written"));
+
+        // The same run, read back the way a human reads a conversation: `status` is the only surface
+        // that shows the agent's words outside the TUI, so the rendering is asserted and not assumed.
+        let read_back = status(&scratch);
+        assert!(read_back.ok, "{}\n{}", read_back.out, read_back.err);
+        let final_answer = read_back
+            .out
+            .lines()
+            .find(|line| line.starts_with("answer ") && line.contains("action=Final"))
+            .expect("the final answer is reported");
+        assert!(
+            final_answer.contains("say=\"the file is written\""),
+            "the agent's words are reported: {final_answer}",
+        );
+    }
+
+    /// The validated configuration and run one scripted `agent run` invocation names.
+    fn driver_config(
+        scratch: &Scratch,
+        script_path: &Path,
+    ) -> (Config, Run) {
+        let mut args = vec!["mokmokd".to_owned()];
+        args.extend(base(scratch));
+        args.extend([
+            "agent".to_owned(),
+            "run".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+            "--goal".to_owned(),
+            "hold a conversation".to_owned(),
+            "--checkout".to_owned(),
+            scratch.checkout().display().to_string(),
+            "--script".to_owned(),
+            script_path.display().to_string(),
+        ]);
+        let parsed = mokmok_kernel::Args::try_parse_from(&args).expect("the command line parses");
+        let config = Config::resolve(&parsed).expect("the configuration resolves");
+        let mokmok_kernel::Command::Agent(mokmok_kernel::Agent::Run(run)) = parsed.command else {
+            panic!("the command line named an agent run");
+        };
+
+        (config, run)
+    }
+
+    #[tokio::test]
+    async fn a_driver_speaks_then_waits_and_extends_the_session() {
+        let scratch = Scratch::new("driver");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "final", "say": "hi there"})]);
+        let (config, run) = driver_config(&scratch, &path);
+        let at = Moment::from_millis(0);
+        let mut driver = Driver::open(&config, &run, at).expect("the driver opens");
+        let session = driver.session();
+
+        driver.speak("hello").expect("the line opens turn 1");
+
+        let awaiting = loop {
+            match driver.step().await.expect("the step runs") {
+                Progress::Awaiting => break true,
+                Progress::Terminal(_) => break false,
+                Progress::Yielded | Progress::Advanced(_) => {},
+            }
+        };
+        assert!(awaiting, "the driver waits for the human's next line");
+
+        let transcript = driver.transcript().expect("the fold reads");
+        assert_eq!(transcript.session.phase(), Phase::Accepting);
+        let (turn, state) = transcript.newest_turn().expect("a newest turn");
+        assert_eq!(turn, turn_id(session, 1));
+        assert_eq!(state.outcome(), Some(TurnOutcome::Completed));
+        assert_eq!(
+            transcript.newest_answer(turn).expect("an answer").prose,
+            "hi there",
+        );
+
+        driver
+            .speak("again")
+            .expect("the line extends the conversation");
+        let extended = driver.transcript().expect("the fold reads");
+        assert_eq!(
+            extended.newest_turn().expect("a newest turn").0,
+            turn_id(session, 2),
+            "the second line opened a second turn rather than a new session",
+        );
+        assert_eq!(extended.speech(turn_id(session, 2)), Some("again"));
+    }
+
+    #[tokio::test]
+    async fn the_attempt_ceiling_waits_when_a_line_is_held() {
+        let scratch = Scratch::new("driver-ceiling");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "malformed", "reason": "one"}),
+                json!({"action": "malformed", "reason": "two"}),
+                json!({"action": "malformed", "reason": "three"}),
+            ],
+        );
+        let (config, run) = driver_config(&scratch, &path);
+        let mut driver =
+            Driver::open(&config, &run, Moment::from_millis(0)).expect("the driver opens");
+
+        driver.speak("hello").expect("the line opens turn 1");
+
+        let awaiting = loop {
+            match driver.step().await.expect("the step runs") {
+                Progress::Awaiting => break true,
+                Progress::Terminal(_) => break false,
+                Progress::Yielded | Progress::Advanced(_) => {},
+            }
+        };
+        assert!(awaiting, "a spent ceiling waits rather than closing");
+
+        let transcript = driver.transcript().expect("the fold reads");
+        assert_eq!(transcript.session.phase(), Phase::Accepting);
+        assert_eq!(
+            transcript.newest_turn().expect("a newest turn").1.outcome(),
+            Some(TurnOutcome::Failed),
+        );
+    }
+
+    #[test]
+    fn a_spent_ceiling_closes_a_goal_run() {
+        let scratch = Scratch::new("ceiling-goal-run");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "malformed", "reason": "one"}),
+                json!({"action": "malformed", "reason": "two"}),
+                json!({"action": "malformed", "reason": "three"}),
+            ],
+        );
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(ran.value("halt").as_deref(), Some("Attempts"));
+        assert_eq!(
+            status(&scratch).value("phase").as_deref(),
+            Some("Closed(Completed)"),
+        );
     }
 }

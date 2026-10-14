@@ -9,7 +9,8 @@ use mokmok_state_machine::{
 
 use crate::model::Action;
 use crate::record::{
-    AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Record, RecordKey, Refusal, TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Record, RecordKey, Refusal, SpeechRecord,
+    TaskRecord,
 };
 use crate::task::Task;
 use crate::tool::{self, ToolReport};
@@ -27,6 +28,8 @@ pub struct Transcript {
     pub task: Option<Task>,
     /// One turn's state per turn, in the order the folds first saw them.
     pub turns: Vec<(TurnID, Turn)>,
+    /// The line that opened one turn, when a human opened it.
+    pub speeches: BTreeMap<TurnID, String>,
     /// The exact context bytes one attempt was handed.
     pub prompts: BTreeMap<(TurnID, Attempt), ArtifactRef>,
     /// The action one attempt answered with.
@@ -46,6 +49,7 @@ impl Transcript {
             session: Session::new(session),
             task: None,
             turns: Vec::new(),
+            speeches: BTreeMap::new(),
             prompts: BTreeMap::new(),
             answers: BTreeMap::new(),
             calls: BTreeMap::new(),
@@ -112,6 +116,23 @@ impl Transcript {
             .map(|(id, turn)| (*id, turn))
     }
 
+    /// The line that opened one turn, when a human opened it.
+    #[must_use]
+    pub fn speech(
+        &self,
+        turn: TurnID,
+    ) -> Option<&str> {
+        self.speeches.get(&turn).map(String::as_str)
+    }
+
+    /// Whether the session has received a human line, which is what makes it a conversation. A
+    /// conversation does not end because the model finished a sentence; a session that has received
+    /// no line is a goal run, and a sentence is what it was for.
+    #[must_use]
+    pub fn holds_speech(&self) -> bool {
+        !self.speeches.is_empty()
+    }
+
     /// The call one turn recorded, if any.
     #[must_use]
     pub fn call_of(
@@ -165,8 +186,9 @@ impl Record {
     ///
     /// # Errors
     ///
-    /// Returns [`Refusal::Floating`], [`Refusal::Conflict`], [`Refusal::CommandMismatch`], or the
-    /// [`Refusal::Rejected`] of the state machine that owns the fact.
+    /// Returns [`Refusal::Floating`], [`Refusal::Late`], [`Refusal::Conflict`],
+    /// [`Refusal::CommandMismatch`], or the [`Refusal::Rejected`] of the state machine that owns
+    /// the fact.
     pub fn apply(
         &self,
         into: &mut Transcript,
@@ -179,6 +201,7 @@ impl Record {
             Self::Prompt(record) => apply_prompt(into, record),
             Self::Answer(record) => apply_answer(into, record),
             Self::Call(record) => apply_call(into, record),
+            Self::Speech(record) => apply_speech(into, record),
         }
     }
 }
@@ -250,6 +273,32 @@ fn apply_task(
             Ok(Ack::Applied)
         },
     }
+}
+
+fn apply_speech(
+    into: &mut Transcript,
+    record: &SpeechRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::Speech { turn: record.turn };
+    if let Some(recorded) = into.speeches.get(&record.turn) {
+        return if recorded == &record.text {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let Some(turn) = into.turn(record.turn) else {
+        return Err(Refusal::Floating(key));
+    };
+    // A prompt records the exact bytes an attempt was handed, so a line folded in after an attempt
+    // was requested would leave the fold disagreeing with that record.
+    if turn.attempts().next().is_some() {
+        return Err(Refusal::Late(key));
+    }
+
+    into.speeches.insert(record.turn, record.text.clone());
+    Ok(Ack::Applied)
 }
 
 fn apply_prompt(
@@ -356,7 +405,8 @@ mod tests {
     use super::{Record, Transcript, number_of};
     use crate::model::{Action, Usage};
     use crate::record::{
-        AnswerRecord, ArtifactRef, CallRecord, PromptRecord, RecordKey, Refusal, TaskRecord,
+        AnswerRecord, ArtifactRef, CallRecord, PromptRecord, RecordKey, Refusal, SpeechRecord,
+        TaskRecord,
     };
     use crate::task::{Budget, Setting, Task};
     use crate::test_support::{artifact, execution_id, session, task, turn_id};
@@ -417,12 +467,23 @@ mod tests {
             turn,
             attempt: Attempt::new(1),
             action,
+            prose: String::new(),
             text: artifact(0xaa),
             model: "test".to_owned(),
             usage: Usage {
                 input: 1,
                 output: 1,
             },
+        })
+    }
+
+    fn speech(
+        turn: TurnID,
+        text: &str,
+    ) -> Record {
+        Record::Speech(SpeechRecord {
+            turn,
+            text: text.to_owned(),
         })
     }
 
@@ -604,6 +665,46 @@ mod tests {
         assert_eq!(
             transcript.apply(&Record::Task(TaskRecord { task: task(5) })),
             Err(Refusal::Conflict(RecordKey::Task)),
+        );
+    }
+
+    #[test]
+    fn a_speech_whose_turn_the_fold_does_not_hold_is_refused() {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+
+        assert_eq!(
+            transcript.apply(&speech(turn, "hello")),
+            Err(Refusal::Floating(RecordKey::Speech { turn })),
+        );
+        assert!(transcript.speech(turn).is_none());
+    }
+
+    #[test]
+    fn a_speech_on_a_turn_that_already_asked_the_model_is_refused() {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        open(&mut transcript, turn, 1);
+        request(&mut transcript, turn, 1);
+
+        assert_eq!(
+            transcript.apply(&speech(turn, "hello")),
+            Err(Refusal::Late(RecordKey::Speech { turn })),
+        );
+    }
+
+    #[test]
+    fn a_speech_redelivered_is_a_duplicate_and_a_different_line_is_a_conflict() {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        open(&mut transcript, turn, 1);
+
+        assert_eq!(transcript.apply(&speech(turn, "hello")), Ok(Ack::Applied));
+        assert_eq!(transcript.speech(turn), Some("hello"));
+        assert_eq!(transcript.apply(&speech(turn, "hello")), Ok(Ack::Duplicate));
+        assert_eq!(
+            transcript.apply(&speech(turn, "goodbye")),
+            Err(Refusal::Conflict(RecordKey::Speech { turn })),
         );
     }
 
@@ -944,6 +1045,7 @@ mod tests {
                     turn: TurnID::from_uuid(turn),
                     attempt,
                     action,
+                    prose: String::new(),
                     text,
                     model: "m".to_owned(),
                     usage: Usage {
@@ -952,6 +1054,12 @@ mod tests {
                     },
                 })
             ),
+            (arb_uuid(), "[a-z ]{0,8}").prop_map(|(turn, text)| {
+                Record::Speech(SpeechRecord {
+                    turn: TurnID::from_uuid(turn),
+                    text,
+                })
+            }),
             (arb_uuid(), arb_uuid(), "[a-z ]{0,8}").prop_map(|(turn, execution, command)| {
                 Record::Call(CallRecord {
                     turn: TurnID::from_uuid(turn),

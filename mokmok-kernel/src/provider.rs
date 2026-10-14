@@ -11,9 +11,11 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use mokmok_agent_runtime::{
-    Action, Answer, ArtifactRef, Context, Error as AgentError, Provider, Usage,
+    Action, Answer, ArtifactRef, Context, ContextAct, ContextTurn, Error as AgentError,
+    MAX_PROSE_BYTES, Provider, Usage,
 };
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_egress::{
@@ -47,6 +49,15 @@ const DEFAULT_HTTPS_PORT: u16 = 443;
 
 /// The port an `http` URL uses when it names none.
 const DEFAULT_HTTP_PORT: u16 = 80;
+
+/// How long one endpoint call may run before the client abandons it.
+///
+/// An endpoint that accepts a request and never answers would otherwise hold a step forever. The
+/// runtime re-asks an interrupted model call under a new attempt with byte-identical context, so an
+/// abandoned call spends one of the turn's attempts rather than the session. The bound is wide
+/// enough for a long answer and short enough that the three attempts a turn gets fit inside a wait
+/// a human will sit through.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why the provider could not be built or one call could not complete.
 #[derive(Debug, thiserror::Error)]
@@ -501,6 +512,7 @@ impl Ollama {
             // pinned for and re-send the goal and the whole transcript to a host mokmok-egress
             // never saw; the pinned address is the only one a redirect may reach.
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(REQUEST_TIMEOUT)
             .resolve_to_addrs(&endpoint.host, validated.addresses())
             .build()
             .map_err(Error::Client)?;
@@ -622,21 +634,41 @@ fn user_text(context: &Context) -> String {
     }
 }
 
-/// Settled turns as the text the one user message carries after the goal.
+/// The turns the model may see, as the text the one user message carries after the goal.
 fn turns_text(context: &Context) -> String {
     context
         .turns
         .iter()
-        .map(|turn| {
-            format!(
-                "Turn {}:\ncommand: {}\nobservation: {}",
-                turn.number.get(),
-                turn.command,
-                turn.observation,
-            )
-        })
+        .map(turn_text)
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// One turn as the text the user message carries, in the labels it has always used.
+fn turn_text(turn: &ContextTurn) -> String {
+    let mut text = format!("Turn {}:", turn.number.get());
+    if let Some(speech) = &turn.speech {
+        text.push_str("\nhuman: ");
+        text.push_str(speech);
+    }
+    match &turn.act {
+        Some(ContextAct::Ran {
+            command,
+            observation,
+        }) => {
+            text.push_str("\ncommand: ");
+            text.push_str(command);
+            text.push_str("\nobservation: ");
+            text.push_str(observation);
+        },
+        Some(ContextAct::Said { reply }) => {
+            text.push_str("\nreply: ");
+            text.push_str(reply);
+        },
+        None => {},
+    }
+
+    text
 }
 
 /// Decodes the endpoint's answer into the runtime's own vocabulary.
@@ -667,6 +699,7 @@ pub fn parse_answer(
 
     Ok(Answer {
         action: action_of(finish, message),
+        prose: prose_of(message),
         text: reference(bytes),
         model: model.to_owned(),
         usage: Usage {
@@ -674,6 +707,32 @@ pub fn parse_answer(
             output: token(body.get("usage"), "completion_tokens"),
         },
     })
+}
+
+/// The model's own words from one message, clipped.
+///
+/// A message with no string `content` yields nothing rather than an error: the action is what
+/// drives the loop, and the prose is for the human.
+fn prose_of(message: &serde_json::Value) -> String {
+    message
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(String::new, clip_prose)
+}
+
+/// Clips prose to [`MAX_PROSE_BYTES`] on a character boundary.
+#[must_use]
+pub fn clip_prose(text: &str) -> String {
+    if text.len() <= MAX_PROSE_BYTES {
+        return text.to_owned();
+    }
+
+    let mut end = MAX_PROSE_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    text[..end].to_owned()
 }
 
 /// The action a `finish_reason` and its message name.
@@ -748,11 +807,12 @@ fn token(
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, Credential, Error, Ollama, Usage, parse_answer, parse_endpoint, request_body,
+        Action, Credential, Error, Ollama, Usage, clip_prose, parse_answer, parse_endpoint,
+        request_body,
     };
     use crate::config::{Config, ProviderKind};
     use clap::Parser as _;
-    use mokmok_agent_runtime::{Context, ContextTurn, Provider as _};
+    use mokmok_agent_runtime::{Context, ContextAct, ContextTurn, MAX_PROSE_BYTES, Provider as _};
     use mokmok_egress::{AddressClass, Rules, Scheme};
     use mokmok_protocol::SessionID;
     use mokmok_state_machine::TurnNumber;
@@ -859,6 +919,68 @@ mod tests {
     }
 
     #[test]
+    fn a_message_content_becomes_the_prose() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "hello there"}, "finish_reason": "stop"}],
+        });
+
+        let answer = parse_answer(&serde_json::to_vec(&body).unwrap(), "m").unwrap();
+
+        assert_eq!(answer.prose, "hello there");
+        assert_eq!(answer.action, Action::Final);
+    }
+
+    #[test]
+    fn a_message_without_content_has_no_prose_rather_than_an_error() {
+        let body = serde_json::json!({
+            "choices": [{"message": {}, "finish_reason": "stop"}],
+        });
+
+        let answer = parse_answer(&serde_json::to_vec(&body).unwrap(), "m").unwrap();
+
+        assert_eq!(answer.prose, "");
+    }
+
+    #[test]
+    fn prose_beyond_the_bound_is_clipped_on_a_character_boundary() {
+        let long = "é".repeat(MAX_PROSE_BYTES);
+
+        let clipped = clip_prose(&long);
+
+        assert!(clipped.len() <= MAX_PROSE_BYTES);
+        assert!(long.starts_with(&clipped));
+    }
+
+    #[test]
+    fn a_turn_holding_a_line_renders_the_human_words_and_the_reply() {
+        let turns = Context {
+            system: "s".to_owned(),
+            goal: "the goal".to_owned(),
+            turns: vec![
+                ContextTurn {
+                    number: TurnNumber::new(1),
+                    speech: Some("hello".to_owned()),
+                    act: Some(ContextAct::Said {
+                        reply: "hi".to_owned(),
+                    }),
+                },
+                ContextTurn {
+                    number: TurnNumber::new(2),
+                    speech: Some("next".to_owned()),
+                    act: None,
+                },
+            ],
+        };
+
+        let body = request_body(&turns, "m", 1);
+        let content = body["messages"][1]["content"].as_str().unwrap();
+
+        assert!(content.contains("human: hello"), "{content}");
+        assert!(content.contains("reply: hi"), "{content}");
+        assert!(content.contains("human: next"), "{content}");
+    }
+
+    #[test]
     fn a_length_finish_is_malformed_and_names_the_reason() {
         let body = serde_json::json!({
             "choices": [{"message": {"content": "cut off"}, "finish_reason": "length"}],
@@ -915,8 +1037,11 @@ mod tests {
             goal: "the goal".to_owned(),
             turns: vec![ContextTurn {
                 number: TurnNumber::new(1),
-                command: "ls".to_owned(),
-                observation: "exit code 0".to_owned(),
+                speech: None,
+                act: Some(ContextAct::Ran {
+                    command: "ls".to_owned(),
+                    observation: "exit code 0".to_owned(),
+                }),
             }],
         };
 

@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use crate::dialogue::Transcript;
 use crate::model::{Action, Usage};
-use crate::record::{AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Record, TaskRecord};
+use crate::record::{
+    AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Record, SpeechRecord, TaskRecord,
+};
 use crate::task::{Budget, Setting, Task};
 use crate::tool::{Exit, ToolReport, observation};
 
@@ -118,12 +120,34 @@ pub fn answer_records(
             turn,
             attempt: Attempt::new(attempt),
             action,
+            prose: String::new(),
             text: artifact(0xaa),
             model: "test".to_owned(),
             usage: Usage {
                 input: 1,
                 output: 1,
             },
+        }),
+    ]
+}
+
+/// The records a human line's commit carries: the turn opens and the line follows.
+#[must_use]
+pub fn speech_records(
+    turn: TurnID,
+    number: u64,
+    text: &str,
+) -> Vec<Record> {
+    vec![
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnOpened {
+                number: TurnNumber::new(number),
+            },
+        },
+        Record::Speech(SpeechRecord {
+            turn,
+            text: text.to_owned(),
         }),
     ]
 }

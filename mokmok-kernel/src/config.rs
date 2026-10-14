@@ -36,10 +36,10 @@ pub enum ProviderKind {
     Ollama,
 }
 
-/// The CLI surface of `mokmokd`.
-#[derive(Debug, Parser)]
-#[command(name = "mokmokd", version, about = "the mokmok OS composition root")]
-pub struct Args {
+/// The options every invocation shares, whichever subcommand runs. Split out of [`Args`] so a
+/// second binary can flatten exactly these flags and inherit exactly these rules.
+#[derive(Debug, clap::Args)]
+pub struct Global {
     /// Where the event log, the artifacts, and the bus socket live.
     #[arg(long, global = true, value_name = "DIR", default_value = "mokmok-data")]
     pub data_dir: PathBuf,
@@ -92,6 +92,14 @@ pub struct Args {
     /// How many answer tokens one model call may spend.
     #[arg(long, global = true, default_value_t = 4096)]
     pub max_answer_tokens: u64,
+}
+
+/// The CLI surface of `mokmokd`.
+#[derive(Debug, Parser)]
+#[command(name = "mokmokd", version, about = "the mokmok OS composition root")]
+pub struct Args {
+    #[command(flatten)]
+    pub global: Global,
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
@@ -142,7 +150,7 @@ pub enum Agent {
 }
 
 /// One `agent run`.
-#[derive(Debug, clap::Args)]
+#[derive(Clone, Debug, clap::Args)]
 pub struct Run {
     /// The session to work in. Its first run opens it.
     #[arg(long)]
@@ -246,25 +254,26 @@ impl Config {
     /// Returns a [`ConfigError`] when a directory cannot be created, a program is not absolute or
     /// not a runnable file, or a named path is not a directory.
     pub fn resolve(args: &Args) -> Result<Self, ConfigError> {
-        create_directory(&args.data_dir)?;
+        let global = &args.global;
+        create_directory(&global.data_dir)?;
 
-        let artifacts = args.data_dir.join("artifacts");
-        let sandbox_root = args.data_dir.join("sandbox");
+        let artifacts = global.data_dir.join("artifacts");
+        let sandbox_root = global.data_dir.join("sandbox");
         for directory in [&artifacts, &sandbox_root] {
             create_directory(directory)?;
         }
 
-        let allow_tool = args
+        let allow_tool = global
             .allow_tool
             .iter()
             .map(|program| runnable(program))
             .collect::<Result<Vec<_>, _>>()?;
-        let allow_path = args
+        let allow_path = global
             .allow_path
             .iter()
             .map(|path| reachable_directory(path))
             .collect::<Result<Vec<_>, _>>()?;
-        let allow_write = args
+        let allow_write = global
             .allow_write
             .iter()
             .map(|path| reachable_directory(path))
@@ -288,45 +297,45 @@ impl Config {
                 });
             }
 
-            match args.provider {
+            match global.provider {
                 ProviderKind::Scripted => {
-                    if args.script.is_none() {
+                    if global.script.is_none() {
                         return Err(ConfigError::NoScript);
                     }
                 },
                 ProviderKind::Ollama => {
-                    if args.model.as_deref().unwrap_or_default().is_empty() {
+                    if global.model.as_deref().unwrap_or_default().is_empty() {
                         return Err(ConfigError::NoModel);
                     }
-                    let Some(credential) = args.provider_credential_file.as_deref() else {
+                    let Some(credential) = global.provider_credential_file.as_deref() else {
                         return Err(ConfigError::NoCredentialFile);
                     };
                     private_credential(credential, &allow_write)?;
                 },
             }
         }
-        let confiner = args
+        let confiner = global
             .confiner
             .clone()
             .unwrap_or_else(|| mokmok_sandbox::Config::default().confiner);
 
         Ok(Self {
-            data_dir: args.data_dir.clone(),
-            events: args.data_dir.join("events.sqlite"),
+            data_dir: global.data_dir.clone(),
+            events: global.data_dir.join("events.sqlite"),
             artifacts,
             sandbox_root,
             allow_tool,
             allow_path,
             allow_write,
-            tool_env: environment(&args.tool_env)?,
+            tool_env: environment(&global.tool_env)?,
             confiner: runnable(&confiner)?,
-            crash_after: args.crash_after,
-            provider: args.provider,
-            script: args.script.clone(),
-            model: args.model.clone(),
-            endpoint: args.endpoint.clone(),
-            provider_credential_file: args.provider_credential_file.clone(),
-            max_answer_tokens: args.max_answer_tokens,
+            crash_after: global.crash_after,
+            provider: global.provider,
+            script: global.script.clone(),
+            model: global.model.clone(),
+            endpoint: global.endpoint.clone(),
+            provider_credential_file: global.provider_credential_file.clone(),
+            max_answer_tokens: global.max_answer_tokens,
         })
     }
 
@@ -543,7 +552,7 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Agent, Args, Command, Config, ConfigError, ProviderKind, Submit, uuid_of};
+    use super::{Agent, Args, Command, Config, ConfigError, Global, ProviderKind, Submit, uuid_of};
     use clap::Parser as _;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
@@ -571,19 +580,21 @@ mod tests {
 
     fn args(data_dir: &Path) -> Args {
         Args {
-            data_dir: data_dir.to_path_buf(),
-            allow_tool: vec![PathBuf::from("/bin/sh")],
-            allow_path: vec![PathBuf::from("/bin")],
-            allow_write: Vec::new(),
-            tool_env: Vec::new(),
-            confiner: Some(PathBuf::from("/bin/sh")),
-            crash_after: None,
-            provider: ProviderKind::Scripted,
-            script: None,
-            model: None,
-            endpoint: "https://ollama.com/v1".to_owned(),
-            provider_credential_file: None,
-            max_answer_tokens: 4096,
+            global: Global {
+                data_dir: data_dir.to_path_buf(),
+                allow_tool: vec![PathBuf::from("/bin/sh")],
+                allow_path: vec![PathBuf::from("/bin")],
+                allow_write: Vec::new(),
+                tool_env: Vec::new(),
+                confiner: Some(PathBuf::from("/bin/sh")),
+                crash_after: None,
+                provider: ProviderKind::Scripted,
+                script: None,
+                model: None,
+                endpoint: "https://ollama.com/v1".to_owned(),
+                provider_credential_file: None,
+                max_answer_tokens: 4096,
+            },
             command: Command::Submit(Submit {
                 session: "018f2f1e-0000-7000-8000-000000000000".to_owned(),
                 idempotency_key: "018f2f1e-0000-7000-8000-000000000001".to_owned(),
@@ -611,7 +622,7 @@ mod tests {
     fn a_relative_program_is_refused() {
         let scratch = Scratch::new("relative");
         let mut args = args(&scratch.0);
-        args.allow_tool = vec![PathBuf::from("sh")];
+        args.global.allow_tool = vec![PathBuf::from("sh")];
 
         assert!(matches!(
             Config::resolve(&args),
@@ -623,7 +634,7 @@ mod tests {
     fn a_program_that_is_not_a_file_is_refused() {
         let scratch = Scratch::new("absent");
         let mut args = args(&scratch.0);
-        args.allow_tool = vec![PathBuf::from("/bin/no-such-tool-mokmok")];
+        args.global.allow_tool = vec![PathBuf::from("/bin/no-such-tool-mokmok")];
 
         assert!(matches!(
             Config::resolve(&args),
@@ -635,7 +646,7 @@ mod tests {
     fn a_reachable_path_that_is_not_a_directory_is_refused() {
         let scratch = Scratch::new("file-path");
         let mut args = args(&scratch.0);
-        args.allow_path = vec![PathBuf::from("/bin/sh")];
+        args.global.allow_path = vec![PathBuf::from("/bin/sh")];
 
         assert!(matches!(
             Config::resolve(&args),
@@ -656,7 +667,7 @@ mod tests {
     fn a_tool_environment_entry_that_is_not_an_assignment_is_refused() {
         let scratch = Scratch::new("tool-env-shape");
         let mut args = args(&scratch.0);
-        args.tool_env = vec!["LANG".to_owned()];
+        args.global.tool_env = vec!["LANG".to_owned()];
 
         assert!(matches!(
             Config::resolve(&args),
@@ -679,7 +690,7 @@ mod tests {
 
         let scratch = Scratch::new("tool-env-resolve");
         let mut args = args(&scratch.0);
-        args.tool_env = vec!["LANG=C".to_owned(), "PATH=/operator".to_owned()];
+        args.global.tool_env = vec!["LANG=C".to_owned(), "PATH=/operator".to_owned()];
 
         let config = Config::resolve(&args).unwrap();
 
@@ -722,7 +733,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(parsed.allow_tool, vec![PathBuf::from("/bin/sh")]);
+        assert_eq!(parsed.global.allow_tool, vec![PathBuf::from("/bin/sh")]);
         let Command::Submit(submit) = parsed.command else {
             panic!("the command line named a submit");
         };
@@ -773,12 +784,12 @@ mod tests {
         assert_eq!(run.context_turns, 16);
         assert_eq!(run.context_bytes, 131_072);
         assert_eq!(run.observation_bytes, 4096);
-        assert_eq!(parsed.provider, ProviderKind::Scripted);
-        assert_eq!(parsed.script, Some(PathBuf::from("/bin/sh")));
-        assert_eq!(parsed.endpoint, "https://ollama.com/v1");
-        assert_eq!(parsed.max_answer_tokens, 4096);
-        assert_eq!(parsed.model, None);
-        assert_eq!(parsed.provider_credential_file, None);
+        assert_eq!(parsed.global.provider, ProviderKind::Scripted);
+        assert_eq!(parsed.global.script, Some(PathBuf::from("/bin/sh")));
+        assert_eq!(parsed.global.endpoint, "https://ollama.com/v1");
+        assert_eq!(parsed.global.max_answer_tokens, 4096);
+        assert_eq!(parsed.global.model, None);
+        assert_eq!(parsed.global.provider_credential_file, None);
 
         let cancel = Args::try_parse_from([
             "mokmokd",

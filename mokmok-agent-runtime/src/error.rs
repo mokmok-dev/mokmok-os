@@ -31,4 +31,10 @@ pub enum Error {
     /// A state machine refused a fact.
     #[error("{0}")]
     Rejected(#[from] Rejected),
+    /// The session is not waiting for a human line.
+    #[error("the session is not waiting for a human line")]
+    NotAwaiting,
+    /// The human line is longer than the log holds.
+    #[error("the line is {found} bytes, and the log holds {limit}")]
+    TooMuch { limit: usize, found: usize },
 }
