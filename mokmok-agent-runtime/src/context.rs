@@ -32,8 +32,10 @@ pub struct ContextTurn {
     pub speech: Option<String>,
     /// What the agent did in this turn, once the turn settled.
     ///
-    /// Absent on the turn being asked now, which is how the human's newest line reaches the model:
-    /// the line opens the very turn that answers it, so that turn is unsettled while it is asked.
+    /// Absent in two cases. While the turn is being asked, which is how the human's newest line
+    /// reaches the model: the line opens the very turn that answers it, so that turn is unsettled
+    /// while it is asked. And on a settled turn the model never finished — one that requested no
+    /// tool — where no command ran, so showing one would tell the model it had.
     pub act: Option<ContextAct>,
 }
 
@@ -131,25 +133,48 @@ const MISSING_COMMAND: &str = "(the command was not recorded)";
 
 impl Transcript {
     /// Every turn the model may see, oldest first: a settled turn, or one holding the human line it
-    /// is being asked to answer.
+    /// is being asked to answer, each paired with the turn it names.
+    ///
+    /// A front end draws this rendering and must read the turn's own state beside it — its
+    /// settlement, its attempts, and its answers — so the rendering carries the identity rather
+    /// than a reader recovering it from the fold a second time.
     ///
     /// A turn in flight with no speech contributes nothing, so a re-ask after a crash rebuilds the
     /// bytes the first attempt sent. A settled turn with no call record still appears, carrying the
     /// rendering the recovery settlement gives it, so an interrupted command stays visible.
     #[must_use]
-    pub fn shown(&self) -> Vec<ContextTurn> {
+    pub fn shown_turns(&self) -> Vec<(TurnID, ContextTurn)> {
         self.turns_in_order()
             .into_iter()
             .filter(|(turn, state)| state.outcome().is_some() || self.speeches.contains_key(turn))
-            .map(|(turn, state)| ContextTurn {
-                number: state.number().unwrap_or(TurnNumber::new(0)),
-                speech: self.speech(turn).map(str::to_owned),
-                act: self.act_of(turn, state),
+            .map(|(turn, state)| {
+                let shown = ContextTurn {
+                    number: state.number().unwrap_or(TurnNumber::new(0)),
+                    speech: self.speech(turn).map(str::to_owned),
+                    act: self.act_of(turn, state),
+                };
+
+                (turn, shown)
             })
             .collect()
     }
 
-    /// What the agent did in one turn, as the model sees it, or nothing while the turn is asked.
+    /// The renderings [`shown_turns`] yields, without the turns that name them.
+    ///
+    /// [`shown_turns`]: Transcript::shown_turns
+    #[must_use]
+    pub fn shown(&self) -> Vec<ContextTurn> {
+        self.shown_turns()
+            .into_iter()
+            .map(|(_, shown)| shown)
+            .collect()
+    }
+
+    /// What the agent did in one turn, as the model sees it.
+    ///
+    /// Nothing while the turn is asked, and nothing on a settled turn that requested no tool: only
+    /// a turn that dispatched a command is shown running one, so a turn the model never finished
+    /// carries no act rather than a command that never ran.
     fn act_of(
         &self,
         turn: TurnID,
@@ -178,6 +203,10 @@ impl Transcript {
                 reply: answer.prose.clone(),
             });
         }
+
+        // `MISSING_COMMAND` would tell the model a command ran, so a turn that requested no tool
+        // shows nothing instead.
+        state.tools().next()?;
 
         Some(ContextAct::Ran {
             command: MISSING_COMMAND.to_owned(),
@@ -276,8 +305,8 @@ mod tests {
     };
     use crate::dialogue::Transcript;
     use crate::find::FindReport;
-    use crate::model::Action;
-    use crate::record::{CallRecord, Record};
+    use crate::model::{Action, Usage};
+    use crate::record::{AnswerRecord, CallRecord, PromptRecord, Record, SpeechRecord};
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
         begin_records, execution_id, find_records, open_records, session, speech_records, task,
@@ -286,7 +315,7 @@ mod tests {
     use crate::tool::{Exit, ToolReport, UNKNOWN_WARNING, observation};
     use mokmok_protocol::{ExecutionID, TurnID};
     use mokmok_state_machine::{
-        Attempt, Deadline, Fact, Resolution, TurnFact, TurnNumber, TurnOutcome,
+        Attempt, Deadline, Fact, Resolution, Turn, TurnFact, TurnNumber, TurnOutcome,
     };
 
     fn turn_of(number: u64) -> ContextTurn {
@@ -810,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_answer_still_renders_its_turn() {
+    fn a_settled_turn_the_model_never_finished_renders_no_act() {
         let task = task(4);
         let turn = turn_id(1);
         let mut transcript = Transcript::new(session());
@@ -828,14 +857,125 @@ mod tests {
         );
         apply_all(
             &mut transcript,
-            &crate::test_support::close_records(turn, false, None),
+            &[Record::Turn {
+                turn,
+                fact: TurnFact::TurnSettled {
+                    outcome: TurnOutcome::Failed,
+                },
+            }],
         );
 
         let built = context(&transcript);
 
         assert_eq!(built.turns.len(), 1);
         assert_eq!(built.turns[0].speech, None);
-        assert_eq!(ran_command(&built.turns[0]), MISSING_COMMAND);
+        assert_eq!(built.turns[0].act, None);
+    }
+
+    #[test]
+    fn shown_turns_pairs_every_rendering_with_the_turn_it_names() {
+        let first = turn_id(1);
+        let second = turn_id(2);
+        let records = vec![
+            Record::Session {
+                fact: Fact::SessionOpened,
+            },
+            Record::Turn {
+                turn: first,
+                fact: TurnFact::TurnOpened {
+                    number: TurnNumber::new(1),
+                },
+            },
+            Record::Speech(SpeechRecord {
+                turn: first,
+                text: "hello".to_owned(),
+            }),
+            Record::Turn {
+                turn: first,
+                fact: TurnFact::ModelRequested {
+                    attempt: Attempt::new(1),
+                },
+            },
+            Record::Prompt(PromptRecord {
+                turn: first,
+                attempt: Attempt::new(1),
+                context: artifact(0x11),
+            }),
+            Record::Turn {
+                turn: first,
+                fact: TurnFact::ModelAnswered,
+            },
+            Record::Answer(AnswerRecord {
+                turn: first,
+                attempt: Attempt::new(1),
+                action: Action::Final,
+                prose: "done".to_owned(),
+                text: artifact(0x12),
+                model: "test".to_owned(),
+                usage: Usage {
+                    input: 1,
+                    output: 1,
+                },
+            }),
+            Record::Turn {
+                turn: first,
+                fact: TurnFact::TurnSettled {
+                    outcome: TurnOutcome::Completed,
+                },
+            },
+            Record::Turn {
+                turn: second,
+                fact: TurnFact::TurnOpened {
+                    number: TurnNumber::new(2),
+                },
+            },
+            Record::Speech(SpeechRecord {
+                turn: second,
+                text: "again".to_owned(),
+            }),
+        ];
+
+        let transcript = Transcript::replay(session(), &records).expect("the history folds");
+        let paired = transcript.shown_turns();
+
+        assert_eq!(
+            paired,
+            vec![
+                (
+                    first,
+                    ContextTurn {
+                        number: TurnNumber::new(1),
+                        speech: Some("hello".to_owned()),
+                        act: Some(ContextAct::Said {
+                            reply: "done".to_owned(),
+                        }),
+                    },
+                ),
+                (
+                    second,
+                    ContextTurn {
+                        number: TurnNumber::new(2),
+                        speech: Some("again".to_owned()),
+                        act: None,
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            paired
+                .iter()
+                .map(|(_, turn)| turn.clone())
+                .collect::<Vec<_>>(),
+            transcript.shown(),
+        );
+
+        for (turn, shown) in paired {
+            assert_eq!(
+                Some(shown.number),
+                transcript.turn(turn).and_then(Turn::number),
+                "the identity must name the turn whose number the rendering carries",
+            );
+        }
     }
 
     const PROMPT_WITHOUT_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
