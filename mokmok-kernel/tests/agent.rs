@@ -11,7 +11,9 @@ mod tests {
     use std::process::{Command, Output};
 
     use clap::Parser as _;
-    use mokmok_agent_runtime::{Action, Progress, Record, UNKNOWN_WARNING, turn_id};
+    use mokmok_agent_runtime::{
+        Action, NO_SEARCH_ROOT, Progress, Record, UNKNOWN_WARNING, turn_id,
+    };
     use mokmok_artifact::{BlobStore, ContentHash};
     use mokmok_kernel::agent::Driver;
     use mokmok_kernel::{Config, Db, Run, uuid_of};
@@ -82,7 +84,19 @@ mod tests {
         PathBuf::from(env!("CARGO_BIN_EXE_mokmokd"))
     }
 
+    /// The confiner the sandbox supervises with.
+    ///
+    /// A workspace build puts every binary in one directory, so the sibling of this package's own
+    /// is the confiner. `cargo mutants` builds one package into a profile directory that holds no
+    /// other package's binary, so a run under it names the confiner with `MOKMOK_CONFINER`.
     fn confiner() -> PathBuf {
+        if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
+            let path = PathBuf::from(named);
+            assert!(path.is_file(), "{} is not a file", path.display());
+
+            return path;
+        }
+
         let path = binary()
             .parent()
             .expect("the binary has a directory")
@@ -90,7 +104,7 @@ mod tests {
         assert!(
             path.is_file(),
             "{} is missing: build the workspace (cargo build --workspace) before running this \
-             package's tests alone",
+             package's tests alone, or name the confiner with MOKMOK_CONFINER",
             path.display(),
         );
 
@@ -235,6 +249,51 @@ mod tests {
         run(&args)
     }
 
+    /// The context bytes the prompt for turn `number` was handed, read back out of the store.
+    fn prompt_context(
+        scratch: &Scratch,
+        number: u64,
+    ) -> String {
+        let report = status(scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        let head = format!(" number={number} ");
+        let prompt = report
+            .out
+            .lines()
+            .rfind(|line| line.starts_with("prompt ") && line.contains(&head))
+            .unwrap_or_else(|| panic!("no prompt for turn {number} in:\n{}", report.out));
+        let hash = prompt
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("hash="))
+            .expect("the prompt names its context bytes");
+        let store = BlobStore::open(scratch.data().join("artifacts")).expect("the store opens");
+        let context = store
+            .read(hash.parse::<ContentHash>().expect("the hash is hex"))
+            .expect("the context bytes are stored");
+
+        String::from_utf8(context).expect("the context is JSON text")
+    }
+
+    /// The session's log and the id its records are under.
+    fn log_of(scratch: &Scratch) -> (mokmok_kernel::Log, SessionID) {
+        let db = Db::open(&scratch.data().join("events.sqlite")).expect("the log opens");
+        let session =
+            SessionID::from_uuid(uuid_of(SESSION, "session").expect("the session is a uuid"));
+
+        (db.log(session).expect("the log reads"), session)
+    }
+
+    /// The one find record the session holds.
+    fn find_of(log: &mokmok_kernel::Log) -> &mokmok_agent_runtime::FindRecord {
+        log.ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::Find(find) => Some(find),
+                _ => None,
+            })
+            .expect("the session holds one find record")
+    }
+
     #[test]
     fn the_whole_loop_runs_a_command_and_closes_the_session() {
         let scratch = Scratch::new("loop");
@@ -302,21 +361,7 @@ mod tests {
             resumed.out,
         );
 
-        let report = status(&scratch);
-        let prompt = report
-            .out
-            .lines()
-            .rfind(|line| line.starts_with("prompt ") && line.contains(" number=2 "))
-            .unwrap_or_else(|| panic!("no prompt for turn 2 in:\n{}", report.out));
-        let hash = prompt
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("hash="))
-            .expect("the prompt names its context bytes");
-        let store = BlobStore::open(scratch.data().join("artifacts")).expect("the store opens");
-        let context = store
-            .read(hash.parse::<ContentHash>().expect("the hash is hex"))
-            .expect("the context bytes are stored");
-        let context = String::from_utf8(context).expect("the context is JSON text");
+        let context = prompt_context(&scratch, 2);
 
         assert!(
             context.contains(UNKNOWN_WARNING),
@@ -577,6 +622,229 @@ mod tests {
         assert_eq!(
             status(&scratch).value("phase").as_deref(),
             Some("Closed(Completed)"),
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_the_root_the_recorded_task_granted() {
+        let scratch = Scratch::new("find-resumed");
+        std::fs::write(
+            scratch.checkout().join("notes.txt"),
+            "the quokka walks at dawn\n",
+        )
+        .expect("the file is written");
+        let path = scratch.0.join("script.json");
+
+        // The first invocation records the task and stops before the model is asked.
+        script(&path, &[]);
+        let root = scratch.checkout().display().to_string();
+        let opened = run(&agent_args(
+            &scratch,
+            &path,
+            &["--search-root", root.as_str(), "--steps", "1"],
+        ));
+        assert!(opened.ok, "{}\n{}", opened.out, opened.err);
+
+        // The second names no root at all, so the finder it opens must come off the recorded task;
+        // one built from this invocation's flags would answer NO_SEARCH_ROOT instead.
+        script(
+            &path,
+            &[
+                json!({"action": "find", "query": "quokka"}),
+                json!({"action": "final"}),
+            ],
+        );
+        let resumed = run(&agent_args(&scratch, &path, &[]));
+        assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
+        assert!(
+            resumed.phrase("move=find ").is_some(),
+            "the resumed run found rather than answered nothing:\n{}",
+            resumed.out,
+        );
+
+        let context = prompt_context(&scratch, 2);
+        assert!(
+            context.contains("notes.txt") && context.contains("hits=1"),
+            "the resumed finder searched the root the task recorded:\n{context}",
+        );
+    }
+
+    #[test]
+    fn a_find_reaches_the_next_prompt_with_the_one_file_it_ranked_first() {
+        let scratch = Scratch::new("find-hit");
+        std::fs::write(
+            scratch.checkout().join("notes.txt"),
+            "the quokka walks at dawn\n",
+        )
+        .expect("the file is written");
+        std::fs::write(scratch.checkout().join("other.txt"), "nothing to see\n")
+            .expect("the file is written");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "find", "query": "quokka"}),
+                json!({"action": "final", "say": "found it"}),
+            ],
+        );
+        let root = scratch.checkout().display().to_string();
+
+        let ran = run(&agent_args(
+            &scratch,
+            &path,
+            &["--search-root", root.as_str()],
+        ));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(ran.value("phase").as_deref(), Some("Closed(Completed)"));
+
+        let report = status(&scratch);
+        let find = report
+            .phrase("find ")
+            .unwrap_or_else(|| panic!("the transcript holds the find:\n{}", report.out));
+        assert!(find.contains("number=1"), "{find}");
+        assert!(find.contains("query=\"quokka\""), "{find}");
+
+        let context = prompt_context(&scratch, 2);
+        assert!(
+            context.contains("notes.txt"),
+            "the hit reached the model in the next turn's prompt:\n{context}",
+        );
+        assert!(
+            context.contains("hits=1"),
+            "the header says the ranking kept one of the two files:\n{context}",
+        );
+    }
+
+    #[test]
+    fn a_hitless_find_settles_the_turn_completed() {
+        let scratch = Scratch::new("find-hitless");
+        std::fs::write(scratch.checkout().join("notes.txt"), "nothing to see\n")
+            .expect("the file is written");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "find", "query": "petrichor"}),
+                json!({"action": "final"}),
+            ],
+        );
+        let root = scratch.checkout().display().to_string();
+
+        let ran = run(&agent_args(
+            &scratch,
+            &path,
+            &["--search-root", root.as_str()],
+        ));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+
+        let (log, session) = log_of(&scratch);
+        let find = find_of(&log);
+
+        assert!(
+            find.report.observation.contains("hits=0"),
+            "the observation says the search found nothing: {}",
+            find.report.observation,
+        );
+        assert_eq!(
+            log.turn(turn_id(session, 1))
+                .expect("turn 1 is in the log")
+                .outcome(),
+            Some(TurnOutcome::Completed),
+            "a search that found nothing settles the turn completed, not failed",
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_granted_root_is_offered_no_finder() {
+        let scratch = Scratch::new("find-no-root");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "final", "say": "done"})]);
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(ran.value("phase").as_deref(), Some("Closed(Completed)"));
+
+        let first = prompt_context(&scratch, 1);
+        assert!(
+            !first.contains("find_files"),
+            "no finder is named to a session that holds no root:\n{first}",
+        );
+        assert!(
+            first.contains("\"search\":false"),
+            "the context carries the flag the tool list is built from:\n{first}",
+        );
+
+        let report = status(&scratch);
+        assert!(
+            report.phrase("find ").is_none(),
+            "the transcript holds no find record:\n{}",
+            report.out,
+        );
+        let (log, _) = log_of(&scratch);
+        assert!(
+            !log.ordered
+                .iter()
+                .any(|record| matches!(record, Record::Find(_))),
+            "the log holds no find record",
+        );
+    }
+
+    #[test]
+    fn a_find_answers_no_search_root_when_the_session_was_granted_none() {
+        let scratch = Scratch::new("find-ungranted-nothing");
+        let path = scratch.0.join("script.json");
+        // The model asks for a finder this session was never offered, which is what a provider
+        // whose context and tool list agreed would never do; the finder still answers.
+        script(
+            &path,
+            &[
+                json!({"action": "find", "query": "quokka"}),
+                json!({"action": "final"}),
+            ],
+        );
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(ran.value("phase").as_deref(), Some("Closed(Completed)"));
+
+        let (log, session) = log_of(&scratch);
+
+        assert_eq!(find_of(&log).report.observation, NO_SEARCH_ROOT);
+        assert_eq!(
+            log.turn(turn_id(session, 1))
+                .expect("turn 1 is in the log")
+                .outcome(),
+            Some(TurnOutcome::Completed),
+        );
+    }
+
+    #[test]
+    fn a_search_root_no_grant_covers_is_refused_before_anything_opens() {
+        let scratch = Scratch::new("find-ungranted");
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("the ungranted directory is made");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "final"})]);
+        let root = elsewhere.display().to_string();
+
+        let refused = run(&agent_args(
+            &scratch,
+            &path,
+            &["--search-root", root.as_str()],
+        ));
+
+        assert!(!refused.ok, "{}", refused.out);
+        assert!(refused.err.contains(&root), "{}", refused.err);
+        assert!(refused.err.contains("grant"), "{}", refused.err);
+        assert!(
+            !scratch.data().join("events.sqlite").exists(),
+            "the run was refused before the log opened:\n{}",
+            refused.out,
+        );
+        assert!(
+            !scratch.data().join("search").exists(),
+            "the run was refused before any index opened:\n{}",
+            refused.out,
         );
     }
 }

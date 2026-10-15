@@ -96,7 +96,7 @@ pub enum Event {
 
 /// One line of the conversation.
 ///
-/// The three cases are the three things a turn can hold, so a renderer cannot invent a fourth.
+/// The four cases are the four things a turn can hold, so a renderer cannot invent a fifth.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Line {
     /// What the human said.
@@ -110,6 +110,16 @@ pub enum Line {
         /// What the command produced, as the model was shown it.
         observation: String,
     },
+    /// What the agent asked the finder, and what it answered.
+    ///
+    /// A find is its own line kind rather than a [`Line::Work`]: nothing ran, and a `command` field
+    /// would tell the human a program had.
+    Find {
+        /// The query the agent asked the finder.
+        query: String,
+        /// What the finder answered, as the model was shown it.
+        observation: String,
+    },
 }
 
 const HUMAN_GUTTER: &str = "you    ";
@@ -120,6 +130,8 @@ const AGENT_GUTTER: &str = "agent  ";
 const CONTINUATION_PREFIX: &str = "       ";
 
 const COMMAND_PREFIX: &str = "  $ ";
+
+const QUERY_PREFIX: &str = "  ? ";
 
 const OBSERVATION_PREFIX: &str = "    ";
 
@@ -137,6 +149,11 @@ impl std::fmt::Display for Line {
                 observation,
             } => {
                 let mut rows = vec![command_row(command)];
+                rows.extend(observation.lines().map(observation_row));
+                rows
+            },
+            Self::Find { query, observation } => {
+                let mut rows = vec![query_row(query)];
                 rows.extend(observation.lines().map(observation_row));
                 rows
             },
@@ -165,11 +182,24 @@ fn rows_of(line: &Line) -> Vec<String> {
 
             rows
         },
+        Line::Find { query, observation } => {
+            let mut rows = vec![query_row(query)];
+
+            if let Some(outcome) = observation.lines().next().filter(|first| !first.is_empty()) {
+                rows.push(observation_row(outcome));
+            }
+
+            rows
+        },
     }
 }
 
 fn command_row(command: &str) -> String {
     format!("{COMMAND_PREFIX}{}", escaped(command))
+}
+
+fn query_row(query: &str) -> String {
+    format!("{QUERY_PREFIX}{}", escaped(query))
 }
 
 fn observation_row(line: &str) -> String {
@@ -303,6 +333,48 @@ mod tests {
             ],
         );
         assert_eq!(view.visible(0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_find_draws_its_query_and_its_outcome_under_a_gutter_of_its_own() {
+        let view = view(
+            vec![
+                Line::Find {
+                    query: "quokka".to_owned(),
+                    observation: "indexed=2 hits=1\n1.500  /checkout/notes.txt\n".to_owned(),
+                },
+                Line::Agent("found it".to_owned()),
+            ],
+            0,
+        );
+
+        assert_eq!(
+            view.visible(10),
+            vec![
+                "  ? quokka".to_owned(),
+                "    indexed=2 hits=1".to_owned(),
+                "agent  found it".to_owned(),
+            ],
+            "a find must not draw the command's gutter",
+        );
+    }
+
+    #[test]
+    fn the_replay_carries_every_find_row_and_the_frame_carries_the_first() {
+        let line = Line::Find {
+            query: "quokka".to_owned(),
+            observation: "indexed=2 hits=1\n1.500  /checkout/notes.txt\n".to_owned(),
+        };
+
+        let replayed = format!("{line}");
+        assert!(
+            replayed.contains("notes.txt"),
+            "the replay must carry every row of the find's answer: {replayed:?}",
+        );
+        assert_eq!(
+            view(vec![line], 0).visible(2),
+            vec!["  ? quokka".to_owned(), "    indexed=2 hits=1".to_owned()],
+        );
     }
 
     #[test]

@@ -52,6 +52,13 @@ pub struct Global {
     /// A directory the workload may also write in. Repeatable.
     #[arg(long = "allow-write", global = true, value_name = "DIR")]
     pub allow_write: Vec<PathBuf>,
+    /// A directory the agent's finder may search. Repeatable.
+    ///
+    /// A root must sit inside an `--allow-path` or `--allow-write` grant: the finder searches what
+    /// the operator granted and nothing else. Naming none offers the agent no finder at all, and
+    /// opens no index.
+    #[arg(long = "search-root", global = true, value_name = "DIR")]
+    pub search_root: Vec<PathBuf>,
     /// A `NAME=VALUE` pair the confined workload is given. Repeatable, in order.
     ///
     /// The workload's environment is exactly these pairs plus `PATH`, taken from this process, and
@@ -226,6 +233,10 @@ pub struct Config {
     pub allow_path: Vec<PathBuf>,
     /// Directories the workload may also write in.
     pub allow_write: Vec<PathBuf>,
+    /// Directories the agent's finder may search, in the order the operator named them.
+    pub search_root: Vec<PathBuf>,
+    /// Where the finder keeps one index directory per granted root.
+    pub search_index: PathBuf,
     /// The exact environment a confined tool is started with: `PATH` from this process, then each
     /// `--tool-env` entry in order. It replaces the daemon's environment rather than adding to it.
     pub tool_env: Vec<(OsString, OsString)>,
@@ -252,7 +263,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns a [`ConfigError`] when a directory cannot be created, a program is not absolute or
-    /// not a runnable file, or a named path is not a directory.
+    /// not a runnable file, a named path is not a directory, or a search root no grant covers.
     pub fn resolve(args: &Args) -> Result<Self, ConfigError> {
         let global = &args.global;
         create_directory(&global.data_dir)?;
@@ -278,6 +289,11 @@ impl Config {
             .iter()
             .map(|path| reachable_directory(path))
             .collect::<Result<Vec<_>, _>>()?;
+        let search_root = global
+            .search_root
+            .iter()
+            .map(|path| reachable_directory(path))
+            .collect::<Result<Vec<_>, _>>()?;
         // The checkout is reached only through a write grant, so a run whose checkout no grant
         // covers would be refused by the sandbox halfway through; refusing it here names the path.
         if let Command::Agent(Agent::Run(run)) = &args.command {
@@ -295,6 +311,15 @@ impl Config {
                 return Err(ConfigError::CheckoutUngranted {
                     checkout: run.checkout.clone(),
                 });
+            }
+            // A root no grant covers reads bytes no grant lets the workload write, and a find
+            // would hand the model text the operator never opened to it, so the run is refused
+            // here, before any index or log exists.
+            if let Some(root) = search_root.iter().find(|root| {
+                !allow_path.iter().any(|grant| root.starts_with(grant))
+                    && !allow_write.iter().any(|grant| root.starts_with(grant))
+            }) {
+                return Err(ConfigError::SearchUngranted { path: root.clone() });
             }
 
             match global.provider {
@@ -327,6 +352,8 @@ impl Config {
             allow_tool,
             allow_path,
             allow_write,
+            search_root,
+            search_index: global.data_dir.join("search"),
             tool_env: environment(&global.tool_env)?,
             confiner: runnable(&confiner)?,
             crash_after: global.crash_after,
@@ -522,6 +549,11 @@ pub enum ConfigError {
     NotAnAssignment(String),
     #[error("the checkout {checkout} is not covered by any --allow-write grant")]
     CheckoutUngranted { checkout: PathBuf },
+    #[error(
+        "the search root {path} is not covered by any --allow-path or --allow-write grant, so the \
+         finder would read what the operator never opened"
+    )]
+    SearchUngranted { path: PathBuf },
     #[error("no --allow-tool program is named, so the agent has nothing to run")]
     NoTool,
     #[error("no --script file is named, and the scripted provider has nothing to answer with")]
@@ -585,6 +617,7 @@ mod tests {
                 allow_tool: vec![PathBuf::from("/bin/sh")],
                 allow_path: vec![PathBuf::from("/bin")],
                 allow_write: Vec::new(),
+                search_root: Vec::new(),
                 tool_env: Vec::new(),
                 confiner: Some(PathBuf::from("/bin/sh")),
                 crash_after: None,
@@ -828,6 +861,106 @@ mod tests {
             "{refusal}",
         );
         assert!(refusal.to_string().contains("/srv/elsewhere"), "{refusal}");
+    }
+
+    #[test]
+    fn a_search_root_no_grant_covers_is_refused_by_path() {
+        let scratch = Scratch::new("search-ungranted");
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let mut parsed = agent_args(&scratch.0);
+        parsed.global.search_root = vec![elsewhere.clone()];
+
+        let refusal = Config::resolve(&parsed).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::SearchUngranted { path } if path == &elsewhere,
+            ),
+            "{refusal}",
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains(&elsewhere.display().to_string()),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("grant"), "{refusal}");
+    }
+
+    #[test]
+    fn a_search_root_inside_a_read_grant_is_accepted() {
+        let scratch = Scratch::new("search-granted");
+        let granted = scratch.0.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let mut parsed = agent_args(&scratch.0);
+        parsed.global.allow_path.push(granted.clone());
+        parsed.global.search_root = vec![granted.clone()];
+        // The workspace's own confiner is not built by a unit test, and it is resolved last.
+        parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
+
+        let config = Config::resolve(&parsed).unwrap();
+
+        assert_eq!(config.search_root, vec![granted]);
+        assert_eq!(config.search_index, config.data_dir.join("search"));
+    }
+
+    #[test]
+    fn a_search_root_that_is_not_a_directory_is_refused() {
+        let scratch = Scratch::new("search-not-a-dir");
+        let mut parsed = agent_args(&scratch.0);
+        parsed.global.search_root = vec![PathBuf::from("/bin/sh")];
+
+        match Config::resolve(&parsed) {
+            Err(ConfigError::NotADirectory(path)) => assert_eq!(path, PathBuf::from("/bin/sh")),
+            other => panic!("a file named as a search root is refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_naming_no_search_root_creates_no_search_directory() {
+        let scratch = Scratch::new("search-absent");
+        let mut parsed = agent_args(&scratch.0);
+        parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
+
+        let config = Config::resolve(&parsed).unwrap();
+
+        assert_eq!(config.search_root, Vec::<PathBuf>::new());
+        assert_eq!(config.search_index, config.data_dir.join("search"));
+        assert!(
+            !config.search_index.exists(),
+            "a session with no root opens no index and creates nothing",
+        );
+    }
+
+    #[test]
+    fn the_parser_reads_a_repeated_search_root() {
+        let scratch = Scratch::new("search-parse");
+        let parsed = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            scratch.0.to_str().unwrap(),
+            "--allow-tool",
+            "/bin/sh",
+            "--search-root",
+            "/bin",
+            "--search-root",
+            "/usr",
+            "submit",
+            "--session",
+            "018f2f1e-0000-7000-8000-000000000000",
+            "--idempotency-key",
+            "018f2f1e-0000-7000-8000-000000000001",
+            "--program",
+            "/bin/sh",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.global.search_root,
+            vec![PathBuf::from("/bin"), PathBuf::from("/usr")],
+        );
     }
 
     /// The parsed shape of one `--provider ollama` run, with `extra` appended.

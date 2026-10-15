@@ -94,7 +94,19 @@ mod tests {
         keys
     }
 
+    /// The confiner the sandbox supervises with.
+    ///
+    /// A workspace build puts every binary in one directory, so the sibling of this package's own
+    /// is the confiner. `cargo mutants` builds one package into a profile directory that holds no
+    /// other package's binary, so a run under it names the confiner with `MOKMOK_CONFINER`.
     fn confiner() -> PathBuf {
+        if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
+            let path = PathBuf::from(named);
+            assert!(path.is_file(), "{} is not a file", path.display());
+
+            return path;
+        }
+
         let path = PathBuf::from(env!("CARGO_BIN_EXE_mokmok-tui"))
             .parent()
             .expect("the binary has a directory")
@@ -102,7 +114,7 @@ mod tests {
         assert!(
             path.is_file(),
             "{} is missing: build the workspace (cargo build --workspace) before running this \
-             package's tests alone",
+             package's tests alone, or name the confiner with MOKMOK_CONFINER",
             path.display(),
         );
 
@@ -175,10 +187,11 @@ mod tests {
         .expect("the script is written");
     }
 
-    /// The validated configuration and run one conversation names.
+    /// The validated configuration and run one conversation names, with `extra` appended.
     fn config_and_run(
         scratch: &Scratch,
         script_path: &Path,
+        extra: &[&str],
     ) -> (Config, Run) {
         let mut args = vec!["mokmok-tui".to_owned()];
         args.extend(base(scratch));
@@ -194,6 +207,7 @@ mod tests {
             "--script".to_owned(),
             script_path.display().to_string(),
         ]);
+        args.extend(extra.iter().map(|value| (*value).to_owned()));
         let parsed = Args::try_parse_from(&args).expect("the command line parses");
         let config = Config::resolve(&parsed).expect("the configuration resolves");
         let Command::Agent(Agent::Run(run)) = parsed.command else {
@@ -214,7 +228,7 @@ mod tests {
                 json!({"action": "final", "say": "the second reply"}),
             ],
         );
-        let (config, spec) = config_and_run(&scratch, &path);
+        let (config, spec) = config_and_run(&scratch, &path, &[]);
 
         let mut session =
             Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
@@ -296,7 +310,7 @@ mod tests {
         let scratch = Scratch::new("refusal");
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "command", "command": "true"})]);
-        let (config, spec) = config_and_run(&scratch, &path);
+        let (config, spec) = config_and_run(&scratch, &path, &[]);
 
         let mut session =
             Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
@@ -316,6 +330,62 @@ mod tests {
                 Err(Error::Agent(mokmok_agent_runtime::Error::NotAwaiting))
             ),
             "a line folded into a turn already asked is refused: {refused:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_find_reaches_the_screen_as_a_find_and_not_as_a_command() {
+        let scratch = Scratch::new("find");
+        std::fs::write(
+            scratch.checkout().join("notes.txt"),
+            "the quokka walks at dawn\n",
+        )
+        .expect("the file is written");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "find", "query": "quokka"}),
+                json!({"action": "final", "say": "found it"}),
+            ],
+        );
+        let root = scratch.checkout().display().to_string();
+        let (config, spec) = config_and_run(&scratch, &path, &["--search-root", root.as_str()]);
+
+        let mut session =
+            Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
+        let mut screen = ScriptedScreen {
+            keys: typed(&["where is the quokka"]),
+            frames: Vec::new(),
+        };
+
+        run(&mut session, &mut screen)
+            .await
+            .expect("the conversation ends when the human leaves");
+
+        let shown: Vec<Line> = screen
+            .frames
+            .iter()
+            .flat_map(|frame| frame.lines.iter())
+            .cloned()
+            .collect();
+        let found = shown
+            .iter()
+            .find_map(|line| match line {
+                Line::Find { query, observation } => Some((query.clone(), observation.clone())),
+                _ => None,
+            })
+            .expect("the find is on screen");
+
+        assert_eq!(found.0, "quokka");
+        assert!(
+            found.1.contains("hits=1") && found.1.contains("notes.txt"),
+            "the find's own answer is on screen: {:?}",
+            found.1,
+        );
+        assert!(
+            !shown.iter().any(|line| matches!(line, Line::Work { .. })),
+            "a find must not be drawn as a command the agent ran: {shown:?}",
         );
     }
 }

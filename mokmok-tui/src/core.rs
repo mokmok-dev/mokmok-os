@@ -68,6 +68,9 @@ fn lines(fold: &Transcript) -> Vec<Line> {
                 observation,
             }),
             Some(ContextAct::Said { reply }) => lines.push(Line::Agent(reply)),
+            Some(ContextAct::Found { query, observation }) => {
+                lines.push(Line::Find { query, observation });
+            },
             None => {},
         }
     }

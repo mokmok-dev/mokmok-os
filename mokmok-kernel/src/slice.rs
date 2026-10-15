@@ -443,6 +443,13 @@ fn transcript_line(
             number(speech.turn),
             speech.text,
         )),
+        mokmok_agent_runtime::Record::Find(find) => Some(format!(
+            "find turn={} number={} query={:?} observation={:?}",
+            find.turn.as_uuid(),
+            number(find.turn),
+            find.query,
+            find.report.observation,
+        )),
         mokmok_agent_runtime::Record::Session { .. }
         | mokmok_agent_runtime::Record::Turn { .. } => None,
     }
