@@ -159,14 +159,13 @@ impl Patch {
 
                 let mut hunks = Vec::new();
                 let mut hunk_rest = after_target;
-                while let Some((hunk_line, _)) = hunk_rest.split_first() {
+                while let Some((hunk_line, after_hunk_line)) = hunk_rest.split_first() {
                     if !hunk_line.starts_with("@@") {
                         break;
                     }
-                    let start = lines.len() - hunk_rest.len();
-                    let (hunk, next_i) = parse_hunk(&lines, start)?;
+                    let (hunk, after_hunk) = parse_hunk(hunk_line, after_hunk_line)?;
                     hunks.push(hunk);
-                    hunk_rest = &lines[next_i..];
+                    hunk_rest = after_hunk;
                 }
 
                 if hunks.is_empty() {
@@ -381,15 +380,15 @@ fn validate_labels(
     }
 }
 
-fn parse_hunk(
-    lines: &[&str],
-    start: usize,
-) -> Result<(Hunk, usize), ParseError> {
-    let header = parse_header(lines[start])?;
+fn parse_hunk<'a>(
+    header: &'a str,
+    tail: &'a [&'a str],
+) -> Result<(Hunk, &'a [&'a str]), ParseError> {
+    let stated = parse_header(header)?;
     let mut body: Vec<Line> = Vec::new();
-    let mut rest = &lines[start + 1..];
+    let mut rest = tail;
 
-    while let Some((line, tail)) = rest.split_first() {
+    while let Some((line, after)) = rest.split_first() {
         if line.starts_with("@@") || line.starts_with("--- ") || line.starts_with("diff ") {
             break;
         }
@@ -398,7 +397,7 @@ fn parse_hunk(
             if let Some(last) = body.last_mut() {
                 last.newline = false;
             }
-            rest = tail;
+            rest = after;
             continue;
         }
 
@@ -408,7 +407,7 @@ fn parse_hunk(
                 text: String::new(),
                 newline: true,
             });
-            rest = tail;
+            rest = after;
             continue;
         }
 
@@ -424,15 +423,15 @@ fn parse_hunk(
             text: line[1..].to_string(),
             newline: true,
         });
-        rest = tail;
+        rest = after;
     }
 
     Ok((
         Hunk {
-            stated: header,
+            stated,
             lines: body,
         },
-        lines.len() - rest.len(),
+        rest,
     ))
 }
 
@@ -1049,6 +1048,22 @@ mod tests {
             vec![
                 Placed::Matched { line: 2, offset: 0 },
                 Placed::Matched { line: 5, offset: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_is_required_when_the_second_hunks_context_appears_earlier() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,4 @@\n-alpha\n+beta\n+gamma\n+delta\n+epsilon\n@@ -3,1 +3,1 @@\n-mark\n+MARK\n";
+        let patch = Patch::parse(diff).unwrap();
+
+        let applied = patch.files[0].apply(b"alpha\nmark\nmark\n").unwrap();
+        assert_eq!(applied.bytes, b"beta\ngamma\ndelta\nepsilon\nmark\nMARK\n");
+        assert_eq!(
+            applied.hunks,
+            vec![
+                Placed::Matched { line: 1, offset: 0 },
+                Placed::Matched { line: 6, offset: 3 },
             ]
         );
     }
