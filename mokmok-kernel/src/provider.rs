@@ -30,21 +30,14 @@ use uuid::Uuid;
 use crate::authority::AGENT;
 use crate::config::Config;
 
-/// The tool that runs a command, matching the runtime's tool surface.
 const SHELL_TOOL: &str = "run_shell";
 
-/// The tool that searches the operator's granted roots, matching the runtime's finder port.
 const FIND_TOOL: &str = "find_files";
 
-/// The shell tool's description, as the endpoint is handed it.
 const SHELL_DESCRIPTION: &str = "Run one shell command with `sh -c` in a fresh, empty working \
      directory. The checkout is reached by absolute path, stdin is empty, and there is no TCP \
      network.";
 
-/// The finder's description, as the endpoint is handed it.
-///
-/// It names the two limits the model cannot guess: the find reads rather than runs, and it searches
-/// the words of a file's name and its contents.
 const FIND_DESCRIPTION: &str = "Find files under the granted search roots by the words in their \
      name or their contents. Returns a ranked list of paths. Reads and changes nothing.";
 
@@ -919,7 +912,6 @@ mod tests {
         }
     }
 
-    /// The same context, for a session the operator granted a root to search.
     fn searching() -> Context {
         Context {
             search: true,
@@ -963,7 +955,6 @@ mod tests {
         );
     }
 
-    /// One tool-call body, with the function name and arguments a test names.
     fn call_body(
         name: &str,
         arguments: &str,

@@ -52,11 +52,6 @@ pub struct Global {
     /// A directory the workload may also write in. Repeatable.
     #[arg(long = "allow-write", global = true, value_name = "DIR")]
     pub allow_write: Vec<PathBuf>,
-    /// A directory the agent's finder may search. Repeatable.
-    ///
-    /// A root must sit inside an `--allow-path` or `--allow-write` grant: the finder searches what
-    /// the operator granted and nothing else. Naming none offers the agent no finder at all, and
-    /// opens no index.
     #[arg(long = "search-root", global = true, value_name = "DIR")]
     pub search_root: Vec<PathBuf>,
     /// A `NAME=VALUE` pair the confined workload is given. Repeatable, in order.
@@ -233,9 +228,7 @@ pub struct Config {
     pub allow_path: Vec<PathBuf>,
     /// Directories the workload may also write in.
     pub allow_write: Vec<PathBuf>,
-    /// Directories the agent's finder may search, in the order the operator named them.
     pub search_root: Vec<PathBuf>,
-    /// Where the finder keeps one index directory per granted root.
     pub search_index: PathBuf,
     /// The exact environment a confined tool is started with: `PATH` from this process, then each
     /// `--tool-env` entry in order. It replaces the daemon's environment rather than adding to it.
@@ -897,7 +890,6 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.allow_path.push(granted.clone());
         parsed.global.search_root = vec![granted.clone()];
-        // The workspace's own confiner is not built by a unit test, and it is resolved last.
         parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
 
         let config = Config::resolve(&parsed).unwrap();

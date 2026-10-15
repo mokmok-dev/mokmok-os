@@ -31,15 +31,15 @@ Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `s
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `next`, `advance`, `turn_id`, `execution_id` | `src/advance.rs:90,120,402,414` | The decision, the step, and the two derived identifiers |
-| `Move`, `Halt`, `Progress` | `src/advance.rs:24,59,74` | Begin, ask, act, find, close, await, halt; the five halt reasons; the step result |
+| `next`, `advance`, `turn_id`, `execution_id` | `src/advance.rs:94,124,406,418` | The decision, the step, and the two derived identifiers |
+| `Move`, `Halt`, `Progress` | `src/advance.rs:24,63,78` | Begin, ask, act, find, close, await, halt; the five halt reasons; the step result |
 | `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `newest_answer`, `observation` |
-| `Provider`, `Journal` | `src/model.rs:51,66` | The two ports the runtime states for itself |
-| `Finder`, `FindReport` | `src/find.rs:21,10` | The third port: the one tool that reads and changes nothing |
-| `Action`, `Answer`, `Usage` | `src/model.rs:13,29,45` | A final answer, a command, a find, or malformed output |
+| `Provider`, `Journal` | `src/model.rs:55,70` | The two ports the runtime states for itself |
+| `Finder`, `FindReport` | `src/find.rs:18,8` | The third port: the one tool that reads and changes nothing |
+| `Action`, `Answer`, `Usage` | `src/model.rs:13,33,49` | A final answer, a command, a find, or malformed output |
 | `Tools`, `ToolCall`, `ToolReport`, `Exit` | `src/tool.rs:90,22,76,31` | The execution port and its vocabulary |
-| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:136,238,168,270,261,287` | The durable record, the step key, and the two answers to an append |
-| `FindRecord`, `MAX_QUERY_BYTES`, `clip_query`, `clip_prose` | `src/record.rs:122,22,29,39` | One find's durable record, and the caps on the query it holds and the prose the model said |
+| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:134,240,170,272,263,289` | The durable record, the step key, and the two answers to an append |
+| `FindRecord`, `MAX_QUERY_BYTES`, `clip_query`, `clip_prose` | `src/record.rs:120,22,29,39` | One find's durable record, and the caps on the query it holds and the prose the model said |
 | `Task`, `Setting`, `Budget` | `src/task.rs:8,19,40` | The goal, its limits, and the ceilings |
 | `Context`, `ContextAct` | `src/context.rs:14,43` | The bytes the model is handed, and what one settled turn reads as |
 
@@ -48,7 +48,7 @@ Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `s
 Nothing durable. `Transcript` holds in-memory maps of turns, speeches, prompts, answers, calls,
 finds, and runs (`src/dialogue.rs:23-43`). Persistence arrives through the `Journal` port
 (`src/model.rs:66-107`), and large bytes are addressed by an artifact hash
-(`src/record.rs:52`).
+(`src/record.rs:66`).
 
 # Invariants
 
@@ -99,16 +99,17 @@ one implementation that runs a command and one that reads an index.
 
 # Tests
 
-There is no `tests/` directory. Six `#[cfg(test)]` modules hold 86 cases, one of them a proptest.
+There is no `tests/` directory. Six `#[cfg(test)]` modules hold 91 cases, one of them a proptest.
 
-`src/advance.rs:708` holds 29 cases for the begin, ask, act, find, and close walk, a replayed intent
-performing no effect, an interrupted find re-deriving its step, the three ceilings, and the draining
-halt. `src/context.rs:268` holds 26 cases for byte accounting, budget trimming, an unknown outcome
-rendered as its warning, a byte-identical re-ask, and the prompt a granted root adds.
-`src/dialogue.rs:459` holds 23 cases and one proptest case for the floating, late, and conflicting
-refusals, the query mismatch, and for refolding a history being invariant. `src/tool.rs:181` holds
-5 cases for the exit-to-outcome map, `src/record.rs:361` holds 2 for the query cap, and
-`src/task.rs:73` holds 1 for a task record written before the finding grant existed.
+`src/advance.rs:712` holds 30 cases for the begin, ask, act, find, and close walk, a replayed intent
+performing no effect, an interrupted find re-deriving its step, the three ceilings, the draining
+halt, and a line at the log's ceiling. `src/context.rs:271` holds 26 cases for byte accounting,
+budget trimming, an unknown outcome rendered as its warning, a byte-identical re-ask, and the prompt
+a granted root adds. `src/dialogue.rs:458` holds 23 cases and one proptest case for the floating,
+late, and conflicting refusals, the query mismatch, and for refolding a history being invariant.
+`src/tool.rs:181` holds 5 cases for the exit-to-outcome map, `src/record.rs:378` holds 6 for the
+query and prose caps, and `src/task.rs:73` holds 1 for a task record written before the finding grant
+existed.
 
 ```
 cargo test -p mokmok-agent-runtime

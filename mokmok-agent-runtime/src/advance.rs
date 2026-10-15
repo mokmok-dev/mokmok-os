@@ -23,7 +23,9 @@ use crate::tool::{DEFAULT_DEADLINE, ToolCall, ToolReport, Tools};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Move {
     /// Write the task, once, and open the session.
-    Begin { task: Task },
+    Begin {
+        task: Task,
+    },
     /// Call the model with `context` as attempt `attempt` of turn `number`.
     Ask {
         turn: TurnID,
@@ -37,8 +39,10 @@ pub enum Move {
         execution: ExecutionID,
         call: ToolCall,
     },
-    /// Ask the finder the query the recorded answer names, and settle the turn on what it answers.
-    Find { turn: TurnID, query: String },
+    Find {
+        turn: TurnID,
+        query: String,
+    },
     /// Settle a turn, and close the session when `ending` is set.
     Close {
         turn: TurnID,
@@ -976,7 +980,6 @@ mod tests {
         }
     }
 
-    /// A finder no test's move reaches: a find is only asked for when an answer names one.
     fn unasked() -> FakeFinder {
         FakeFinder::of(NO_SEARCH_ROOT)
     }

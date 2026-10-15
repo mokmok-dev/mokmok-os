@@ -40,7 +40,6 @@ pub fn clip_prose(text: &str) -> String {
     clipped(text, MAX_PROSE_BYTES)
 }
 
-/// The longest prefix of `text` no longer than `limit`, cut on a character boundary.
 #[must_use]
 fn clipped(
     text: &str,
@@ -117,7 +116,6 @@ pub struct CallRecord {
     pub command: String,
 }
 
-/// One find the model asked for, and what it answered.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FindRecord {
     pub turn: TurnID,
@@ -135,9 +133,14 @@ pub struct FindRecord {
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum Record {
     /// A fact of the session machine.
-    Session { fact: Fact },
+    Session {
+        fact: Fact,
+    },
     /// A fact of one turn's machine, with the turn it belongs to.
-    Turn { turn: TurnID, fact: TurnFact },
+    Turn {
+        turn: TurnID,
+        fact: TurnFact,
+    },
     /// What one execution produced, with the bounded rendering of its outcome.
     Result {
         execution: ExecutionID,
@@ -151,7 +154,6 @@ pub enum Record {
     Answer(AnswerRecord),
     /// The command about to be dispatched.
     Call(CallRecord),
-    /// One find the model asked for, and what the finder answered.
     Find(FindRecord),
     /// A human's line, which opened this turn.
     Speech(SpeechRecord),

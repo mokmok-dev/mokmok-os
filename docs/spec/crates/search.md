@@ -29,20 +29,20 @@ Modules `corpus`, `error`, `query`, `render`, `token`, and `walk`.
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `Corpus` | `src/corpus.rs:52` | One root and the index derived from it |
-| `Corpus::DEFAULT_LIMIT`, `open`, `root`, `refresh`, `query` | `src/corpus.rs:63,72,100,115,184` | Open or create, reconcile with the tree, and answer |
-| `Limits` | `src/corpus.rs:275` | `file_bytes`, `body_bytes`, `files`: what a pass will not read |
-| `Refresh` | `src/corpus.rs:296` | What one pass did: indexed, updated, removed, unchanged, skipped |
-| `Hit`, `Response` | `src/query.rs:23,35` | One scored path with its snippet, and the documents the index held |
-| `render` | `src/render.rs:13` | One response as the text the model reads |
-| `Error` | `src/error.rs:11` | `Io`, `Index`, and `Root` |
+| `Corpus` | `src/corpus.rs:39` | One root and the index derived from it |
+| `Corpus::DEFAULT_LIMIT`, `open`, `root`, `refresh`, `query` | `src/corpus.rs:49,58,85,100,169` | Open or create, reconcile with the tree, and answer |
+| `Limits` | `src/corpus.rs:256` | `file_bytes`, `body_bytes`, `files`: what a pass will not read |
+| `Refresh` | `src/corpus.rs:276` | What one pass did: indexed, updated, removed, unchanged, skipped |
+| `Hit`, `Response` | `src/query.rs:16,26` | One scored path with its snippet, and the documents the index held |
+| `render` | `src/render.rs:11` | One response as the text the model reads |
+| `Error` | `src/error.rs:9` | `Io`, `Index`, and `Root` |
 
 `refresh` and `query` both take `&self`. The writer is created for the length of a pass and dropped
 with it, so a caller holds no lock around a corpus.
 
 # Owned state
 
-A tantivy index directory and a `manifest.json` (`src/corpus.rs:35`) beside it, both under the store
+A tantivy index directory and a `manifest.json` (`src/corpus.rs:27`) beside it, both under the store
 path the caller names. The manifest records the modification time and the length of every indexed
 file; the index holds the documents. Nothing else is durable.
 
@@ -82,8 +82,8 @@ in `mokmok-agent-runtime`, which is what keeps tantivy out of that crate.
 
 # Tests
 
-There is one `#[cfg(test)]` module in `src/token.rs` with 3 cases, and `tests/corpus.rs` holds 24:
-23 behaviour cases and one proptest case. Two doctests build a corpus in the temporary directory and
+There is a `#[cfg(test)]` module in `src/token.rs` with 5 cases, and `tests/corpus.rs` holds 33: 32
+behaviour cases and one proptest case. Two doctests build a corpus in the temporary directory and
 query it.
 
 ```

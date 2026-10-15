@@ -1,9 +1,3 @@
-//! The corpus: one directory tree, the index derived from it, and the manifest between the two.
-//!
-//! A pass over the tree is incremental. The manifest records the length and the modification time
-//! of every file the last pass indexed, so a file whose stamp has not moved is never read. Two
-//! orders make a pass that is interrupted cheap rather than wrong:
-//!
 //! - The index is committed first and the manifest is written second, so a crash between them
 //!   costs a re-index on the next pass, never a document the manifest claims and the index does
 //!   not hold. A manifest that is absent, torn, or unreadable reads as empty and costs the same.
@@ -29,19 +23,12 @@ use crate::query::{self, Hit, Response};
 use crate::token::{self, CodeTokenizer};
 use crate::walk::{self, Candidate};
 
-/// The tokenizer name the schema's analyzed fields carry.
 const TOKENIZER: &str = "code";
-/// The manifest's file name inside the store.
 const MANIFEST: &str = "manifest.json";
-/// How many bytes of writer memory one pass may fill before it spills a segment.
 const WRITER_BYTES: usize = 50_000_000;
-/// How many bytes of a file the NUL check looks at.
 const HEAD_BYTES: usize = 8 * 1024;
-/// The default size cap: one mebibyte.
 const FILE_BYTES: u64 = 1024 * 1024;
-/// The default body cap: 256 KiB, the longest body one file contributes.
 const BODY_BYTES: usize = 256 * 1024;
-/// The default file cap: a walk past it stops and says so.
 const FILES: usize = 50_000;
 
 /// A directory tree and the BM25 index derived from it.
@@ -59,7 +46,6 @@ pub struct Corpus {
 }
 
 impl Corpus {
-    /// How many hits one query returns when the caller names no limit.
     pub const DEFAULT_LIMIT: usize = 10;
 
     /// Opens the index at `store`, creating it when absent, and binds it to `root`.
@@ -95,7 +81,6 @@ impl Corpus {
         })
     }
 
-    /// The directory tree this corpus is bound to.
     #[must_use]
     pub fn root(&self) -> &Path {
         self.root.as_path()
@@ -234,7 +219,6 @@ impl Corpus {
         Ok(Response { indexed, hits })
     }
 
-    /// The manifest the last committed pass left, or nothing when there is none to read.
     fn manifest(&self) -> Manifest {
         std::fs::read(self.store.join(MANIFEST))
             .ok()
@@ -242,7 +226,6 @@ impl Corpus {
             .unwrap_or_default()
     }
 
-    /// Writes the manifest that describes what the committed index now holds.
     fn write_manifest(
         &self,
         manifest: &Manifest,
@@ -253,7 +236,6 @@ impl Corpus {
         write_atomic(&self.store.join(MANIFEST), &bytes).map_err(Error::Io)
     }
 
-    /// The text to index for `candidate`, or nothing when the file is not text.
     fn body(
         &self,
         candidate: &Candidate,
@@ -270,7 +252,6 @@ impl Corpus {
     }
 }
 
-/// The caps one corpus holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     /// The largest file the walk indexes, in bytes. A file past it is skipped and counted.
@@ -291,7 +272,6 @@ impl Default for Limits {
     }
 }
 
-/// What one pass over the tree did.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Refresh {
     /// The files the index holds after the pass: the updated ones and the unchanged ones.
@@ -307,7 +287,6 @@ pub struct Refresh {
     pub skipped: u64,
 }
 
-/// The three fields every document carries.
 #[derive(Clone, Copy, Debug)]
 pub struct Fields {
     /// The path, untokenized: the term a document is deleted under and the value the model reads.
@@ -345,7 +324,6 @@ fn schema() -> (Schema, Fields) {
     (builder.build(), Fields { path, name, body })
 }
 
-/// The text one stored field holds in `document`, or the empty string when it holds none.
 fn stored(
     document: &TantivyDocument,
     field: Field,
@@ -356,7 +334,6 @@ fn stored(
         .unwrap_or_default()
 }
 
-/// At most `cap` bytes of the file at `path`.
 fn read_capped(
     path: &Path,
     cap: u64,
@@ -367,7 +344,6 @@ fn read_capped(
     Ok(bytes)
 }
 
-/// `text` cut to `limit` bytes on a character boundary.
 fn capped(
     text: &str,
     limit: usize,

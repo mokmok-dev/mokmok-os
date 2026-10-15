@@ -1,5 +1,3 @@
-//! The model-facing text one response renders as.
-
 use std::fmt::Write;
 
 use crate::query::Response;

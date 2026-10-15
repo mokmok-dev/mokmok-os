@@ -7,7 +7,6 @@
 
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
-/// The byte spans, in order, of every word `text` carries.
 fn spans(text: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut open: Option<usize> = None;
@@ -35,7 +34,6 @@ fn spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// The words `text` carries, lowercased, in order.
 #[must_use]
 pub fn tokens(text: &str) -> Vec<String> {
     spans(text)
@@ -64,7 +62,6 @@ impl Tokenizer for CodeTokenizer {
     }
 }
 
-/// The token stream [`CodeTokenizer`] hands to tantivy.
 #[derive(Debug)]
 pub struct CodeTokenStream<'a> {
     text: &'a str,
@@ -102,15 +99,12 @@ mod tests {
     use super::{CodeTokenizer, tokens};
     use tantivy::tokenizer::{AsciiFoldingFilter, TextAnalyzer, TokenStream};
 
-    /// The tokens tantivy's own analyzer pipeline produces, which is the index-time path.
     fn analyzed(text: &str) -> Vec<String> {
         let mut analyzer = TextAnalyzer::from(CodeTokenizer);
         let mut stream = analyzer.token_stream(text);
         let mut words = Vec::new();
 
-        // Bounded on purpose: a stream that never reports the end of its text would loop here for
-        // ever, and a suite that hangs on a mutant scores that mutant as a timeout rather than as
-        // caught. No text yields more words than it has bytes.
+        // A hang scores as a timeout rather than a catch, so the loop is bounded.
         while words.len() <= text.len() {
             let Some(token) = stream.next() else {
                 return words;
@@ -121,8 +115,6 @@ mod tests {
         panic!("{text:?} yielded more words than it has bytes");
     }
 
-    /// One step of a stream, as a filter or an indexer reads it: the word with the span it came
-    /// from and the position it stands at.
     fn step(stream: &mut dyn TokenStream) -> Option<(String, usize, usize, usize)> {
         stream.next().map(|token| {
             (

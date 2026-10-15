@@ -428,17 +428,13 @@ impl Provider for Scripted {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Script {
-    /// The model asked for the one tool.
     Command {
         command: String,
-        /// The model's own words, when the script supplies them, so an offline run shows prose.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },
-    /// The model asked the finder.
     Find {
         query: String,
-        /// The model's own words, when the script supplies them, so an offline run shows prose.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },

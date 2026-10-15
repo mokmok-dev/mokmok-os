@@ -47,9 +47,13 @@ pub enum ContextAct {
         observation: String,
     },
     /// The agent answered without the tool.
-    Said { reply: String },
-    /// The agent asked the finder, and it answered.
-    Found { query: String, observation: String },
+    Said {
+        reply: String,
+    },
+    Found {
+        query: String,
+        observation: String,
+    },
 }
 
 impl Context {
@@ -181,7 +185,6 @@ impl Transcript {
         })
     }
 
-    /// How many bytes of one observation the model is shown, as a `usize`.
     fn observation_limit(&self) -> usize {
         bytes_of(
             self.task
@@ -835,7 +838,6 @@ mod tests {
         assert_eq!(ran_command(&built.turns[0]), MISSING_COMMAND);
     }
 
-    /// The system prompt this crate produced before the finder existed, word for word.
     const PROMPT_WITHOUT_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
          You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n\
          The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
@@ -846,7 +848,6 @@ mod tests {
          rather than run, so work inside the grants.\n\
          When the goal is met, answer without calling the tool.";
 
-    /// The system prompt a session with a granted root is handed, word for word.
     const PROMPT_WITH_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
          You have two tools. run_shell takes a command string and runs `sh -c`. find_files takes a \
          query string and searches the names and contents of the files under /srv/checkout; it \
@@ -860,7 +861,6 @@ mod tests {
          rather than run, so work inside the grants.\n\
          When the goal is met, answer without calling the tool.";
 
-    /// A transcript whose first turn asked the finder and settled on what it answered.
     fn found_turn(
         task: &crate::task::Task,
         query: &str,

@@ -1,5 +1,3 @@
-//! The second tool the model may reach for: a search over what the operator granted.
-
 use crate::error::Error;
 
 /// What one find answered, as the model reads it.
@@ -11,7 +9,6 @@ pub struct FindReport {
     pub observation: String,
 }
 
-/// What a session that was granted no root answers with.
 pub const NO_SEARCH_ROOT: &str = "no search root was granted, so no file can be found";
 
 /// The second tool the model may reach for: reads, changes nothing.

@@ -147,7 +147,6 @@ impl Transcript {
         self.calls.values().find(|call| call.turn == turn)
     }
 
-    /// The find one turn recorded, if any.
     #[must_use]
     pub fn find_of(
         &self,
@@ -557,7 +556,6 @@ mod tests {
         })
     }
 
-    /// A turn whose newest answer asked the finder for `query`.
     fn a_find_answered_turn(query: &str) -> (Transcript, TurnID) {
         let turn = turn_id(1);
         let mut transcript = Transcript::new(session());

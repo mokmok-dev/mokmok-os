@@ -25,7 +25,6 @@ pub enum Error {
     /// The tools failed to report.
     #[error("the tools failed: {0}")]
     Tool(#[source] Source),
-    /// The finder failed to answer.
     #[error("the finder failed: {0}")]
     Finder(#[source] Source),
     /// The fold refused a record.

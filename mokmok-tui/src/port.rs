@@ -95,8 +95,6 @@ pub enum Event {
 }
 
 /// One line of the conversation.
-///
-/// The four cases are the four things a turn can hold, so a renderer cannot invent a fifth.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Line {
     /// What the human said.
@@ -114,12 +112,7 @@ pub enum Line {
     ///
     /// A find is its own line kind rather than a [`Line::Work`]: nothing ran, and a `command` field
     /// would tell the human a program had.
-    Find {
-        /// The query the agent asked the finder.
-        query: String,
-        /// What the finder answered, as the model was shown it.
-        observation: String,
-    },
+    Find { query: String, observation: String },
 }
 
 const HUMAN_GUTTER: &str = "you    ";

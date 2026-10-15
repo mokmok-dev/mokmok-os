@@ -16,7 +16,6 @@ use mokmok_agent_runtime::{Error as AgentError, FindReport, Finder, NO_SEARCH_RO
 use mokmok_artifact::ContentHash;
 use mokmok_search::{Corpus, Error as SearchError, Hit, Limits, Response, render};
 
-/// The finder one session runs: the corpora of the roots the operator granted it.
 pub struct Index {
     corpora: Vec<Corpus>,
 }
@@ -123,7 +122,6 @@ mod tests {
 
     use super::Index;
 
-    /// A directory this test's own, removed when it ends.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -287,8 +285,6 @@ mod tests {
             .collect();
         assert_eq!(indexed.len(), 1, "one root owns one index directory");
 
-        // The second index is derived from the same root bytes, so it opens the directory above
-        // rather than creating a second one beside it.
         let second = Index::open(&[root], &scratch.store()).unwrap();
         assert!(observation(&second, "quokka").contains(&file.display().to_string()));
         assert_eq!(

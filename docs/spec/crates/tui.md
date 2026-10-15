@@ -31,7 +31,7 @@ the kernel keeps.[^crate]
 | `core::run` | `src/core.rs:173` | The driver loop |
 | `Engine` | `src/port.rs:15` | `fold`, `speak`, `step`, `reopen` |
 | `Screen` | `src/port.rs:52` | `event`, `draw` |
-| `Key`, `Event`, `Line`, `View` | `src/port.rs:73,90,101,257` | Input, the four line kinds, and the rendered rows |
+| `Key`, `Event`, `Line`, `View` | `src/port.rs:73,90,99,250` | Input, the four line kinds, and the rendered rows |
 | `Session` | `src/session.rs:15` | The kernel-backed engine |
 | `Terminal` | `src/terminal.rs:22` | The terminal mode, its restoration, and the key reader |
 | `Outcome` | `src/lib.rs:24` | The ending and the printed transcript |
@@ -84,9 +84,9 @@ the loop be driven without a terminal (`src/port.rs:12-16`).
 22 cases: 3 in `tests/conversation.rs` and 19 across three `#[cfg(test)]` modules.
 
 All three conversation cases are asynchronous. One asserts that a conversation shows the line it
-answers and survives two exchanges (`tests/conversation.rs:207`), one asserts that a line is refused
-while the turn is in flight (`tests/conversation.rs:295`), and one asserts that a find reaches the
-screen as its own line kind rather than as a command (`tests/conversation.rs:325`). `src/port.rs`
+answers and survives two exchanges (`tests/conversation.rs:217`), one asserts that a line is refused
+while the turn is in flight (`tests/conversation.rs:305`), and one asserts that a find reaches the
+screen as its own line kind rather than as a command (`tests/conversation.rs:333`). `src/port.rs`
 holds 10 cases for gutters, multi-row replies, row-wise windowing, and the replay.
 `src/terminal.rs` holds 8 cases for the layout, scrollback, and control keys.
 

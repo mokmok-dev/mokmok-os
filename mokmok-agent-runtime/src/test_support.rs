@@ -230,7 +230,6 @@ pub fn act_outcome_records(
     records
 }
 
-/// The records a find writes: the record, and the turn it settled.
 #[must_use]
 pub fn find_records(
     turn: TurnID,
@@ -300,8 +299,6 @@ pub fn apply_all(
     }
 }
 
-/// A finder that answers every query with one observation, and remembers what it was asked.
-///
 /// The count is what proves a search ran again, which is the whole of what an interrupted find
 /// leaves to check.
 pub struct FakeFinder {
@@ -310,7 +307,6 @@ pub struct FakeFinder {
 }
 
 impl FakeFinder {
-    /// A finder that answers every query with `observation`.
     #[must_use]
     pub fn of(observation: &str) -> Self {
         Self {
@@ -319,13 +315,11 @@ impl FakeFinder {
         }
     }
 
-    /// How many finds this finder has answered.
     #[must_use]
     pub fn calls(&self) -> usize {
         self.queries.lock().unwrap().len()
     }
 
-    /// The queries this finder has been asked, in the order it was asked them.
     #[must_use]
     pub fn queries(&self) -> Vec<String> {
         self.queries.lock().unwrap().clone()

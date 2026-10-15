@@ -84,11 +84,7 @@ mod tests {
         PathBuf::from(env!("CARGO_BIN_EXE_mokmokd"))
     }
 
-    /// The confiner the sandbox supervises with.
-    ///
-    /// A workspace build puts every binary in one directory, so the sibling of this package's own
-    /// is the confiner. `cargo mutants` builds one package into a profile directory that holds no
-    /// other package's binary, so a run under it names the confiner with `MOKMOK_CONFINER`.
+    /// A `cargo mutants` run names the confiner with `MOKMOK_CONFINER`.
     fn confiner() -> PathBuf {
         if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
             let path = PathBuf::from(named);
@@ -249,7 +245,6 @@ mod tests {
         run(&args)
     }
 
-    /// The context bytes the prompt for turn `number` was handed, read back out of the store.
     fn prompt_context(
         scratch: &Scratch,
         number: u64,
@@ -274,7 +269,6 @@ mod tests {
         String::from_utf8(context).expect("the context is JSON text")
     }
 
-    /// The session's log and the id its records are under.
     fn log_of(scratch: &Scratch) -> (mokmok_kernel::Log, SessionID) {
         let db = Db::open(&scratch.data().join("events.sqlite")).expect("the log opens");
         let session =
@@ -283,7 +277,6 @@ mod tests {
         (db.log(session).expect("the log reads"), session)
     }
 
-    /// The one find record the session holds.
     fn find_of(log: &mokmok_kernel::Log) -> &mokmok_agent_runtime::FindRecord {
         log.ordered
             .iter()
@@ -635,7 +628,6 @@ mod tests {
         .expect("the file is written");
         let path = scratch.0.join("script.json");
 
-        // The first invocation records the task and stops before the model is asked.
         script(&path, &[]);
         let root = scratch.checkout().display().to_string();
         let opened = run(&agent_args(
@@ -645,8 +637,6 @@ mod tests {
         ));
         assert!(opened.ok, "{}\n{}", opened.out, opened.err);
 
-        // The second names no root at all, so the finder it opens must come off the recorded task;
-        // one built from this invocation's flags would answer NO_SEARCH_ROOT instead.
         script(
             &path,
             &[

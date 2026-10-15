@@ -77,7 +77,6 @@ mod tests {
 
     #[test]
     fn a_setting_written_before_the_search_field_still_decodes() {
-        // The bytes a task record carried before `search` existed.
         let json = r#"{
             "checkout": "/srv/checkout",
             "readable": ["/nix/store"],

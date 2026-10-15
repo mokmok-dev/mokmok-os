@@ -1,5 +1,3 @@
-//! The tree walk and the limits it holds.
-
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -13,29 +11,23 @@ const PRUNED: [&str; 2] = ["target", "node_modules"];
 /// One file the walk offers the index, with the stamp a pass compares against the manifest.
 #[derive(Clone, Debug)]
 pub struct Candidate {
-    /// Where the file is.
     pub path: PathBuf,
     /// The path as the index stores it, which the walk has proven is UTF-8.
     pub key: String,
-    /// The base name the `name` field is written from.
     pub name: String,
-    /// The file's length.
     pub size: u64,
     /// The file's modification time in milliseconds since the epoch, when the platform has one.
     pub modified: Option<u64>,
 }
 
-/// What one walk found.
 #[derive(Debug, Default)]
 pub struct Walk {
-    /// The files the walk offers, in the order the directories handed them over.
     pub files: Vec<Candidate>,
     /// The entries the walk refused or stopped on: past a limit, unreadable, or not a plain file.
     pub skipped: u64,
 }
 
 impl Walk {
-    /// Counts one entry the walk refused, wherever the refusal was decided.
     const fn skip(&mut self) {
         self.skipped += 1;
     }
@@ -152,7 +144,6 @@ fn pruned(
     named || own
 }
 
-/// The file's modification time in milliseconds since the epoch, when the platform reports one.
 fn modified(metadata: &std::fs::Metadata) -> Option<u64> {
     let elapsed = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
 

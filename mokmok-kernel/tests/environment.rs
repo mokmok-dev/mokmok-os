@@ -55,11 +55,7 @@ mod tests {
         PathBuf::from(env!("CARGO_BIN_EXE_mokmokd"))
     }
 
-    /// The confiner the sandbox supervises with.
-    ///
-    /// A workspace build puts every binary in one directory, so the sibling of this package's own
-    /// is the confiner. `cargo mutants` builds one package into a profile directory that holds no
-    /// other package's binary, so a run under it names the confiner with `MOKMOK_CONFINER`.
+    /// A `cargo mutants` run names the confiner with `MOKMOK_CONFINER`.
     fn confiner() -> PathBuf {
         if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
             let path = PathBuf::from(named);
@@ -75,7 +71,7 @@ mod tests {
         assert!(
             path.is_file(),
             "{} is missing: build the workspace (cargo build --workspace) before running this \
-             package's tests alone",
+             package's tests alone, or name the confiner with MOKMOK_CONFINER",
             path.display(),
         );
 
