@@ -33,7 +33,7 @@ Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `s
 | --- | --- | --- |
 | `next`, `advance`, `turn_id`, `execution_id` | `src/advance.rs:94,124,406,418` | The decision, the step, and the two derived identifiers |
 | `Move`, `Halt`, `Progress` | `src/advance.rs:24,63,78` | Begin, ask, act, find, close, await, halt; the five halt reasons; the step result |
-| `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `newest_answer`, `observation` |
+| `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `newest_answer`, `observation`, `shown_turns`, `shown` |
 | `Provider`, `Journal` | `src/model.rs:55,70` | The two ports the runtime states for itself |
 | `Finder`, `FindReport` | `src/find.rs:18,8` | The third port: the one tool that reads and changes nothing |
 | `Action`, `Answer`, `Usage` | `src/model.rs:13,33,49` | A final answer, a command, a find, or malformed output |
@@ -69,6 +69,12 @@ finds, and runs (`src/dialogue.rs:23-43`). Persistence arrives through the `Jour
   step replays (`src/record.rs:145`).
 - Three ceilings halt the loop: tokens (`src/advance.rs:238`), turns (`src/advance.rs:275`), and
   attempts (`src/advance.rs:336`).- Every refusal returns before any mutation, so a refused record leaves the fold untouched.
+- `shown_turns` pairs each rendering with the turn it names (`src/context.rs:146`), which is what a
+  front end draws a turn's own settlement, attempts, and answers beside; `shown` is its projection.
+- An absent `act` means the turn being asked now, or a settled turn the model never finished: such
+  a turn requested no tool, so no command ran and its prompt carries only the human's line
+  (`src/context.rs:178`). A settled turn that did dispatch a command without a call record still
+  renders `MISSING_COMMAND` (`src/context.rs:132`).
 
 # Dependencies
 
@@ -99,17 +105,20 @@ one implementation that runs a command and one that reads an index.
 
 # Tests
 
-There is no `tests/` directory. Six `#[cfg(test)]` modules hold 91 cases, one of them a proptest.
+There is no `tests/` directory. Seven `#[cfg(test)]` modules hold 95 cases, two of them property
+cases.
 
 `src/advance.rs:712` holds 30 cases for the begin, ask, act, find, and close walk, a replayed intent
 performing no effect, an interrupted find re-deriving its step, the three ceilings, the draining
-halt, and a line at the log's ceiling. `src/context.rs:271` holds 26 cases for byte accounting,
-budget trimming, an unknown outcome rendered as its warning, a byte-identical re-ask, and the prompt
-a granted root adds. `src/dialogue.rs:458` holds 23 cases and one proptest case for the floating,
+halt, and a line at the log's ceiling. `src/context.rs:300` holds 27 cases for byte accounting,
+budget trimming, an unknown outcome rendered as its warning, a byte-identical re-ask, the prompt a
+granted root adds, a rendering paired with the turn it names, and a settled turn the model never
+finished carrying no act. `src/dialogue.rs:458` holds 23 cases and one proptest for the floating,
 late, and conflicting refusals, the query mismatch, and for refolding a history being invariant.
-`src/tool.rs:181` holds 5 cases for the exit-to-outcome map, `src/record.rs:378` holds 6 for the
-query and prose caps, and `src/task.rs:73` holds 1 for a task record written before the finding grant
-existed.
+`src/record.rs:378` holds 7 cases for the query and prose caps and the two byte bounds the log
+declares. `src/speech.rs:105` holds 2 cases and one property case for the line bound in both
+directions. `src/tool.rs:181` holds 5 cases for the exit-to-outcome map, and `src/task.rs:73` holds 1
+for a task record written before the finding grant existed.
 
 ```
 cargo test -p mokmok-agent-runtime

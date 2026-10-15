@@ -32,7 +32,10 @@ impl Terminal {
     /// a pipe leaves the screen exactly as it found it, and [`Error::Terminal`] when raw mode or the
     /// alternate screen cannot be entered.
     pub fn open() -> Result<Self, Error> {
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        if !both_are_terminals(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) {
             return Err(Error::NotATerminal);
         }
 
@@ -64,14 +67,8 @@ impl Drop for Terminal {
 impl Screen for Terminal {
     fn event(&mut self) -> Result<Event, Error> {
         loop {
-            match event::read().map_err(Error::Terminal)? {
-                CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                    if let Some(key) = mapped(&key) {
-                        return Ok(Event::Key(key));
-                    }
-                },
-                CtEvent::Resize(..) => return Ok(Event::Resize),
-                _ => {},
+            if let Some(event) = classified(&event::read().map_err(Error::Terminal)?) {
+                return Ok(event);
             }
         }
     }
@@ -88,12 +85,38 @@ impl Screen for Terminal {
     }
 }
 
+/// Whether both ends the screen needs are terminals, so a pipe on either end leaves the shell's
+/// screen exactly as it was found.
+const fn both_are_terminals(
+    input: bool,
+    output: bool,
+) -> bool {
+    input && output
+}
+
+/// The conversation's event for what the terminal reported, when it acts on it.
+///
+/// Everything else the terminal can report is dropped here rather than by the driver, which has no
+/// answer for an event that moves nothing.
+fn classified(event: &CtEvent) -> Option<Event> {
+    match event {
+        CtEvent::Key(key) => mapped(key).map(Event::Key),
+        CtEvent::Resize(..) => Some(Event::Resize),
+        _ => None,
+    }
+}
+
 /// The conversation's key for a reported key event, when it listens for it.
 ///
 /// A control or alt chord that is not the mapped `Ctrl-C` is dropped rather than typed as its
 /// letter, so a human reaching for a key the program does not bind finds no stray character in the
-/// line; a shifted character still types itself.
+/// line; a shifted character still types itself. A release and a repeat are the same key already
+/// reported, so only a press is the stroke.
 fn mapped(key: &KeyEvent) -> Option<Key> {
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Some(Key::Interrupt);
     }
@@ -150,12 +173,14 @@ mod tests {
     use ratatui::Terminal as RtTerminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{
+        Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    };
     use ratatui::layout::Position;
     use uuid::Uuid;
 
-    use super::{mapped, render};
-    use crate::port::{Key, Line, View};
+    use super::{both_are_terminals, classified, mapped, render};
+    use crate::port::{Event, Key, Line, View};
     use mokmok_protocol::SessionID;
 
     #[test]
@@ -189,6 +214,75 @@ mod tests {
             mapped(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(Key::Enter),
         );
+    }
+
+    #[test]
+    fn a_key_that_is_not_pressed_is_not_the_conversation_s_key() {
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(Key::Char('a')),
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            None,
+            "a release is the key coming back up, not a second stroke",
+        );
+    }
+
+    #[test]
+    fn the_line_and_scroll_keys_map_to_themselves() {
+        for (code, key) in [
+            (KeyCode::Backspace, Key::Backspace),
+            (KeyCode::Up, Key::Up),
+            (KeyCode::Down, Key::Down),
+        ] {
+            assert_eq!(
+                mapped(&KeyEvent::new(code, KeyModifiers::NONE)),
+                Some(key),
+                "{code:?} is a key the conversation acts on",
+            );
+        }
+    }
+
+    #[test]
+    fn a_reported_event_becomes_the_one_the_conversation_acts_on() {
+        assert_eq!(
+            classified(&CtEvent::Resize(10, 20)),
+            Some(Event::Resize),
+            "a resize redraws the frame",
+        );
+        assert_eq!(
+            classified(&CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))),
+            Some(Event::Key(Key::Char('a'))),
+        );
+        assert_eq!(
+            classified(&CtEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ))),
+            None,
+        );
+        assert_eq!(
+            classified(&CtEvent::FocusGained),
+            None,
+            "a key press and a resize are the only two the conversation acts on",
+        );
+    }
+
+    #[test]
+    fn a_screen_needs_both_ends_to_be_terminals() {
+        assert!(both_are_terminals(true, true));
+        assert!(!both_are_terminals(true, false));
+        assert!(!both_are_terminals(false, true));
+        assert!(!both_are_terminals(false, false));
     }
 
     fn row(
