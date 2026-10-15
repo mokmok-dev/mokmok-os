@@ -147,11 +147,6 @@ impl Patch {
         let mut rest = lines.as_slice();
 
         while let Some((line, tail)) = rest.split_first() {
-            if is_ignored_preamble(line) {
-                rest = tail;
-                continue;
-            }
-
             if let Some(source_rest) = line.strip_prefix("--- ") {
                 let source_label = parse_label(source_rest)?;
                 let (target_line, after_target) =
@@ -346,15 +341,6 @@ impl FilePatch {
             hunks: placed,
         })
     }
-}
-
-fn is_ignored_preamble(line: &str) -> bool {
-    line.starts_with("diff ")
-        || line.starts_with("index ")
-        || line.starts_with("new file mode")
-        || line.starts_with("old mode")
-        || line.starts_with("deleted file mode")
-        || line.starts_with("similarity index ")
 }
 
 fn parse_label(raw: &str) -> Result<Label, ParseError> {
@@ -1047,6 +1033,64 @@ mod tests {
             patch.to_unified(),
             "--- src/x.rs\n+++ src/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n",
         );
+    }
+
+    #[test]
+    fn two_hunks_and_the_first_shift_makes_the_second_match() {
+        let diff = "--- a/f\n+++ b/f\n@@ -2,1 +2,3 @@\n-beta\n+B\n+B2\n+B3\n@@ -3,1 +3,1 @@\n-gamma\n+GAMMA\n";
+        let patch = Patch::parse(diff).unwrap();
+
+        let applied = patch.files[0]
+            .apply(b"alpha\nbeta\ngamma\ndelta\n")
+            .unwrap();
+        assert_eq!(applied.bytes, b"alpha\nB\nB2\nB3\nGAMMA\ndelta\n");
+        assert_eq!(
+            applied.hunks,
+            vec![
+                Placed::Matched { line: 2, offset: 0 },
+                Placed::Matched { line: 5, offset: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn both_labels_null_is_rejected() {
+        let diff = "--- /dev/null\n+++ /dev/null\n@@ -1,1 +1,1 @@\n x\n";
+        assert_eq!(
+            Patch::parse(diff),
+            Err(ParseError::InvalidPath(
+                "both sides name /dev/null".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn differing_source_and_target_paths_are_rejected() {
+        let diff = "--- a/x.rs\n+++ b/y.rs\n@@ -1,1 +1,1 @@\n x\n";
+        assert_eq!(
+            Patch::parse(diff),
+            Err(ParseError::InvalidPath(
+                "source \"x.rs\" differs from target \"y.rs\"".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn header_without_lengths_parses_and_applies() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
+        let patch = Patch::parse(diff).unwrap();
+        assert_eq!(
+            patch.files[0].hunks[0].stated,
+            Header {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1,
+            }
+        );
+
+        let applied = patch.files[0].apply(b"old\n").unwrap();
+        assert_eq!(applied.bytes, b"new\n");
     }
 
     fn line_text() -> impl Strategy<Value = String> {
