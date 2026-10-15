@@ -1466,6 +1466,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mokmok-patch"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mokmok-protocol"
 version = "0.0.0"
 dependencies = [

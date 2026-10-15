@@ -1,0 +1,13 @@
+[package]
+edition.workspace = true
+name = "mokmok-patch"
+version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
