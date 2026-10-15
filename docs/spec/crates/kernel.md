@@ -28,13 +28,14 @@ databases, runs recovery before the daemon reports ready, and exposes the five s
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `Config`, `Args`, `Command` | `src/config.rs:216,100,110` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
+| `Config`, `Args`, `Command` | `src/config.rs:223,107,117` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
 | `Db`, `Log`, `Entry`, `TurnRecord`, `ResultRecord` | `src/db.rs:276,103,45,89,96` | The appender over the event log and the folded view of one session |
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
 | `Relay`, `serve` | `src/serve.rs:52,146` | The outbox relay and the daemon loop |
-| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,457,476` | The vertical slice |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:635,534,517,360` | The agent loop and its scripted model |
+| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,463,482` | The vertical slice |
+| `Index` | `src/index.rs:20` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:635,546,529,360` | The agent loop and its scripted model |
 | `Error` | `src/error.rs:17` | 29 variants |
 
 `authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `serve`, and
@@ -46,16 +47,19 @@ databases, runs recovery before the daemon reports ready, and exposes the five s
 Every durable file the system uses passes through this crate: `events.sqlite`
 (`src/config.rs:324`) opened by `Db::open` into `mokmok_event_store::Store`, `bus.sqlite`
 (`src/serve.rs:154`), the `artifacts/` directory (`src/config.rs:260`), the `sandbox/` directory
-(`src/config.rs:261`), the `bus.sock` socket (`src/config.rs:345`), and `audit.jsonl`
-(`src/provider.rs:45`). In memory: the folded `Log` for a session (`src/db.rs:103-114`), one
+(`src/config.rs:261`), the `bus.sock` socket (`src/config.rs:345`), `audit.jsonl`
+(`src/provider.rs:45`), and one `search/<key>/` index directory per granted search root
+(`src/config.rs:356`). In memory: the folded `Log` for a session (`src/db.rs:103-114`), one
 publisher per topic in `Relay` (`src/serve.rs:54`), the scripted model's answer queue
-(`src/agent.rs:361`), the notification socket (`src/notify.rs:43-48`), and the provider credential
-(`src/provider.rs:136`).
+(`src/agent.rs:361`), the notification socket (`src/notify.rs:43-48`), the provider credential
+(`src/provider.rs:136`), and one opened corpus per search root (`src/index.rs:20`).
 
 # Invariants
 
 - Authority is default-deny. `Policy::new()` holds no rules and every rule comes from a named flag
   (`src/authority.rs:60-92`).
+- A search root must sit inside a read or write grant, or the run is refused before any index is
+  opened (`src/config.rs:318`).
 - A credential file must be mode 0600 (`src/config.rs:424`) and must not sit inside a write grant
   (`src/config.rs:437`).
 - An artifact path must be plain and relative. A parent-directory component, a root component, and

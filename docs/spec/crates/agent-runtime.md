@@ -26,25 +26,29 @@ replayed intent performs nothing.[^crate]
 
 # Public surface
 
-Modules `advance`, `context`, `dialogue`, `error`, `model`, `record`, `speech`, `task`, and `tool`.
+Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `speech`, `task`, and
+`tool`.
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `next`, `advance`, `turn_id`, `execution_id` | `src/advance.rs:87,113,378,390` | The decision, the step, and the two derived identifiers |
-| `Move`, `Halt`, `Progress` | `src/advance.rs:23,56,71` | Begin, ask, act, close, await, halt; the five halt reasons; the step result |
-| `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `newest_answer`, `observation` |
-| `Provider`, `Journal` | `src/model.rs:49,64` | The two ports the runtime states for itself |
-| `Action`, `Answer`, `Usage` | `src/model.rs:13,27,43` | A final answer, a command, or malformed output |
+| `next`, `advance`, `turn_id`, `execution_id` | `src/advance.rs:90,120,402,414` | The decision, the step, and the two derived identifiers |
+| `Move`, `Halt`, `Progress` | `src/advance.rs:24,59,74` | Begin, ask, act, find, close, await, halt; the five halt reasons; the step result |
+| `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `newest_answer`, `observation` |
+| `Provider`, `Journal` | `src/model.rs:51,66` | The two ports the runtime states for itself |
+| `Finder`, `FindReport` | `src/find.rs:21,10` | The third port: the one tool that reads and changes nothing |
+| `Action`, `Answer`, `Usage` | `src/model.rs:13,29,45` | A final answer, a command, a find, or malformed output |
 | `Tools`, `ToolCall`, `ToolReport`, `Exit` | `src/tool.rs:90,22,76,31` | The execution port and its vocabulary |
-| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:89,186,119,218,209,233` | The durable record, the step key, and the two answers to an append |
-| `Task`, `Setting`, `Budget` | `src/task.rs:8,19,34` | The goal, its limits, and the ceilings |
+| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:136,238,168,270,261,287` | The durable record, the step key, and the two answers to an append |
+| `FindRecord`, `MAX_QUERY_BYTES`, `clip_query`, `clip_prose` | `src/record.rs:122,22,29,39` | One find's durable record, and the caps on the query it holds and the prose the model said |
+| `Task`, `Setting`, `Budget` | `src/task.rs:8,19,40` | The goal, its limits, and the ceilings |
+| `Context`, `ContextAct` | `src/context.rs:14,43` | The bytes the model is handed, and what one settled turn reads as |
 
 # Owned state
 
-Nothing durable. `Transcript` holds in-memory maps of turns, speeches, prompts, answers, calls, and
-runs (`src/dialogue.rs:23-41`). Persistence arrives through the `Journal` port
-(`src/model.rs:64-105`), and large bytes are addressed by an artifact hash
-(`src/record.rs:28`).
+Nothing durable. `Transcript` holds in-memory maps of turns, speeches, prompts, answers, calls,
+finds, and runs (`src/dialogue.rs:23-43`). Persistence arrives through the `Journal` port
+(`src/model.rs:66-107`), and large bytes are addressed by an artifact hash
+(`src/record.rs:52`).
 
 # Invariants
 
@@ -52,10 +56,15 @@ runs (`src/dialogue.rs:23-41`). Persistence arrives through the `Journal` port
   `Receipt::Replayed` intent yields instead, at every move that appends
   (`src/advance.rs:145,164,176,188`).
 - The fold refuses a content record with no admitting machine fact (`Floating`) and a second record
-  under one key with different content (`Conflict`) (`src/dialogue.rs:183-190`).
-- A call's command must equal the command the answer named (`src/dialogue.rs:376`).
-- A speech record folded after an attempt was requested is `Late` (`src/dialogue.rs:295`), and
+  under one key with different content (`Conflict`), at the one dispatch every record passes,
+  `Record::apply` (`src/dialogue.rs:206`).
+- A call's command must equal the command the answer named (`src/dialogue.rs:372`), and a find's
+  query must equal the query its answer named (`src/dialogue.rs:415`).
+- A speech record folded after an attempt was requested is `Late` (`src/dialogue.rs:312`), and
   `speak` is refused unless the fold is at `Begin` or `Await` (`src/speech.rs:40`).
+- A find commits in one transaction, and only one: the record and the turn's settlement share a
+  step, so a crash before it re-derives the same move and searches again, because a find changes
+  nothing (`src/advance.rs:120`).
 - A step identifier is derived from the session and the step key as a version-5 UUID, so a repeated
   step replays (`src/record.rs:145`).
 - Three ceilings halt the loop: tokens (`src/advance.rs:238`), turns (`src/advance.rs:275`), and
@@ -77,25 +86,29 @@ There is no `recovery` module. Recovery lives in `mokmok-kernel/src/recovery.rs`
 in-flight executions from the durable log.
 
 The design names `ToolExecutor` and persistence interfaces as the ports. The ports the crate
-declares are `Provider`, `Journal`, and `Tools`. The name `SrtBackend` appears in no Rust file in
-the workspace.
+declares are `Provider`, `Journal`, `Tools`, and `Finder`. The name `SrtBackend` appears in no Rust
+file in the workspace.
 
 The design's `orchestrator` module has no counterpart. The kernel owns the loop that calls
 `advance`, in `mokmok-kernel/src/agent.rs`.
 
 Behaviour the design does not name: speech turns, the derived step identifier, the two byte caps on
-speech and prose, the `Await` move, and the three budget fields.
+speech and prose, the `Await` move, the three budget fields, and the fourth port. The second tool is
+not a design decision either: the design's `ToolExecutor` is one interface, and the tree gives it
+one implementation that runs a command and one that reads an index.
 
 # Tests
 
-There is no `tests/` directory. Four `#[cfg(test)]` modules hold 61 cases and 1 proptest case.
+There is no `tests/` directory. Six `#[cfg(test)]` modules hold 86 cases, one of them a proptest.
 
-`src/advance.rs:650` holds 18 cases for the begin, ask, act, and close walk, a replayed intent
-performing no effect, the three ceilings, and the draining halt. `src/context.rs:226` holds 20
-cases for byte accounting, budget trimming, an unknown outcome rendered as its warning, and a
-byte-identical re-ask. `src/dialogue.rs:403` holds 18 cases and one proptest case for the floating,
-late, and conflicting refusals and for refolding a history being invariant. `src/tool.rs:181` holds
-5 cases for the exit-to-outcome map.
+`src/advance.rs:708` holds 29 cases for the begin, ask, act, find, and close walk, a replayed intent
+performing no effect, an interrupted find re-deriving its step, the three ceilings, and the draining
+halt. `src/context.rs:268` holds 26 cases for byte accounting, budget trimming, an unknown outcome
+rendered as its warning, a byte-identical re-ask, and the prompt a granted root adds.
+`src/dialogue.rs:459` holds 23 cases and one proptest case for the floating, late, and conflicting
+refusals, the query mismatch, and for refolding a history being invariant. `src/tool.rs:181` holds
+5 cases for the exit-to-outcome map, `src/record.rs:361` holds 2 for the query cap, and
+`src/task.rs:73` holds 1 for a task record written before the finding grant existed.
 
 ```
 cargo test -p mokmok-agent-runtime
@@ -103,4 +116,4 @@ MUTANTS_PACKAGE=mokmok-agent-runtime ./scripts/mutants.sh --jobs 8
 ```
 
 [^architecture]: Section 5.5 of `mokmok-os-architecture.md`.
-[^crate]: The re-export list is `mokmok-agent-runtime/src/lib.rs:28-41`.
+[^crate]: The re-export list is `mokmok-agent-runtime/src/lib.rs:29-45`.

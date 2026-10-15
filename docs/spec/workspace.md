@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: The workspace as it stands
-description: The thirteen workspace members, who composes each one, and how they map onto the design's crate set.
+description: The fourteen workspace members, who composes each one, and how they map onto the design's crate set.
 resource: ../../Cargo.toml
 tags: [mokmok-os, architecture, workspace]
 status: draft
@@ -15,13 +15,13 @@ sources:
   - id: manifest
     resource: ../../Cargo.toml
     title: the workspace manifest
-    last_modified: 2026-10-14T03:34:14Z
+    last_modified: 2026-10-15T08:39:00Z
 ---
 
-# The thirteen members
+# The fourteen members
 
-`Cargo.toml` lists thirteen members.[^manifest] Each one carries a target logical boundary from the
-design's crate map, and the last one has no section in the design at all.
+`Cargo.toml` lists fourteen members.[^manifest] Each one carries a target logical boundary from the
+design's crate map, and the last two have no section in the design at all.
 
 | Member | Design section | Dependents | How it is composed |
 | --- | --- | --- | --- |
@@ -36,13 +36,14 @@ design's crate map, and the last one has no section in the design at all.
 | `mokmok-egress` | 5.9 | `mokmok-kernel` | The model provider's destination validation |
 | `mokmok-artifact` | 5.10 | `mokmok-kernel` | `BlobStore` and `ContentHash` only |
 | `mokmok-observability` | 5.11 | `mokmok-kernel` | The tracing subscriber, and the audit journal |
+| `mokmok-search` | None | `mokmok-kernel` | One corpus per granted root, read by the kernel's finder |
 | `mokmok-kernel` | 5.12 | `mokmok-tui` | The daemon binary and the TUI |
 | `mokmok-tui` | None | Nobody | An application above the kernel |
 
 # The physical split differs from the plan
 
 The design proposes seven physical crates with the target boundaries grouped inside them, and an
-extraction step later.[^architecture] The tree holds thirteen, one per target boundary, and never
+extraction step later.[^architecture] The tree holds fourteen, one per target boundary, and never
 created the grouped crates `mokmok-agent`, `mokmok-security`, or `mokmok-execution`.
 
 | Design's initial crate | What it grouped | What exists instead |
@@ -56,6 +57,7 @@ created the grouped crates `mokmok-agent`, `mokmok-security`, or `mokmok-executi
 | `mokmok-kernel` | Composition and lifecycle | `mokmok-kernel` |
 | Not in the plan | Tracing | `mokmok-observability` |
 | Not in the plan | A user interface | `mokmok-tui` |
+| Not in the plan | Search over the files an agent works on | `mokmok-search` |
 
 Two of the design's ordering decisions held. The contract layer, the event store, and the event bus
 came first, and the execution and security crates followed. The design places a complex user
