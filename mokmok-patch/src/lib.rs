@@ -144,31 +144,34 @@ impl Patch {
     pub fn parse(source: &str) -> Result<Self, ParseError> {
         let lines: Vec<&str> = source.lines().collect();
         let mut files = Vec::new();
-        let mut i = 0;
+        let mut rest = lines.as_slice();
 
-        while i < lines.len() {
-            let line = lines[i];
+        while let Some((line, tail)) = rest.split_first() {
             if is_ignored_preamble(line) {
-                i += 1;
+                rest = tail;
                 continue;
             }
 
-            if let Some(rest) = line.strip_prefix("--- ") {
-                let source_label = parse_label(rest)?;
-                i += 1;
-                let target_line = lines.get(i).ok_or(ParseError::NoFileSection)?;
+            if let Some(source_rest) = line.strip_prefix("--- ") {
+                let source_label = parse_label(source_rest)?;
+                let (target_line, after_target) =
+                    tail.split_first().ok_or(ParseError::NoFileSection)?;
                 let target_rest = target_line
                     .strip_prefix("+++ ")
                     .ok_or(ParseError::NoFileSection)?;
                 let target_label = parse_label(target_rest)?;
-                i += 1;
                 validate_labels(&source_label, &target_label)?;
 
                 let mut hunks = Vec::new();
-                while i < lines.len() && lines[i].starts_with("@@") {
-                    let (hunk, next_i) = parse_hunk(&lines, i)?;
+                let mut hunk_rest = after_target;
+                while let Some((hunk_line, _)) = hunk_rest.split_first() {
+                    if !hunk_line.starts_with("@@") {
+                        break;
+                    }
+                    let start = lines.len() - hunk_rest.len();
+                    let (hunk, next_i) = parse_hunk(&lines, start)?;
                     hunks.push(hunk);
-                    i = next_i;
+                    hunk_rest = &lines[next_i..];
                 }
 
                 if hunks.is_empty() {
@@ -180,13 +183,14 @@ impl Patch {
                     target: target_label,
                     hunks,
                 });
+                rest = hunk_rest;
                 continue;
             }
 
             // A model that wraps its answer in a sentence still has a patch inside it, so anything
             // before the first section is skipped rather than refused. Inside a section nothing is
             // skipped: a body line we guessed at is a body line we could apply wrongly.
-            i += 1;
+            rest = tail;
         }
 
         if files.is_empty() {
@@ -299,7 +303,6 @@ impl FilePatch {
                     return Err(ApplyError::NotFound { hunk: hunk_index });
                 }
 
-                let max_start = n - side_len + 1;
                 let raw_start = usize::try_from(hunk.stated.old_start).unwrap_or(usize::MAX);
                 let shifted = if delta >= 0 {
                     raw_start.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
@@ -307,24 +310,19 @@ impl FilePatch {
                     raw_start
                         .saturating_sub(usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX))
                 };
-                let start = shifted.clamp(1, max_start);
-                let mut idx = start - 1;
                 let max_idx = n - side_len;
-                let mut found = None;
-                while idx <= max_idx {
-                    if old_side
-                        .iter()
-                        .enumerate()
-                        .all(|(offset_in_side, &line_index)| {
-                            file_lines[idx + offset_in_side].matches(&hunk.lines[line_index])
-                        })
-                    {
-                        found = Some(idx);
-                        break;
-                    }
-                    idx += 1;
-                }
-                let found_idx = found.ok_or(ApplyError::NotFound { hunk: hunk_index })?;
+                let idx = shifted.saturating_sub(1).clamp(0, max_idx);
+                let found_idx = (idx..=max_idx)
+                    .find(|&candidate| {
+                        old_side
+                            .iter()
+                            .enumerate()
+                            .all(|(offset_in_side, &line_index)| {
+                                file_lines[candidate + offset_in_side]
+                                    .matches(&hunk.lines[line_index])
+                            })
+                    })
+                    .ok_or(ApplyError::NotFound { hunk: hunk_index })?;
                 let line = u64::try_from(found_idx + 1).unwrap_or(u64::MAX);
                 let offset = i64::try_from(found_idx + 1).unwrap_or(i64::MAX)
                     - i64::try_from(hunk.stated.old_start).unwrap_or(i64::MAX);
@@ -403,19 +401,18 @@ fn parse_hunk(
 ) -> Result<(Hunk, usize), ParseError> {
     let header = parse_header(lines[start])?;
     let mut body: Vec<Line> = Vec::new();
-    let mut i = start + 1;
+    let mut rest = &lines[start + 1..];
 
-    while i < lines.len() {
-        let line = lines[i];
+    while let Some((line, tail)) = rest.split_first() {
         if line.starts_with("@@") || line.starts_with("--- ") || line.starts_with("diff ") {
             break;
         }
 
-        if line == "\\ No newline at end of file" {
+        if *line == "\\ No newline at end of file" {
             if let Some(last) = body.last_mut() {
                 last.newline = false;
             }
-            i += 1;
+            rest = tail;
             continue;
         }
 
@@ -425,7 +422,7 @@ fn parse_hunk(
                 text: String::new(),
                 newline: true,
             });
-            i += 1;
+            rest = tail;
             continue;
         }
 
@@ -441,7 +438,7 @@ fn parse_hunk(
             text: line[1..].to_string(),
             newline: true,
         });
-        i += 1;
+        rest = tail;
     }
 
     Ok((
@@ -449,7 +446,7 @@ fn parse_hunk(
             stated: header,
             lines: body,
         },
-        i,
+        lines.len() - rest.len(),
     ))
 }
 
