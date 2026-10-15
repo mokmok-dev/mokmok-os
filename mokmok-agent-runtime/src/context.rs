@@ -15,6 +15,10 @@ pub struct Context {
     pub system: String,
     pub goal: String,
     pub turns: Vec<ContextTurn>,
+    /// Whether the session holds a granted root. The body offers the finder exactly when the
+    /// prompt names it, because both are built from the same recorded task.
+    #[serde(default)]
+    pub search: bool,
 }
 
 /// One turn the model may see: what opened it and what the agent did with it.
@@ -44,6 +48,8 @@ pub enum ContextAct {
     },
     /// The agent answered without the tool.
     Said { reply: String },
+    /// The agent asked the finder, and it answered.
+    Found { query: String, observation: String },
 }
 
 impl Context {
@@ -60,10 +66,16 @@ impl Context {
                 .map(|turn| {
                     turn.speech.as_ref().map_or(0, String::len)
                         + match &turn.act {
-                            Some(ContextAct::Ran {
-                                command,
-                                observation,
-                            }) => command.len() + observation.len(),
+                            Some(
+                                ContextAct::Ran {
+                                    command,
+                                    observation,
+                                }
+                                | ContextAct::Found {
+                                    query: command,
+                                    observation,
+                                },
+                            ) => command.len() + observation.len(),
                             Some(ContextAct::Said { reply }) => reply.len(),
                             None => 0,
                         }
@@ -79,9 +91,24 @@ impl Context {
 /// measured here answers a body whose messages are the system prompt alone with nothing.
 #[must_use]
 pub fn system_prompt(task: &Task) -> String {
+    // A session granted no root is handed the words it was handed before the finder existed. The
+    // task is durable, so a resumed session must rebuild its first prompt byte for byte.
+    let tooling = if task.setting.search.is_empty() {
+        "You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n"
+            .to_owned()
+    } else {
+        format!(
+            "You have two tools. run_shell takes a command string and runs `sh -c`. find_files \
+             takes a query string and searches the names and contents of the files under {}; it \
+             enters no directory whose name begins with a dot, and it reads and changes nothing, so \
+             a find never changes the checkout.\n",
+            paths(&task.setting.search),
+        )
+    };
+
     format!(
         "You are a coding agent working in a scratch checkout.\n\
-         You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n\
+         {tooling}\
          The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
          There is no TCP network. Reach the checkout by absolute path, for example \
          `cd {checkout} && ...`.\n\
@@ -133,6 +160,13 @@ impl Transcript {
             });
         }
 
+        if let Some(find) = self.find_of(turn) {
+            return Some(ContextAct::Found {
+                query: find.query.clone(),
+                observation: clip(find.report.observation.as_bytes(), self.observation_limit()),
+            });
+        }
+
         if let Some(answer) = self.newest_answer(turn)
             && answer.action == crate::model::Action::Final
         {
@@ -147,17 +181,23 @@ impl Transcript {
         })
     }
 
+    /// How many bytes of one observation the model is shown, as a `usize`.
+    fn observation_limit(&self) -> usize {
+        bytes_of(
+            self.task
+                .as_ref()
+                .map_or(0, |task| task.budget.observation_bytes),
+        )
+    }
+
     fn shown_observation(
         &self,
         turn: TurnID,
     ) -> String {
-        let limit = self
-            .task
-            .as_ref()
-            .map_or(0, |task| task.budget.observation_bytes);
+        let limit = self.observation_limit();
 
         self.observation(turn)
-            .map_or_else(String::new, |text| clip(text.as_bytes(), bytes_of(limit)))
+            .map_or_else(String::new, |text| clip(text.as_bytes(), limit))
     }
 }
 
@@ -175,6 +215,7 @@ pub fn context(transcript: &Transcript) -> Context {
             system: String::new(),
             goal: String::new(),
             turns: Vec::new(),
+            search: false,
         };
     };
 
@@ -185,6 +226,7 @@ pub fn context(transcript: &Transcript) -> Context {
         system: system_prompt(task),
         goal: task.goal.clone(),
         turns,
+        search: !task.setting.search.is_empty(),
     };
     while context.bytes() > bytes_of(task.budget.context_bytes) && !context.turns.is_empty() {
         context.turns.remove(0);
@@ -230,11 +272,13 @@ mod tests {
         system_prompt,
     };
     use crate::dialogue::Transcript;
+    use crate::find::FindReport;
     use crate::model::Action;
     use crate::record::{CallRecord, Record};
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
-        begin_records, execution_id, open_records, session, speech_records, task, turn_id,
+        begin_records, execution_id, find_records, open_records, session, speech_records, task,
+        turn_id,
     };
     use crate::tool::{Exit, ToolReport, UNKNOWN_WARNING, observation};
     use mokmok_protocol::{ExecutionID, TurnID};
@@ -378,6 +422,7 @@ mod tests {
             system: "sys".to_owned(),
             goal: "goal!!".to_owned(),
             turns: vec![turn_of(1)],
+            search: false,
         };
 
         assert_eq!(
@@ -788,5 +833,145 @@ mod tests {
         assert_eq!(built.turns.len(), 1);
         assert_eq!(built.turns[0].speech, None);
         assert_eq!(ran_command(&built.turns[0]), MISSING_COMMAND);
+    }
+
+    /// The system prompt this crate produced before the finder existed, word for word.
+    const PROMPT_WITHOUT_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
+         You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n\
+         The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
+         There is no TCP network. Reach the checkout by absolute path, for example \
+         `cd /srv/checkout && ...`.\n\
+         The checkout grants allow what a command can reach: readable and executable paths are \
+         /nix/store; writable paths are /srv/checkout. A command that reaches outside them is refused \
+         rather than run, so work inside the grants.\n\
+         When the goal is met, answer without calling the tool.";
+
+    /// The system prompt a session with a granted root is handed, word for word.
+    const PROMPT_WITH_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
+         You have two tools. run_shell takes a command string and runs `sh -c`. find_files takes a \
+         query string and searches the names and contents of the files under /srv/checkout; it \
+         enters no directory whose name begins with a dot, and it reads and changes nothing, so a \
+         find never changes the checkout.\n\
+         The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
+         There is no TCP network. Reach the checkout by absolute path, for example \
+         `cd /srv/checkout && ...`.\n\
+         The checkout grants allow what a command can reach: readable and executable paths are \
+         /nix/store; writable paths are /srv/checkout. A command that reaches outside them is refused \
+         rather than run, so work inside the grants.\n\
+         When the goal is met, answer without calling the tool.";
+
+    /// A transcript whose first turn asked the finder and settled on what it answered.
+    fn found_turn(
+        task: &crate::task::Task,
+        query: &str,
+        observation: &str,
+    ) -> Transcript {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Find {
+                    query: query.to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &find_records(
+                turn,
+                query,
+                &FindReport {
+                    observation: observation.to_owned(),
+                },
+            ),
+        );
+        transcript
+    }
+
+    #[test]
+    fn a_task_with_no_granted_root_gets_the_prompt_it_got_before_the_finder() {
+        let mut task = task(4);
+        task.setting.search.clear();
+
+        assert_eq!(system_prompt(&task), PROMPT_WITHOUT_FINDER);
+    }
+
+    #[test]
+    fn a_task_with_a_granted_root_is_offered_the_finder_over_that_root() {
+        assert_eq!(system_prompt(&task(4)), PROMPT_WITH_FINDER);
+    }
+
+    #[test]
+    fn the_context_says_whether_the_task_granted_a_root() {
+        let task = task(4);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+
+        assert!(context(&transcript).search);
+
+        let mut without = task;
+        without.setting.search.clear();
+        assert!(!context(&found_turn(&without, "bm25", "indexed=831 hits=0")).search);
+    }
+
+    #[test]
+    fn a_context_written_before_the_finder_decodes_without_one() {
+        let json = r#"{"system":"sys","goal":"goal","turns":[]}"#;
+
+        assert_eq!(
+            serde_json::from_str::<Context>(json).unwrap(),
+            Context {
+                system: "sys".to_owned(),
+                goal: "goal".to_owned(),
+                turns: Vec::new(),
+                search: false,
+            },
+        );
+    }
+
+    #[test]
+    fn a_find_is_shown_as_a_found_act_and_a_re_ask_rebuilds_the_same_bytes() {
+        let task = task(4);
+        let mut transcript = found_turn(&task, "bm25", "indexed=831 hits=2");
+        apply_all(&mut transcript, &open_records(turn_id(2), 2, 1));
+
+        let built = context(&transcript);
+
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Found {
+                query: "bm25".to_owned(),
+                observation: "indexed=831 hits=2".to_owned(),
+            }),
+        );
+
+        let first = serde_json::to_vec(&context(&transcript)).unwrap();
+        apply_all(&mut transcript, &open_records(turn_id(2), 2, 2));
+        let second = serde_json::to_vec(&context(&transcript)).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_find_observation_is_clipped_like_a_run_observation() {
+        let mut task = task(4);
+        task.budget.observation_bytes = 10;
+        let mut transcript = found_turn(&task, "bm25", &"x".repeat(40));
+        apply_all(&mut transcript, &open_records(turn_id(2), 2, 1));
+
+        let built = context(&transcript);
+
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Found {
+                query: "bm25".to_owned(),
+                observation: format!("{}\n… 30 bytes elided …\n{}", "x".repeat(5), "x".repeat(5)),
+            }),
+        );
     }
 }

@@ -11,8 +11,8 @@ pub type Source = Box<dyn std::error::Error + Send + Sync>;
 
 /// Why a step could not complete.
 ///
-/// The three port arms carry the adapter's error without naming its type, so no store, socket, or
-/// sandbox type crosses the port boundary. The last two are the runtime's own: [`Refusal`] is the
+/// The port arms carry the adapter's error without naming its type, so no store, socket, sandbox, or
+/// index type crosses the port boundary. The last two are the runtime's own: [`Refusal`] is the
 /// fold rejecting a record, and [`Rejected`] is a state machine rejecting a fact.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -25,6 +25,9 @@ pub enum Error {
     /// The tools failed to report.
     #[error("the tools failed: {0}")]
     Tool(#[source] Source),
+    /// The finder failed to answer.
+    #[error("the finder failed: {0}")]
+    Finder(#[source] Source),
     /// The fold refused a record.
     #[error("{0}")]
     Refused(#[from] Refusal),

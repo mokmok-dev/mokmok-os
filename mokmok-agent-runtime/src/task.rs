@@ -27,6 +27,12 @@ pub struct Setting {
     pub program: PathBuf,
     /// How long one command may run, as the operator set it when the task was recorded.
     pub deadline: Duration,
+    /// Directories the operator granted for searching. Empty means no finder is offered.
+    ///
+    /// `default` keeps a task record written before this field readable: an older setting folds with
+    /// no root rather than refusing to decode.
+    #[serde(default)]
+    pub search: Vec<PathBuf>,
 }
 
 /// The ceilings one session runs under.
@@ -61,5 +67,37 @@ impl Default for Budget {
             context_turns: 0,
             context_bytes: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Setting;
+    use std::time::Duration;
+
+    #[test]
+    fn a_setting_written_before_the_search_field_still_decodes() {
+        // The bytes a task record carried before `search` existed.
+        let json = r#"{
+            "checkout": "/srv/checkout",
+            "readable": ["/nix/store"],
+            "writable": ["/srv/checkout"],
+            "program": "/bin/sh",
+            "deadline": {"secs": 120, "nanos": 0}
+        }"#;
+
+        let setting: Setting = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            setting,
+            Setting {
+                checkout: "/srv/checkout".into(),
+                readable: vec!["/nix/store".into()],
+                writable: vec!["/srv/checkout".into()],
+                program: "/bin/sh".into(),
+                deadline: Duration::from_secs(120),
+                search: Vec::new(),
+            },
+        );
     }
 }

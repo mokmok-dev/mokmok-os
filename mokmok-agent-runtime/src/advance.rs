@@ -8,9 +8,10 @@ use mokmok_state_machine::{
 use crate::context::{Context, context};
 use crate::dialogue::{Transcript, number_of};
 use crate::error::Error;
+use crate::find::{FindReport, Finder};
 use crate::model::{Journal, Provider};
 use crate::record::{
-    AnswerRecord, CallRecord, PromptRecord, Receipt, Record, Step, StepId, StepKey,
+    AnswerRecord, CallRecord, FindRecord, PromptRecord, Receipt, Record, Step, StepId, StepKey,
 };
 use crate::task::Task;
 use crate::tool::{DEFAULT_DEADLINE, ToolCall, ToolReport, Tools};
@@ -36,6 +37,8 @@ pub enum Move {
         execution: ExecutionID,
         call: ToolCall,
     },
+    /// Ask the finder the query the recorded answer names, and settle the turn on what it answers.
+    Find { turn: TurnID, query: String },
     /// Settle a turn, and close the session when `ending` is set.
     Close {
         turn: TurnID,
@@ -105,15 +108,20 @@ pub fn next(transcript: &Transcript) -> Move {
 /// runs only on [`Receipt::Written`]. A [`Receipt::Replayed`] intent yields instead, so a second
 /// resume cannot execute a tool twice.
 ///
+/// A find spends one transaction rather than two: it writes its record and its turn's settlement
+/// together, because a search that changes nothing has no outcome to prove and no intent to
+/// reconcile.
+///
 /// # Errors
 ///
 /// Returns [`Error::Journal`] for a journal failure, [`Error::Provider`] for a provider failure,
-/// [`Error::Tool`] for a tool failure, and [`Error::Refused`]/[`Error::Rejected`] when the fold
-/// refuses the step the move would write.
+/// [`Error::Tool`] for a tool failure, the finder's own failure, and
+/// [`Error::Refused`]/[`Error::Rejected`] when the fold refuses the step the move would write.
 pub async fn advance(
     journal: &mut impl Journal,
     provider: &impl Provider,
     tools: &impl Tools,
+    finder: &impl Finder,
     session: SessionID,
     at: Moment,
 ) -> Result<Progress, Error> {
@@ -178,6 +186,13 @@ pub async fn advance(
             }
             let report = tools.invoke(call).await?;
             journal.append(act_outcome(session, &transcript, *turn, *execution, report))?;
+        },
+        Move::Find { turn, query } => {
+            let report = finder.find(query)?;
+            let step = find_step(session, &transcript, *turn, query, report);
+            if journal.append(step)? == Receipt::Replayed {
+                return Ok(Progress::Yielded);
+            }
         },
         Move::Close {
             turn,
@@ -250,11 +265,14 @@ fn accepting(transcript: &Transcript) -> Move {
 
     if state.outcome().is_some() {
         // Gating on `holds_speech` alone would stop the conversation after every tool call, so an
-        // agent could never run two commands in one exchange. Only a command it asked for leaves
-        // the agent mid-work.
+        // agent could never run two commands in one exchange. Only a tool it asked for leaves the
+        // agent mid-work.
         let awaiting_human = transcript.holds_speech()
             && !transcript.newest_answer(turn).is_some_and(|answer| {
-                matches!(&answer.action, crate::model::Action::Command { .. })
+                matches!(
+                    &answer.action,
+                    crate::model::Action::Command { .. } | crate::model::Action::Find { .. }
+                )
             });
         if awaiting_human {
             return Move::Await;
@@ -321,6 +339,12 @@ fn open_turn(
                             deadline,
                         },
                     }
+                },
+                crate::model::Action::Find { query } => {
+                    let query = transcript
+                        .find_of(turn)
+                        .map_or_else(|| query.clone(), |find| find.query.clone());
+                    Move::Find { turn, query }
                 },
                 crate::model::Action::Malformed { .. } => reask(turn, number, state, transcript),
             },
@@ -546,6 +570,40 @@ fn act_outcome(
     )
 }
 
+/// The one step a find takes.
+///
+/// The turn settles [`TurnOutcome::Completed`] whatever the finder answered: a find cannot fail the
+/// turn, because it reads rather than acts, and its observation is where a hitless or ungranted
+/// search says so.
+fn find_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    query: &str,
+    report: FindReport,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let records = vec![
+        Record::Find(FindRecord {
+            turn,
+            query: query.to_owned(),
+            report,
+        }),
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled {
+                outcome: TurnOutcome::Completed,
+            },
+        },
+    ];
+
+    Step::new(
+        StepId::derive(session, StepKey::Find { turn: number }),
+        session,
+        records,
+    )
+}
+
 fn close_step(
     session: SessionID,
     transcript: &Transcript,
@@ -653,13 +711,15 @@ mod tests {
     use crate::context::Context;
     use crate::dialogue::Transcript;
     use crate::error::Error;
+    use crate::find::{FindReport, NO_SEARCH_ROOT};
     use crate::model::{Action, Answer, Journal, Provider, Usage};
     use crate::record::{ArtifactRef, MAX_SPEECH_BYTES, Receipt, Record, Step, StepId, StepKey};
     use crate::speech::speak;
     use crate::task::Task;
     use crate::test_support::{
-        act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
-        begin_records, execution_id, open_records, report, session, speech_records, task, turn_id,
+        FakeFinder, act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
+        begin_records, execution_id, find_records, open_records, report, session, speech_records,
+        task, turn_id,
     };
     use crate::tool::{Exit, ToolCall, ToolReport, Tools};
     use mokmok_protocol::{Moment, SessionID};
@@ -916,6 +976,11 @@ mod tests {
         }
     }
 
+    /// A finder no test's move reaches: a find is only asked for when an answer names one.
+    fn unasked() -> FakeFinder {
+        FakeFinder::of(NO_SEARCH_ROOT)
+    }
+
     fn answer(action: Action) -> Answer {
         Answer {
             action,
@@ -942,37 +1007,79 @@ mod tests {
         ]);
         let tools = FakeTools::of([report(Exit::Finished { code: 0 })]);
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert!(matches!(progress, Progress::Advanced(Move::Begin { .. })));
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert!(matches!(progress, Progress::Advanced(Move::Ask { .. })));
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert!(matches!(progress, Progress::Advanced(Move::Act { .. })));
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert!(matches!(progress, Progress::Advanced(Move::Ask { .. })));
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             progress,
             Progress::Advanced(Move::Close { ending: None, .. })
         ));
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             progress,
             Progress::Advanced(Move::Close {
@@ -982,9 +1089,16 @@ mod tests {
             }),
         );
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert_eq!(progress, Progress::Terminal(Ending::Completed));
 
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
@@ -1013,9 +1127,16 @@ mod tests {
         let provider = ScriptedProvider::of([]);
         let tools = FakeTools::of([report(Exit::Finished { code: 0 })]);
 
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert_eq!(progress, Progress::Yielded);
         assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -1228,9 +1349,16 @@ mod tests {
 
         let provider = ScriptedProvider::of([]);
         let tools = FakeTools::of([]);
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(progress, Progress::Advanced(Move::Halt(Halt::Draining)));
         assert_eq!(
@@ -1258,9 +1386,16 @@ mod tests {
 
         let provider = ScriptedProvider::of([]);
         let tools = FakeTools::of([]);
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(progress, Progress::Advanced(Move::Halt(Halt::Tokens)));
         assert_eq!(
@@ -1281,9 +1416,16 @@ mod tests {
 
         let provider = ScriptedProvider::of([]);
         let tools = FakeTools::of([]);
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(progress, Progress::Advanced(Move::Halt(Halt::Attempts)));
         let transcript = journal.transcript(session).unwrap();
@@ -1305,9 +1447,16 @@ mod tests {
         let provider = ScriptedProvider::of([]);
         let tools = FakeTools::of([]);
 
-        let first = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let first = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             first,
             Progress::Advanced(Move::Close {
@@ -1321,9 +1470,16 @@ mod tests {
             Phase::Accepting,
         );
 
-        let second = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let second = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             second,
             Progress::Advanced(Move::Close {
@@ -1411,6 +1567,212 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_answered_find_yields_a_find_move_until_its_record_is_held() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Find {
+                    query: "bm25".to_owned(),
+                },
+            ),
+        );
+
+        assert_eq!(
+            next(&transcript),
+            Move::Find {
+                turn,
+                query: "bm25".to_owned(),
+            },
+        );
+
+        apply_all(
+            &mut transcript,
+            &find_records(
+                turn,
+                "bm25",
+                &FindReport {
+                    observation: "indexed=831 hits=2".to_owned(),
+                },
+            ),
+        );
+
+        assert_eq!(
+            next(&transcript),
+            Move::Ask {
+                turn: turn_id(2),
+                number: TurnNumber::new(2),
+                attempt: Attempt::new(1),
+                context: crate::context::context(&transcript),
+            },
+        );
+    }
+
+    #[test]
+    fn a_find_keeps_the_agent_working_in_a_conversation() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Find {
+                    query: "bm25".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &find_records(
+                turn,
+                "bm25",
+                &FindReport {
+                    observation: "indexed=831 hits=2".to_owned(),
+                },
+            ),
+        );
+
+        assert!(
+            matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2)),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_find_derives_the_same_step_and_searches_again() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let seeded: Vec<Record> = [
+            begin_records(&task),
+            open_records(turn, 1, 1),
+            answer_records(
+                turn,
+                1,
+                Action::Find {
+                    query: "bm25".to_owned(),
+                },
+            ),
+        ]
+        .concat();
+
+        let finder = FakeFinder::of("indexed=831 hits=0");
+        let provider = ScriptedProvider::of([]);
+        let tools = FakeTools::of([]);
+
+        let mut first = TestJournal::new(session, task.clone());
+        first.seed(&seeded);
+        let progress = advance(
+            &mut first,
+            &provider,
+            &tools,
+            &finder,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress,
+            Progress::Advanced(Move::Find {
+                turn,
+                query: "bm25".to_owned(),
+            }),
+        );
+        assert_eq!(finder.calls(), 1);
+        assert_eq!(finder.queries(), vec!["bm25".to_owned()]);
+        let step = *first
+            .written
+            .last()
+            .expect("the find is the one step this journal wrote");
+        assert_eq!(step, StepId::derive(session, StepKey::Find { turn: 1 }));
+
+        // A crash between the search and the append leaves the record nowhere, so the resumed run
+        // derives the same move under the same step id and asks the finder again.
+        let mut resumed = TestJournal::new(session, task.clone());
+        resumed.seed(&seeded);
+        let none = resumed.transcript(session).unwrap().find_of(turn).is_none();
+        assert!(none);
+
+        let progress = advance(
+            &mut resumed,
+            &provider,
+            &tools,
+            &finder,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress,
+            Progress::Advanced(Move::Find {
+                turn,
+                query: "bm25".to_owned(),
+            }),
+        );
+        assert_eq!(*resumed.written.last().unwrap(), step);
+        assert_eq!(finder.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_find_settles_the_turn_completed_when_the_finder_holds_no_root() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(
+            turn,
+            1,
+            Action::Find {
+                query: "bm25".to_owned(),
+            },
+        ));
+        let finder = FakeFinder::of(NO_SEARCH_ROOT);
+
+        let provider = ScriptedProvider::of([]);
+        let tools = FakeTools::of([]);
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &finder,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            progress,
+            Progress::Advanced(Move::Find {
+                turn,
+                query: "bm25".to_owned(),
+            }),
+        );
+        let transcript = journal.transcript(session).unwrap();
+        let (_, state) = transcript.newest_turn().unwrap();
+        assert_eq!(state.outcome(), Some(TurnOutcome::Completed));
+        assert_eq!(
+            transcript.find_of(turn).unwrap().report.observation,
+            NO_SEARCH_ROOT,
+        );
+        assert!(matches!(next(&transcript), Move::Ask { .. }));
+    }
+
     #[tokio::test]
     async fn the_attempt_ceiling_leaves_a_conversation_open() {
         let session = session();
@@ -1425,9 +1787,16 @@ mod tests {
 
         let provider = ScriptedProvider::of([]);
         let tools = FakeTools::of([]);
-        let progress = advance(&mut journal, &provider, &tools, session, Moment::EPOCH)
-            .await
-            .unwrap();
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &tools,
+            &unasked(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(progress, Progress::Awaiting);
         let transcript = journal.transcript(session).unwrap();
@@ -1551,9 +1920,27 @@ mod tests {
         let refused = speak(&mut journal, session, &line).unwrap_err();
 
         assert!(
-            matches!(refused, Error::TooMuch { limit, found }
-                if limit == MAX_SPEECH_BYTES && found == MAX_SPEECH_BYTES + 1),
-            "{refused}",
+            matches!(
+                refused,
+                Error::TooMuch {
+                    limit: 4096,
+                    found: 4097
+                }
+            ),
+            "a line of 4097 bytes is refused as over the 4096 the log holds: {refused}",
+        );
+    }
+
+    #[test]
+    fn a_line_exactly_as_long_as_the_log_holds_is_taken() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task);
+
+        assert_eq!(
+            speak(&mut journal, session, &"x".repeat(4096)).unwrap(),
+            Receipt::Written,
+            "the ceiling is inclusive: 4096 bytes is a line the log holds, 4097 is not",
         );
     }
 }
