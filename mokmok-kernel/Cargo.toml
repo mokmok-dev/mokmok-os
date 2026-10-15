@@ -15,6 +15,7 @@ mokmok-observability = { workspace = true }
 mokmok-protocol = { workspace = true }
 mokmok-sandbox = { workspace = true }
 mokmok-scheduler = { workspace = true }
+mokmok-search = { workspace = true }
 mokmok-state-machine = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

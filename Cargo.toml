@@ -11,6 +11,7 @@ members = [
   "mokmok-protocol",
   "mokmok-sandbox",
   "mokmok-scheduler",
+  "mokmok-search",
   "mokmok-state-machine",
   "mokmok-tui",
 ]
@@ -32,6 +33,7 @@ mokmok-observability = { path = "mokmok-observability" }
 mokmok-protocol = { path = "mokmok-protocol" }
 mokmok-sandbox = { path = "mokmok-sandbox" }
 mokmok-scheduler = { path = "mokmok-scheduler" }
+mokmok-search = { path = "mokmok-search" }
 mokmok-state-machine = { path = "mokmok-state-machine" }
 nix = { version = "0.31", default-features = false, features = [
   "fs",
@@ -49,6 +51,7 @@ rusqlite = { version = "0.40.2", default-features = false }
 serde = { version = "1.0.229", default-features = false }
 serde_json = "1.0.151"
 sha2 = { version = "0.11.0", default-features = false }
+tantivy = { version = "0.26.2", default-features = false, features = ["mmap"] }
 thiserror = "2.0.21"
 tokio = "1.53.2"
 tokio-tungstenite = "0.30.0"
