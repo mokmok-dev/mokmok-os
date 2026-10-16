@@ -100,11 +100,9 @@
             dependencyRules =
               pkgs.runCommand "dependency-rules"
                 {
-                  nativeBuildInputs = with pkgs; [
-                    bash
-                    coreutils
-                    gawk
-                    gnugrep
+                  nativeBuildInputs = [
+                    pkgs.jq
+                    rustToolchain
                   ];
                 }
                 ''

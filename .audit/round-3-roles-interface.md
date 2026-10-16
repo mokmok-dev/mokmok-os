@@ -116,10 +116,17 @@ is the non-vacuity floor: a rule that selects nothing must fail rather than pass
 
 The check prints `pure=<n> adapter=<n> shell=<n>` as its detail, so the role mix is in CI's log.
 
-Sensitivity is a mode, not a sentence. `dependency-rules.sh faults` lays down a four-member
-repository, asserts the four rules pass over it, then applies one edit per fault and asserts the
-intended rule fails with a detail naming the offender. Today: four controls pass, eight faults trip
-the intended rule.
+Sensitivity is a mode, not a sentence. `dependency-rules.sh faults` lays down an eight-member
+repository, asserts all nine rules pass over it, then applies one edit per fault and asserts the
+intended rule fails with a detail naming the offender. Today: nine controls pass and seventeen faults
+trip the intended rule.
+
+Every rule reads the dependency graph through `cargo metadata --no-deps --offline`. It did read
+`Cargo.toml` as text until an independent verifier falsified the enforcement claim on the first
+version: a crate declaring `pure` could depend on tokio under
+`tokio_rt = { package = "tokio", version = "1" }` and the check stayed green, and the same held for
+a `[target.'cfg(unix)'.dependencies]` table and for the dotted `[dependencies.mokmok-kernel]` form.
+Three faults in the mode now hold that fix.
 
 ### The new crate
 
@@ -181,7 +188,7 @@ type its public surface mentions already is.
 
 | phase | what lands | ends in |
 | --- | --- | --- |
-| P0 | The declaration in fifteen manifests, the four rules and the retirement of the opt-in selector that deletion 9 names, the `dependencyRules` check, the `faults` mode. No crate moves. | `dependencyRules` green logging `pure=4 adapter=9 shell=2`, `faults` green over nine controls and fourteen faults. **Landed.** |
+| P0 | The declaration in fifteen manifests, the four rules and the retirement of the opt-in selector that deletion 9 names, the `dependencyRules` check, the `faults` mode. No crate moves. | `dependencyRules` green logging `pure=4 adapter=9 shell=2`, `faults` green over nine controls and seventeen faults. **Landed.** |
 | P1 | Subtraction: the stale `mokmok-scheduler` edge, the five confiner helpers collapsed to one, the half of `capability-performs-no-enforcement-io` the compiler already covers, the `docs/spec` drift, `mokmok-data/` ignored. | `cargo metadata` current, `specBundle` added and green. |
 | P2 | `mokmok-patch` becomes `#![no_std]`. The cheapest purity win, done by hand to learn the recipe. | `dependencyRules` logging `pure=5`, `MUTANTS_PACKAGE=mokmok-patch` at 100%. |
 | P3 | `mokmok-delivery` lands with the window types, `retention_step`, the eviction property, and the store's loop. The shadow is deleted. | `dependencyRules` logging `pure=6`, `cargo test -p mokmok-event-bus` green. |

@@ -3,6 +3,9 @@
 
 set -uo pipefail
 
+SCRATCH=$(mktemp -d)
+trap 'rm -rf "$SCRATCH"' EXIT
+
 # The composition roots: the crates that compose others rather than being composed. Two rules read
 # this one list, so a third root is one reviewed edit here rather than a second list to keep in step.
 COMPOSITION_ROOTS="mokmok-kernel
@@ -32,52 +35,63 @@ ENFORCEMENT_CRATES="tokio
 nix
 landlock"
 
-members() {
-	awk '
-		/^\[/ { inside = 0 }
-		/^\[workspace\]/ { inside = 1; next }
-		inside && /^members[[:space:]]*=/ { listing = 1; next }
-		listing && /^\]/ { listing = 0; next }
-		listing { gsub(/[",[:space:]]/, ""); if ($0 != "") print }
-	' "$1/Cargo.toml"
-}
-
-deps() {
-	awk '
-		/^\[/ { section = $0; gsub(/[][[:space:]]/, "", section); next }
-		/^[A-Za-z0-9_-]+[[:space:]]*=/ && (section == "dependencies" || section == "dev-dependencies") {
-			entry = $0
-			sub(/[[:space:]]*=.*/, "", entry)
-			print section "\t" entry
+# Every rule asks Cargo rather than scanning the manifest text. A scan of `Cargo.toml` cannot see a
+# dependency renamed with `package = "..."`, one declared under a `[target.'cfg(...)'.dependencies]`
+# table, or the dotted `[dependencies.name]` form, so an edge written in any of those three shapes
+# was invisible to it and the rule reported a pass over a crate that named the forbidden package.
+load_metadata() {
+	METADATA="$SCRATCH/metadata.json"
+	cargo metadata --no-deps --offline --format-version 1 --manifest-path "$1/Cargo.toml" > "$METADATA" ||
+		{
+			printf 'cargo metadata failed for %s\n' "$1" >&2
+			return 1
 		}
-	' "$1/Cargo.toml"
 }
 
-selected() {
-	deps "$1" | awk -F'\t' -v s="$2" '$1 == s { print $2 }'
+members() {
+	jq -r '
+		. as $doc
+		| .workspace_members[] as $id
+		| $doc.packages[] | select(.id == $id)
+		| .manifest_path | sub("/Cargo.toml$"; "") | sub("^.*/"; "")
+	' "$METADATA"
+}
+
+# The role a member declares for itself, from `[package.metadata.mokmok]` in its own manifest.
+declared_role() {
+	jq -r --arg dir "$1" '
+		.packages[]
+		| select(.manifest_path | sub("/Cargo.toml$"; "") | sub("^.*/"; "") == $dir)
+		| (.metadata.mokmok.purity // "")
+	' "$METADATA"
+}
+
+# One member's declared dependencies, as `kind<TAB>package<TAB>rename`. An empty kind is a normal
+# dependency, and `rename` is empty unless the manifest renamed the package.
+edges() {
+	jq -r --arg dir "$1" '
+		.packages[]
+		| select(.manifest_path | sub("/Cargo.toml$"; "") | sub("^.*/"; "") == $dir)
+		| .dependencies[]
+		| [(.kind // ""), .name, (.rename // "")] | @tsv
+	' "$METADATA"
+}
+
+# What the crate links: every table except the dev and build ones, which reach a test or a build
+# script rather than the artifact.
+linked() {
+	edges "$1" | awk -F'\t' '$1 != "dev" && $1 != "build" { print $2 }'
 }
 
 forbidden_hit() {
-	local dir=$1 list=$2 section=${3:-dependencies}
-	selected "$dir" "$section" | grep -x -F -f <(printf '%s\n' "$list") | paste -sd, -
-}
-
-declared_role() {
-	awk '
-		/^\[/ { section = $0; gsub(/[][[:space:]]/, "", section); next }
-		section == "package.metadata.mokmok" && $1 == "purity" {
-			value = $3
-			gsub(/"/, "", value)
-			print value
-			exit
-		}
-	' "$1/Cargo.toml"
+	local dir=$1 list=$2
+	linked "$dir" | grep -x -F -f <(printf '%s\n' "$list") | paste -sd, -
 }
 
 members_declaring() {
 	local repo=$1 want=$2 dir
 	while IFS= read -r dir; do
-		[[ $(declared_role "$repo/$dir") == "$want" ]] && printf '%s\n' "$dir"
+		[[ $(declared_role "$dir") == "$want" ]] && printf '%s\n' "$dir"
 	done < <(members "$repo")
 }
 
@@ -94,7 +108,7 @@ $1
 
 rule_protocol-has-no-domain-dependency() {
 	local repo=$1 hit
-	hit=$(selected "$repo/mokmok-protocol" dependencies | grep '^mokmok-' | paste -sd, -)
+	hit=$(linked mokmok-protocol | grep '^mokmok-' | paste -sd, -)
 	[[ -z $hit ]] || {
 		printf 'mokmok-protocol depends on %s\n' "$hit"
 		return 1
@@ -104,7 +118,7 @@ rule_protocol-has-no-domain-dependency() {
 rule_every-member-declares-its-role() {
 	local repo=$1 dir role
 	while IFS= read -r dir; do
-		role=$(declared_role "$repo/$dir")
+		role=$(declared_role "$dir")
 		case $role in
 			pure | adapter) ;;
 			shell)
@@ -128,7 +142,7 @@ rule_every-member-declares-its-role() {
 rule_pure-crates-are-no_std() {
 	local repo=$1 dir role hit
 	while IFS= read -r dir; do
-		role=$(declared_role "$repo/$dir")
+		role=$(declared_role "$dir")
 		if grep -q '^#!\[no_std\]' "$repo/$dir/src/lib.rs" 2>/dev/null; then
 			if [[ $role != pure ]]; then
 				printf '%s is no_std and declares the role %s\n' "$dir" "${role:-nothing}"
@@ -140,7 +154,7 @@ rule_pure-crates-are-no_std() {
 		else
 			continue
 		fi
-		hit=$(forbidden_hit "$repo/$dir" "$IO_CRATES")
+		hit=$(forbidden_hit "$dir" "$IO_CRATES")
 		[[ -z $hit ]] || {
 			printf '%s is no_std and depends on %s\n' "$dir" "$hit"
 			return 1
@@ -153,12 +167,12 @@ rule_pure-crates-depend-only-on-pure-crates() {
 	while IFS= read -r dir; do
 		while IFS= read -r dep; do
 			[[ -n $dep ]] || continue
-			role=$(declared_role "$repo/$dep")
+			role=$(declared_role "$dep")
 			[[ $role == pure ]] || {
 				printf '%s is pure and depends on %s, which declares %s\n' "$dir" "$dep" "${role:-nothing}"
 				return 1
 			}
-		done < <(selected "$repo/$dir" dependencies | grep '^mokmok-')
+		done < <(linked "$dir" | grep '^mokmok-')
 	done < <(members_declaring "$repo" pure)
 }
 
@@ -180,7 +194,7 @@ rule_the-role-census-is-not-empty() {
 
 rule_event-store-has-no-transport-dependency() {
 	local repo=$1 hit
-	hit=$(forbidden_hit "$repo/mokmok-event-store" "$TRANSPORT_CRATES")
+	hit=$(forbidden_hit mokmok-event-store "$TRANSPORT_CRATES")
 	[[ -z $hit ]] || {
 		printf 'mokmok-event-store depends on %s\n' "$hit"
 		return 1
@@ -189,7 +203,7 @@ rule_event-store-has-no-transport-dependency() {
 
 rule_scheduler-has-no-model-dependency() {
 	local repo=$1 hit
-	hit=$(forbidden_hit "$repo/mokmok-scheduler" "$MODEL_CRATES")
+	hit=$(forbidden_hit mokmok-scheduler "$MODEL_CRATES")
 	[[ -z $hit ]] || {
 		printf 'mokmok-scheduler depends on %s\n' "$hit"
 		return 1
@@ -198,7 +212,7 @@ rule_scheduler-has-no-model-dependency() {
 
 rule_capability-performs-no-enforcement-io() {
 	local repo=$1 hit source_hit
-	hit=$(forbidden_hit "$repo/mokmok-capability" "$ENFORCEMENT_CRATES")
+	hit=$(forbidden_hit mokmok-capability "$ENFORCEMENT_CRATES")
 	[[ -z $hit ]] || {
 		printf 'mokmok-capability depends on %s\n' "$hit"
 		return 1
@@ -214,7 +228,7 @@ rule_kernel-dependents-are-applications() {
 	local repo=$1 dir hit
 	while IFS= read -r dir; do
 		[[ $dir == mokmok-kernel ]] && continue
-		hit=$(deps "$repo/$dir" | awk -F'\t' '$2 == "mokmok-kernel" { print "yes" }')
+		hit=$(linked "$dir" | grep -x 'mokmok-kernel')
 		[[ -n $hit ]] || continue
 		is_composition_root "$dir" || {
 			printf '%s depends on mokmok-kernel and is outside the composition roots\n' "$dir"
@@ -237,6 +251,7 @@ RULES=(
 
 run_rule() {
 	local repo=$1 rule=$2
+	load_metadata "$repo" || return 2
 	case $rule in
 		protocol-has-no-domain-dependency) rule_protocol-has-no-domain-dependency "$repo" ;;
 		every-member-declares-its-role) rule_every-member-declares-its-role "$repo" ;;
@@ -256,6 +271,12 @@ run_rule() {
 
 check() {
 	local repo=$1 only=${2:-} rule detail status failed=0
+	if [[ -n $only ]]; then
+		printf '%s\n' "${RULES[@]}" | grep -qxF "$only" || {
+			printf 'unknown rule %s\n' "$only" >&2
+			return 2
+		}
+	fi
 	for rule in "${RULES[@]}"; do
 		[[ -n $only && $only != "$rule" ]] && continue
 		if detail=$(run_rule "$repo" "$rule"); then
@@ -353,6 +374,9 @@ lay_down_base() {
 	write_manifest "$root/mokmok-tui/Cargo.toml" shell ""
 }
 
+# Each fault is one manifest shape the reader must see through. The three that name a package under a
+# key other than its own, or under a table other than `[dependencies]`, are the reason the reader is
+# Cargo rather than a scan.
 trip() {
 	local root=$1 fault=$2
 	case $fault in
@@ -387,6 +411,15 @@ nix = "0.31"
 		capability-reaching-the-os) printf '#![no_std]\nfn main() { let _ = std::fs::read("x"); }\n' > "$root/mokmok-capability/src/lib.rs" ;;
 		an-application-outside-the-roots) write_manifest "$root/mokmok-alpha/Cargo.toml" pure '[dependencies]
 mokmok-kernel = { path = "../mokmok-kernel" }
+' ;;
+		renamed-io-dependency) write_manifest "$root/mokmok-capability/Cargo.toml" pure '[dependencies]
+tokio_rt = { package = "tokio", version = "1" }
+' ;;
+		target-table-io-dependency) write_manifest "$root/mokmok-capability/Cargo.toml" pure "[target.'cfg(unix)'.dependencies]
+tokio = \"1\"
+" ;;
+		dotted-table-kernel-dependency) write_manifest "$root/mokmok-alpha/Cargo.toml" pure '[dependencies.mokmok-kernel]
+path = "../mokmok-kernel"
 ' ;;
 		*)
 			printf 'unknown fault %s\n' "$fault"
@@ -435,6 +468,9 @@ scheduler-with-a-model-client|scheduler-has-no-model-dependency|mokmok-scheduler
 capability-with-an-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on nix
 capability-reaching-the-os|capability-performs-no-enforcement-io|mokmok-capability reaches the operating system
 an-application-outside-the-roots|kernel-dependents-are-applications|mokmok-alpha depends on mokmok-kernel and is outside
+renamed-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on tokio
+target-table-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on tokio
+dotted-table-kernel-dependency|kernel-dependents-are-applications|mokmok-alpha depends on mokmok-kernel and is outside
 CASES
 
 	rm -rf "$root"
