@@ -35,10 +35,12 @@ carries.[^crate]
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
 | `Relay`, `serve` | `src/serve.rs:52,138` | The outbox relay and the daemon loop |
-| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,464,483` | The vertical slice |
+| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,480,499` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:665,546,529,363` | The agent loop and its scripted model |
-| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:557` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
+| `editor::Editor` | `src/editor.rs:32` | The model's editor: it plans a patch against the checkout, asks the authority for the write, and commits the bytes through a resolved directory |
+| `Authority::may_write_at`, `access_at` | `src/authority.rs:127,163` | The one place the write answer is decided, from the grants the operator named |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:691,568,551,373` | The agent loop and its scripted model |
+| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:573` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
 `authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`, `serve`,

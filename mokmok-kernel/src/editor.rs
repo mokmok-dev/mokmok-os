@@ -571,12 +571,7 @@ mod tests {
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
-            provider: crate::config::ProviderKind::Scripted,
-            script: None,
-            model: None,
-            endpoint: "https://ollama.com/v1".to_owned(),
-            provider_credential_file: None,
-            max_answer_tokens: 4096,
+            provider: crate::config::ProviderSettings::default(),
         }
     }
 
