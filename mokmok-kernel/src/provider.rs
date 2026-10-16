@@ -34,12 +34,20 @@ const SHELL_TOOL: &str = "run_shell";
 
 const FIND_TOOL: &str = "find_files";
 
+const EDIT_TOOL: &str = "apply_patch";
+
 const SHELL_DESCRIPTION: &str = "Run one shell command with `sh -c` in a fresh, empty working \
      directory. The checkout is reached by absolute path, stdin is empty, and there is no TCP \
      network.";
 
 const FIND_DESCRIPTION: &str = "Find files under the granted search roots by the words in their \
      name or their contents. Returns a ranked list of paths. Reads and changes nothing.";
+
+const EDIT_DESCRIPTION: &str = "Apply a unified diff to one file under the checkout, replacing \
+     that file's bytes. The diff's --- and +++ labels name the file relative to the checkout; \
+     the tool never follows a symlink. One file per call, and the patch applies cleanly or \
+     nothing is written. An optional expect carries the sha256 the model believes the file \
+     holds; the edit is refused if the file does not match.";
 
 /// The chat-completions path appended to a configured endpoint.
 const COMPLETIONS: &str = "/chat/completions";
@@ -628,6 +636,9 @@ fn tools(context: &Context) -> Vec<serde_json::Value> {
     if context.search {
         tools.push(find_tool());
     }
+    if context.writable {
+        tools.push(edit_tool());
+    }
 
     tools
 }
@@ -657,6 +668,30 @@ fn find_tool() -> serde_json::Value {
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
                 "required": ["query"],
+            },
+        },
+    })
+}
+
+fn edit_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": EDIT_TOOL,
+            "description": EDIT_DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "A unified diff: a --- label, a +++ label, then @@ hunks.",
+                    },
+                    "expect": {
+                        "type": "string",
+                        "description": "Optional. The sha256 of the bytes you believe the file holds. The edit is refused if the file does not match.",
+                    },
+                },
+                "required": ["patch"],
             },
         },
     })
@@ -708,6 +743,11 @@ fn turn_text(turn: &ContextTurn) -> String {
             text.push_str("\nfind: ");
             text.push_str(query);
             text.push_str("\nobservation: ");
+            text.push_str(observation);
+        },
+        // An edit names the file in its own observation, so no path rides beside it.
+        Some(ContextAct::Edited { observation }) => {
+            text.push_str("\nedit: ");
             text.push_str(observation);
         },
         None => {},
@@ -840,6 +880,26 @@ fn tool_call(message: &serde_json::Value) -> Action {
                     query: clip_query(query),
                 },
             ),
+        EDIT_TOOL => mokmok_agent_runtime::patch_refusal(arguments).map_or_else(
+            || {
+                decoded
+                    .get("patch")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(
+                        || Action::Malformed {
+                            reason: "the tool arguments name no patch string".to_owned(),
+                        },
+                        |patch| Action::Edit {
+                            patch: patch.to_owned(),
+                            expect: decoded
+                                .get("expect")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                        },
+                    )
+            },
+            |reason| Action::Malformed { reason },
+        ),
         other => Action::Malformed {
             reason: format!("the answer called {other:?}, which is not a tool of this session"),
         },
@@ -915,12 +975,21 @@ mod tests {
             goal: "the goal".to_owned(),
             turns: Vec::new(),
             search: false,
+            writable: false,
         }
     }
 
     fn searching() -> Context {
         Context {
             search: true,
+            writable: false,
+            ..context()
+        }
+    }
+
+    fn writable() -> Context {
+        Context {
+            writable: true,
             ..context()
         }
     }
@@ -1099,6 +1168,7 @@ mod tests {
                 },
             ],
             search: false,
+            writable: false,
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1123,6 +1193,7 @@ mod tests {
                 }),
             }],
             search: true,
+            writable: false,
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1209,6 +1280,22 @@ mod tests {
     }
 
     #[test]
+    fn the_body_offers_the_editor_exactly_when_the_session_holds_a_writable_checkout() {
+        let editable = request_body(&writable(), "m", 1);
+        let tools = editable["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "run_shell");
+        assert_eq!(tools[1]["function"]["name"], "apply_patch");
+        assert_eq!(tools[1]["function"]["parameters"]["required"][0], "patch",);
+        assert!(
+            tools[1]["function"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("unified diff")),
+            "the editor's description must say it takes a unified diff",
+        );
+    }
+
+    #[test]
     fn the_first_call_carries_the_goal_as_a_user_message() {
         let body = request_body(&context(), "m", 1);
 
@@ -1232,6 +1319,7 @@ mod tests {
                 }),
             }],
             search: false,
+            writable: false,
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1404,6 +1492,7 @@ mod tests {
             goal: "list the source files".to_owned(),
             turns: Vec::new(),
             search: false,
+            writable: false,
         };
 
         let answer = provider.complete(&prompt).await.unwrap();

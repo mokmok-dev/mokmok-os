@@ -14,6 +14,7 @@ pub mod agent;
 mod authority;
 mod config;
 mod db;
+mod editor;
 mod error;
 mod execution;
 mod index;
@@ -31,6 +32,7 @@ pub use config::{
     uuid_of,
 };
 pub use db::{Db, Entry, Log, ResultRecord, TurnRecord};
+pub use editor::Editor;
 pub use error::Error;
 pub use execution::{Blob, ExecutionResult, Plan, Ran, Refused};
 pub use roster::{Summary, sessions};

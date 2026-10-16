@@ -144,13 +144,39 @@ pub fn ruleset(plan: &Plan) -> Result<RulesetCreated, Failure> {
 }
 
 /// Opens a resolved path atomically, with no symlink resolution, so a symlink planted after the
-/// plan was written cannot move the rule to an object the gate never covered.
-fn open_resolved(path: &Path) -> io::Result<OwnedFd> {
+/// plan was written cannot move the rule to an object the gate never covered. Refuses with
+/// `ELOOP` when any path component is a symbolic link.
+///
+/// # Errors
+///
+/// Returns the `openat2` error: `ELOOP` for a symlink, `ENOENT` when the path is missing, and the
+/// underlying kernel error for any other refusal.
+pub fn open_resolved(path: &Path) -> io::Result<OwnedFd> {
     openat2(
         AT_FDCWD,
         path,
         OpenHow::new()
             .flags(OFlag::O_PATH | OFlag::O_CLOEXEC)
+            .mode(Mode::empty())
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )
+    .map_err(io::Error::from)
+}
+
+/// Opens a resolved directory atomically, with no symlink resolution, so a symlink planted after
+/// planning cannot move the directory the caller will read and write through. Refuses with
+/// `ENOTDIR` when the path is not a directory and with `ELOOP` when any component is a symlink.
+///
+/// # Errors
+///
+/// Returns the `openat2` error: `ELOOP` for a symlink, `ENOTDIR` when the path is not a directory,
+/// `ENOENT` when it is missing, and the underlying kernel error otherwise.
+pub fn open_resolved_dir(path: &Path) -> io::Result<OwnedFd> {
+    openat2(
+        AT_FDCWD,
+        path,
+        OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
             .mode(Mode::empty())
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )

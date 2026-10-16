@@ -10,7 +10,7 @@
 //! translates what was granted into the sandbox's own narrow types, so the sandbox enforces
 //! mechanically what the decision allowed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mokmok_capability::{
     Action, ActionSet, Authority as Decisions, Context, Decision, Denial, DenialReason, Name,
@@ -44,6 +44,7 @@ pub const DEV_NULL: &str = "/dev/null";
 /// Authority as this round's configuration states it.
 pub struct Authority {
     decisions: Decisions,
+    write_roots: Vec<PathBuf>,
 }
 
 impl Authority {
@@ -59,8 +60,10 @@ impl Authority {
     ) -> Result<Self, Error> {
         let mut policy = Policy::new();
         let mut roots = Vec::new();
+        let mut write_roots = Vec::new();
 
         for path in &config.allow_write {
+            write_roots.push(path.clone());
             let resource = Resource::Path(path_of(path)?);
             policy = policy
                 .with(rule(Action::Read, resource.clone()))
@@ -105,7 +108,47 @@ impl Authority {
             );
         }
 
-        Ok(Self { decisions })
+        Ok(Self {
+            decisions,
+            write_roots,
+        })
+    }
+
+    /// Whether the agent principal may write at one path, from the deepest write grant that covers it.
+    ///
+    /// The path is compared to the `--allow-write` roots the policy was built from, so a path
+    /// outside every grant is denied before the policy is asked. The grant that covers it is then
+    /// asked for `Action::Write`, and the answer is the one the policy gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Denial`] when no write root covers the path, or when the policy denies write
+    /// on the root that does.
+    pub fn may_write_at(
+        &self,
+        path: &Path,
+        at: Moment,
+    ) -> Result<Access, Denial> {
+        let root = self
+            .write_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .ok_or_else(|| Denial::new(DenialReason::NotGranted))?;
+        let text = root
+            .to_str()
+            .ok_or_else(|| Denial::new(DenialReason::NotGranted))?
+            .to_owned();
+        let resource = Resource::Path(text);
+        let request = Self::request(Action::Write, &resource, Self::agent());
+
+        match self.decisions.decide(&request, at) {
+            Decision::Allow(grant) if grant.permission().actions().covers(ActionSet::WRITE) => {
+                Ok(Access::WRITE)
+            },
+            Decision::Allow(_) | Decision::Approve(_) => Err(Denial::new(DenialReason::NotGranted)),
+            Decision::Deny(denial) => Err(denial),
+        }
     }
 
     /// The sandbox authority for one path, from what the policy and a live grant allow there.
