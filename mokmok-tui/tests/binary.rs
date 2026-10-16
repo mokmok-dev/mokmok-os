@@ -224,6 +224,7 @@ mod tests {
         std::fs::write(&script, b"[]").expect("the script is written");
 
         let run = Command::new(env!("CARGO_BIN_EXE_mokmok-tui"))
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(args(&scratch.0, &script))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -278,6 +279,7 @@ mod tests {
 
         let mut child = Reaped::new(
             Command::new(env!("CARGO_BIN_EXE_mokmok-tui"))
+                .env("XDG_CONFIG_HOME", scratch.0.join("config"))
                 .args(args(&scratch.0, &script))
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::from(pty.slave))

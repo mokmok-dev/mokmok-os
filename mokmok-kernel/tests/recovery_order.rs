@@ -139,9 +139,13 @@ mod tests {
         args
     }
 
-    fn run(args: &[String]) -> Ran {
+    fn run(
+        scratch: &Scratch,
+        args: &[String],
+    ) -> Ran {
         let output = Command::new(binary())
             .env("MOKMOKD_CRASH", "1")
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(args)
             .output()
             .expect("the binary runs");
@@ -183,7 +187,7 @@ mod tests {
             "before-dispatch".to_owned(),
         ]);
 
-        let ran = run(&args);
+        let ran = run(&scratch, &args);
         assert_eq!(ran.code, Some(97), "{}\n{}", ran.out, ran.err);
     }
 
@@ -195,7 +199,7 @@ mod tests {
         let mut args = base(scratch);
         args.extend(["status".to_owned(), "--session".to_owned(), session(index)]);
 
-        let ran = run(&args);
+        let ran = run(&scratch, &args);
         assert!(
             ran.code == Some(0),
             "status failed for {}: {}\n{}",
@@ -241,6 +245,7 @@ mod tests {
 
         let _serving = Serving(
             Command::new(binary())
+                .env("XDG_CONFIG_HOME", scratch.0.join("config"))
                 .args(base(&scratch))
                 .args([
                     "serve".to_owned(),

@@ -192,9 +192,13 @@ mod tests {
     }
 
     /// Runs the binary with the crash knob unlocked, as the crash harness does.
-    fn run(args: &[String]) -> Ran {
+    fn run(
+        scratch: &Scratch,
+        args: &[String],
+    ) -> Ran {
         ran(&Command::new(binary())
             .env("MOKMOKD_CRASH", "1")
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(args)
             .output()
             .expect("the binary runs"))
@@ -256,7 +260,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&args)
+        run(&scratch, &args)
     }
 
     /// One `submit` of `body` through the operator's shell, which is the path the kernel takes
@@ -344,7 +348,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(
             std::fs::read_to_string(scratch.checkout().join("out.txt")).expect("the command wrote"),
@@ -373,11 +377,14 @@ mod tests {
         );
         script(&path, &[json!({"action": "command", "command": command})]);
 
-        let crashed = run(&agent_args(
+        let crashed = run(
             &scratch,
-            &path,
-            &["--crash-after", "before-dispatch", "--steps", "3"],
-        ));
+            &agent_args(
+                &scratch,
+                &path,
+                &["--crash-after", "before-dispatch", "--steps", "3"],
+            ),
+        );
         assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
         assert!(
             !scratch.checkout().join("marker.txt").exists(),
@@ -388,7 +395,7 @@ mod tests {
         // The resumed model answers final. An automatic re-dispatch of the in-flight command would
         // leave the marker behind, so its absence is the measurement.
         script(&path, &[json!({"action": "final"})]);
-        let resumed = run(&agent_args(&scratch, &path, &[]));
+        let resumed = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
         assert!(
             !scratch.checkout().join("marker.txt").exists(),
@@ -415,7 +422,7 @@ mod tests {
         script(&path, &[]);
 
         // One step opens the session and writes the task, and the model is never asked.
-        let opened = run(&agent_args(&scratch, &path, &["--steps", "1"]));
+        let opened = run(&scratch, &agent_args(&scratch, &path, &["--steps", "1"]));
         assert!(opened.ok, "{}\n{}", opened.out, opened.err);
         assert_eq!(
             status(&scratch).value("phase").as_deref(),
@@ -429,17 +436,17 @@ mod tests {
             "--session".to_owned(),
             SESSION.to_owned(),
         ]);
-        let cancelled = run(&cancel);
+        let cancelled = run(&scratch, &cancel);
         assert!(cancelled.ok, "{}\n{}", cancelled.out, cancelled.err);
 
-        let closed = run(&agent_args(&scratch, &path, &[]));
+        let closed = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(closed.ok, "{}\n{}", closed.out, closed.err);
         assert_eq!(
             status(&scratch).value("phase").as_deref(),
             Some("Closed(Cancelled)"),
         );
 
-        let refused = run(&submit_args(&scratch, "printf hello > out.txt"));
+        let refused = run(&scratch, &submit_args(&scratch, "printf hello > out.txt"));
         assert!(
             refused.err.contains("the session is \"closed\""),
             "a closed session admits no new turn and names the phase it is in:\n{}",
@@ -450,7 +457,7 @@ mod tests {
     #[test]
     fn a_submit_into_a_cancelled_session_is_refused_and_names_the_phase() {
         let scratch = Scratch::new("submit-draining");
-        let submitted = run(&submit_args(&scratch, "printf hello > out.txt"));
+        let submitted = run(&scratch, &submit_args(&scratch, "printf hello > out.txt"));
         assert!(submitted.ok, "{}\n{}", submitted.out, submitted.err);
         assert_eq!(submitted.value("phase").as_deref(), Some("Accepting"));
 
@@ -461,12 +468,12 @@ mod tests {
             "--session".to_owned(),
             SESSION.to_owned(),
         ]);
-        let cancelled = run(&cancel);
+        let cancelled = run(&scratch, &cancel);
         assert!(cancelled.ok, "{}\n{}", cancelled.out, cancelled.err);
 
         // The cancel landed while the session was open, so the next invocation is the one that
         // refuses a new turn rather than the run that closes what the cancel left behind.
-        let again = run(&submit_args(&scratch, "printf hello > out.txt"));
+        let again = run(&scratch, &submit_args(&scratch, "printf hello > out.txt"));
         assert!(
             again.err.contains("the session is \"draining\""),
             "a cancelled session admits no new turn and names the phase it is in:\n{}",
@@ -506,7 +513,7 @@ mod tests {
             "4".to_owned(),
         ]);
 
-        let ran = run(&args);
+        let ran = run(&scratch, &args);
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert!(
             !scratch.checkout().join("marker.txt").exists(),
@@ -537,7 +544,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
 
         let db = Db::open(&scratch.data().join("events.sqlite")).expect("the log opens");
@@ -688,7 +695,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(ran.value("halt").as_deref(), Some("Attempts"));
         assert_eq!(
@@ -709,11 +716,14 @@ mod tests {
 
         script(&path, &[]);
         let root = scratch.checkout().display().to_string();
-        let opened = run(&agent_args(
+        let opened = run(
             &scratch,
-            &path,
-            &["--search-root", root.as_str(), "--steps", "1"],
-        ));
+            &agent_args(
+                &scratch,
+                &path,
+                &["--search-root", root.as_str(), "--steps", "1"],
+            ),
+        );
         assert!(opened.ok, "{}\n{}", opened.out, opened.err);
 
         script(
@@ -723,7 +733,7 @@ mod tests {
                 json!({"action": "final"}),
             ],
         );
-        let resumed = run(&agent_args(&scratch, &path, &[]));
+        let resumed = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
         assert!(
             resumed.phrase("move=find ").is_some(),
@@ -758,11 +768,10 @@ mod tests {
         );
         let root = scratch.checkout().display().to_string();
 
-        let ran = run(&agent_args(
+        let ran = run(
             &scratch,
-            &path,
-            &["--search-root", root.as_str()],
-        ));
+            &agent_args(&scratch, &path, &["--search-root", root.as_str()]),
+        );
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(ran.value("phase").as_deref(), Some("Closed(Completed)"));
 
@@ -799,11 +808,10 @@ mod tests {
         );
         let root = scratch.checkout().display().to_string();
 
-        let ran = run(&agent_args(
+        let ran = run(
             &scratch,
-            &path,
-            &["--search-root", root.as_str()],
-        ));
+            &agent_args(&scratch, &path, &["--search-root", root.as_str()]),
+        );
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
 
         let (log, session) = log_of(&scratch);
@@ -829,7 +837,7 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "final", "say": "done"})]);
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(ran.value("phase").as_deref(), Some("Closed(Completed)"));
 
@@ -872,7 +880,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(ran.value("phase").as_deref(), Some("Closed(Completed)"));
 
@@ -896,11 +904,10 @@ mod tests {
         script(&path, &[json!({"action": "final"})]);
         let root = elsewhere.display().to_string();
 
-        let refused = run(&agent_args(
+        let refused = run(
             &scratch,
-            &path,
-            &["--search-root", root.as_str()],
-        ));
+            &agent_args(&scratch, &path, &["--search-root", root.as_str()]),
+        );
 
         assert!(!refused.ok, "{}", refused.out);
         assert!(refused.err.contains(&root), "{}", refused.err);
@@ -926,11 +933,10 @@ mod tests {
             &[json!({"action": "command", "command": "printf hello"})],
         );
 
-        let crashed = run(&agent_args(
+        let crashed = run(
             &scratch,
-            &path,
-            &["--crash-after", "after-dispatch"],
-        ));
+            &agent_args(&scratch, &path, &["--crash-after", "after-dispatch"]),
+        );
 
         assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
         let left =
@@ -953,7 +959,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
 
         let (log, _) = log_of(&scratch);
@@ -985,7 +991,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
 
         assert!(
@@ -1021,7 +1027,10 @@ mod tests {
         // A first run over a session of its own says how many steps the loop takes. The second run
         // stops on the step that carried the ending, because the step after it reaches the terminal
         // progress and answers the same ending whatever the close step recorded.
-        let counted = run(&agent_args_of(COUNTED, &scratch, &path, &["--steps", "20"]));
+        let counted = run(
+            &scratch,
+            &agent_args_of(COUNTED, &scratch, &path, &["--steps", "20"]),
+        );
         assert!(counted.ok, "{}\n{}", counted.out, counted.err);
         assert_eq!(counted.value("phase").as_deref(), Some("Closed(Completed)"));
         let close = counted
@@ -1036,12 +1045,10 @@ mod tests {
         let pinned = {
             let steps = close.to_string();
 
-            run(&agent_args_of(
-                SESSION,
+            run(
                 &scratch,
-                &path,
-                &["--steps", steps.as_str()],
-            ))
+                &agent_args_of(SESSION, &scratch, &path, &["--steps", steps.as_str()]),
+            )
         };
 
         assert_eq!(

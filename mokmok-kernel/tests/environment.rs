@@ -164,6 +164,7 @@ mod tests {
         // environment the daemon never held would make the absence below prove nothing.
         let output = Command::new(binary())
             .env(MARKER, "present")
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(&args)
             .output()
             .expect("the binary runs");

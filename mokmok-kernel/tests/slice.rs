@@ -215,11 +215,15 @@ mod tests {
         }
     }
 
-    fn run(args: &[String]) -> Ran {
+    fn run(
+        scratch: &Scratch,
+        args: &[String],
+    ) -> Ran {
         // `config::crash` honours `--crash-after` only under `MOKMOKD_CRASH=1`, so the harness that
         // passes the flag sets it; the invocations that never pass the flag ignore it.
         let output = Command::new(binary())
             .env("MOKMOKD_CRASH", "1")
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(args)
             .output()
             .expect("the binary runs");
@@ -229,8 +233,12 @@ mod tests {
 
     /// Runs the binary as a caller that did not mean to crash the daemon does: with the crash knob
     /// left locked.
-    fn run_locked(args: &[String]) -> Ran {
+    fn run_locked(
+        scratch: &Scratch,
+        args: &[String],
+    ) -> Ran {
         let output = Command::new(binary())
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(args)
             .output()
             .expect("the binary runs");
@@ -241,10 +249,12 @@ mod tests {
     /// Runs the binary as `run_locked` does, but bounded: a daemon that never exits fails the test
     /// with a message rather than hanging a suite that would then report nothing about it at all.
     fn run_locked_bounded(
+        scratch: &Scratch,
         args: &[String],
         bound: Duration,
     ) -> Ran {
         let mut child = Command::new(binary())
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -275,7 +285,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&args)
+        run(&scratch, &args)
     }
 
     fn reconcile(scratch: &Scratch) -> Ran {
@@ -286,7 +296,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&args)
+        run(&scratch, &args)
     }
 
     /// The arguments of one `submit` that writes `body` into `out.txt` in the workload's own
@@ -326,7 +336,10 @@ mod tests {
         key: &str,
         extra: &[&str],
     ) -> Ran {
-        run(&submit_args(scratch, key, "printf hello > out.txt", extra))
+        run(
+            &scratch,
+            &submit_args(scratch, key, "printf hello > out.txt", extra),
+        )
     }
 
     /// One `submit` whose workload writes `body`, so two runs leave distinguishable artifacts.
@@ -335,7 +348,7 @@ mod tests {
         key: &str,
         body: &str,
     ) -> Ran {
-        run(&submit_args(scratch, key, body, &[]))
+        run(&scratch, &submit_args(scratch, key, body, &[]))
     }
 
     #[test]
@@ -527,12 +540,10 @@ mod tests {
 
         // The artifact is written before the shell kills itself, so the run settles with a result
         // rather than failing on a file the workload never made.
-        let submitted = run(&submit_args(
+        let submitted = run(
             &scratch,
-            KEY_A,
-            "printf x > out.txt; kill -9 $$",
-            &[],
-        ));
+            &submit_args(&scratch, KEY_A, "printf x > out.txt; kill -9 $$", &[]),
+        );
 
         assert!(submitted.ok, "{}\n{}", submitted.out, submitted.err);
         assert!(
@@ -570,7 +581,7 @@ mod tests {
             "--arg".to_owned(),
             "printf hello".to_owned(),
         ]);
-        let refused = run(&args);
+        let refused = run(&scratch, &args);
 
         assert!(refused.ok, "{}\n{}", refused.out, refused.err);
         assert!(
@@ -700,12 +711,15 @@ mod tests {
     fn the_crash_knob_stays_shut_without_the_deliberate_signal() {
         let scratch = Scratch::new("no-crash-signal");
 
-        let completed = run_locked(&submit_args(
+        let completed = run_locked(
             &scratch,
-            KEY_A,
-            "printf hello > out.txt",
-            &["--crash-after", "before-dispatch"],
-        ));
+            &submit_args(
+                &scratch,
+                KEY_A,
+                "printf hello > out.txt",
+                &["--crash-after", "before-dispatch"],
+            ),
+        );
 
         assert_eq!(
             completed.code,
@@ -733,6 +747,7 @@ mod tests {
         let socket = scratch.0.join("bus.sock");
         let _serving = Serving(
             Command::new(binary())
+                .env("XDG_CONFIG_HOME", scratch.0.join("config"))
                 .args(base(&scratch, true))
                 .args([
                     "serve".to_owned(),
@@ -873,6 +888,7 @@ mod tests {
 
         let socket = scratch.0.join("bus.sock");
         let mut child = Command::new(binary())
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(base(&scratch, true))
             .args([
                 "serve".to_owned(),
@@ -942,7 +958,7 @@ mod tests {
         ]);
         // Bounded, because a daemon that waits on a peer rather than on the bus never reaches this
         // assertion and the suite would report a timeout instead of the refusal it was promised.
-        let refused = run_locked_bounded(&args, Duration::from_secs(8));
+        let refused = run_locked_bounded(&scratch, &args, Duration::from_secs(8));
 
         assert_eq!(refused.code, Some(1), "{}\n{}", refused.out, refused.err);
         assert!(
