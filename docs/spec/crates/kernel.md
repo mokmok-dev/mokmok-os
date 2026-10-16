@@ -160,8 +160,9 @@ injection (`src/config.rs:953`), and the workspace's only wall-clock read
 
 221 cases: 166 in `#[cfg(test)]` modules, one of them ignored, and 55 across five integration files.
 
-`src/provider.rs` holds 30 cases for the measured model exchange, malformed output, the request
-body, endpoint parsing, and not following a redirect. `src/config.rs` holds 66 cases for resolution
+`src/provider.rs` holds 31 cases for the measured model exchange, malformed output, the request
+body, endpoint parsing, the tool list a session's grants decide, and not following a redirect. One of
+them is ignored: it reaches a live endpoint by hand. `src/config.rs` holds 66 cases for resolution
 and refusal, 33 of them driving a configuration file the test wrote.
 `src/editor.rs` holds 26 cases for planning an edit and committing one: the plan for one file, for a
 file that does not exist, at the size ceiling, and through a checkout the operator reached by a
