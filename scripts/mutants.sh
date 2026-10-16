@@ -150,8 +150,13 @@ sweep_all() {
 
   : > "$scratch/rows.jsonl"
 
-  local member
+  local swept=()
   while read -r member; do
+    swept+=("$member")
+  done < <(sweep_targets)
+
+  local member
+  for member in "${swept[@]}"; do
     echo "=== $member ==="
 
     local status=0
@@ -164,9 +169,36 @@ sweep_all() {
     record_row "$scratch" "$member" "$status"
 
     echo
-  done < <(members)
+  done
 
   assemble_ledger "$scratch"
+}
+
+# Every member, or the ones named on the command line, so one crate can be re-measured without
+# re-running the sweep. `--jobs` and its value are options here, not member names.
+sweep_targets() {
+  local index=0
+  local named=()
+
+  while [ "$index" -lt "${#ARGUMENTS[@]}" ]; do
+    case "${ARGUMENTS[$index]}" in
+      --jobs)
+        index=$((index + 2))
+        ;;
+      *)
+        named+=("${ARGUMENTS[$index]}")
+        index=$((index + 1))
+        ;;
+    esac
+  done
+
+  if [ "${#named[@]}" -gt 0 ]; then
+    printf '%s\n' "${named[@]}"
+
+    return
+  fi
+
+  members
 }
 
 record_row() {
@@ -176,9 +208,12 @@ record_row() {
 
   digest=$(digest_of "$member/src" "$member/tests")
 
-  if [ "$status" -gt 2 ] || [ ! -f "$outcomes" ]; then
+  # A non-zero status only says some mutant survived or timed out; cargo-mutants still writes the
+  # outcomes, and those mutants are exactly the ones the score has to account for. Only a run that
+  # left no outcomes at all, such as one whose unmutated baseline failed, is unscoreable.
+  if [ ! -f "$outcomes" ]; then
     echo "$member: cargo mutants exited $status without outcomes" >&2
-    printf '{"name":%s,"score":null,"target":null,"tested":0,"missed":[],"digest":%s,"note":"cargo mutants exited %s"}\n' \
+    printf '{"name":%s,"score":null,"target":null,"tested":0,"missed":[],"digest":%s,"note":"cargo mutants exited %s without outcomes"}\n' \
       "$(jq -n --arg v "$member" '$v')" "$(jq -n --arg v "$digest" '$v')" "$status" \
       >> "$scratch/rows.jsonl"
 
@@ -231,9 +266,18 @@ ledger_target() {
 
 assemble_ledger() {
   local scratch="$1"
+  local previous='[]'
 
-  jq -s --arg harness "$(harness_digest)" --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{harness: $harness, generated: $generated, members: .}' \
+  # A narrowed sweep replaces the rows it measured and leaves the rest of the ledger alone, so
+  # re-measuring one member cannot drop another member's recorded score.
+  if [ -f "$LEDGER" ]; then
+    previous=$(jq -c '.members // []' "$LEDGER")
+  fi
+
+  jq -s --argjson previous "$previous" --arg harness "$(harness_digest)" \
+    --arg generated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{harness: $harness, generated: $generated,
+      members: (($previous + .) | group_by(.name) | map(last) | sort_by(.name))}' \
     "$scratch/rows.jsonl" > "$LEDGER"
 
   echo "wrote $LEDGER"
