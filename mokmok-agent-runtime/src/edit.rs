@@ -48,7 +48,7 @@ pub enum EditOutcome {
     Applied,
     /// The file held different bytes when commit read it.
     Stale { found: ArtifactRef },
-    /// The edit was refused before anything was written.
+    /// The edit was refused, and the file it names still holds the bytes it held.
     Refused { reason: String },
 }
 

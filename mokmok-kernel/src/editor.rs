@@ -326,7 +326,12 @@ impl EditorPort for Editor {
             },
             Err(WriteFailure::NothingWritten(error)) => Ok(Self::refused_report(
                 &ready.relative,
-                format!("the write did not land ({error}), so nothing was written"),
+                // The staging file is written before the rename, so the claim a refusal may make is
+                // about the file the model named, not about the directory around it.
+                format!(
+                    "the write did not land ({error}), so {} is unchanged",
+                    ready.relative
+                ),
             )),
             // The bytes are in place, so a refusal here would be a claim the log cannot keep.
             // Leaving the outcome unwritten hands the turn to recovery, which settles it
