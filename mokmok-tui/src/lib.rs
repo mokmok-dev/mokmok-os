@@ -48,6 +48,14 @@ pub enum Error {
     /// Standard input or output is not a terminal, so there is no screen to draw on.
     #[error("this is not a terminal; use 'mokmokd agent run' for a run that writes no screen")]
     NotATerminal,
+    /// The log holds a history for the session and no task in it.
+    #[error(
+        "the session {} recorded no task, and a session runs under the task its log holds; read it \
+         with 'mokmokd status --session {}'",
+        .0.as_uuid(),
+        .0.as_uuid()
+    )]
+    Untasked(SessionID),
     /// The configuration was refused: a grant, a program, a credential, a script.
     #[error("{0}")]
     Config(#[from] mokmok_kernel::ConfigError),

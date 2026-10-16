@@ -93,37 +93,62 @@ impl Sessions {
     ///
     /// # Errors
     ///
-    /// Returns the errors of opening the session's world.
+    /// Returns [`Error::Untasked`] when the log holds a taskless history for that session, and the
+    /// errors of opening the session's world.
     pub fn start(&self) -> Result<Session, Error> {
-        Session::open(&self.config, &self.run, self.at)
+        let session = SessionID::from_uuid(mokmok_kernel::uuid_of(&self.run.session, "session")?);
+        let run = self.run_for(session)?;
+
+        Session::open(&self.config, &run, self.at)
     }
 
-    /// The command line's own run, with a session's identity and, when it has one, the goal and the
-    /// checkout that session recorded.
+    /// The run one session is opened with: the command line's own, refused when the log holds a
+    /// history for the session and no task in it.
     ///
-    /// A session that recorded a task is held to it: the fold prefers the recorded task for the
-    /// prompt the model is handed, so the run only has to name the session and stay inside the
-    /// grants the operator passed.
+    /// The goal and the checkout stay the command line's, because the fold prefers the task the log
+    /// recorded: a session that recorded one runs under it whatever this carries, and one the log
+    /// holds nothing for is opened under the command line's goal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Untasked`] when the log holds a history for the session and no task in it.
+    /// The runtime continues a session under the task its log recorded, so such a session has no goal
+    /// to be opened under, and opening it with the command line's goal would spend a model call on a
+    /// session nobody asked that of.
     fn run_for(
         &self,
         session: SessionID,
-        listing: Option<&Listing>,
-    ) -> Run {
-        let run = Run {
+    ) -> Result<Run, Error> {
+        self.taskless(session)?;
+
+        Ok(Run {
             session: session.as_uuid().to_string(),
             ..self.run.clone()
-        };
+        })
+    }
 
-        match listing {
-            Some(listing) => Run {
-                goal: listing.goal.clone().unwrap_or(run.goal),
-                checkout: listing
-                    .checkout
-                    .clone()
-                    .unwrap_or_else(|| run.checkout.clone()),
-                ..run
-            },
-            None => run,
+    /// Refuses a session whose log holds a history and no task in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Untasked`] for such a session, and the log's failure when it cannot be read.
+    fn taskless(
+        &self,
+        session: SessionID,
+    ) -> Result<(), Error> {
+        // The listing is the kernel's own reading of the log, so what a session's history holds stays
+        // one answer from one source.
+        let summary = mokmok_kernel::sessions(&self.config)?
+            .into_iter()
+            .find(|summary| summary.session == session);
+
+        match summary {
+            // The log holds nothing for the session, so the command line opens it.
+            None => Ok(()),
+            // The kernel reads both the goal and the checkout from the one task record a session
+            // wrote, so the goal stands for the task being there at all.
+            Some(summary) if summary.goal.is_some() => Ok(()),
+            Some(_) => Err(Error::Untasked(session)),
         }
     }
 }
@@ -147,7 +172,7 @@ impl Roster for Sessions {
         &self,
         listing: &Listing,
     ) -> Result<Self::Engine, Error> {
-        let run = self.run_for(listing.session, Some(listing));
+        let run = self.run_for(listing.session)?;
 
         Session::open(&self.config, &run, self.at)
     }
@@ -159,7 +184,7 @@ impl Roster for Sessions {
         let session = mokmok_kernel::mint_session(self.at);
         let run = Run {
             goal: goal.to_owned(),
-            ..self.run_for(session, None)
+            ..self.run_for(session)?
         };
 
         Session::open(&self.config, &run, self.at)
@@ -180,6 +205,7 @@ mod tests {
     use mokmok_state_machine::{Fact, TurnFact, TurnNumber};
 
     use super::{Session, Sessions};
+    use crate::Error;
     use crate::port::{Engine, Listing, Roster};
     use mokmok_protocol::SessionID;
     use mokmok_state_machine::Phase;
@@ -261,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_the_log_holds_no_task_for_is_resumed_under_the_command_line_s_own_goal() {
+    fn a_session_the_log_holds_nothing_for_is_opened_under_the_command_line_s_own_run() {
         let scratch = Scratch::new("resume-bare");
         let script = scratch.0.join("script.json");
         std::fs::write(&script, b"[]").expect("the script is written");
@@ -269,8 +295,6 @@ mod tests {
         let checkout = scratch.0.join("checkout");
         let sessions = Sessions::new(config, run, Moment::from_millis(0));
 
-        // A stream this build reads no task from, which is what a session the log holds only session
-        // facts for looks like to a chooser.
         let listing = Listing {
             session: SessionID::from_uuid(uuid::Uuid::from_u128(0x11)),
             phase: Phase::Unopened,
@@ -289,28 +313,110 @@ mod tests {
     }
 
     #[test]
-    fn a_session_that_recorded_a_goal_is_resumed_under_that_goal_and_checkout() {
-        let scratch = Scratch::new("resume-recorded");
+    fn a_session_the_log_holds_no_task_for_is_refused_every_way_in() {
+        let scratch = Scratch::new("untasked");
         let script = scratch.0.join("script.json");
         std::fs::write(&script, b"[]").expect("the script is written");
         let (config, run) = config_and_run(&scratch, &script);
+        let id = SessionID::from_uuid(uuid::Uuid::from_u128(0x21));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        // A session a `submit` wrote: its log holds session and turn facts, and no task.
+        runtime.block_on(async {
+            mokmok_kernel::submit(
+                &config,
+                &mokmok_kernel::Submit {
+                    session: id.as_uuid().to_string(),
+                    idempotency_key: uuid::Uuid::from_u128(0x22).to_string(),
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".to_owned(), "true".to_owned()],
+                    artifacts: Vec::new(),
+                    deadline_seconds: 30,
+                },
+                Moment::from_millis(0),
+            )
+            .await
+            .expect("the submit lands");
+        });
+
+        let named = Sessions::new(
+            config.clone(),
+            Run {
+                session: id.as_uuid().to_string(),
+                ..run.clone()
+            },
+            Moment::from_millis(0),
+        );
+        let refused = named.start();
+
+        assert!(
+            matches!(refused, Err(Error::Untasked(refused)) if refused == id),
+            "the command line naming it is refused",
+        );
+
         let sessions = Sessions::new(config, run, Moment::from_millis(0));
+        let listing = Listing {
+            session: id,
+            phase: Phase::Accepting,
+            goal: None,
+            checkout: None,
+        };
+        let refused = sessions.resume(&listing);
+
+        assert!(
+            matches!(refused, Err(Error::Untasked(refused)) if refused == id),
+            "and so is choosing it from the listing",
+        );
+    }
+
+    #[test]
+    fn a_session_that_recorded_a_task_is_opened_under_the_goal_the_log_holds() {
+        let scratch = Scratch::new("resume-recorded");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, br#"[{"action": "final", "say": "done"}]"#)
+            .expect("the script is written");
+        let (config, run) = config_and_run(&scratch, &script);
+        let checkout = scratch.0.join("checkout");
+        let sessions = Sessions::new(config, run, Moment::from_millis(0));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+
+        // The session's own first step is what writes its task, so the log is where the next opening
+        // reads the goal and the checkout from.
+        let mut created = sessions
+            .create("count the quokkas")
+            .expect("the session opens");
+        let id = created.session();
+        runtime.block_on(async {
+            for _ in 0..4 {
+                match created.step().await.expect("the step runs") {
+                    mokmok_agent_runtime::Progress::Awaiting
+                    | mokmok_agent_runtime::Progress::Terminal(_) => break,
+                    _ => {},
+                }
+            }
+        });
 
         let listing = Listing {
-            session: SessionID::from_uuid(uuid::Uuid::from_u128(0x12)),
+            session: id,
             phase: Phase::Accepting,
-            goal: Some("count the quokkas".to_owned()),
-            checkout: Some(PathBuf::from("/elsewhere")),
+            goal: None,
+            checkout: None,
         };
         let resumed = sessions.resume(&listing).expect("the session opens");
         let task = resumed
             .fold()
             .expect("the fold reads")
             .task
-            .expect("the run seeds the task the log does not hold");
+            .expect("the log holds the task");
 
         assert_eq!(task.goal, "count the quokkas");
-        assert_eq!(task.setting.checkout, PathBuf::from("/elsewhere"));
+        assert_eq!(task.setting.checkout, checkout);
     }
 
     #[test]
