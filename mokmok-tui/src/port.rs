@@ -499,7 +499,7 @@ mod tests {
     use proptest::prelude::*;
     use uuid::Uuid;
 
-    use super::{Line, Row, Sheet, View};
+    use super::{Line, Row, Sheet, View, edit_row};
     use mokmok_protocol::SessionID;
 
     fn view(
@@ -705,6 +705,37 @@ mod tests {
                 "agent  found it".to_owned(),
             ],
             "a find must not draw the command's gutter",
+        );
+    }
+
+    #[test]
+    fn an_edit_draws_its_first_two_lines_with_the_edit_gutter() {
+        let line = Line::Edit {
+            observation: "edit applied to src/x.rs\n1 bytes became 1 bytes\n".to_owned(),
+        };
+
+        assert_eq!(
+            view(vec![line.clone()], 0).visible(2),
+            vec![
+                "  ✎ edit applied to src/x.rs".to_owned(),
+                "    1 bytes became 1 bytes".to_owned(),
+            ],
+            "an edit's first two non-empty lines appear in the frame",
+        );
+
+        let replayed = format!("{line}");
+        assert!(
+            replayed.contains("edit applied to src/x.rs")
+                && replayed.contains("1 bytes became 1 bytes"),
+            "the replay carries every line of the edit: {replayed:?}"
+        );
+    }
+
+    #[test]
+    fn edit_row_renders_the_exact_gutter() {
+        assert_eq!(
+            edit_row("applied to src/x.rs"),
+            "  ✎ applied to src/x.rs".to_owned(),
         );
     }
 

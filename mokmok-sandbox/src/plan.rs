@@ -420,7 +420,7 @@ pub mod text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Plan, Status, StatusFile, probe, read_status, rights, ruleset};
+    use super::{Plan, Status, StatusFile, open_resolved_dir, probe, read_status, rights, ruleset};
     use crate::capability::Access;
     use crate::limits::Limits;
     use crate::request::Request;
@@ -438,6 +438,34 @@ mod tests {
         request.limits = Limits::default();
 
         Plan::of(&request, program, workspace, &request.exposures)
+    }
+
+    #[test]
+    fn open_resolved_dir_opens_a_directory_and_refuses_a_file_or_symlink() {
+        let directory =
+            std::env::temp_dir().join(format!("mokmok-open-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+
+        assert!(open_resolved_dir(&directory).is_ok(), "a directory opens");
+        let file_err = open_resolved_dir(&file).unwrap_err();
+        assert_eq!(
+            file_err.kind(),
+            std::io::ErrorKind::NotADirectory,
+            "a file must be refused as not a directory: {file_err}"
+        );
+        let link_err = open_resolved_dir(&link).unwrap_err();
+        assert_eq!(
+            link_err.raw_os_error(),
+            Some(nix::errno::Errno::ELOOP as i32),
+            "a symlink must be refused with ELOOP: {link_err}"
+        );
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

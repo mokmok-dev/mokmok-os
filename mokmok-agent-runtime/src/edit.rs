@@ -248,6 +248,16 @@ mod tests {
     }
 
     #[test]
+    fn refused_renders_the_exact_sentence() {
+        let text = refused("the patch named two files");
+
+        assert_eq!(
+            text,
+            "the edit was refused: the patch named two files".to_owned(),
+        );
+    }
+
+    #[test]
     fn unproven_names_both_hashes() {
         let intent = EditIntentRecord {
             turn: mokmok_protocol::TurnID::from_uuid(uuid::Uuid::nil()),
