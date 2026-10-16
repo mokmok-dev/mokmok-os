@@ -27,7 +27,8 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), Error> {
-    let config = Config::resolve(&args)?;
+    let discovered = mokmok_kernel::config_path();
+    let config = Config::resolve(&args, discovered.as_deref())?;
     let at = now();
 
     match &args.command {

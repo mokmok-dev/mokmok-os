@@ -473,16 +473,18 @@ impl Ollama {
         session: SessionID,
     ) -> Result<Self, Error> {
         let path = config
-            .provider_credential_file
+            .provider
+            .credential_file
             .as_deref()
             .ok_or(Error::NoCredential)?;
         let credential = Credential::read(path)?;
         let model = config
+            .provider
             .model
             .clone()
             .filter(|model| !model.is_empty())
             .ok_or(Error::NoModel)?;
-        let endpoint = parse_endpoint(&config.endpoint)?;
+        let endpoint = parse_endpoint(&config.provider.endpoint)?;
         let host = host_of(&endpoint.host);
         let context = CallContext {
             principal: AGENT,
@@ -529,7 +531,7 @@ impl Ollama {
                 endpoint.request_path(),
             ),
             model,
-            max_tokens: config.max_answer_tokens,
+            max_tokens: config.provider.max_answer_tokens,
             credential,
             store: BlobStore::open(&config.artifacts).map_err(Error::Artifact)?,
         })
@@ -870,7 +872,7 @@ mod tests {
         Action, Credential, Error, Ollama, Permit, PolicyClient, Usage, parse_answer,
         parse_endpoint, request_body,
     };
-    use crate::config::{Config, ProviderKind};
+    use crate::config::{Config, ProviderKind, ProviderSettings};
     use clap::Parser as _;
     use mokmok_agent_runtime::{
         Context, ContextAct, ContextTurn, MAX_PROSE_BYTES, MAX_QUERY_BYTES, Provider as _,
@@ -1388,7 +1390,7 @@ mod tests {
             credential.to_str().unwrap(),
         ])
         .unwrap();
-        let config = crate::config::Config::resolve(&args).unwrap();
+        let config = crate::config::Config::resolve(&args, None).unwrap();
         let session = mokmok_protocol::SessionID::from_uuid(uuid::Uuid::nil());
         let provider = super::Ollama::open(&config, session).unwrap();
         let prompt = Context {
@@ -1440,12 +1442,14 @@ mod tests {
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
-            provider: ProviderKind::Ollama,
-            script: None,
-            model: Some("m".to_owned()),
-            endpoint: endpoint.to_owned(),
-            provider_credential_file: Some(credential.to_path_buf()),
-            max_answer_tokens: 16,
+            provider: ProviderSettings {
+                kind: ProviderKind::Ollama,
+                model: Some("m".to_owned()),
+                endpoint: endpoint.to_owned(),
+                credential_file: Some(credential.to_path_buf()),
+                max_answer_tokens: 16,
+                ..ProviderSettings::default()
+            },
         }
     }
 

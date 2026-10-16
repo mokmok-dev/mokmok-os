@@ -66,7 +66,10 @@ the artifact store, and the sandbox belong to the kernel.
 - The trouble row renders through `prose_rows` with the gutter `TROUBLE_GUTTER` (`src/port.rs:128`),
   so the frame and the plain replay show the same text.
 - The library reads no clock; the binary reads one once and passes it in
-  (`src/bin/mokmok-tui.rs:77-85`).
+  (`src/bin/mokmok-tui.rs:78-86`).
+- The binary declares no flag of its own. It flattens the kernel's `Global` and `Run`, so every rule
+  the kernel applies to a flag applies to a conversation, and `--config` and the provider keys reach
+  the TUI through the kernel's own resolution (`src/bin/mokmok-tui.rs:45-46`).
 
 # Dependencies
 

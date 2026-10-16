@@ -294,7 +294,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(args.command, Command::Submit(_)));
-        let config = Config::resolve(&args).unwrap();
+        let config = Config::resolve(&args, None).unwrap();
 
         assert_eq!(
             super::exposures(&config),

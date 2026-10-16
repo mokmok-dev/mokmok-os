@@ -153,6 +153,7 @@ mod tests {
     fn base(scratch: &Scratch) -> Command {
         let mut command = Command::new(binary());
         command
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args([
                 "--data-dir".to_owned(),
                 scratch.data().display().to_string(),
