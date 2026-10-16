@@ -200,7 +200,7 @@ mod tests {
         Journal, Receipt, Record, SpeechRecord, Step, StepId, StepKey, turn_id,
     };
     use mokmok_kernel::agent::Ledger;
-    use mokmok_kernel::{Agent, Args, Command, Config, Run};
+    use mokmok_kernel::{Agent, Args, Command, Config, ProcessEnvironment, Run};
     use mokmok_protocol::Moment;
     use mokmok_state_machine::{Fact, TurnFact, TurnNumber};
 
@@ -278,7 +278,8 @@ mod tests {
             script.display().to_string(),
         ];
         let parsed = Args::try_parse_from(&args).expect("the command line parses");
-        let config = Config::resolve(&parsed, None).expect("the configuration resolves");
+        let config = Config::resolve(&parsed, None, &ProcessEnvironment::default())
+            .expect("the configuration resolves");
         let Command::Agent(Agent::Run(run)) = parsed.command else {
             panic!("the command line named an agent run");
         };

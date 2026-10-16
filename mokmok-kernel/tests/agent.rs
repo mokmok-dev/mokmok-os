@@ -16,7 +16,7 @@ mod tests {
     };
     use mokmok_artifact::{BlobStore, ContentHash};
     use mokmok_kernel::agent::{Driver, Ledger};
-    use mokmok_kernel::{Config, Db, Run, uuid_of};
+    use mokmok_kernel::{Config, Db, ProcessEnvironment, Run, uuid_of};
     use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Phase, TurnOutcome};
     use serde_json::json;
@@ -652,7 +652,8 @@ mod tests {
             script_path.display().to_string(),
         ]);
         let parsed = mokmok_kernel::Args::try_parse_from(&args).expect("the command line parses");
-        let config = Config::resolve(&parsed, None).expect("the configuration resolves");
+        let config = Config::resolve(&parsed, None, &ProcessEnvironment::default())
+            .expect("the configuration resolves");
         let mokmok_kernel::Command::Agent(mokmok_kernel::Agent::Run(run)) = parsed.command else {
             panic!("the command line named an agent run");
         };
