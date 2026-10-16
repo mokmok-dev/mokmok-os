@@ -597,6 +597,24 @@ mod tests {
             listing(5, 0, &goals).body(0).is_empty(),
             "a pane with no room shows no row",
         );
+
+        // An even pane height, where the rows kept above the cursor are not the rows between the top
+        // of the window and the cursor.
+        let even = listing(6, 3, &[None; 6]).body(4);
+
+        assert_eq!(even.len(), 4);
+        assert_eq!(
+            even.iter()
+                .map(|row| row.chars().next().expect("a marker"))
+                .collect::<Vec<_>>(),
+            vec![' ', ' ', '>', ' '],
+            "a pane four rows tall keeps two rows above the cursor",
+        );
+        assert!(
+            even[0].contains("00000000-0000-0000-0000-000000000002"),
+            "the window starts two rows above the cursor's own row: {:?}",
+            even[0],
+        );
     }
 
     #[test]

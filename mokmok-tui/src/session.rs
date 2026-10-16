@@ -179,8 +179,10 @@ mod tests {
     use mokmok_protocol::Moment;
     use mokmok_state_machine::{Fact, TurnFact, TurnNumber};
 
-    use super::Session;
-    use crate::port::Engine;
+    use super::{Session, Sessions};
+    use crate::port::{Engine, Listing, Roster};
+    use mokmok_protocol::SessionID;
+    use mokmok_state_machine::Phase;
 
     const SESSION: &str = "018f2f1e-0000-7000-8000-000000000000";
 
@@ -256,6 +258,165 @@ mod tests {
         };
 
         (config, run)
+    }
+
+    #[test]
+    fn a_session_the_log_holds_no_task_for_is_resumed_under_the_command_line_s_own_goal() {
+        let scratch = Scratch::new("resume-bare");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, b"[]").expect("the script is written");
+        let (config, run) = config_and_run(&scratch, &script);
+        let checkout = scratch.0.join("checkout");
+        let sessions = Sessions::new(config, run, Moment::from_millis(0));
+
+        // A stream this build reads no task from, which is what a session the log holds only session
+        // facts for looks like to a chooser.
+        let listing = Listing {
+            session: SessionID::from_uuid(uuid::Uuid::from_u128(0x11)),
+            phase: Phase::Unopened,
+            goal: None,
+            checkout: None,
+        };
+        let resumed = sessions.resume(&listing).expect("the session opens");
+        let task = resumed
+            .fold()
+            .expect("the fold reads")
+            .task
+            .expect("the run seeds the task the log does not hold");
+
+        assert_eq!(task.goal, "hold a conversation");
+        assert_eq!(task.setting.checkout, checkout);
+    }
+
+    #[test]
+    fn a_session_that_recorded_a_goal_is_resumed_under_that_goal_and_checkout() {
+        let scratch = Scratch::new("resume-recorded");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, b"[]").expect("the script is written");
+        let (config, run) = config_and_run(&scratch, &script);
+        let sessions = Sessions::new(config, run, Moment::from_millis(0));
+
+        let listing = Listing {
+            session: SessionID::from_uuid(uuid::Uuid::from_u128(0x12)),
+            phase: Phase::Accepting,
+            goal: Some("count the quokkas".to_owned()),
+            checkout: Some(PathBuf::from("/elsewhere")),
+        };
+        let resumed = sessions.resume(&listing).expect("the session opens");
+        let task = resumed
+            .fold()
+            .expect("the fold reads")
+            .task
+            .expect("the run seeds the task the log does not hold");
+
+        assert_eq!(task.goal, "count the quokkas");
+        assert_eq!(task.setting.checkout, PathBuf::from("/elsewhere"));
+    }
+
+    #[test]
+    fn a_created_session_runs_under_the_goal_the_human_typed() {
+        let scratch = Scratch::new("create");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, b"[]").expect("the script is written");
+        let (config, run) = config_and_run(&scratch, &script);
+        let checkout = scratch.0.join("checkout");
+        let sessions = Sessions::new(config, run, Moment::from_millis(0));
+
+        let created = sessions
+            .create("count the quokkas")
+            .expect("the session opens");
+        let task = created
+            .fold()
+            .expect("the fold reads")
+            .task
+            .expect("the run seeds the task the log does not hold");
+
+        assert_eq!(task.goal, "count the quokkas");
+        assert_eq!(
+            task.setting.checkout, checkout,
+            "a session started here runs in the checkout the command line named",
+        );
+    }
+
+    #[test]
+    fn a_created_session_is_one_nothing_has_opened_yet() {
+        let scratch = Scratch::new("create-identity");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, b"[]").expect("the script is written");
+        let (config, run) = config_and_run(&scratch, &script);
+        let sessions = Sessions::new(config, run, Moment::from_millis(0));
+
+        let first = sessions.create("one").expect("the session opens");
+        let second = sessions.create("two").expect("the session opens");
+
+        assert_ne!(
+            first.session(),
+            second.session(),
+            "two sessions minted from one clock reading are two identities",
+        );
+        assert_eq!(
+            second
+                .fold()
+                .expect("the fold reads")
+                .task
+                .map(|task| task.goal),
+            Some("two".to_owned()),
+            "each session carries the goal it was named with",
+        );
+    }
+
+    #[test]
+    fn a_listed_session_maps_onto_what_the_kernel_holds_of_it() {
+        let scratch = Scratch::new("listed");
+        let script = scratch.0.join("script.json");
+        let answers = serde_json::to_vec(&serde_json::json!([
+            {"action": "final", "say": "the reply"}
+        ]))
+        .expect("the script encodes");
+        std::fs::write(&script, answers).expect("the script is written");
+        let (config, run) = config_and_run(&scratch, &script);
+        let checkout = scratch.0.join("checkout");
+        let id = SessionID::from_uuid(
+            SESSION
+                .parse::<uuid::Uuid>()
+                .expect("the session is a uuid"),
+        );
+        let sessions = Sessions::new(config, run, Moment::from_millis(0));
+
+        assert_eq!(
+            sessions.listed().expect("the log is read"),
+            Vec::new(),
+            "a log nothing has committed to holds no session",
+        );
+
+        // One turn, so the session has a task record and a settled answer the listing reads.
+        let mut engine = sessions.start().expect("the session opens");
+        engine.speak("hello").expect("the session takes the line");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            for _ in 0..8 {
+                match engine.step().await.expect("the step runs") {
+                    mokmok_agent_runtime::Progress::Awaiting
+                    | mokmok_agent_runtime::Progress::Terminal(_) => break,
+                    _ => {},
+                }
+            }
+        });
+
+        let listed = sessions.listed().expect("the log is read");
+
+        assert_eq!(
+            listed,
+            vec![Listing {
+                session: id,
+                phase: Phase::Accepting,
+                goal: Some("hold a conversation".to_owned()),
+                checkout: Some(checkout),
+            }],
+        );
     }
 
     #[test]

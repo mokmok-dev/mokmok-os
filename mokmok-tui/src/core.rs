@@ -1328,6 +1328,17 @@ mod tests {
             "the rotation starts at the session on screen",
         );
 
+        // Three sessions, with the one that can move furthest around the ring: stepping forwards from
+        // the focus reaches it, and stepping backwards from the focus has to pass the focus.
+        let mut three = holding(vec![waiting(), waiting(), waiting()]);
+        three.focus = 1;
+        three.held[2].engine = Fake::new(others(4), &in_flight(turn_id(others(4), 1)));
+        assert_eq!(
+            three.next_to_step(&folds_of(&three)),
+            Some(2),
+            "the rotation walks forward from the session on screen",
+        );
+
         let quiet = holding(vec![waiting(), waiting()]);
         assert_eq!(
             quiet.next_to_step(&folds_of(&quiet)),
@@ -1688,6 +1699,20 @@ mod tests {
             Some(Pane::New {
                 goal: format!("{}a", "x".repeat(MAX_SPEECH_BYTES - 1))
             }),
+        );
+
+        // Two bytes of room left, so a two-byte character still fits whole.
+        let mut exact = holding(vec![Fake::awaiting()]);
+        exact.pane = Some(Pane::New {
+            goal: "x".repeat(MAX_SPEECH_BYTES - 2),
+        });
+        assert_eq!(react(&mut exact, Key::Char('é')), Reaction::Idle);
+        assert_eq!(
+            exact.pane,
+            Some(Pane::New {
+                goal: format!("{}é", "x".repeat(MAX_SPEECH_BYTES - 2))
+            }),
+            "a character that fits in the room left is taken",
         );
     }
 

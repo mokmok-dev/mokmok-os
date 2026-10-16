@@ -244,10 +244,9 @@ mod tests {
         );
     }
 
-    /// The keys a real terminal delivers for the pane keys, for Enter, and for the interrupt.
+    /// The keys a real terminal delivers for the pane keys, and for the interrupt.
     const CTRL_N: &[u8] = b"\x0e";
     const CTRL_O: &[u8] = b"\x0f";
-    const CARRIAGE_RETURN: &[u8] = b"\r";
 
     /// The real adapter, reached the only way a test can reach it: as a child with the pty's slave
     /// on its own stdin and stdout. In this process the adapter is out of reach, because
@@ -391,10 +390,31 @@ mod tests {
             transcript.escape_ascii(),
         );
 
-        master.write_all(b"hi").expect("two characters are typed");
+        // One write, so the key after the line is already in the terminal's queue while the turn is
+        // in flight: the loop has to ask what the terminal holds rather than wait on it, or the key
+        // is read only once nothing can move and the answer overtakes it. The carriage return is the
+        // Enter a terminal in raw mode delivers.
         master
-            .write_all(CARRIAGE_RETURN)
-            .expect("the line is submitted");
+            .write_all(b"hi\rz")
+            .expect("a line, and one more key");
+        assert!(
+            await_bytes(
+                &master,
+                &mut transcript,
+                &[b"\x1b[9;3Hz", b"done"],
+                deadline
+            ),
+            "the key and the answer are both drawn: {}",
+            transcript.escape_ascii(),
+        );
+
+        let typed_at = found(&transcript, b"\x1b[9;3Hz", 0).expect("the key is drawn");
+        let answered_at = found(&transcript, b"done", 0).expect("the answer is drawn");
+        assert!(
+            typed_at < answered_at,
+            "a key pressed while the turn is in flight is answered before the next step: {}",
+            transcript.escape_ascii(),
+        );
         assert!(
             await_bytes(
                 &master,
@@ -403,11 +423,6 @@ mod tests {
                 deadline
             ),
             "a frame drawn while the turn is in flight: {}",
-            transcript.escape_ascii(),
-        );
-        assert!(
-            await_bytes(&master, &mut transcript, &[b"done"], deadline),
-            "the answer is drawn, and the step that produced it ran with no key pending: {}",
             transcript.escape_ascii(),
         );
 
