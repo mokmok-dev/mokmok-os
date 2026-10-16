@@ -892,10 +892,10 @@ mod tests {
     use uuid::Uuid;
 
     /// The measured tool-call response, kept as the fixture it is rather than re-encoded.
-    const TOOL_CALLS: &str = include_str!("../tests/fixtures/probe-tool-calls.json");
+    const TOOL_CALLS: &str = include_str!("../testdata/probe-tool-calls.json");
 
     /// The measured tool-result response, the same way.
-    const TOOL_RESULT: &str = include_str!("../tests/fixtures/probe-tool-result.json");
+    const TOOL_RESULT: &str = include_str!("../testdata/probe-tool-result.json");
 
     /// A directory this test's own, left behind for the caller to remove.
     fn scratch(name: &str) -> PathBuf {
