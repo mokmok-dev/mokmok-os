@@ -24,8 +24,10 @@
 # Copy the example to /tmp first: /home/<user> is 0700, and the script's grants have to reach it.
 #
 # Leave with Ctrl-C. The session is left open and resumable, and the whole conversation is printed
-# as plain text once the terminal is handed back. The command the script prints on exit reads it
-# back later with `mokmokd status`.
+# as plain text once the terminal is handed back. Ctrl-N starts a second session with a goal of your
+# own, Tab shows the next session this process holds, and Ctrl-O lists every session the log holds so
+# you can switch to one of them. The command the script prints on exit reads it back later with
+# `mokmokd status`.
 
 set -eu
 
