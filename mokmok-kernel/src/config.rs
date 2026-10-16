@@ -478,7 +478,7 @@ impl Config {
                         return Err(ConfigError::NoModel);
                     }
                     if provider.credential.is_none() {
-                        return Err(ConfigError::NoCredentialFile);
+                        return Err(ConfigError::NoCredential);
                     }
                 },
             }
@@ -1092,7 +1092,7 @@ pub enum ConfigError {
     #[error("no --model is named, and the ollama provider has nothing to ask")]
     NoModel,
     #[error("provider = \"ollama\" needs a credential, and no --env-key or env_key names one")]
-    NoCredentialFile,
+    NoCredential,
     #[error("--config names {path}, and no file is there to read")]
     ConfigFileMissing { path: PathBuf },
     #[error("the configuration file {path} could not be read: {source}")]
@@ -1668,7 +1668,7 @@ mod tests {
                 None,
                 &ProcessEnvironment::default()
             ),
-            Err(ConfigError::NoCredentialFile),
+            Err(ConfigError::NoCredential),
         ));
     }
 

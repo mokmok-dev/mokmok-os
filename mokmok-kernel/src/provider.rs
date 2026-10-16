@@ -1332,8 +1332,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// A provider configuration over `directory`, pointing at `endpoint`, with the credential
-    /// resolution already answered for the variable `--env-key` names.
+    /// A provider configuration over `directory`, pointing at `endpoint`, with a hardcoded
+    /// credential.
     fn provider_config(
         directory: &Path,
         endpoint: &str,

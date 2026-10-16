@@ -515,7 +515,7 @@ fn model(
                 .provider
                 .credential
                 .clone()
-                .ok_or(ConfigError::NoCredentialFile)?;
+                .ok_or(ConfigError::NoCredential)?;
             let provider = crate::provider::Ollama::open(config, credential, session)
                 .map_err(|error| Error::Agent(AgentError::Provider(Box::new(error))))?;
 
