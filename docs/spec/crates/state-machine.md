@@ -50,11 +50,11 @@ file, no table, and no clock.
   before `TurnOpened` is refused (`src/turn.rs:164`).
 - A closed session admits only a redelivery of a fact it already holds
   (`src/session.rs:182`), and a launch after the close is `SessionOver` (`src/session.rs:222`).
-- A resolution is applied once. A repeated settlement with the same answer is `Duplicate`, and a
-  different answer is `ResolutionConflict` (`src/session.rs:247`). A second `ResultApplied` is
-  `Duplicate` (`src/session.rs:267`).
-- `Resolution::TimedOut` requires a bounded deadline (`src/session.rs:249`), and a cancellation
-  outside the draining phase is `UnrequestedCancel` (`src/session.rs:248`).
+- A resolution is applied once. A repeated settlement with the same answer is `Duplicate`
+  (`src/session.rs:253`), and a different answer is `ResolutionConflict` (`src/session.rs:255`). A
+  second `ResultApplied` is `Duplicate` (`src/session.rs:275`).
+- `Resolution::TimedOut` requires a bounded deadline (`src/session.rs:259`), and a cancellation
+  outside the draining phase is `UnrequestedCancel` (`src/session.rs:258`).
 - Replay stops at the first refusal and names the offset that caused it (`src/session.rs:121`).
 - A tool call before the model answers is `ModelNotAnswered` (`src/turn.rs:235`), an answer with no
   request is `UnrequestedAnswer` (`src/turn.rs:211`), a settled turn refuses new facts
