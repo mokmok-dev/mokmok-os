@@ -18,8 +18,9 @@ use mokmok_agent_runtime::{
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_patch::{ApplyError, Label, ParseError, Patch, Placed};
 use mokmok_protocol::Moment;
-use nix::fcntl::{OFlag, openat};
+use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::Mode;
+use nix::unistd::linkat;
 
 use crate::authority::Authority;
 use crate::config::{Config, CrashPoint};
@@ -31,7 +32,13 @@ const MAX_EDIT_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// The adapter that turns one patch into one atomic file write.
 pub struct Editor {
     config: Config,
+    /// The resolved checkout path. Every open, read, and write uses this so no symlink is followed
+    /// during I/O.
     checkout: PathBuf,
+    /// The checkout path as the operator wrote it. The authority compares this literal grant path
+    /// to the literal `--allow-write` roots, so a checkout reached through a symlink is still
+    /// covered by a grant that names the symlink.
+    checkout_literal: PathBuf,
     store: BlobStore,
     at: Moment,
 }
@@ -51,6 +58,7 @@ impl Editor {
         Ok(Self {
             config: config.clone(),
             checkout: mokmok_sandbox::resolve(checkout)?,
+            checkout_literal: checkout.to_path_buf(),
             store: BlobStore::open(&config.artifacts)?,
             at,
         })
@@ -80,10 +88,16 @@ impl Editor {
                 "the source is absent, so a hunk with an old side has nothing to match".to_owned()
             },
             PatchError::Apply(ApplyError::ZeroStart { hunk }) => {
-                format!("hunk {hunk} starts at 0 in a file that exists")
+                format!(
+                    "hunk {} starts at 0 in a file that exists",
+                    hunk.saturating_add(1)
+                )
             },
             PatchError::Apply(ApplyError::NotFound { hunk }) => {
-                format!("hunk {hunk} does not match the file from its stated line forward")
+                format!(
+                    "hunk {} does not match the file from its stated line forward",
+                    hunk.saturating_add(1)
+                )
             },
             PatchError::TooManyFiles => {
                 "the patch must name exactly one file, and it named more than one".to_owned()
@@ -102,6 +116,29 @@ impl Editor {
 
         EditReport {
             outcome,
+            observation,
+        }
+    }
+
+    /// Builds the report an applied edit records, with an optional directory-sync warning.
+    fn applied_report(
+        ready: &Ready,
+        unsynced: bool,
+    ) -> EditReport {
+        let mut observation = edit::observation(
+            &ready.relative,
+            &ready.before,
+            &ready.after,
+            &EditOutcome::Applied,
+            &ready.placement,
+        );
+        if unsynced {
+            observation
+                .push_str("\nthe directory could not be synced, so a crash may lose the edit");
+        }
+
+        EditReport {
+            outcome: EditOutcome::Applied,
             observation,
         }
     }
@@ -164,22 +201,25 @@ impl EditorPort for Editor {
             Err(error) => {
                 return Ok(Plan::Refused(open_reason(
                     &error,
+                    &relative,
                     parent,
                     &format!("{relative} could not be opened"),
                 )));
             },
         };
 
-        if let Err(denial) = authority.may_write_at(&target, self.at) {
+        let literal_target = self.checkout_literal.join(&relative);
+        if let Err(denial) = authority.may_write_at(&literal_target, self.at) {
             return Ok(Plan::Refused(format!(
                 "{relative} is not under a directory the operator granted for writing, so nothing \
                  was written: {denial}"
             )));
         }
 
+        let create = matches!(section.source, Label::Absent);
         let (before_bytes, _mode) = match read_target(&parent_fd, name, &relative) {
             Ok(Some(value)) => {
-                if matches!(section.source, Label::Absent) {
+                if create {
                     return Ok(Plan::Refused(format!(
                         "{relative} already exists; patch it instead of creating it"
                     )));
@@ -187,7 +227,7 @@ impl EditorPort for Editor {
                 value
             },
             Ok(None) => {
-                if !matches!(section.source, Label::Absent) {
+                if !create {
                     return Ok(Plan::Refused(format!(
                         "{relative} does not exist; create it with a command before patching it"
                     )));
@@ -228,12 +268,17 @@ impl EditorPort for Editor {
         );
 
         if let Some(expected) = &call.expect {
-            let actual = before_hash.to_string();
-            if actual != *expected {
+            if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Ok(Plan::Refused(format!(
-                    "{relative} is {} bytes (sha256 {actual}), not the {}-byte file (sha256 \
-                     {expected}) the call expected",
-                    before.bytes, before.bytes,
+                    "{relative}: expect is not a 64-character hexadecimal sha256 hash"
+                )));
+            }
+            let actual = before_hash.to_string();
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Ok(Plan::Refused(format!(
+                    "{relative} is {} bytes (sha256 {actual}), not the file (sha256 {expected}) \
+                     the call expected",
+                    before.bytes,
                 )));
             }
         }
@@ -246,6 +291,7 @@ impl EditorPort for Editor {
             after,
             bytes: applied.bytes,
             placement,
+            create,
         }))
     }
 
@@ -274,56 +320,67 @@ impl EditorPort for Editor {
             Err(error) => {
                 return Ok(Self::refused_report(
                     &ready.relative,
-                    open_reason(&error, parent, "the parent directory could not be opened"),
-                ));
-            },
-        };
-
-        let (current_bytes, mode) = match read_target(&parent_fd, name, &ready.relative) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                return Ok(Self::refused_report(
-                    &ready.relative,
-                    "the file disappeared before the edit could be written".to_owned(),
-                ));
-            },
-            Err(reason) => return Ok(Self::refused_report(&ready.relative, reason)),
-        };
-
-        let current_hash = ContentHash::of(&current_bytes);
-        if current_hash.to_string() != ready.before.hash {
-            let found = artifact_ref(
-                &current_hash,
-                u64::try_from(current_bytes.len()).unwrap_or(u64::MAX),
-            );
-            let outcome = EditOutcome::Stale { found };
-            let observation =
-                edit::observation(&ready.relative, &ready.before, &ready.after, &outcome, "");
-            return Ok(EditReport {
-                outcome,
-                observation,
-            });
-        }
-
-        let tmp_name = format!(".mokmok-edit-{}-{}", std::process::id(), ready.after.hash);
-        match write_atomic(&parent_fd, name, &tmp_name, &ready.bytes, mode) {
-            Ok(()) => {
-                crate::config::crash(&self.config, CrashPoint::AfterDispatch);
-                Ok(EditReport {
-                    outcome: EditOutcome::Applied,
-                    observation: edit::observation(
+                    open_reason(
+                        &error,
                         &ready.relative,
-                        &ready.before,
-                        &ready.after,
-                        &EditOutcome::Applied,
-                        &ready.placement,
+                        parent,
+                        "the parent directory could not be opened",
                     ),
-                })
+                ));
             },
-            Err(error) => Ok(Self::refused_report(
-                &ready.relative,
-                format!("the write did not land ({error}), so nothing was written"),
-            )),
+        };
+
+        let mode = if ready.create {
+            DEFAULT_MODE
+        } else {
+            let (current_bytes, mode) = match read_target(&parent_fd, name, &ready.relative) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return Ok(Self::refused_report(
+                        &ready.relative,
+                        "the file disappeared before the edit could be written".to_owned(),
+                    ));
+                },
+                Err(reason) => return Ok(Self::refused_report(&ready.relative, reason)),
+            };
+
+            let current_hash = ContentHash::of(&current_bytes);
+            if current_hash.to_string() != ready.before.hash {
+                let found = artifact_ref(
+                    &current_hash,
+                    u64::try_from(current_bytes.len()).unwrap_or(u64::MAX),
+                );
+                let outcome = EditOutcome::Stale { found };
+                let observation =
+                    edit::observation(&ready.relative, &ready.before, &ready.after, &outcome, "");
+                return Ok(EditReport {
+                    outcome,
+                    observation,
+                });
+            }
+            mode
+        };
+
+        match write_atomic(&parent_fd, name, &ready.bytes, mode, ready.create) {
+            Ok(WriteResult::Applied) => {
+                crate::config::crash(&self.config, CrashPoint::AfterDispatch);
+                Ok(Self::applied_report(ready, false))
+            },
+            Ok(WriteResult::Unsynced) => {
+                crate::config::crash(&self.config, CrashPoint::AfterDispatch);
+                Ok(Self::applied_report(ready, true))
+            },
+            Err(error) => {
+                let reason = if ready.create && error.kind() == io::ErrorKind::AlreadyExists {
+                    format!(
+                        "{relative} already exists; patch it instead of creating it",
+                        relative = ready.relative,
+                    )
+                } else {
+                    format!("the write did not land ({error}), so nothing was written")
+                };
+                Ok(Self::refused_report(&ready.relative, reason))
+            },
         }
     }
 }
@@ -384,6 +441,7 @@ fn render_placement(hunks: &[Placed]) -> String {
 
 fn open_reason(
     error: &io::Error,
+    relative: &str,
     path: &Path,
     fallback: &str,
 ) -> String {
@@ -393,7 +451,10 @@ fn open_reason(
             path.display()
         )
     } else if error.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32) {
-        "the target is a symbolic link, and this tool never follows one".to_owned()
+        format!(
+            "a directory on the way to {relative} is a symbolic link, and this tool never follows \
+             one"
+        )
     } else {
         format!("{fallback}: {error}")
     }
@@ -443,17 +504,26 @@ fn read_target(
     Ok(Some((bytes, mode)))
 }
 
-fn write_atomic(
+/// Whether the atomic write succeeded, or succeeded but the directory could not be synced.
+#[derive(Debug)]
+pub enum WriteResult {
+    Applied,
+    Unsynced,
+}
+
+pub fn write_atomic(
     parent_fd: &OwnedFd,
     name: &OsStr,
-    tmp_name: &str,
     bytes: &[u8],
     mode: u32,
-) -> Result<(), io::Error> {
+    create: bool,
+) -> Result<WriteResult, io::Error> {
+    let tmp_name = format!(".mokmok-edit-{}", uuid::Uuid::now_v7());
+    let tmp_path = tmp_name.as_str();
     let mode = Mode::from_bits_truncate(mode & 0o777);
     let tmp = match openat(
         parent_fd,
-        tmp_name,
+        tmp_path,
         OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_NOFOLLOW,
         mode,
     ) {
@@ -463,19 +533,53 @@ fn write_atomic(
 
     let mut tmp = File::from(tmp);
     if let Err(error) = tmp.write_all(bytes) {
-        let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
+        let _ = nix::unistd::unlinkat(parent_fd, tmp_path, nix::unistd::UnlinkatFlags::NoRemoveDir);
         return Err(error);
     }
     if let Err(error) = tmp.sync_all() {
-        let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
+        let _ = nix::unistd::unlinkat(parent_fd, tmp_path, nix::unistd::UnlinkatFlags::NoRemoveDir);
         return Err(error);
     }
     drop(tmp);
 
-    nix::fcntl::renameat(parent_fd, tmp_name, parent_fd, name).map_err(io::Error::from)?;
-    nix::unistd::fsync(parent_fd).map_err(io::Error::from)?;
+    if create {
+        match linkat(parent_fd, tmp_path, parent_fd, name, AtFlags::empty()) {
+            Ok(()) => {
+                let _ = nix::unistd::unlinkat(
+                    parent_fd,
+                    tmp_path,
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+            },
+            Err(nix::errno::Errno::EEXIST) => {
+                let _ = nix::unistd::unlinkat(
+                    parent_fd,
+                    tmp_path,
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the file appeared while the edit was being written",
+                ));
+            },
+            Err(error) => {
+                let _ = nix::unistd::unlinkat(
+                    parent_fd,
+                    tmp_path,
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+                return Err(io::Error::from(error));
+            },
+        }
+    } else if let Err(error) = nix::fcntl::renameat(parent_fd, tmp_path, parent_fd, name) {
+        let _ = nix::unistd::unlinkat(parent_fd, tmp_path, nix::unistd::UnlinkatFlags::NoRemoveDir);
+        return Err(io::Error::from(error));
+    }
 
-    Ok(())
+    match nix::unistd::fsync(parent_fd) {
+        Ok(()) => Ok(WriteResult::Applied),
+        Err(_) => Ok(WriteResult::Unsynced),
+    }
 }
 
 impl From<Error> for mokmok_agent_runtime::Error {
@@ -715,6 +819,70 @@ mod tests {
     }
 
     #[test]
+    fn plan_refuses_an_invalid_expect_format() {
+        let scratch = Scratch::new("expect-format");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
+        call.expect = Some("not-a-hash".to_owned());
+
+        let plan = editor.plan(&call).unwrap();
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(
+            reason.contains("64-character hexadecimal sha256 hash"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn plan_refuses_an_expect_that_is_long_but_not_hex() {
+        let scratch = Scratch::new("expect-hex");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
+        // 64 characters, but the last one is not hexadecimal.
+        let mut almost = "0".repeat(63);
+        almost.push('g');
+        call.expect = Some(almost);
+
+        let plan = editor.plan(&call).unwrap();
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(
+            reason.contains("64-character hexadecimal sha256 hash"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn plan_allows_an_uppercase_expect_match() {
+        let scratch = Scratch::new("expect-upper");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
+        let lower = ContentHash::of(b"one\n").to_string();
+        call.expect = Some(lower.to_ascii_uppercase());
+
+        let plan = editor.plan(&call).unwrap();
+        assert!(
+            matches!(plan, Plan::Ready(_)),
+            "uppercase expect must match: {plan:?}"
+        );
+    }
+
+    #[test]
     fn plan_refuses_a_non_utf8_file() {
         let scratch = Scratch::new("binary");
         let checkout = checkout(&scratch);
@@ -751,7 +919,10 @@ mod tests {
         let Plan::Refused(reason) = plan else {
             panic!("expected Refused");
         };
-        assert!(reason.contains("hunk"), "{reason}");
+        assert!(
+            reason.contains("hunk 1"),
+            "refusal must number hunks from 1: {reason}"
+        );
     }
 
     #[test]
@@ -772,7 +943,82 @@ mod tests {
         let Plan::Refused(reason) = plan else {
             panic!("expected Refused");
         };
-        assert!(reason.contains("symbolic link"), "{reason}");
+        assert!(
+            reason.contains("symbolic link") && !reason.contains("directory on the way"),
+            "target refusal must name the file itself: {reason}"
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_symlinked_parent_component() {
+        let scratch = Scratch::new("symlink-parent");
+        let checkout = checkout(&scratch);
+        std::fs::create_dir(checkout.join("sub")).unwrap();
+        std::fs::write(checkout.join("sub").join("y.rs"), "one\n").unwrap();
+        std::os::unix::fs::symlink(checkout.join("sub"), checkout.join("link")).unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/link/y.rs\n+++ b/link/y.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(
+            reason.contains("directory on the way"),
+            "parent symlink refusal must name the component: {reason}"
+        );
+    }
+
+    #[test]
+    fn plan_applies_through_a_symlinked_grant() {
+        let scratch = Scratch::new("symlink-grant");
+        let real = scratch.0.join("real");
+        let base = scratch.0.join("base");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(real.join("x.rs"), "one\n").unwrap();
+        std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+
+        // The operator grants the path through the symlink, and the checkout is named the same way.
+        let grant = base.join("link");
+        let config = config(&scratch.0, std::slice::from_ref(&grant), &[]);
+        let editor = Editor::new(&config, &grant, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+
+        assert!(
+            matches!(plan, Plan::Ready(_)),
+            "a symlinked grant must cover its checkout: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_path_under_no_grant() {
+        let scratch = Scratch::new("no-grant");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, &[], &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("granted"), "{reason}");
     }
 
     #[test]
@@ -820,6 +1066,7 @@ mod tests {
     fn open_reason_renders_exact_sentences() {
         let not_found = open_reason(
             &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            "src/x.rs",
             std::path::Path::new("/tmp/missing"),
             "the parent directory could not be opened",
         );
@@ -830,16 +1077,20 @@ mod tests {
 
         let symlink = open_reason(
             &std::io::Error::from_raw_os_error(nix::errno::Errno::ELOOP as i32),
+            "src/x.rs",
             std::path::Path::new("/tmp/link"),
             "the parent directory could not be opened",
         );
         assert_eq!(
             symlink,
-            "the target is a symbolic link, and this tool never follows one".to_owned(),
+            "a directory on the way to src/x.rs is a symbolic link, and this tool never follows \
+             one"
+            .to_owned(),
         );
 
         let other = open_reason(
             &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            "src/x.rs",
             std::path::Path::new("/tmp/dir"),
             "/tmp/dir could not be opened",
         );
@@ -921,5 +1172,203 @@ mod tests {
         let report = editor.commit(&ready).unwrap();
         assert!(matches!(report.outcome, EditOutcome::Stale { .. }));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed\n");
+    }
+
+    #[test]
+    fn commit_creates_a_file_that_does_not_exist() {
+        let scratch = Scratch::new("commit-create");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- /dev/null\n+++ b/x.rs\n@@ -0,0 +1,1 @@\n+new\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+
+        let report = editor.commit(&ready).unwrap();
+        assert!(
+            matches!(report.outcome, EditOutcome::Applied),
+            "{}",
+            report.observation
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, DEFAULT_MODE & 0o777, "mode was {mode:o}");
+        assert_eq!(temp_count(&checkout), 0, "no temp should survive a create");
+    }
+
+    #[test]
+    fn commit_refuses_create_when_the_file_appears_and_leaves_no_temp() {
+        let scratch = Scratch::new("create-race");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- /dev/null\n+++ b/x.rs\n@@ -0,0 +1,1 @@\n+new\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+
+        std::fs::write(&target, "raced\n").unwrap();
+        let report = editor.commit(&ready).unwrap();
+        assert!(
+            matches!(report.outcome, EditOutcome::Refused { .. }),
+            "report was not Refused: {}",
+            report.observation
+        );
+        assert!(
+            report.observation.contains("already exists") || report.observation.contains("create"),
+            "refusal must name the race: {}",
+            report.observation
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "raced\n");
+        assert_eq!(
+            temp_count(&checkout),
+            0,
+            "no temp should survive a refused create"
+        );
+    }
+
+    #[test]
+    fn commit_create_reports_a_generic_reason_when_the_write_fails_for_a_non_race() {
+        let scratch = Scratch::new("create-perm");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- /dev/null\n+++ b/x.rs\n@@ -0,0 +1,1 @@\n+new\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+
+        // Removing write permission makes the atomic write fail with a permission error, not a
+        // race, so the refusal must not claim the file already exists.
+        std::fs::set_permissions(&checkout, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let report = editor.commit(&ready).unwrap();
+        std::fs::set_permissions(&checkout, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(report.outcome, EditOutcome::Refused { .. }),
+            "report was not Refused: {}",
+            report.observation
+        );
+        assert!(
+            report.observation.contains("did not land"),
+            "refusal must name the write failure: {}",
+            report.observation
+        );
+        assert!(
+            !report.observation.contains("already exists"),
+            "refusal must not claim a race: {}",
+            report.observation
+        );
+        assert!(
+            !target.exists(),
+            "no file should have been created: {:?}",
+            std::fs::read_dir(&checkout)
+        );
+    }
+
+    #[test]
+    fn write_atomic_unlinks_temp_when_rename_fails() {
+        let scratch = Scratch::new("rename-fail");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        std::fs::create_dir(&target).unwrap();
+        let parent_fd = mokmok_sandbox::open_resolved_dir(&checkout).unwrap();
+
+        let result = write_atomic(
+            &parent_fd,
+            target.file_name().unwrap(),
+            b"post",
+            0o644,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "rename onto a directory must fail: {result:?}"
+        );
+        assert_eq!(
+            temp_count(&checkout),
+            0,
+            "no temp should survive a failed rename"
+        );
+    }
+
+    #[test]
+    fn write_atomic_creates_a_file_and_unlinks_the_temp() {
+        let scratch = Scratch::new("wa-create");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        let parent_fd = mokmok_sandbox::open_resolved_dir(&checkout).unwrap();
+
+        let result = write_atomic(
+            &parent_fd,
+            target.file_name().unwrap(),
+            b"post",
+            0o644,
+            true,
+        );
+        assert!(matches!(result, Ok(WriteResult::Applied)), "{result:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "post");
+        assert_eq!(temp_count(&checkout), 0, "no temp should survive a create");
+    }
+
+    #[test]
+    fn write_atomic_create_refuses_eexist_and_unlinks_temp() {
+        let scratch = Scratch::new("wa-create-eexist");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        std::fs::write(&target, "exists\n").unwrap();
+        let parent_fd = mokmok_sandbox::open_resolved_dir(&checkout).unwrap();
+
+        let result = write_atomic(
+            &parent_fd,
+            target.file_name().unwrap(),
+            b"post",
+            0o644,
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "linkat onto an existing file must fail: {result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "exists\n");
+        assert_eq!(
+            temp_count(&checkout),
+            0,
+            "no temp should survive a refused create"
+        );
+    }
+
+    #[cfg(test)]
+    fn temp_count(checkout: &Path) -> usize {
+        std::fs::read_dir(checkout).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".mokmok-edit-")
+                })
+                .count()
+        })
     }
 }

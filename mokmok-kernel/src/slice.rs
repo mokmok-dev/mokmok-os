@@ -451,12 +451,17 @@ fn transcript_line(
             find.report.observation,
         )),
         mokmok_agent_runtime::Record::EditIntent(edit) => Some(format!(
-            "edit turn={} number={} execution={} patch={:?} relative={:?}",
+            "edit turn={} number={} execution={} patch={:?} relative={:?} before={} bytes \
+             (sha256 {}) after={} bytes (sha256 {})",
             edit.turn.as_uuid(),
             number(edit.turn),
             edit.execution.as_uuid(),
             edit.patch,
             edit.relative,
+            edit.before.bytes,
+            edit.before.hash,
+            edit.after.bytes,
+            edit.after.hash,
         )),
         mokmok_agent_runtime::Record::EditOutcome(edit) => Some(format!(
             "edit turn={} number={} execution={} outcome={:?} observation={:?}",
@@ -636,6 +641,65 @@ mod tests {
             first.as_uuid(),
             "the command line reads the identity back as a session",
         );
+    }
+
+    #[test]
+    fn transcript_line_for_edit_intent_names_both_hashes() {
+        use super::transcript_line;
+        use crate::db::Db;
+        use mokmok_agent_runtime::{ArtifactRef, EditIntentRecord};
+        use mokmok_protocol::TurnID;
+
+        let data =
+            std::env::temp_dir().join(format!("mokmok-kernel-intent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        let mut db = Db::open(&data.join("events.sqlite")).unwrap();
+        let session = SessionID::from_uuid(Uuid::from_u128(7));
+        let turn = TurnID::from_uuid(Uuid::from_u128(8));
+        let execution = mokmok_protocol::ExecutionID::from_uuid(Uuid::from_u128(9));
+        db.append(
+            CommandId::from_uuid(Uuid::from_u128(10)),
+            Db::stream(session),
+            mokmok_event_store::Expected::New,
+            &[crate::db::Entry::Session(
+                mokmok_state_machine::Fact::SessionOpened,
+            )],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let intent = mokmok_agent_runtime::Record::EditIntent(EditIntentRecord {
+            turn,
+            execution,
+            patch: String::new(),
+            expect: None,
+            relative: "src/x.rs".to_owned(),
+            before: ArtifactRef {
+                hash: "01".to_owned(),
+                bytes: 1,
+                truncated: false,
+            },
+            after: ArtifactRef {
+                hash: "02".to_owned(),
+                bytes: 2,
+                truncated: false,
+            },
+            placement: String::new(),
+            create: false,
+        });
+        let line = transcript_line(
+            &intent,
+            &std::collections::BTreeMap::from([(
+                turn,
+                Some(mokmok_state_machine::TurnNumber::new(1)),
+            )]),
+        )
+        .expect("intent renders a line");
+        assert!(line.contains("sha256 01"), "{line}");
+        assert!(line.contains("sha256 02"), "{line}");
+        assert!(line.contains("before=1 bytes"), "{line}");
+        assert!(line.contains("after=2 bytes"), "{line}");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
