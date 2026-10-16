@@ -1,7 +1,7 @@
 ---
 type: Attested Computation
 title: The architectural dependency rules
-description: Checks the nine dependency rules the architecture document asks CI to enforce, one rule per run, by reading the manifests, the declared crate roles, and the sources.
+description: Checks the nine dependency rules this repository holds the workspace to, one rule per run, by reading the dependency graph through Cargo, the declared crate roles, and the sources. Six come from the architecture document's section 9 and three were added with the role declarations.
 runtime: bash
 tags: [mokmok-os, verification, architecture]
 status: draft
@@ -53,11 +53,26 @@ names, which are the values the `rule` parameter takes.
 | `capability-performs-no-enforcement-io` | tokio, nix, or landlock in the capability crate, and any reach to `std::process`, `std::fs`, `std::net`, or `Command::new` in its sources |
 | `kernel-dependents-are-applications` | A dependency on `mokmok-kernel` from any crate outside the composition roots |
 
-The design states these rules as constraints on which crate may depend on what, and asks CI to
-check them.[^architecture] The check is the flake's `dependencyRules` attribute, which runs all nine
-because it passes no rule name. Each member declares its own role, so a member added without one
+The design states six of these rules as constraints on which crate may depend on what, and asks CI to
+check them.[^architecture] One of those six is the retired
+`pure-crates-have-no-io-dependency`, which `pure-crates-are-no_std` replaces and strengthens by
+reading the declared role. The other three rules arrived with the role declarations. The check is the
+flake's `dependencyRules` attribute, which runs all nine because it passes no rule name. Each member declares its own role, so a member added without one
 fails rather than being silently treated as std, and `kernel-dependents-are-applications` reads the
 same list of composition roots that `every-member-declares-its-role` holds the `shell` role to.
+
+Every rule asks `cargo metadata --no-deps --offline` rather than reading `Cargo.toml` as text. The
+dependency edges a rule sees are the ones Cargo reports for the crate, so a renamed package, a
+target-specific table, and the dotted form all count. The check's derivation carries `cargo` and
+`jq` for this reason.
+
+Which tables a rule counts depends on what that rule is about. Seven rules read the dependency graph
+and two read the declared roles and no table at all. Of the seven, six count the normal and
+target-specific tables and skip the dev and build ones, because a test or a build script reaches
+`std` without linking it into the artifact. The seventh, `kernel-dependents-are-applications`, counts
+the dev table as well, because a test that composes the kernel records the same layering edge that a
+dependency does, and a rule that skipped it would report a pass over a crate whose tests reach the
+composition root. Its fault `a-test-outside-the-roots` holds that.
 
 # The run on 2026-10-15
 
@@ -113,20 +128,30 @@ fault=scheduler-with-a-model-client rule=scheduler-has-no-model-dependency statu
 fault=capability-with-an-io-dependency rule=capability-performs-no-enforcement-io status=fail detail=mokmok-capability depends on nix
 fault=capability-reaching-the-os rule=capability-performs-no-enforcement-io status=fail detail=mokmok-capability reaches the operating system in <the temporary tree>/mokmok-capability/src/lib.rs
 fault=an-application-outside-the-roots rule=kernel-dependents-are-applications status=fail detail=mokmok-alpha depends on mokmok-kernel and is outside the composition roots
+fault=a-test-outside-the-roots rule=kernel-dependents-are-applications status=fail detail=mokmok-alpha depends on mokmok-kernel and is outside the composition roots
+fault=renamed-io-dependency rule=capability-performs-no-enforcement-io status=fail detail=mokmok-capability depends on tokio
+fault=target-table-io-dependency rule=capability-performs-no-enforcement-io status=fail detail=mokmok-capability depends on tokio
+fault=dotted-table-kernel-dependency rule=kernel-dependents-are-applications status=fail detail=mokmok-alpha depends on mokmok-kernel and is outside the composition roots
 ```
 
 The one line above that is not verbatim is `capability-reaching-the-os`, whose detail names the
-temporary directory the run created and therefore differs every time. Nine controls and fourteen
+temporary directory the run created and therefore differs every time. Nine controls and eighteen
 faults, exit 0.
 
-`nix flake check` builds the `dependencyRules` attribute over this same command, so the nine rules
-are a gate rather than an operator step.
+The last three faults are the reason the reader is Cargo rather than a scan of `Cargo.toml`. A
+manifest can name a package under a key that is not the package name, with
+`tokio_rt = { package = "tokio", version = "1" }`. It can declare one under a
+`[target.'cfg(unix)'.dependencies]` table. It can use the dotted `[dependencies.mokmok-kernel]` form.
+A text scan sees none of the three, so the rule reported a pass over a crate that named the
+forbidden package. An independent verifier found this on the first version of this page and the
+three faults hold the fix.
 
 # What this proves
 
-The nine rules hold over the workspace manifests, the declared roles, and the capability crate's
-sources at commit `fbe5270` plus the role declarations. Every one of the nine has a rerunnable fault
-that makes it fail with a named reason, and the base tree it is one edit away from passes all nine.
+The nine rules hold over the dependency graph Cargo resolves, the declared roles, and the capability
+crate's sources at commit `fbe5270` plus the role declarations. Every one of the nine has a rerunnable
+fault that makes it fail with a named reason, and the base tree it is one edit away from passes all
+nine. A rule name outside the nine is an error, so a misspelled parameter fails the run.
 
 What the compiler proves on top of that is narrower than the ladder's name suggests, and this is the
 part a reader should not overstate. `#![no_std]` on a crate makes rustc reject `std` in that crate's
@@ -138,10 +163,13 @@ that list passes both.
 
 # What this does not prove
 
-A rule reads a manifest and a source text. It cannot see a dependency that arrives transitively, so
-the closure a `pure` crate is held to is the `mokmok-` graph plus a fixed list of crates, not the
-whole dependency tree. It cannot see an architectural violation expressed through a port the caller
-implements. A rule name outside the nine is an error, so a misspelled parameter fails the run.
+Every edge a rule sees is one Cargo reports for the crate, including a target-specific table and a
+renamed package. Of the seven rules that read the graph, six skip the dev and build tables, because a
+test or a build script reaches those without linking them into the artifact, and
+`kernel-dependents-are-applications` counts the dev table while skipping the build one. A rule cannot
+see a dependency that arrives transitively, so the closure a `pure` crate is held to is the `mokmok-`
+graph plus a fixed list of crates, not the whole dependency tree. A rule cannot see an architectural
+violation expressed through a port the caller implements.
 
 A `pure` declaration says nothing about how much of a crate is a decision and how much is arithmetic
 on values it was handed. `mokmok-agent-runtime` is the crate where that gap is widest: its own
