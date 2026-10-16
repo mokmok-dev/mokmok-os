@@ -638,11 +638,6 @@ fn act_outcome(
     )
 }
 
-/// The one step a find takes.
-///
-/// The turn settles [`TurnOutcome::Completed`] whatever the finder answered: a find cannot fail the
-/// turn, because it reads rather than acts, and its observation is where a hitless or ungranted
-/// search says so.
 fn edit_intent_step(
     session: SessionID,
     transcript: &Transcript,
@@ -791,6 +786,11 @@ fn edit_refused_step(
     )
 }
 
+/// The one step a find takes.
+///
+/// The turn settles [`TurnOutcome::Completed`] whatever the finder answered: a find cannot fail the
+/// turn, because it reads rather than acts, and its observation is where a hitless or ungranted
+/// search says so.
 fn find_step(
     session: SessionID,
     transcript: &Transcript,

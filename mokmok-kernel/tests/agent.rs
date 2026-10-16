@@ -1471,12 +1471,15 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
 
-        // Three steps reach the edit's commit; the crash stops before anything is written.
-        let crashed = run(&scratch, &agent_args(
+        // Three steps reach the edit's commit.
+        let crashed = run(
             &scratch,
-            &path,
-            &["--crash-after", "before-dispatch", "--steps", "3"],
-        ));
+            &agent_args(
+                &scratch,
+                &path,
+                &["--crash-after", "before-dispatch", "--steps", "3"],
+            ),
+        );
         assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
         assert_eq!(
             std::fs::read_to_string(&target).expect("the file reads"),
@@ -1530,12 +1533,15 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
 
-        // Three steps reach the edit's commit; the write lands before the crash.
-        let crashed = run(&scratch, &agent_args(
+        // Three steps reach the edit's commit.
+        let crashed = run(
             &scratch,
-            &path,
-            &["--crash-after", "after-dispatch", "--steps", "3"],
-        ));
+            &agent_args(
+                &scratch,
+                &path,
+                &["--crash-after", "after-dispatch", "--steps", "3"],
+            ),
+        );
         assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
         assert_eq!(
             std::fs::read_to_string(&target).expect("the file reads"),

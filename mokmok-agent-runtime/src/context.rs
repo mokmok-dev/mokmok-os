@@ -106,8 +106,10 @@ impl Context {
 /// measured here answers a body whose messages are the system prompt alone with nothing.
 #[must_use]
 pub fn system_prompt(task: &Task) -> String {
-    // A session granted no root is handed the words it was handed before the finder existed. The
-    // task is durable, so a resumed session must rebuild its first prompt byte for byte.
+    // A tool this session cannot use is left out rather than described, because a body offering one
+    // would leave the model asking into a refusal. Each condition here is the one the tool list and
+    // the prompt are both built from, and the recorded task is durable, so a resumed session
+    // rebuilds its first prompt byte for byte.
     let shell = "run_shell takes a command string and runs `sh -c`";
     let find = if task.setting.search.is_empty() {
         None
@@ -1328,8 +1330,6 @@ mod tests {
                 },
             ),
         );
-        // A refusal decided before anything was written records an outcome and no intent, so the
-        // rendering has to come from the outcome or the turn reads as a command that never ran.
         apply_all(
             &mut transcript,
             &edit_refusal_records(

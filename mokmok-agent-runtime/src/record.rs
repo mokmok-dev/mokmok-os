@@ -372,7 +372,7 @@ pub enum Refusal {
     },
     /// An edit whose patch the answer recorded for the same turn did not name.
     ///
-    /// `answer` is the patch that answer named, and empty when it named no patch at all.
+    /// `answer` is whatever that answer named instead: another patch, a command, or a query.
     EditMismatch {
         turn: TurnID,
         answer: String,

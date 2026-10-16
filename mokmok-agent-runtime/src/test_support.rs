@@ -457,7 +457,8 @@ impl Finder for FakeFinder {
     }
 }
 
-/// The count is what proves an edit ran again, and the value is what it produced.
+/// One queued answer per `plan` and per `commit`, and a count of the plans, so a test can tell a
+/// replayed intent from one that planned again.
 pub struct FakeEditor {
     plans: Mutex<VecDeque<Result<Plan, Error>>>,
     commits: Mutex<VecDeque<Result<EditReport, Error>>>,

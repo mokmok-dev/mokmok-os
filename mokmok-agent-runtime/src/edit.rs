@@ -99,7 +99,7 @@ pub trait Editor: Sync {
     ) -> Result<EditReport, Error>;
 }
 
-/// Renders the observation a successful edit becomes.
+/// Renders the observation the outcome a commit reached becomes.
 #[must_use]
 pub fn observation(
     relative: &str,
