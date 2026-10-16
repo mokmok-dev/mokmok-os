@@ -52,27 +52,26 @@ pub enum State {
     InFlight,
     /// `Resolution` is written once and never changes.
     Settled(Resolution),
-    /// The [`Resolution::Finished`] result was handed to its consumer exactly once.
+    /// The result was handed to its consumer exactly once.
     ///
     /// The hand-off is a state marker, so it lives here and not in a recorded [`Fact`]: a field
     /// inside `Finished` could disagree with the history it was folded from. Re-applying the
     /// settle fact after the result was consumed therefore still names the same settlement and is
     /// an [`Ack::Duplicate`], which is the idempotence the bus's at-least-once delivery needs.
     Applied {
-        code: i32,
+        resolution: Resolution,
     },
 }
 
 impl State {
     /// The settlement this state records, or `None` while the execution is still in flight.
     ///
-    /// An [`State::Applied`] execution settled as `Finished { code }`, so the settle fact that
-    /// recorded it matches the state even after the result was handed over.
+    /// An [`State::Applied`] execution still names the settlement it was settled with, so the
+    /// settle fact that recorded it matches the state even after the result was handed over.
     #[must_use]
     const fn settlement(self) -> Option<Resolution> {
         match self {
-            Self::Settled(resolution) => Some(resolution),
-            Self::Applied { code } => Some(Resolution::Finished { code }),
+            Self::Settled(resolution) | Self::Applied { resolution } => Some(resolution),
             Self::InFlight => None,
         }
     }
@@ -82,13 +81,22 @@ impl State {
         matches!(self, Self::Applied { .. })
     }
 
-    /// The exit code of a [`Resolution::Finished`] result still waiting to be applied.
+    /// The resolution of a result still waiting to be applied.
     ///
-    /// One home for the rule, so the arms of [`Session::consume`] branch on it.
+    /// One home for the rule, so the arms of [`Session::consume`] branch on it. Only a result that
+    /// produced something to hand over can be applied; `Unknown`, `Refused`, `Cancelled`,
+    /// `Killed`, and `TimedOut` have nothing to consume.
     #[must_use]
-    const fn waiting_result(self) -> Option<i32> {
+    const fn waiting_result(self) -> Option<Resolution> {
         match self {
-            Self::Settled(Resolution::Finished { code }) => Some(code),
+            Self::Settled(resolution)
+                if matches!(
+                    resolution,
+                    Resolution::Finished { .. } | Resolution::Applied
+                ) =>
+            {
+                Some(resolution)
+            },
             _ => None,
         }
     }
@@ -265,9 +273,9 @@ impl Session {
         };
         if recorded.state.is_applied() {
             Ok(Ack::Duplicate)
-        } else if let Some(code) = recorded.state.waiting_result() {
+        } else if let Some(resolution) = recorded.state.waiting_result() {
             if self.phase == Phase::Accepting || self.phase == Phase::Draining {
-                recorded.state = State::Applied { code };
+                recorded.state = State::Applied { resolution };
                 Ok(Ack::Applied)
             } else {
                 Err(Rejection::SessionOver)
