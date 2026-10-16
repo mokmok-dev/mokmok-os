@@ -138,10 +138,12 @@ impl Patch {
     /// both counts are reached and the following line starts the next section, the body ends
     /// there. This is what lets a real diff remove a line beginning with `-- ` or add one
     /// beginning with `++ ` without confusing it with a file-section header. If the counts do not
-    /// fit, the body is read by prefix scan: it ends on `@@ `, on `diff `, or on `--- ` only
-    /// when that line is followed by `+++ `. The residual limit is a diff whose counts are wrong
-    /// and whose body has a removed line `-- x` immediately before an added line `++ y`: those
-    /// two lines together look like a section header and are read as one.
+    /// fit, the body is read by prefix scan: it ends on `@@`, on `diff `, or on `--- ` only when
+    /// that line is followed by `+++ `. Two limits follow from reading by counts. A diff whose
+    /// counts are wrong and whose body removes a line `-- x` immediately before adding a line
+    /// `++ y` has those two lines read as a section header. A count reached exactly at a section's
+    /// own `--- ` and `+++ ` label pair reads those two labels as body lines and joins the two
+    /// sections into one body, and `Patch::recounted` then reports the counts that body holds.
     ///
     /// # Errors
     ///
@@ -478,16 +480,16 @@ fn body_by_counts<'a>(
 
 /// Whether `line` ends a hunk body.
 ///
-/// `@@ ` and `diff ` cannot begin a body line, because a body line carries its leading space, `-`,
+/// `@@` and `diff ` cannot begin a body line, because a body line carries its leading space, `-`,
 /// or `+`. A `--- ` line can: a diff that removes `-- x` spells that body line `--- x`, and the only
 /// `--- ` a section header puts before a `+++ ` line is a real one. Both readers of a body take
 /// their boundary from here, so a wrong set of counts cannot end a body somewhere the prefix scan
-/// would not.
+/// would not, and a header that opens a section also ends a body.
 fn is_body_boundary(
     line: &str,
     next: Option<&&str>,
 ) -> bool {
-    line.starts_with("@@ ")
+    line.starts_with("@@")
         || line.starts_with("diff ")
         || (line.starts_with("--- ") && next.is_some_and(|next| next.starts_with("+++ ")))
 }
@@ -909,6 +911,19 @@ mod tests {
         let recounted = patch.recounted();
         assert_eq!(recounted.files[0].hunks[0].stated.old_len, 2);
         assert_eq!(recounted.files[0].hunks[0].stated.new_len, 2);
+    }
+
+    #[test]
+    fn a_compact_header_after_a_body_opens_the_next_hunk() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-one\n+ONE\n@@-3,1 +3,1@@\n-three\n+THREE\n";
+
+        let patch = Patch::parse(diff).unwrap();
+
+        assert_eq!(patch.files.len(), 1);
+        assert_eq!(patch.files[0].hunks.len(), 2);
+        assert_eq!(patch.files[0].hunks[0].lines[0].text, "one");
+        assert_eq!(patch.files[0].hunks[1].stated.old_start, 3);
+        assert_eq!(patch.files[0].hunks[1].lines[1].text, "THREE");
     }
 
     #[test]
