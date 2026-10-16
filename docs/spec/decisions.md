@@ -59,15 +59,21 @@ protocol (`mokmok-kernel/src/notify.rs`), so there is no endpoint to probe and n
 supervision tests bind their own notification socket to assert it.
 
 Crash injection takes two signals. A crash point fires only when the `--crash-after` flag names it
-and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:570`), so a production process cannot be
+and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:809`), so a production process cannot be
 crashed by a flag alone.
 
 The provider group comes from a file, and authority does not. Both binaries read the provider, the
 model, the endpoint, the script, the credential path, and the answer ceiling from
 `$XDG_CONFIG_HOME/mokmok/config.toml`, falling back to `$HOME/.config`, with a flag above the file
-and the file above the built-in default (`mokmok-kernel/src/config.rs:454`). The authority grants,
+and the file above the built-in default (`mokmok-kernel/src/config.rs:463`). The authority grants,
 the data directory, the tool environment, and the agent-run budgets stay on the command line, so a
-file the operator can edit cannot widen what the sandbox lets a workload reach. The design names no
+file the operator can edit cannot widen what the sandbox lets a workload reach. A value in that file
+may name a variable of the daemon's environment as `$NAME` or `${NAME}`, and the two binaries read
+the environment once at their boundary and hand it to resolution as data. A reference reaches only
+the four keys serde reads as text, so `endpoint` is one of them, and the environment a unit,
+container, or wrapper starts the daemon with picks the host that receives the goal and the
+credential. That is not a new class, because the same command line already carries `--endpoint` and
+`mokmok-egress` validates the destination. The design names no
 configuration file at all, and its default-deny authority section assumes every rule arrives as a
 named flag.
 

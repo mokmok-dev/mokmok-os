@@ -94,7 +94,8 @@ artifact store, and the sandbox belong to the kernel.
   or mints takes that one reading (`src/bin/mokmok-tui.rs:91-99`).
 - The binary declares no flag of its own. It flattens the kernel's `Global` and `Run`, so every rule
   the kernel applies to a flag applies to a conversation, and `--config` and the provider keys reach
-  the TUI through the kernel's own resolution (`src/bin/mokmok-tui.rs:45-46`).
+  the TUI through the kernel's own resolution, which reads the process environment once into
+  `ProcessEnvironment` and hands it in (`src/bin/mokmok-tui.rs:53-55`).
 
 # Dependencies
 
