@@ -320,10 +320,14 @@ impl EditorPort for Editor {
                     ),
                 })
             },
-            Err(error) => Ok(Self::refused_report(
+            Err(WriteFailure::NothingWritten(error)) => Ok(Self::refused_report(
                 &ready.relative,
                 format!("the write did not land ({error}), so nothing was written"),
             )),
+            // The bytes are in place, so a refusal here would be a claim the log cannot keep.
+            // Leaving the outcome unwritten hands the turn to recovery, which settles it
+            // `Unknown` and renders the two images the intent recorded.
+            Err(WriteFailure::LandedUnsynced(error)) => Err(Error::Io(error).into()),
         }
     }
 }
@@ -443,13 +447,23 @@ fn read_target(
     Ok(Some((bytes, mode)))
 }
 
+/// Where a write stopped, because the bytes and the directory entry do not land together.
+#[derive(Debug)]
+enum WriteFailure {
+    /// No byte of the target changed: the temporary file was removed, or the rename never happened.
+    NothingWritten(io::Error),
+    /// `renameat` installed the bytes and the directory's own sync failed, so the file holds the
+    /// post-image while the edit's survival across a crash is unproven.
+    LandedUnsynced(io::Error),
+}
+
 fn write_atomic(
     parent_fd: &OwnedFd,
     name: &OsStr,
     tmp_name: &str,
     bytes: &[u8],
     mode: u32,
-) -> Result<(), io::Error> {
+) -> Result<(), WriteFailure> {
     let mode = Mode::from_bits_truncate(mode & 0o777);
     let tmp = match openat(
         parent_fd,
@@ -458,24 +472,28 @@ fn write_atomic(
         mode,
     ) {
         Ok(fd) => fd,
-        Err(error) => return Err(io::Error::from(error)),
+        Err(error) => return Err(WriteFailure::NothingWritten(io::Error::from(error))),
     };
 
     let mut tmp = File::from(tmp);
     if let Err(error) = tmp.write_all(bytes) {
         let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
-        return Err(error);
+        return Err(WriteFailure::NothingWritten(error));
     }
     if let Err(error) = tmp.sync_all() {
         let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
-        return Err(error);
+        return Err(WriteFailure::NothingWritten(error));
     }
     drop(tmp);
 
-    nix::fcntl::renameat(parent_fd, tmp_name, parent_fd, name).map_err(io::Error::from)?;
-    nix::unistd::fsync(parent_fd).map_err(io::Error::from)?;
+    if let Err(error) = nix::fcntl::renameat(parent_fd, tmp_name, parent_fd, name) {
+        return Err(WriteFailure::NothingWritten(io::Error::from(error)));
+    }
 
-    Ok(())
+    // Past the rename the target holds the post-image, so what fails here is the durability of the
+    // directory entry and not the write.
+    nix::unistd::fsync(parent_fd)
+        .map_err(|error| WriteFailure::LandedUnsynced(io::Error::from(error)))
 }
 
 impl From<Error> for mokmok_agent_runtime::Error {
@@ -921,5 +939,38 @@ mod tests {
         let report = editor.commit(&ready).unwrap();
         assert!(matches!(report.outcome, EditOutcome::Stale { .. }));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed\n");
+    }
+
+    /// `O_PATH` carries `renameat` and refuses `fsync`, which is the one way to fail the directory
+    /// sync with the bytes already in place.
+    #[test]
+    fn a_directory_sync_that_fails_after_the_rename_is_not_a_refusal() {
+        let scratch = Scratch::new("landed-unsynced");
+        let target = scratch.0.join("x.rs");
+        std::fs::write(&target, "one\n").unwrap();
+        let dir = nix::fcntl::openat2(
+            nix::fcntl::AT_FDCWD,
+            &scratch.0,
+            nix::fcntl::OpenHow::new()
+                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                .mode(Mode::empty())
+                .resolve(nix::fcntl::ResolveFlag::RESOLVE_NO_SYMLINKS),
+        )
+        .unwrap();
+
+        let failure = write_atomic(
+            &dir,
+            OsStr::new("x.rs"),
+            ".mokmok-edit-rehearsal",
+            b"two\n",
+            0o644,
+        )
+        .expect_err("a directory sync fails on an O_PATH descriptor");
+
+        assert!(
+            matches!(failure, WriteFailure::LandedUnsynced(_)),
+            "{failure:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "two\n");
     }
 }

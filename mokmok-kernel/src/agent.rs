@@ -589,7 +589,7 @@ impl Driver {
     /// # Errors
     ///
     /// Returns the errors of [`Run::task`], the provider the configuration named, the tool, the
-    /// ledger, and the finder.
+    /// ledger, the editor, and the finder.
     pub fn open(
         config: &Config,
         run: &Run,
@@ -600,7 +600,6 @@ impl Driver {
         let provider = model(config, session)?;
         let shell = Shell::new(config, task.setting.program.clone(), at)?;
         let ledger = Ledger::open(config, session, Some(task.clone()), at)?;
-        let editor = Editor::new(config, &task.setting.checkout, at)?;
         // The task the fold holds, not the one this invocation built: the prompt the model was
         // handed, the tools the provider was given, and the roots the finder opened must all come
         // off the one recorded task, or a resumed session is offered a tool that will not answer
@@ -610,6 +609,7 @@ impl Driver {
             .map_err(Error::Agent)?
             .task
             .unwrap_or(task);
+        let editor = Editor::new(config, &task.setting.checkout, at)?;
         let index = if task.setting.search.is_empty() {
             Index::none()
         } else {
