@@ -126,12 +126,12 @@ intent performing no effect, an interrupted find re-deriving its step, a refused
 step, the three ceilings, the draining halt, and a line at the log's ceiling. `src/dialogue.rs:606`
 holds 35 cases and one proptest for the floating, late, and conflicting refusals, the query and
 patch mismatches, an edit outcome with no intent, and for refolding a history being invariant.
-`src/context.rs:350` holds 33 cases for byte accounting, budget trimming, an unknown outcome
+`src/context.rs:352` holds 33 cases for byte accounting, budget trimming, an unknown outcome
 rendered as its warning, a byte-identical re-ask, the prompt a granted root or a writable checkout
 adds, a rendering paired with the turn it names, a settled edit shown from its outcome, an
 interrupted one shown from its intent, and a settled turn the model never finished carrying no act.
 `src/record.rs:469` holds 8 cases for the query, prose, and patch caps and the two byte bounds the
-log declares, and `src/edit.rs:149` holds 7 for the outcome-to-settlement map and the three
+log declares, and `src/edit.rs:151` holds 7 for the outcome-to-settlement map and the three
 renderers. `src/tool.rs:183` holds 5 cases for the exit-to-outcome map, `src/speech.rs:106` holds 2
 cases and one property case for the line bound in both directions, and `src/task.rs:74` holds 1 for a
 task record written before the finding grant existed.
