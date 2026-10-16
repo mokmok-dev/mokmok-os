@@ -34,7 +34,7 @@ session the human is not looking at still moves, between his keystrokes.[^crate]
 | `Roster` | `src/port.rs:71` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:107` | `poll`, `event`, `draw` |
 | `Listing`, `Key`, `Event`, `Line` | `src/port.rs:59,135,160,173` | What the log holds of one session, the keys, and the five line kinds |
-| `View`, `Sheet`, `Row` | `src/port.rs:329,353,370` | The frame, the pane over the transcript, and one row of the listing |
+| `View`, `Sheet`, `Row` | `src/port.rs:358,382,399` | The frame, the pane over the transcript, and one row of the listing |
 | `Session` | `src/session.rs:15` | The kernel-backed engine |
 | `Sessions` | `src/session.rs:76` | The kernel-backed roster |
 | `Terminal` | `src/terminal.rs:28` | The terminal mode, its restoration, and the key reader |

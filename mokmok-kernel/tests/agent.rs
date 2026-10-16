@@ -326,7 +326,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&args)
+        run(scratch, &args)
     }
 
     /// One `submit` of `body` through the operator's shell, which is the path the kernel takes
@@ -1369,7 +1369,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(
             std::fs::read_to_string(&target).expect("the file reads"),
@@ -1434,7 +1434,7 @@ mod tests {
             ],
         );
 
-        let ran = run(&agent_args(&scratch, &path, &[]));
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(ran.ok, "{}\n{}", ran.out, ran.err);
         assert_eq!(
             std::fs::read_to_string(&target).expect("the file reads"),
@@ -1472,7 +1472,7 @@ mod tests {
         script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
 
         // Three steps reach the edit's commit; the crash stops before anything is written.
-        let crashed = run(&agent_args(
+        let crashed = run(&scratch, &agent_args(
             &scratch,
             &path,
             &["--crash-after", "before-dispatch", "--steps", "3"],
@@ -1508,7 +1508,7 @@ mod tests {
         );
 
         script(&path, &[json!({"action": "final", "say": "done"})]);
-        let resumed = run(&agent_args(&scratch, &path, &[]));
+        let resumed = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
 
         let context = prompt_context(&scratch, 2);
@@ -1531,7 +1531,7 @@ mod tests {
         script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
 
         // Three steps reach the edit's commit; the write lands before the crash.
-        let crashed = run(&agent_args(
+        let crashed = run(&scratch, &agent_args(
             &scratch,
             &path,
             &["--crash-after", "after-dispatch", "--steps", "3"],
@@ -1567,7 +1567,7 @@ mod tests {
         );
 
         script(&path, &[json!({"action": "final", "say": "done"})]);
-        let resumed = run(&agent_args(&scratch, &path, &[]));
+        let resumed = run(&scratch, &agent_args(&scratch, &path, &[]));
         assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
 
         let context = prompt_context(&scratch, 2);
