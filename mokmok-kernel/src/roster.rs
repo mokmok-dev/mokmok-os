@@ -134,7 +134,7 @@ mod tests {
         ])
         .expect("the command line parses");
 
-        Config::resolve(&args).expect("the configuration resolves")
+        Config::resolve(&args, None).expect("the configuration resolves")
     }
 
     fn session(seed: u128) -> SessionID {
