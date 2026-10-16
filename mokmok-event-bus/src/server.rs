@@ -756,7 +756,10 @@ fn millis(value: NonZeroU32) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{Parked, Phase, ServeError, Server, SocketFile, Step, is_stale, pull, signals};
+    use super::{
+        Parked, Phase, ServeError, Server, SocketFile, Step, is_stale, pull, signals,
+        window_changed,
+    };
     use crate::bus::Bus;
     use crate::config::{Config, Limits, Retention};
     use crate::event::{Cursor, Seq};
@@ -879,6 +882,37 @@ mod tests {
         assert!(
             resolved.is_err(),
             "the shutdown future resolved with no signal",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_wait_stays_pending_until_the_window_changes() {
+        let config = Config {
+            store: PathBuf::from(":memory:"),
+            ..Config::default()
+        };
+        let bus = Bus::open(config).unwrap();
+        bus.store().open_topic(Topic::Global).await.unwrap();
+        let Ok((entry, watching)) = bus.open_topic(Topic::Global).await else {
+            panic!("the topic could not be opened");
+        };
+        let mut ticks = Some(watching);
+
+        let unresolved =
+            tokio::time::timeout(Duration::from_millis(50), window_changed(&mut ticks)).await;
+
+        assert!(
+            unresolved.is_err(),
+            "the window wait resolved while the window stood still",
+        );
+
+        entry.append(Topic::Global, payload(8)).await.unwrap();
+        let resolved =
+            tokio::time::timeout(Duration::from_millis(50), window_changed(&mut ticks)).await;
+
+        assert!(
+            resolved.is_ok(),
+            "the window wait did not resolve after an append",
         );
     }
 
