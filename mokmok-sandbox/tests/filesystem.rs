@@ -6,6 +6,8 @@ mod common;
 mod tests {
     use crate::common::tests::{Scratch, config, issued, program, shell, which, within};
     use mokmok_sandbox::{Access, Capability, Confined, Exposure, Outcome, Sandbox};
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[tokio::test]
     async fn a_read_outside_the_exposures_is_denied() {
@@ -80,6 +82,31 @@ mod tests {
             std::fs::read(workspace.join("out.txt")).unwrap(),
             b"written"
         );
+        completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_only_grant_is_enough_to_write_through() {
+        let scratch = Scratch::new("write-only-grant");
+        let dropbox = scratch.path().join("dropbox");
+        std::fs::create_dir_all(&dropbox).unwrap();
+        std::fs::set_permissions(&dropbox, Permissions::from_mode(0o300)).unwrap();
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let mut request = shell(&format!("printf written > {}/out.txt", dropbox.display()));
+        request
+            .exposures
+            .push(Exposure::path(&dropbox, Access::WRITE));
+        let mut capabilities = issued();
+        capabilities.push(Capability::issued(&dropbox, Access::WRITE));
+
+        // The confiner opens every rule path with `O_PATH`, which needs no right on the object it
+        // names, so an exposure nobody may read is still one the workload can write through.
+        let run = sandbox.spawn(&request, &capabilities).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert_eq!(completed.outcome(), Outcome::Exited(0));
+        assert_eq!(std::fs::read(dropbox.join("out.txt")).unwrap(), b"written");
+        std::fs::set_permissions(&dropbox, Permissions::from_mode(0o700)).unwrap();
         completed.cleanup().unwrap();
     }
 

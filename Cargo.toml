@@ -42,6 +42,7 @@ nix = { version = "0.31", default-features = false, features = [
   "process",
   "resource",
   "signal",
+  "term",
 ] }
 proptest = "1.12.0"
 proptest-state-machine = "0.9.0"

@@ -391,7 +391,7 @@ pub mod text {
 
 #[cfg(test)]
 mod tests {
-    use super::{Plan, Status, StatusFile, read_status, rights, ruleset};
+    use super::{Plan, Status, StatusFile, probe, read_status, rights, ruleset};
     use crate::capability::Access;
     use crate::limits::Limits;
     use crate::request::Request;
@@ -435,6 +435,15 @@ mod tests {
             matches!(built, Err(Failure::Path(_))),
             "a path that is not there was accepted: {built:?}",
         );
+    }
+
+    #[test]
+    fn the_probe_refuses_a_workspace_that_is_not_there() {
+        let missing = std::env::temp_dir().join("mokmok-probe-missing-path");
+
+        let probed = probe(&missing, &missing);
+
+        assert!(matches!(probed, Err(Failure::Path(_))), "got {probed:?}");
     }
 
     #[test]

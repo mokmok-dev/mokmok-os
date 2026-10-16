@@ -5,7 +5,9 @@ mod common;
 #[cfg(test)]
 mod tests {
     use crate::common::tests::{BOUND, Scratch, config, issued, shell, within};
-    use mokmok_sandbox::{Completed, Confined, LimitsOnly, Outcome, Request, Sandbox};
+    use mokmok_sandbox::{
+        Access, Capability, Completed, Confined, Exposure, LimitsOnly, Outcome, Request, Sandbox,
+    };
     use std::num::NonZeroU64;
     use std::time::Instant;
 
@@ -78,6 +80,24 @@ mod tests {
         let completed = within("wait", run.wait()).await.unwrap();
 
         expect_reported_limits(&completed);
+        completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_default_capture_cap_is_one_mebibyte() {
+        let scratch = Scratch::new("default-cap");
+        let long = scratch.write("long.txt", &"a".repeat(1_100_000));
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let mut request = shell(&format!("cat {}", long.display()));
+        request.exposures.push(Exposure::read(&long));
+        let mut capabilities = issued();
+        capabilities.push(Capability::issued(&long, Access::READ));
+
+        let run = sandbox.spawn(&request, &capabilities).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert_eq!(completed.stdout().bytes().len(), 1_048_576);
+        assert!(completed.stdout().truncated());
         completed.cleanup().unwrap();
     }
 

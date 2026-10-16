@@ -1,0 +1,171 @@
+{
+  "harness": "1c836862806597d273a1c6a29456c0c4ea6a634c53e82f24a34a8a07121196b5",
+  "generated": "2026-10-16T04:55:28Z",
+  "members": [
+    {
+      "name": "mokmok-agent-runtime",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 135,
+      "caught": 135,
+      "missed": [],
+      "timeout": 0,
+      "digest": "c92d709451ca9ab65f5ba1913389ea7164aac378d6eb24a0369371d9d514a4f3",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-artifact",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 51,
+      "caught": 51,
+      "missed": [],
+      "timeout": 0,
+      "digest": "81bca9b020f3745816a1526e5efb575a2047151ba1e09d214602c6ee50d52973",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-capability",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 108,
+      "caught": 108,
+      "missed": [],
+      "timeout": 0,
+      "digest": "0b288aaf0e3ea89f6b599dfe1a8de47927b284f3c0f2a1b5c1361f90a6ef5294",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-egress",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 46,
+      "caught": 46,
+      "missed": [],
+      "timeout": 0,
+      "digest": "43ac3068353652741a9468b354ffd9c99028e9b325d2437ae1e9518c8b85f006",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-event-bus",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 185,
+      "caught": 185,
+      "missed": [],
+      "timeout": 0,
+      "digest": "a10d8bb335582fc2567e44f466b263984deac67fa4dc87935e01c1e66a354930",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-event-store",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 87,
+      "caught": 87,
+      "missed": [],
+      "timeout": 0,
+      "digest": "5c59701335469051712301c67034949e6864745b3868fdcd70d86015faee7484",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-kernel",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 197,
+      "caught": 197,
+      "missed": [],
+      "timeout": 0,
+      "timed_out": [],
+      "digest": "17cab4de1b3198b438212c5336ea5a63cfa3f98eb0c187cf3cae3c4a91703e0e"
+    },
+    {
+      "name": "mokmok-observability",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 40,
+      "caught": 40,
+      "missed": [],
+      "timeout": 0,
+      "timed_out": [],
+      "digest": "0aaf911c098590dacfeb544ca67f94beab71266183af2d53a45a67eb9687de24"
+    },
+    {
+      "name": "mokmok-patch",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 84,
+      "caught": 84,
+      "missed": [],
+      "timeout": 0,
+      "digest": "172214b26819c77c2dc0a25e9b25b55cfe905315a328cc9c42c7d89162a18f7c",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-protocol",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 73,
+      "caught": 73,
+      "missed": [],
+      "timeout": 0,
+      "digest": "bf9ff6b785352c5c14f360467515b92908baf3ce645c75a868da1ea7511077f8",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-sandbox",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 128,
+      "caught": 128,
+      "missed": [],
+      "timeout": 0,
+      "digest": "a22db1249fd24c6ad8d85e433aed402bc46b501e278005f98cb9b4ef93cd87df",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-scheduler",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 50,
+      "caught": 50,
+      "missed": [],
+      "timeout": 0,
+      "digest": "020ed2636236c1059862c99c09280b1c050972e24dc898d728b5249d21410c25",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-search",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 76,
+      "caught": 76,
+      "missed": [],
+      "timeout": 0,
+      "digest": "5ce6eaf8696707ba610920bd150ad947f9fb615bce800c3df05a44cbf056787c",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-state-machine",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 62,
+      "caught": 62,
+      "missed": [],
+      "timeout": 0,
+      "digest": "b4c2cc359dc9838c0ef3d45fdcb8308ec7248547ef0bb02c8ba03c1bf71426e7",
+      "timed_out": []
+    },
+    {
+      "name": "mokmok-tui",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 68,
+      "caught": 68,
+      "missed": [],
+      "timeout": 0,
+      "digest": "fd458d61d9065f73af072c25bff94f13eb0f70a10d229532a07f59b10d8a346d",
+      "timed_out": []
+    }
+  ]
+}

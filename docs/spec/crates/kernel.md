@@ -32,7 +32,7 @@ databases, runs recovery before the daemon reports ready, and exposes the five s
 | `Db`, `Log`, `Entry`, `TurnRecord`, `ResultRecord` | `src/db.rs:276,103,45,89,96` | The appender over the event log and the folded view of one session |
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
-| `Relay`, `serve` | `src/serve.rs:52,146` | The outbox relay and the daemon loop |
+| `Relay`, `serve` | `src/serve.rs:52,138` | The outbox relay and the daemon loop |
 | `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,464,483` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
 | `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:661,542,525,363` | The agent loop and its scripted model |
@@ -97,7 +97,7 @@ declares no axum dependency.
 The design names the modules `config`, `bootstrap`, `services`, `lifecycle`, `recovery`, and
 `shutdown`.[^architecture] The crate names them `authority`, `config`, `db`, `error`, `execution`,
 `agent`, `notify`, `provider`, `recovery`, `serve`, and `slice`. There is no service registry and no
-lifecycle type; serving and shutdown both live in `serve_until_stopped` (`src/serve.rs:173-292`).
+lifecycle type; serving and shutdown both live in `serve_until_stopped` (`src/serve.rs:165-285`).
 
 The design has the kernel initiate migrations. There is no migration module, no schema-version row,
 and no expected-version check. Schema creation is `CREATE TABLE IF NOT EXISTS` inside

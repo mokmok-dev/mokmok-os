@@ -11,7 +11,9 @@ mod tests {
         Completed, Config, Confined, Error, Exposure, Failure, LimitsOnly, Outcome, Reached,
         Refusal, Run, Sandbox, Signal, Started,
     };
+    use std::fs::Permissions;
     use std::num::NonZeroUsize;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -59,6 +61,8 @@ mod tests {
         // status from the control directory, which no rule lets the workload write.
         assert_eq!(completed.stdout().bytes(), b"out");
         assert_eq!(completed.stderr().bytes(), FORGED.as_bytes());
+        assert!(!completed.stdout().truncated());
+        assert!(!completed.stderr().truncated());
         assert_eq!(completed.outcome(), Outcome::Exited(0));
         completed.cleanup().unwrap();
     }
@@ -279,6 +283,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_completed_run_removes_its_directory() {
+        let scratch = Scratch::new("completed-drop");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let directory = run.workspace().parent().unwrap().to_path_buf();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        assert!(
+            directory.is_dir(),
+            "the workspace did not outlive the run until the value dropped",
+        );
+
+        drop(completed);
+
+        assert!(
+            !directory.exists(),
+            "dropping the completed run left its directory behind",
+        );
+        assert!(nothing_left(&scratch.root()));
+    }
+
+    #[tokio::test]
+    async fn cleanup_reports_a_directory_it_cannot_remove() {
+        let scratch = Scratch::new("cleanup-failure");
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let run = sandbox.spawn(&shell("exit 0"), &issued()).unwrap();
+        let directory = run.workspace().parent().unwrap().to_path_buf();
+        let root = scratch.root();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        // Removing an entry needs write access to the directory that holds it, so sealing the root
+        // is what makes the removal fail rather than succeed.
+        std::fs::set_permissions(&root, Permissions::from_mode(0o500)).unwrap();
+        let error = completed
+            .cleanup()
+            .expect_err("a removal that cannot happen is an error");
+
+        assert!(
+            matches!(&error, Error::Cleanup { path, .. } if path == &directory),
+            "got {error:?}",
+        );
+        assert!(directory.is_dir(), "the directory is still there");
+        std::fs::set_permissions(&root, Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[tokio::test]
     async fn declared_artifacts_are_registered_and_undeclared_ones_are_not() {
         let scratch = Scratch::new("artifacts");
         let sandbox = Confined::new(config(&scratch)).unwrap();
@@ -394,6 +444,29 @@ mod tests {
             matches!(&refused, Refusal::Confiner(path) if path == &missing),
             "got {refused:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn a_confiner_that_is_not_an_executable_file_is_refused() {
+        let scratch = Scratch::new("unexecutable-confiner");
+        let directory = scratch.path().join("directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let plain = scratch.write("confiner.txt", "not a program\n");
+
+        for path in [&directory, &plain] {
+            let refused = match Confined::new(Config {
+                confiner: path.clone(),
+                ..config(&scratch)
+            }) {
+                Err(refused) => refused,
+                Ok(_sandbox) => panic!("{} was accepted as a confiner", path.display()),
+            };
+
+            assert!(
+                matches!(&refused, Refusal::Confiner(named) if named == path),
+                "got {refused:?}",
+            );
+        }
     }
 
     #[tokio::test]

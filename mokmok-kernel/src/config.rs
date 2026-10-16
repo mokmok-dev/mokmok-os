@@ -577,7 +577,10 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Agent, Args, Command, Config, ConfigError, Global, ProviderKind, Submit, uuid_of};
+    use super::{
+        Agent, Args, Command, Config, ConfigError, Global, ProviderKind, Submit, relative_path,
+        uuid_of,
+    };
     use clap::Parser as _;
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt as _;
@@ -678,6 +681,20 @@ mod tests {
             Config::resolve(&args),
             Err(ConfigError::NotADirectory(_)),
         ));
+    }
+
+    #[test]
+    fn a_path_inside_the_workload_workspace_is_relative_and_one_that_leaves_it_is_not() {
+        assert!(matches!(
+            relative_path("../escape"),
+            Err(ConfigError::NotRelative(value)) if value == "../escape",
+        ));
+        assert!(matches!(
+            relative_path(""),
+            Err(ConfigError::NotRelative(value)) if value.is_empty(),
+        ));
+        // The path the sandbox registers, which the two refusals above are read against.
+        assert_eq!(relative_path("out.txt").unwrap(), PathBuf::from("out.txt"));
     }
 
     #[test]

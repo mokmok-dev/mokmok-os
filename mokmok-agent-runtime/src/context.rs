@@ -280,9 +280,12 @@ fn keep_newest(
     turns: &mut Vec<ContextTurn>,
     keep: usize,
 ) {
-    if keep != 0 && turns.len() > keep {
-        turns.drain(..turns.len() - keep);
+    if keep == 0 {
+        return;
     }
+    // No `len > keep` guard: at `len == keep` the drain is `..0`, which removes nothing.
+    let excess = turns.len().saturating_sub(keep);
+    turns.drain(..excess);
 }
 
 fn paths(granted: &[std::path::PathBuf]) -> String {
@@ -510,8 +513,6 @@ mod tests {
 
         let mut all = vec![turn_of(1), turn_of(2), turn_of(3)];
         keep_newest(&mut all, 0);
-        // A `len > keep` widened to `len >= keep` is indistinguishable here: at `len == keep` the
-        // drain is `..0`, which removes nothing.
         assert_eq!(all.len(), 3);
     }
 

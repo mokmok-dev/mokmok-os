@@ -510,3 +510,28 @@ fn outcome_of(status: ExitStatus) -> Outcome {
 fn nix_pid(pid: u32) -> Pid {
     Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Signal, escalate, present};
+    use std::time::Duration;
+
+    #[test]
+    fn the_signal_numbers_are_the_ones_the_kernel_names() {
+        assert_eq!(Signal::Interrupt.raw(), 2);
+        assert_eq!(Signal::Terminate.raw(), 15);
+        assert_eq!(Signal::Kill.raw(), 9);
+    }
+
+    #[test]
+    fn a_pid_no_process_holds_is_not_present() {
+        assert!(present(std::process::id()));
+        // Above `pid_max`, so no process can hold it.
+        assert!(!present(u32::MAX));
+    }
+
+    #[tokio::test]
+    async fn escalating_a_workload_that_is_already_gone_is_not_a_failure() {
+        assert!(escalate(u32::MAX, Duration::ZERO).await.is_ok());
+    }
+}

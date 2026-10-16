@@ -19,6 +19,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use mokmok_event_bus::{Subscriber, SubscriberId, Topic};
+    use mokmok_kernel::Db;
+    use mokmok_protocol::SessionID;
+    use uuid::Uuid;
 
     /// The SHA-256 of the empty input, as a known-answer vector from outside this code.
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -132,6 +135,17 @@ mod tests {
         path
     }
 
+    /// The session's durable log, read out of the database the runs wrote.
+    fn log_of(scratch: &Scratch) -> mokmok_kernel::Log {
+        let session =
+            SessionID::from_uuid(Uuid::parse_str(SESSION).expect("the session is a uuid"));
+
+        Db::open(&scratch.data().join("events.sqlite"))
+            .expect("the events database re-opens")
+            .log(session)
+            .expect("the session's log reads")
+    }
+
     /// The first shell on `PATH`, which is where a confined workload can find one.
     fn shell() -> PathBuf {
         let path = std::env::var_os("PATH").expect("a PATH");
@@ -222,6 +236,35 @@ mod tests {
             .expect("the binary runs");
 
         ran(&output)
+    }
+
+    /// Runs the binary as `run_locked` does, but bounded: a daemon that never exits fails the test
+    /// with a message rather than hanging a suite that would then report nothing about it at all.
+    fn run_locked_bounded(
+        args: &[String],
+        bound: Duration,
+    ) -> Ran {
+        let mut child = Command::new(binary())
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary starts");
+        let deadline = Instant::now() + bound;
+
+        loop {
+            if child.try_wait().expect("the child is polled").is_some() {
+                return ran(&child.wait_with_output().expect("the output is read"));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+
+                panic!("the daemon did not exit within {bound:?}");
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn status(scratch: &Scratch) -> Ran {
@@ -458,6 +501,54 @@ mod tests {
             report.out.contains(&format!("turn={first_turn} ")),
             "{}",
             report.out
+        );
+    }
+
+    #[test]
+    fn a_settled_workload_records_the_exit_code_it_returned() {
+        let scratch = Scratch::new("exit-code");
+
+        let submitted = submit(&scratch, KEY_A, &[]);
+        assert!(submitted.ok, "{}\n{}", submitted.out, submitted.err);
+
+        let log = log_of(&scratch);
+
+        assert_eq!(log.results.len(), 1, "one execution settled");
+        assert_eq!(
+            log.results[0].result.code,
+            Some(0),
+            "the exit status the workload returned is what the durable result holds",
+        );
+    }
+
+    #[test]
+    fn a_workload_that_kills_itself_records_the_signal_it_died_of() {
+        let scratch = Scratch::new("signalled");
+
+        // The artifact is written before the shell kills itself, so the run settles with a result
+        // rather than failing on a file the workload never made.
+        let submitted = run(&submit_args(
+            &scratch,
+            KEY_A,
+            "printf x > out.txt; kill -9 $$",
+            &[],
+        ));
+
+        assert!(submitted.ok, "{}\n{}", submitted.out, submitted.err);
+        assert!(
+            submitted
+                .require("execution=")
+                .ends_with("resolution=Some(Killed { signal: 9 })"),
+            "{}",
+            submitted.out,
+        );
+
+        let log = log_of(&scratch);
+
+        assert_eq!(log.results[0].result.signal, Some(9));
+        assert_eq!(
+            log.results[0].result.code, None,
+            "a workload killed by a signal exited with no code",
         );
     }
 
@@ -849,7 +940,9 @@ mod tests {
             "--socket".to_owned(),
             scratch.0.join("bus.sock").display().to_string(),
         ]);
-        let refused = run_locked(&args);
+        // Bounded, because a daemon that waits on a peer rather than on the bus never reaches this
+        // assertion and the suite would report a timeout instead of the refusal it was promised.
+        let refused = run_locked_bounded(&args, Duration::from_secs(8));
 
         assert_eq!(refused.code, Some(1), "{}\n{}", refused.out, refused.err);
         assert!(

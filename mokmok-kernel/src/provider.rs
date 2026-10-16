@@ -867,7 +867,8 @@ fn token(
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, Credential, Error, Ollama, Usage, parse_answer, parse_endpoint, request_body,
+        Action, Credential, Error, Ollama, Permit, PolicyClient, Usage, parse_answer,
+        parse_endpoint, request_body,
     };
     use crate::config::{Config, ProviderKind};
     use clap::Parser as _;
@@ -875,8 +876,11 @@ mod tests {
         Context, ContextAct, ContextTurn, MAX_PROSE_BYTES, MAX_QUERY_BYTES, Provider as _,
         clip_prose,
     };
-    use mokmok_egress::{AddressClass, Rules, Scheme};
-    use mokmok_protocol::SessionID;
+    use mokmok_egress::{
+        AddressClass, CallContext, Destination, Host, Port, Refusal, Rules, Scheme,
+    };
+    use mokmok_observability::{AuditKind, AuditLog as _, Journal, Outcome};
+    use mokmok_protocol::{ExecutionID, Moment, SessionID};
     use mokmok_state_machine::TurnNumber;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -1501,6 +1505,75 @@ mod tests {
             !followed.load(Ordering::SeqCst),
             "a redirect opened a second connection the destination was never validated for",
         );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// One destination over `host` and `port` on the cleartext transport.
+    fn destination(
+        host: Host,
+        port: Port,
+    ) -> Destination {
+        Destination {
+            scheme: Scheme::Http,
+            host,
+            port,
+        }
+    }
+
+    #[test]
+    fn the_policy_refuses_a_destination_that_only_shares_the_port() {
+        let address = "127.0.0.1".parse().expect("a loopback address");
+        let port = Port::new(8080).expect("a port");
+        let permit = Permit {
+            host: Host::Ip(address),
+            port,
+        };
+        let context = CallContext {
+            principal: crate::authority::AGENT,
+            execution: ExecutionID::from_uuid(Uuid::nil()),
+        };
+
+        assert_eq!(
+            permit.check(
+                &destination(Host::Name("elsewhere.test".to_owned()), port),
+                &context
+            ),
+            Err(Refusal::Denied),
+            "a name that is not the pinned host is refused however well the port matches",
+        );
+        assert_eq!(
+            permit.check(&destination(Host::Ip(address), port), &context),
+            Ok(()),
+            "and the pinned host and port together are what it admits",
+        );
+    }
+
+    #[test]
+    fn opening_the_provider_audits_the_destination_it_validated() {
+        let directory = scratch("provider-audit");
+        let credential = credential_file(&directory);
+        // A bound port is a free one. Nothing connects to it: opening the provider only resolves and
+        // validates the destination.
+        let bound = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = bound.local_addr().unwrap().port();
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+        let config = provider_config(&directory, &endpoint, &credential);
+
+        let _provider = Ollama::open(&config, SessionID::from_uuid(Uuid::nil())).unwrap();
+
+        let journal = Journal::open(config.data_dir.join("audit.jsonl")).unwrap();
+        let entries = journal.read(Moment::from_millis(0)).unwrap();
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "the decision that pinned the destination is the one entry: {entries:#?}",
+        );
+        assert_eq!(entries[0].kind(), AuditKind::Egress);
+        assert_eq!(entries[0].outcome(), Outcome::Allowed);
+        let detail = format!("model provider 127.0.0.1:{port}");
+        assert_eq!(entries[0].detail(), Some(detail.as_str()));
+
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

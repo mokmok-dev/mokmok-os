@@ -301,8 +301,10 @@ mod tests {
     use crate::payload::Payload;
     use crate::topic::Topic;
     use mokmok_protocol::AgentID;
+    use std::future::Future;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
+    use std::task::{Context, Waker};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -406,6 +408,54 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 3);
         bus.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_reclaim_sweep_spares_a_topic_a_session_attached_to_mid_reclaim() {
+        let store = std::env::temp_dir().join(format!("mokmok-bus-reclaim-{}", std::process::id()));
+        let bus = Bus::open(Config {
+            store: store.clone(),
+            ..config(1, Duration::ZERO)
+        })
+        .unwrap();
+        let Ok((entry, ticks)) = bus.open_topic(Topic::Global).await else {
+            panic!("the topic could not be opened");
+        };
+        drop(ticks);
+
+        // A second connection holding the write lock keeps the reclaim unanswered, so the sweep
+        // driven by hand below really does suspend inside it.
+        let blocker = rusqlite::Connection::open(&store).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        let mut reclaim = Box::pin(bus.sweep());
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(
+            reclaim.as_mut().poll(&mut context).is_pending(),
+            "the sweep did not suspend inside the reclaim",
+        );
+
+        let mut attached = entry.appended.subscribe();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        reclaim.await;
+
+        let Ok((again, _ticks)) = bus.open_topic(Topic::Global).await else {
+            panic!("the topic could not be reopened");
+        };
+        again.append(Topic::Global, payload()).await.unwrap();
+        let woken = tokio::time::timeout(Duration::from_millis(50), attached.changed()).await;
+
+        bus.shutdown().await.unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", store.display()));
+        }
+
+        assert!(
+            woken.is_ok(),
+            "the session that attached during the reclaim never saw the next append",
+        );
     }
 
     #[tokio::test]
