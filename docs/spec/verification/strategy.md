@@ -63,7 +63,7 @@ The mutation gate is a script the operator runs, not a check. One package per in
 by `MUTANTS_PACKAGE`, enforces a floor of 95% by default. `--all` sweeps every member, writes each
 one's score and target to `mutation.json`, and exports the confiner the kernel's and the tui's
 integration tests need; `--check-baseline` reads that ledger back and reports which rows moved.
-Eight mutants across five members are excluded as equivalent, each with its proof beside the
+Eight mutants across six members are excluded as equivalent, each with its proof beside the
 exclusion in `.cargo/mutants.toml`, and one of those eight is a scope limit rather than an
 equivalence. All fifteen members score 100% over the mutants that remain.[^mutants]
 
