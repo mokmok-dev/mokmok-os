@@ -39,8 +39,13 @@ Eleven are std.
 `rule_pure-crates-have-no-io-dependency`, and its selector is:
 
 ```
-no_std_crates() { ... grep -q '^#\[no_std\]' "$repo/$dir/src/lib.rs" ... }
+no_std_crates() { ... grep -q '^#!\[no_std\]' "$repo/$dir/src/lib.rs" ... }
 ```
+
+Corrected 2026-10-16 after the cross-judge checked it: an earlier revision of this file wrote the
+pattern as `'^#\[no_std\]'`, dropping the `!`, and one candidate copied that into its design. The
+pattern in the script has always included the `!` and matches all four crates, so the rule examines
+four crates and is not vacuous.
 
 So the rule fires **only for a crate that is already `#![no_std]`**. A crate that never opts in is
 never asked whether it should have. Purity is opt-in per crate with nothing measuring the opt-in
@@ -70,6 +75,11 @@ Recorded scores, and their dates:
 | `mokmok-patch` | 80 | 0 | 0 | 100% | 2026-10-15 |
 | `mokmok-kernel` | 173 | 24 | 2 | 86.9% | 2026-10-16 |
 | `mokmok-tui` | 65 | 3 | 0 | 95.5% | 2026-10-16 |
+
+The kernel row is an earlier run of the same day, carried in from memory rather than reproduced by
+this round. This round's own run of the same crate split the same 199 tested mutants as 171 caught
+and 26 missed, 85.9%, with the same 2 timeouts. Two mutants therefore moved between the runs without
+the code moving, which is a load-sensitive difference, and the design document records both numbers.
 
 Eight members have no recorded run at all: `mokmok-protocol`, `mokmok-state-machine`,
 `mokmok-scheduler`, `mokmok-capability`, `mokmok-artifact`, `mokmok-egress`, `mokmok-observability`,

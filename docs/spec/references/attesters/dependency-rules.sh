@@ -5,8 +5,7 @@ set -uo pipefail
 
 # The composition roots. `mokmok-kernel` assembles every other crate and `mokmok-tui` is an
 # application above it, the way the `mokmokd` binary is. Two rules read this one list, so a third
-# root is one reviewed edit rather than a second list to keep in step.
-KERNEL_DEPENDENT_ALLOWLIST="mokmok-tui"
+# root is one reviewed edit here.
 COMPOSITION_ROOTS="mokmok-kernel
 mokmok-tui"
 
@@ -222,13 +221,10 @@ rule_kernel-dependents-are-applications() {
 		[[ $dir == mokmok-kernel ]] && continue
 		hit=$(deps "$repo/$dir" | awk -F'\t' '$2 == "mokmok-kernel" { print "yes" }')
 		[[ -n $hit ]] || continue
-		case ",$KERNEL_DEPENDENT_ALLOWLIST," in
-			*",$dir,"*) ;;
-			*) {
-				printf '%s depends on mokmok-kernel and is outside the allowlist %s\n' "$dir" "$KERNEL_DEPENDENT_ALLOWLIST"
-				return 1
-			} ;;
-		esac
+		is_composition_root "$dir" || {
+			printf '%s depends on mokmok-kernel and is outside the composition roots\n' "$dir"
+			return 1
+		}
 	done < <(members "$repo")
 }
 
@@ -322,11 +318,22 @@ write_manifest() {
 	} > "$path"
 }
 
+# The members of a fabricated tree. The names matter for the rules that hardcode a crate, and
+# `mokmok-alpha` and `mokmok-beta` stand in for the members whose only role is to be a role.
+FAKE_MEMBERS="mokmok-alpha
+mokmok-beta
+mokmok-capability
+mokmok-event-store
+mokmok-kernel
+mokmok-protocol
+mokmok-scheduler
+mokmok-tui"
+
 write_root() {
 	local root=$1 member
 	{
 		printf '[workspace]\nmembers = [\n'
-		for member in mokmok-alpha mokmok-beta mokmok-kernel mokmok-tui; do
+		for member in $FAKE_MEMBERS; do
 			printf '  "%s",\n' "$member"
 		done
 		printf ']\nresolver = "3"\n'
@@ -334,22 +341,23 @@ write_root() {
 }
 
 # The base tree every fault is one edit away from, so a fault case has a control as well as a
-# subject: the base passes all four purity rules, and one edit makes one of them fail.
+# subject: the base passes all nine rules, and one edit makes exactly one of them fail.
 lay_down_base() {
 	local root=$1 member
 	mkdir -p "$root"
 	write_root "$root"
-	for member in mokmok-alpha mokmok-beta mokmok-kernel mokmok-tui; do
+	for member in $FAKE_MEMBERS; do
 		mkdir -p "$root/$member/src"
-	done
-	write_manifest "$root/mokmok-alpha/Cargo.toml" pure ""
-	write_manifest "$root/mokmok-beta/Cargo.toml" adapter ""
-	write_manifest "$root/mokmok-kernel/Cargo.toml" shell ""
-	write_manifest "$root/mokmok-tui/Cargo.toml" shell ""
-	printf '#![no_std]\n' > "$root/mokmok-alpha/src/lib.rs"
-	for member in mokmok-beta mokmok-kernel mokmok-tui; do
 		printf '\n' > "$root/$member/src/lib.rs"
 	done
+	for member in mokmok-alpha mokmok-protocol mokmok-scheduler mokmok-capability; do
+		write_manifest "$root/$member/Cargo.toml" pure ""
+		printf '#![no_std]\n' > "$root/$member/src/lib.rs"
+	done
+	write_manifest "$root/mokmok-beta/Cargo.toml" adapter ""
+	write_manifest "$root/mokmok-event-store/Cargo.toml" adapter ""
+	write_manifest "$root/mokmok-kernel/Cargo.toml" shell ""
+	write_manifest "$root/mokmok-tui/Cargo.toml" shell ""
 }
 
 trip() {
@@ -366,7 +374,27 @@ tokio = "1"
 		pure-depending-on-an-adapter) write_manifest "$root/mokmok-alpha/Cargo.toml" pure '[dependencies]
 mokmok-beta = { path = "../mokmok-beta" }
 ' ;;
-		no-pure-member) write_manifest "$root/mokmok-alpha/Cargo.toml" adapter "" ;;
+		no-pure-member)
+			for member in mokmok-alpha mokmok-protocol mokmok-scheduler mokmok-capability; do
+				write_manifest "$root/$member/Cargo.toml" adapter ""
+			done
+			;;
+		protocol-depends-on-a-member) write_manifest "$root/mokmok-protocol/Cargo.toml" pure '[dependencies]
+mokmok-alpha = { path = "../mokmok-alpha" }
+' ;;
+		event-store-with-a-transport) write_manifest "$root/mokmok-event-store/Cargo.toml" adapter '[dependencies]
+tokio = "1"
+' ;;
+		scheduler-with-a-model-client) write_manifest "$root/mokmok-scheduler/Cargo.toml" pure '[dependencies]
+reqwest = "0.12"
+' ;;
+		capability-with-an-io-dependency) write_manifest "$root/mokmok-capability/Cargo.toml" pure '[dependencies]
+nix = "0.31"
+' ;;
+		capability-reaching-the-os) printf '#![no_std]\nfn main() { let _ = std::fs::read("x"); }\n' > "$root/mokmok-capability/src/lib.rs" ;;
+		an-application-outside-the-roots) write_manifest "$root/mokmok-alpha/Cargo.toml" pure '[dependencies]
+mokmok-kernel = { path = "../mokmok-kernel" }
+' ;;
 		*)
 			printf 'unknown fault %s\n' "$fault"
 			return 2
@@ -380,8 +408,7 @@ faults() {
 	local root fault rule expected detail status failures=0
 	root=$(mktemp -d)
 	lay_down_base "$root"
-	for rule in every-member-declares-its-role pure-crates-are-no_std \
-		pure-crates-depend-only-on-pure-crates the-role-census-is-not-empty; do
+	for rule in "${RULES[@]}"; do
 		if detail=$(run_rule "$root" "$rule"); then
 			printf 'control=base rule=%s status=pass\n' "$rule"
 		else
@@ -411,6 +438,12 @@ no_std-and-declared-adapter|pure-crates-are-no_std|mokmok-beta is no_std and dec
 no_std-with-an-io-dependency|pure-crates-are-no_std|mokmok-alpha is no_std and depends on tokio
 pure-depending-on-an-adapter|pure-crates-depend-only-on-pure-crates|mokmok-alpha is pure and depends on mokmok-beta
 no-pure-member|the-role-census-is-not-empty|no member declares the pure role
+protocol-depends-on-a-member|protocol-has-no-domain-dependency|mokmok-protocol depends on mokmok-alpha
+event-store-with-a-transport|event-store-has-no-transport-dependency|mokmok-event-store depends on tokio
+scheduler-with-a-model-client|scheduler-has-no-model-dependency|mokmok-scheduler depends on reqwest
+capability-with-an-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on nix
+capability-reaching-the-os|capability-performs-no-enforcement-io|mokmok-capability reaches the operating system
+an-application-outside-the-roots|kernel-dependents-are-applications|mokmok-alpha depends on mokmok-kernel and is outside
 CASES
 
 	rm -rf "$root"

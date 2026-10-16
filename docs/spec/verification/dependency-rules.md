@@ -84,16 +84,21 @@ rule=capability-performs-no-enforcement-io status=pass
 rule=kernel-dependents-are-applications status=pass
 ```
 
-Sensitivity, run as a mode rather than by hand. `dependency-rules.sh faults` lays down a four-member
-repository in a temporary directory, asserts the four role rules pass over it, then applies one edit
-per fault and asserts the intended rule reports `status=fail` with a detail naming the offender. The
-base tree is the control: a fault case is only evidence if the unedited tree passes.
+Sensitivity, run as a mode rather than by hand. `dependency-rules.sh faults` lays down an eight-member
+repository in a temporary directory, asserts all nine rules pass over it, then applies one edit per
+fault and asserts the intended rule reports `status=fail` with a detail naming the offender. The base
+tree is the control: a fault case is only evidence if the unedited tree passes.
 
 ```
+control=base rule=protocol-has-no-domain-dependency status=pass
 control=base rule=every-member-declares-its-role status=pass
 control=base rule=pure-crates-are-no_std status=pass
 control=base rule=pure-crates-depend-only-on-pure-crates status=pass
 control=base rule=the-role-census-is-not-empty status=pass
+control=base rule=event-store-has-no-transport-dependency status=pass
+control=base rule=scheduler-has-no-model-dependency status=pass
+control=base rule=capability-performs-no-enforcement-io status=pass
+control=base rule=kernel-dependents-are-applications status=pass
 fault=no-declaration rule=every-member-declares-its-role status=fail detail=mokmok-beta declares no role in its own manifest
 fault=unknown-role rule=every-member-declares-its-role status=fail detail=mokmok-beta declares the unknown role adaptor
 fault=shell-outside-the-roots rule=every-member-declares-its-role status=fail detail=mokmok-alpha declares the shell role and is not a composition root
@@ -102,7 +107,17 @@ fault=no_std-and-declared-adapter rule=pure-crates-are-no_std status=fail detail
 fault=no_std-with-an-io-dependency rule=pure-crates-are-no_std status=fail detail=mokmok-alpha is no_std and depends on tokio
 fault=pure-depending-on-an-adapter rule=pure-crates-depend-only-on-pure-crates status=fail detail=mokmok-alpha is pure and depends on mokmok-beta, which declares adapter
 fault=no-pure-member rule=the-role-census-is-not-empty status=fail detail=no member declares the pure role, so the purity rule selects nothing
+fault=protocol-depends-on-a-member rule=protocol-has-no-domain-dependency status=fail detail=mokmok-protocol depends on mokmok-alpha
+fault=event-store-with-a-transport rule=event-store-has-no-transport-dependency status=fail detail=mokmok-event-store depends on tokio
+fault=scheduler-with-a-model-client rule=scheduler-has-no-model-dependency status=fail detail=mokmok-scheduler depends on reqwest
+fault=capability-with-an-io-dependency rule=capability-performs-no-enforcement-io status=fail detail=mokmok-capability depends on nix
+fault=capability-reaching-the-os rule=capability-performs-no-enforcement-io status=fail detail=mokmok-capability reaches the operating system in <the temporary tree>/mokmok-capability/src/lib.rs
+fault=an-application-outside-the-roots rule=kernel-dependents-are-applications status=fail detail=mokmok-alpha depends on mokmok-kernel and is outside the composition roots
 ```
+
+The one line above that is not verbatim is `capability-reaching-the-os`, whose detail names the
+temporary directory the run created and therefore differs every time. Nine controls and fourteen
+faults, exit 0.
 
 `nix flake check` builds the `dependencyRules` attribute over this same command, so the nine rules
 are a gate rather than an operator step.
@@ -110,20 +125,26 @@ are a gate rather than an operator step.
 # What this proves
 
 The nine rules hold over the workspace manifests, the declared roles, and the capability crate's
-sources at commit `fbe5270` plus the role declarations. Each of the four role rules has a rerunnable
-fault that makes it fail with a named reason.
+sources at commit `fbe5270` plus the role declarations. Every one of the nine has a rerunnable fault
+that makes it fail with a named reason, and the base tree it is one edit away from passes all nine.
 
-That the four crates declaring `pure` are `#![no_std]` and free of an IO dependency is checked by
-the compiler as well, because `#![no_std]` makes rustc reject `std`, and `unsafe_code = "deny"`
-closes the `extern "C"` route. The rule adds the declaration, which the compiler cannot see.
+What the compiler proves on top of that is narrower than the ladder's name suggests, and this is the
+part a reader should not overstate. `#![no_std]` on a crate makes rustc reject `std` in that crate's
+own code, and `unsafe_code = "deny"` closes the `extern "C"` route, so a `pure` crate's own logic
+cannot reach an operating system interface. It says nothing about the crate's dependencies.
+`pure-crates-depend-only-on-pure-crates` holds the `mokmok-` edges to the same standard, and the
+`IO_CRATES` list holds the known IO crates, but a third-party crate that uses `std` and is not on
+that list passes both.
 
 # What this does not prove
 
-A rule reads a manifest and a source text. It cannot see a dependency that arrives transitively, and
-it cannot see an architectural violation expressed through a port the caller implements. A rule name
-outside the nine is an error, so a misspelled parameter fails the run.
+A rule reads a manifest and a source text. It cannot see a dependency that arrives transitively, so
+the closure a `pure` crate is held to is the `mokmok-` graph plus a fixed list of crates, not the
+whole dependency tree. It cannot see an architectural violation expressed through a port the caller
+implements. A rule name outside the nine is an error, so a misspelled parameter fails the run.
 
 A `pure` declaration says nothing about how much of a crate is a decision and how much is arithmetic
 on values it was handed. `mokmok-agent-runtime` is the crate where that gap is widest: its own
-documentation claims it is pure, its declared role is `adapter`, and the rule cannot tell which is
-right until the blockers in its manifest and its `Setting` type are gone.
+documentation at `mokmok-agent-runtime/src/lib.rs:3` claims it is pure, its declared role is
+`adapter`, and the rule cannot tell which is right until the blockers in its manifest and its
+`Setting` type are gone.

@@ -51,9 +51,15 @@ Claims that held under independent check: `Validated::connect` has no caller out
 `mokmok-egress/tests/enforcement.rs`; `Resolver`'s only implementer and only user is
 `mokmok-kernel/src/provider.rs`; `Setting`'s `PathBuf` serde form is a plain string, proven by the
 round trip at `mokmok-agent-runtime/src/task.rs:75`, so a `#[serde(transparent)] Path(String)` is
-wire-identical; `cargo mutants 27.1.0` does have `--test-workspace`; the kernel's 26 unkilled
-mutants are 24 missed plus 2 timeouts. One extra finding: no mutation ledger exists in the tree, so
+wire-identical; `cargo mutants 27.1.0` does have `--test-workspace`; the kernel's 199 tested mutants
+split as 2 timeouts plus the rest. One extra finding: no mutation ledger exists in the tree, so
 "eight members with no recorded run" describes operator runs rather than a committed file.
+
+Correction, added after the review of this round. The kernel's caught and missed counts are not
+stable: the grounding's row (173/24) and this round's own run (171/26) describe the same 199 tested
+mutants on the same tree, so two mutants moved between runs. The review of the round caught the
+scorecard treating one run's arithmetic as though it settled the other's, and this paragraph replaces
+that reconciliation.
 
 ## Recommended base
 

@@ -24,8 +24,12 @@ and assert it exists, and the confiner is a bin of `mokmok-sandbox`, which a pac
 never produces. The helper reads `MOKMOK_CONFINER` first and nothing ever set it.
 
 Measured with the confiner named, on this tree: **294 mutants tested in 4m, 171 caught, 26 missed, 2
-timeouts, 85.9%**, exit 3. The 26 missed mutants are the extraction list, because every one of them
-sits where the grounding says pure logic is locked behind I/O:
+timeouts, 85.9%**, exit 3. An earlier run of the same crate on 2026-10-16, the one this round
+inherited through memory, split the same 199 mutants as 173 caught and 24 missed, 86.9%. Two mutants
+between the two runs are a load-sensitive difference rather than a code difference, and it is worth
+knowing before treating any kernel score as a fixed number. The 26 missed mutants of this run are the
+extraction list, because every one of them sits where the grounding says pure logic is locked behind
+I/O:
 
 ```
 MISSED   src/agent.rs:847:5: replace ask_line -> String with String::new()
@@ -64,8 +68,10 @@ purity = "pure"      # or "adapter", or "shell"
 ```
 
 - `pure` means the crate is `#![no_std]`, so rustc rejects `std` and no convention has to hold the
-  line. `unsafe_code = "deny"` closes the `extern "C"` route, so no-std plus the dependency closure
-  is no-IO.
+  line. `unsafe_code = "deny"` closes the `extern "C"` route, so the crate's own logic cannot reach
+  an operating system interface. That is narrower than it sounds and the verification page says so:
+  rustc constrains only the crate's own code, the closure rule holds the `mokmok-` edges, and the
+  known IO crates are a fixed list.
 - `adapter` means the crate binds the world. Its role is to be thin, and the pure logic inside it is
   a decision lifted out of the IO that carries it.
 - `shell` means a composition root. Only `mokmok-kernel` and `mokmok-tui` may hold it, and the check
@@ -75,7 +81,7 @@ End state, sixteen members:
 
 | member | role | why |
 | --- | --- | --- |
-| `mokmok-protocol` | pure | unchanged |
+| `mokmok-protocol` | pure | gains `Path`, the owned path type the runtime's `Setting` needs |
 | `mokmok-state-machine` | pure | unchanged |
 | `mokmok-scheduler` | pure | unchanged |
 | `mokmok-capability` | pure | unchanged |
@@ -94,8 +100,9 @@ End state, sixteen members:
 
 ### The check
 
-`docs/spec/references/attesters/dependency-rules.sh` owns the architecture's dependency rules and
-gains four beside the five it had. `flake.nix` gains one check, `dependencyRules`, which runs it.
+`docs/spec/references/attesters/dependency-rules.sh` owns the architecture's dependency rules. It had
+six; one is retired and four are added, so it has nine. `flake.nix` gains one check,
+`dependencyRules`, which runs it.
 
 | Rule | What it forbids |
 | --- | --- |
@@ -174,14 +181,14 @@ type its public surface mentions already is.
 
 | phase | what lands | ends in |
 | --- | --- | --- |
-| P0 | The declaration in fifteen manifests, the four rules, the `dependencyRules` check, the `faults` mode. Nothing else moves. | `dependencyRules` green logging `pure=4 adapter=9 shell=2`, `faults` green. **Landed.** |
-| P1 | Subtraction: the stale `mokmok-scheduler` edge, the five confiner helpers collapsed to one, the half of `capability-performs-no-enforcement-io` the compiler already covers, the `byte_bound_start` shadow, the `docs/spec` drift, `mokmok-data/` ignored. | `cargo metadata` current, `specBundle` added and green. |
+| P0 | The declaration in fifteen manifests, the four rules and the retirement of the opt-in selector that deletion 9 names, the `dependencyRules` check, the `faults` mode. No crate moves. | `dependencyRules` green logging `pure=4 adapter=9 shell=2`, `faults` green over nine controls and fourteen faults. **Landed.** |
+| P1 | Subtraction: the stale `mokmok-scheduler` edge, the five confiner helpers collapsed to one, the half of `capability-performs-no-enforcement-io` the compiler already covers, the `docs/spec` drift, `mokmok-data/` ignored. | `cargo metadata` current, `specBundle` added and green. |
 | P2 | `mokmok-patch` becomes `#![no_std]`. The cheapest purity win, done by hand to learn the recipe. | `dependencyRules` logging `pure=5`, `MUTANTS_PACKAGE=mokmok-patch` at 100%. |
 | P3 | `mokmok-delivery` lands with the window types, `retention_step`, the eviction property, and the store's loop. The shadow is deleted. | `dependencyRules` logging `pure=6`, `cargo test -p mokmok-event-bus` green. |
 | P4 | `plan_pull`, `PullPlan`, the credit property. `pull` executes the plan. | `MUTANTS_PACKAGE=mokmok-delivery` at 95% or above. |
 | P5 | The gate reaches every member. `scripts/mutants.sh --all` builds the confiner, exports `MOKMOK_CONFINER`, sweeps all sixteen, and writes `mutation.toml`. `--check-baseline` reads it. | sixteen rows, the check logging how many sit below 95. |
 | P6 | The kernel's in-place seams plus the integration assertions that kill the survivors. | `MUTANTS_PACKAGE=mokmok-kernel` at 95%, target raised in the same PR. |
-| P7 | `mokmok-agent-runtime` becomes `#![no_std]`, with `mokmok_protocol::Path` replacing five `PathBuf` fields. | `dependencyRules` logging `pure=7`, the runtime's row unchanged at 99.2%. |
+| P7 | `mokmok-protocol` gains `Path` and `mokmok-agent-runtime` becomes `#![no_std]`, with that type replacing five `PathBuf` fields. Both edits are in this PR because protocol has to export the type before the runtime can name it. | `dependencyRules` logging `pure=7`, the runtime's row unchanged at 99.2%. |
 | P8 | The in-place seams, one PR per crate. The tui pty harness is its own PR. | each crate's row refreshed and its target raised. |
 | P9 | The bundle describes the new roles. | `specBundle` green. |
 
@@ -257,6 +264,12 @@ vacuous, on the grounds that the selector greps `^#\[no_std\]` while the sources
 The pattern includes the `!` and matches all four crates. Both the parent and the cross-judge
 reproduced this independently. Its second deliverable rested on the same premise, so its R1 score
 does not stand either, though its non-vacuity floor does as an idea and is grafted.
+
+The blame is shared and the record should say so: the grounding this round handed every candidate
+quotes the selector as `grep -q '^#\[no_std\]'`, dropping the `!`. Candidate 2 copied that pattern
+from its brief. It is still wrong to build a design on a quoted pattern without running it, which is
+why the claim is rejected, but the brief was the source and the brief has been corrected in
+`.audit/round-3-arena/grounding.md`.
 
 **Grafted from candidate 1:**
 - The `shell` role and the composition-root allowlist, so a third root cannot appear silently. Its
