@@ -7,8 +7,12 @@
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use clap::Parser as _;
     use mokmok_agent_runtime::{
@@ -270,6 +274,50 @@ mod tests {
         run(scratch, &args)
     }
 
+    /// A stub endpoint on this host that answers one chat-completions response, and the
+    /// `Authorization` header it received.
+    ///
+    /// Cleartext HTTP is allowed for loopback, so this reaches the provider's credential without
+    /// the network the gate has none of.
+    fn stub_endpoint() -> (u16, Arc<Mutex<Option<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("the bound address").port();
+        let seen = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
+            *captured.lock().unwrap() = request.lines().find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+
+                lower
+                    .strip_prefix("authorization: ")
+                    .map(|_| line["authorization: ".len()..].to_owned())
+            });
+
+            let body = br#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        (port, seen)
+    }
+
     /// One `submit` of `body` through the operator's shell, which is the path the kernel takes
     /// before the agent's own loop is ever opened.
     fn submit_args(
@@ -463,6 +511,47 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(scratch.checkout().join("out.txt")).expect("the command wrote"),
             "hello",
+        );
+    }
+
+    #[test]
+    fn the_credential_the_env_key_names_reaches_the_provider() {
+        let scratch = Scratch::new("credential-env");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "final", "say": "done"})]);
+        let (port, seen) = stub_endpoint();
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let args = agent_args(
+            &scratch,
+            &path,
+            &[
+                "--provider",
+                "ollama",
+                "--model",
+                "kimi-k2.7-code",
+                "--endpoint",
+                &endpoint,
+                "--env-key",
+                "MOKMOK_CREDENTIAL",
+            ],
+        );
+        let ran = ran(&child(&scratch)
+            .env("MOKMOK_CREDENTIAL", "s3cr3t")
+            .args(&args)
+            .output()
+            .expect("the binary runs"));
+
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert!(
+            ran.out.contains("phase=Closed(Completed)"),
+            "the run did not close completed:\n{}",
+            ran.out,
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("Bearer s3cr3t"),
+            "the credential the environment held did not reach the endpoint",
         );
     }
 
