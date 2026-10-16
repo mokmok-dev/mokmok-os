@@ -17,8 +17,6 @@ const fn session_id() -> SessionID {
     SessionID::from_uuid(Uuid::from_u128(0))
 }
 
-/// The settlement a state records, re-derived from the public [`State`] rather than read back from
-/// the machine. An [`State::Applied`] execution still names the resolution it settled with.
 const fn settlement_of(state: State) -> Option<Resolution> {
     match state {
         State::Settled(resolution) | State::Applied { resolution } => Some(resolution),

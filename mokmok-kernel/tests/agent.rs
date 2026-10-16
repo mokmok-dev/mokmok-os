@@ -1436,7 +1436,6 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
 
-        // Three steps reach the edit's commit; the crash stops before anything is written.
         let crashed = run(
             &scratch,
             &agent_args(
@@ -1498,7 +1497,6 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
 
-        // Three steps reach the edit's commit; the write lands before the crash.
         let crashed = run(
             &scratch,
             &agent_args(

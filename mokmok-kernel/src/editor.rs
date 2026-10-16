@@ -64,7 +64,6 @@ impl Editor {
         })
     }
 
-    /// Renders a patch-crate error as the sentence the model reads.
     fn patch_reason(error: PatchError) -> String {
         match error {
             PatchError::Parse(ParseError::NoFileSection) => "no file section opened".to_owned(),
@@ -106,7 +105,6 @@ impl Editor {
         }
     }
 
-    /// Builds the report a commit-time refusal records.
     fn refused_report(
         relative: &str,
         reason: String,
@@ -120,7 +118,6 @@ impl Editor {
         }
     }
 
-    /// Builds the report an applied edit records, with an optional directory-sync warning.
     fn applied_report(
         ready: &Ready,
         unsynced: bool,
@@ -394,7 +391,6 @@ enum PatchError {
     NoFile,
 }
 
-/// Default mode for a file the patch creates.
 const DEFAULT_MODE: u32 = 0o644;
 
 const fn dummy_ref() -> ArtifactRef {
@@ -848,7 +844,6 @@ mod tests {
         let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
 
         let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
-        // 64 characters, but the last one is not hexadecimal.
         let mut almost = "0".repeat(63);
         almost.push('g');
         call.expect = Some(almost);
@@ -984,7 +979,6 @@ mod tests {
         std::fs::write(real.join("x.rs"), "one\n").unwrap();
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
 
-        // The operator grants the path through the symlink, and the checkout is named the same way.
         let grant = base.join("link");
         let config = config(&scratch.0, std::slice::from_ref(&grant), &[]);
         let editor = Editor::new(&config, &grant, Moment::EPOCH).unwrap();

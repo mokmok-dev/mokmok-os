@@ -1296,7 +1296,6 @@ mod tests {
                 "hunk 1 matched at line 1 (offset 0)",
             ),
         );
-        // Recovery settles the turn failed, so the in-flight edit stays visible.
         apply_all(&mut transcript, &recovery_facts(turn, execution));
 
         let built = context(&transcript);
@@ -1328,8 +1327,6 @@ mod tests {
                 },
             ),
         );
-        // A refusal decided before anything was written records an outcome and no intent, so the
-        // rendering has to come from the outcome or the turn reads as a command that never ran.
         apply_all(
             &mut transcript,
             &edit_refusal_records(
