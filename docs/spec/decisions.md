@@ -50,7 +50,7 @@ store.[^architecture] The bus opens a second SQLite file with its own schema, an
 no position, no transaction, and no identifier space. A system that needed one durable order across
 both would have to build it.
 
-Recovery reads the commit log directly. `Db::unsettled_sessions` (`mokmok-kernel/src/db.rs:392`)
+Recovery reads the commit log directly. `Db::unsettled_sessions` (`mokmok-kernel/src/db.rs:425`)
 groups the log by event stream and folds each one, so the log is the session index and no registry
 of live sessions exists. A session whose log is unreadable stops startup by design.
 
