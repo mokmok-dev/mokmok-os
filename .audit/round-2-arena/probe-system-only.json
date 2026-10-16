@@ -1,1 +1,0 @@
-{"id":"chatcmpl-379","object":"chat.completion","created":1791867265,"model":"kimi-k2.7-code","system_fingerprint":"fp_ollama","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"load"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}
