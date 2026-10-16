@@ -1,19 +1,23 @@
-//! The pure core: two fields of state, three pure functions, one driver.
+//! The pure core: the sessions one process holds, one pane, three pure functions, one driver.
 
 use std::mem;
 
 use mokmok_agent_runtime::{
     Action, ContextAct, Halt, MAX_SPEECH_BYTES, Move, Progress, Transcript, next,
 };
-use mokmok_protocol::TurnID;
+use mokmok_protocol::{SessionID, TurnID};
 use mokmok_state_machine::{Attempt, Ending, Phase};
 
-use crate::port::{Engine, Event, Key, Line, Screen, View};
-use crate::{Error, Outcome};
+use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, View};
+use crate::{Error, Left, Outcome};
 
-/// What the conversation holds that the fold does not.
-#[derive(Debug, Default)]
-struct Ui {
+/// One session this process holds: its engine, the line being typed in it, and how far back its
+/// transcript is scrolled.
+///
+/// The line and the scroll belong to the session rather than to the screen, so switching away and
+/// back leaves what the human was typing where he left it.
+struct Held<E> {
+    engine: E,
     input: String,
     scroll: u16,
 }
@@ -36,8 +40,35 @@ enum Reaction {
     Idle,
     /// The line the human submitted.
     Speak(String),
-    /// Leave, with the session as it stands.
+    /// Leave, with every session as it stands.
     Quit,
+    /// Show the sessions the log holds.
+    List,
+    /// Open the session the listing's cursor is on.
+    Adopt(SessionID),
+    /// Open a session that does not exist yet, with this goal.
+    Create(String),
+}
+
+/// The pane the human opened, and where he is in it.
+#[derive(Debug, Eq, PartialEq)]
+enum Pane {
+    /// The sessions this process holds and the ones the log holds, with the cursor on a row.
+    List { cursor: usize },
+    /// The goal of a session that does not exist yet, as it is being typed.
+    New { goal: String },
+}
+
+/// The sessions this process holds, the one the human is in, and the pane he opened.
+///
+/// Every question about the screen is answered here from the folds the caller hands in, so the frame
+/// and the keys are testable without a log, a model, or a terminal.
+struct Manager<E> {
+    held: Vec<Held<E>>,
+    focus: usize,
+    /// The log's own listing, as it was when the listing pane was opened.
+    listed: Vec<Listing>,
+    pane: Option<Pane>,
 }
 
 /// Whose turn it is. The one question the driver asks, and a pure function of the fold.
@@ -114,149 +145,534 @@ fn reason(
     )
 }
 
+/// One phrase for a session's state and whose turn it is.
 fn status(
     fold: &Transcript,
-    ui: &Ui,
+    input: &str,
 ) -> String {
     match mode(fold) {
-        Mode::Ended(ending) => format!("closed ({ending:?})"),
-        Mode::Waiting if ui.input.len() >= MAX_SPEECH_BYTES => "the line is full".to_owned(),
+        Mode::Ended(ending) => closed_phrase(ending),
+        Mode::Waiting if input.len() >= MAX_SPEECH_BYTES => "the line is full".to_owned(),
         Mode::Waiting => "your turn".to_owned(),
         Mode::Working => "the agent is working".to_owned(),
     }
 }
 
-impl Ui {
+/// One phrase for a session that ended.
+fn closed_phrase(ending: Ending) -> String {
+    format!("closed ({ending:?})")
+}
+
+/// One phrase for the phase a session reached, for a session this process holds no engine for.
+fn phase_phrase(phase: Phase) -> String {
+    match phase {
+        Phase::Unopened => "not opened".to_owned(),
+        Phase::Accepting => "open".to_owned(),
+        Phase::Draining => "draining".to_owned(),
+        Phase::Closed(ending) => closed_phrase(ending),
+    }
+}
+
+/// One phrase for the sessions whose turn it is besides the one on screen, when any are.
+fn background(
+    folds: &[Transcript],
+    focus: usize,
+) -> Option<String> {
+    let working = folds
+        .iter()
+        .enumerate()
+        .filter(|(index, fold)| *index != focus && matches!(mode(fold), Mode::Working))
+        .count();
+
+    match working {
+        0 => None,
+        1 => Some("1 other session working".to_owned()),
+        other => Some(format!("{other} other sessions working")),
+    }
+}
+
+/// What answering one reported event left the process doing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Keep {
+    /// Every session is as it was, and the loop carries on.
+    Running,
+    /// The human left, with every session as it stands.
+    Leaving,
+}
+
+/// Whether every held session has ended, which is when the process is done.
+fn settled(folds: &[Transcript]) -> bool {
+    folds
+        .iter()
+        .all(|fold| matches!(mode(fold), Mode::Ended(_)))
+}
+
+/// What the process leaves behind, one entry per held session in roster order.
+fn outcome(folds: &[Transcript]) -> Outcome {
+    Outcome {
+        left: folds
+            .iter()
+            .map(|fold| Left {
+                session: fold.session.id(),
+                ending: match mode(fold) {
+                    Mode::Ended(ending) => Some(ending),
+                    Mode::Waiting | Mode::Working => None,
+                },
+                lines: lines(fold),
+            })
+            .collect(),
+    }
+}
+
+/// The legend the listing's status row carries for the mark its held rows take.
+const HELD_LEGEND: &str = "* is held";
+
+impl<E: Engine> Manager<E> {
+    /// A manager holding one session, with the human in it and no pane open.
+    fn holding(engine: E) -> Self {
+        Self {
+            held: vec![Held {
+                engine,
+                input: String::new(),
+                scroll: 0,
+            }],
+            focus: 0,
+            listed: Vec::new(),
+            pane: None,
+        }
+    }
+
+    /// Every held session's past, in roster order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's failure when one session's history cannot be read or does not fold.
+    fn folds(&self) -> Result<Vec<Transcript>, Error> {
+        self.held.iter().map(|held| held.engine.fold()).collect()
+    }
+
     fn view(
         &self,
-        fold: &Transcript,
+        folds: &[Transcript],
     ) -> View {
+        let held = &self.held[self.focus];
+
         View {
-            session: fold.session.id(),
-            lines: lines(fold),
-            input: self.input.clone(),
-            status: status(fold, self),
-            scroll: self.scroll,
+            session: folds[self.focus].session.id(),
+            lines: lines(&folds[self.focus]),
+            input: held.input.clone(),
+            status: self.status(folds),
+            scroll: held.scroll,
+            background: background(folds, self.focus),
+            sheet: self.sheet(folds),
         }
+    }
+
+    /// The state row: the pane's own phrase when one is open, and the session's otherwise.
+    fn status(
+        &self,
+        folds: &[Transcript],
+    ) -> String {
+        match &self.pane {
+            Some(Pane::List { .. }) => format!(
+                "{} sessions; {HELD_LEGEND}; enter opens one, esc closes",
+                self.rows(folds).len(),
+            ),
+            Some(Pane::New { .. }) => {
+                "type a goal; enter creates a session, esc cancels".to_owned()
+            },
+            None => status(&folds[self.focus], &self.held[self.focus].input),
+        }
+    }
+
+    fn sheet(
+        &self,
+        folds: &[Transcript],
+    ) -> Option<Sheet> {
+        match &self.pane {
+            None => None,
+            Some(Pane::List { cursor }) => Some(Sheet::List {
+                rows: self.rows(folds),
+                cursor: *cursor,
+            }),
+            Some(Pane::New { goal }) => Some(Sheet::New { goal: goal.clone() }),
+        }
+    }
+
+    /// The listing's rows: every session this process holds, then every one only the log holds.
+    fn rows(
+        &self,
+        folds: &[Transcript],
+    ) -> Vec<Row> {
+        let mut rows: Vec<Row> = self
+            .held
+            .iter()
+            .enumerate()
+            .map(|(index, held)| Row {
+                session: held.engine.session(),
+                goal: folds[index].task.as_ref().map(|task| task.goal.clone()),
+                status: status(&folds[index], &held.input),
+                held: true,
+                focused: index == self.focus,
+            })
+            .collect();
+
+        rows.extend(
+            self.listed
+                .iter()
+                .filter(|listing| self.index_of(listing.session).is_none())
+                .map(|listing| Row {
+                    session: listing.session,
+                    goal: listing.goal.clone(),
+                    status: phase_phrase(listing.phase),
+                    held: false,
+                    focused: false,
+                }),
+        );
+
+        rows
+    }
+
+    /// The index of the held session `session` names, when this process holds it.
+    fn index_of(
+        &self,
+        session: SessionID,
+    ) -> Option<usize> {
+        self.held
+            .iter()
+            .position(|held| held.engine.session() == session)
+    }
+
+    /// The held session to step next: the first one in rotation from the focus whose turn it is.
+    ///
+    /// The rotation starts at the focus, so the session the human is watching moves first and the
+    /// ones behind it take their turns in between his keystrokes.
+    fn next_to_step(
+        &self,
+        folds: &[Transcript],
+    ) -> Option<usize> {
+        let count = folds.len();
+
+        (0..count)
+            .map(|offset| (self.focus + offset) % count)
+            .find(|index| matches!(mode(&folds[*index]), Mode::Working))
+    }
+
+    /// Adds a session this process just opened, and puts the human in it.
+    fn hold(
+        &mut self,
+        engine: E,
+    ) {
+        self.held.push(Held {
+            engine,
+            input: String::new(),
+            scroll: 0,
+        });
+        self.focus = self.held.len() - 1;
+        self.pane = None;
+    }
+
+    /// Shows the next session this process holds, wrapping at the end.
+    const fn cycle(&mut self) {
+        self.focus = (self.focus + 1) % self.held.len();
+    }
+
+    /// Opens the listing, with the cursor on the session the human is in.
+    fn open_list(
+        &mut self,
+        folds: &[Transcript],
+    ) {
+        let focused = self.held[self.focus].engine.session();
+        let cursor = self
+            .rows(folds)
+            .iter()
+            .position(|row| row.session == focused)
+            .unwrap_or(0);
+
+        self.pane = Some(Pane::List { cursor });
+    }
+
+    /// Opens a session the human chose, which is one this process holds or one only the log holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of opening a session this process does not hold yet.
+    fn adopt(
+        &mut self,
+        session: SessionID,
+        world: &impl Roster<Engine = E>,
+    ) -> Result<(), Error> {
+        // Two engines on one session would make the second one's recovery mark the first one's work
+        // in flight as unknown, so a session this process holds is focused and not re-opened.
+        if let Some(index) = self.index_of(session) {
+            self.focus = index;
+            self.pane = None;
+        } else if let Some(listing) = self
+            .listed
+            .iter()
+            .find(|listing| listing.session == session)
+            .cloned()
+        {
+            let engine = world.resume(&listing)?;
+            self.hold(engine);
+        }
+
+        Ok(())
     }
 
     fn react(
         &mut self,
         key: Key,
-        mode: Mode,
+        folds: &[Transcript],
     ) -> Reaction {
+        if self.pane.is_some() {
+            return self.react_pane(key, folds);
+        }
+
         match key {
             Key::Char(character) => {
-                if self.input.len() + character.len_utf8() <= MAX_SPEECH_BYTES {
-                    self.input.push(character);
+                self.line(|input| {
+                    if input.len() + character.len_utf8() <= MAX_SPEECH_BYTES {
+                        input.push(character);
+                    }
+                });
+
+                Reaction::Idle
+            },
+            Key::Backspace => {
+                self.line(|input| {
+                    input.pop();
+                });
+
+                Reaction::Idle
+            },
+            // A line is spoken only in the conversation pane, while the session waits for one, and
+            // only when it holds something to say.
+            Key::Enter => match mode(&folds[self.focus]) {
+                Mode::Waiting if !self.held[self.focus].input.trim().is_empty() => {
+                    Reaction::Speak(mem::take(&mut self.held[self.focus].input))
+                },
+                Mode::Waiting | Mode::Working | Mode::Ended(_) => Reaction::Idle,
+            },
+            Key::Up => {
+                let held = &mut self.held[self.focus];
+                held.scroll = held.scroll.saturating_add(1);
+
+                Reaction::Idle
+            },
+            Key::Down => {
+                let held = &mut self.held[self.focus];
+                held.scroll = held.scroll.saturating_sub(1);
+
+                Reaction::Idle
+            },
+            Key::Next => {
+                self.cycle();
+
+                Reaction::Idle
+            },
+            Key::List => Reaction::List,
+            Key::New => {
+                self.pane = Some(Pane::New {
+                    goal: String::new(),
+                });
+
+                Reaction::Idle
+            },
+            Key::Escape => Reaction::Idle,
+            Key::Interrupt => Reaction::Quit,
+        }
+    }
+
+    /// The keys the pane the human opened answers.
+    fn react_pane(
+        &mut self,
+        key: Key,
+        folds: &[Transcript],
+    ) -> Reaction {
+        // Read before the pane is borrowed, because a cursor that moves needs the rows to clamp to.
+        let rows = self.rows(folds);
+
+        match key {
+            Key::Interrupt => Reaction::Quit,
+            Key::Escape | Key::List => {
+                self.pane = None;
+
+                Reaction::Idle
+            },
+            Key::Up | Key::Down => {
+                if let Some(Pane::List { cursor }) = &mut self.pane {
+                    *cursor = if matches!(key, Key::Up) {
+                        cursor.saturating_sub(1)
+                    } else {
+                        cursor.saturating_add(1).min(rows.len().saturating_sub(1))
+                    };
+                }
+
+                Reaction::Idle
+            },
+            Key::Enter => match &mut self.pane {
+                Some(Pane::List { cursor }) => rows
+                    .get(*cursor)
+                    .map_or(Reaction::Idle, |row| Reaction::Adopt(row.session)),
+                Some(Pane::New { goal }) if !goal.trim().is_empty() => {
+                    Reaction::Create(mem::take(goal))
+                },
+                Some(Pane::New { .. }) | None => Reaction::Idle,
+            },
+            Key::Char(character) => {
+                if let Some(Pane::New { goal }) = &mut self.pane
+                    && goal.len() + character.len_utf8() <= MAX_SPEECH_BYTES
+                {
+                    goal.push(character);
                 }
 
                 Reaction::Idle
             },
             Key::Backspace => {
-                self.input.pop();
+                if let Some(Pane::New { goal }) = &mut self.pane {
+                    goal.pop();
+                }
 
                 Reaction::Idle
             },
-            Key::Enter => match mode {
-                Mode::Waiting if !self.input.trim().is_empty() => {
-                    Reaction::Speak(mem::take(&mut self.input))
-                },
-                Mode::Waiting | Mode::Working | Mode::Ended(_) => Reaction::Idle,
-            },
-            Key::Up => {
-                self.scroll = self.scroll.saturating_add(1);
-
-                Reaction::Idle
-            },
-            Key::Down => {
-                self.scroll = self.scroll.saturating_sub(1);
-
-                Reaction::Idle
-            },
-            Key::Interrupt => Reaction::Quit,
+            Key::Next | Key::New => Reaction::Idle,
         }
     }
 
-    fn read_line(
+    /// Answers one thing the terminal reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal of a line, the log's failure when its sessions cannot be
+    /// listed, and the errors of opening a session.
+    fn event(
         &mut self,
-        screen: &mut impl Screen,
-        fold: &Transcript,
-    ) -> Result<Option<String>, Error> {
-        loop {
-            screen.draw(&self.view(fold))?;
+        event: Event,
+        folds: &[Transcript],
+        world: &impl Roster<Engine = E>,
+    ) -> Result<Keep, Error> {
+        // A resize asks for the frame the loop draws next, and nothing else.
+        let Event::Key(key) = event else {
+            return Ok(Keep::Running);
+        };
 
-            let key = match screen.event()? {
-                Event::Resize => continue,
-                Event::Key(key) => key,
-            };
+        let reaction = self.react(key, folds);
 
-            match self.react(key, mode(fold)) {
-                Reaction::Idle => {},
-                Reaction::Speak(line) => return Ok(Some(line)),
-                Reaction::Quit => return Ok(None),
-            }
+        self.apply(reaction, folds, world)
+    }
+
+    /// Carries out what one keystroke asked for, which is where the world is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal of the line, the log's failure when its sessions cannot be
+    /// listed, and the errors of opening a session.
+    fn apply(
+        &mut self,
+        reaction: Reaction,
+        folds: &[Transcript],
+        world: &impl Roster<Engine = E>,
+    ) -> Result<Keep, Error> {
+        match reaction {
+            Reaction::Quit => return Ok(Keep::Leaving),
+            Reaction::Idle => {},
+            Reaction::Speak(line) => self.held[self.focus].engine.speak(&line)?,
+            Reaction::List => {
+                self.listed = world.listed()?;
+                self.open_list(folds);
+            },
+            Reaction::Adopt(session) => self.adopt(session, world)?,
+            Reaction::Create(goal) => {
+                let engine = world.create(&goal)?;
+                self.hold(engine);
+            },
         }
+
+        Ok(Keep::Running)
+    }
+
+    /// Reaches the line of the session on screen.
+    fn line(
+        &mut self,
+        change: impl FnOnce(&mut String),
+    ) {
+        change(&mut self.held[self.focus].input);
+    }
+
+    /// Performs one bounded step of the session at `index`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of a step that is not the provider's own.
+    async fn step(
+        &mut self,
+        index: usize,
+    ) -> Result<(), Error> {
+        match self.held[index].engine.step().await {
+            // A replayed intent is a write that landed with no outcome after it: re-read the log,
+            // which settles it, and step again. A cancel from another process left work in flight,
+            // and recovery on the reopen settles it before the next step closes.
+            Ok(Progress::Yielded | Progress::Advanced(Move::Halt(Halt::Draining))) => {
+                self.held[index].engine.reopen()?;
+            },
+            // A session that reaches its ending is left in the roster: the loop ends when every one
+            // of them has, and until then the human can switch to it and read it.
+            // `mokmok-agent-runtime/src/lib.rs` states why a provider failure does not end the
+            // conversation: an interrupted model call is re-asked under a new attempt with
+            // byte-identical context, while an interrupted tool call may have changed the world and
+            // is never re-dispatched, so the turn spends its next attempt and the attempt ceiling
+            // settles it failed.
+            Ok(Progress::Advanced(_) | Progress::Awaiting | Progress::Terminal(_))
+            | Err(Error::Agent(mokmok_agent_runtime::Error::Provider(_))) => {},
+            Err(failure) => return Err(failure),
+        }
+
+        Ok(())
     }
 }
 
-/// Runs the conversation until the session ends or the human leaves.
+/// Runs every session the process holds until they have all ended or the human leaves.
 ///
-/// The loop does what the domain's answer names: one bounded step, or — when the fold says the
-/// conversation belongs to the human — one line read and committed. Nothing here knows what a turn,
-/// a budget, a closure, or a fold refusal is.
+/// The loop does what the domain's answer names: one bounded step of the session whose turn it is,
+/// or — when the human is the one who owes something — one line read and committed. Nothing here
+/// knows what a turn, a budget, a closure, or a fold refusal is.
 ///
 /// # Errors
 ///
 /// Returns the engine's or the screen's own failure. A provider failure is not one of them: the
 /// turn spends its next attempt instead.
-pub async fn run(
-    engine: &mut impl Engine,
+pub async fn run<R: Roster>(
+    world: &R,
+    first: R::Engine,
     screen: &mut impl Screen,
 ) -> Result<Outcome, Error> {
-    let mut ui = Ui::default();
+    let mut manager = Manager::holding(first);
 
     loop {
-        let fold = engine.fold()?;
-        screen.draw(&ui.view(&fold))?;
+        let folds = manager.folds()?;
+        screen.draw(&manager.view(&folds))?;
 
-        match mode(&fold) {
-            Mode::Waiting => match ui.read_line(screen, &fold)? {
-                Some(line) => engine.speak(&line)?,
-                None => {
-                    return Ok(Outcome {
-                        ending: None,
-                        lines: ui.view(&fold).lines,
-                    });
+        if settled(&folds) {
+            return Ok(outcome(&folds));
+        }
+
+        match manager.next_to_step(&folds) {
+            // What the human pressed is answered before another session takes its step, so typing
+            // never has to wait for a session he is not looking at.
+            Some(index) => match screen.poll()? {
+                Some(event) => {
+                    if manager.event(event, &folds, world)? == Keep::Leaving {
+                        return Ok(outcome(&folds));
+                    }
                 },
+                None => manager.step(index).await?,
             },
-            Mode::Working => match engine.step().await {
-                // A replayed intent is a write that landed with no outcome after it: re-read the log,
-                // which settles it, and step again. A cancel from another process left work in
-                // flight, and recovery on the reopen settles it before the next step closes.
-                Ok(Progress::Yielded | Progress::Advanced(Move::Halt(Halt::Draining))) => {
-                    engine.reopen()?;
-                },
-                // Why a provider failure does not end the conversation:
-                // `mokmok-agent-runtime/src/lib.rs` states that an interrupted model call is
-                // re-asked under a new attempt with byte-identical context, while an interrupted
-                // tool call may have changed the world and is never re-dispatched. So the turn
-                // spends its next attempt, and the attempt ceiling settles it failed.
-                Ok(Progress::Advanced(_) | Progress::Awaiting)
-                | Err(Error::Agent(mokmok_agent_runtime::Error::Provider(_))) => {},
-                Ok(Progress::Terminal(ending)) => {
-                    return Ok(Outcome {
-                        ending: Some(ending),
-                        lines: ui.view(&fold).lines,
-                    });
-                },
-                Err(failure) => return Err(failure),
-            },
-            Mode::Ended(ending) => {
-                return Ok(Outcome {
-                    ending: Some(ending),
-                    lines: ui.view(&fold).lines,
-                });
+            // Nothing can move, so the process waits on the human and on nothing else.
+            None => {
+                if manager.event(screen.event()?, &folds, world)? == Keep::Leaving {
+                    return Ok(outcome(&folds));
+                }
             },
         }
     }
@@ -264,24 +680,30 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use proptest::prelude::*;
 
-    use super::{Mode, Reaction, Ui, lines, status};
+    use super::{
+        Keep, Manager, Mode, Pane, Reaction, background, lines, mode, outcome, phase_phrase,
+        settled, status,
+    };
     use crate::Error;
-    use crate::port::{Event, Key, Line, Screen, View};
+    use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row};
     use mokmok_agent_runtime::{
-        Action, AnswerRecord, ArtifactRef, Budget, CallRecord, MAX_SPEECH_BYTES, Record, Setting,
-        SpeechRecord, Task, TaskRecord, Transcript, UNKNOWN_WARNING, Usage, execution_id, turn_id,
+        Action, AnswerRecord, ArtifactRef, Budget, CallRecord, MAX_SPEECH_BYTES, Progress, Record,
+        Setting, SpeechRecord, Task, TaskRecord, Transcript, UNKNOWN_WARNING, Usage, execution_id,
+        turn_id,
     };
     use mokmok_protocol::{SessionID, TurnID};
     use mokmok_state_machine::{
-        Attempt, Deadline, Fact, Resolution, TurnFact, TurnNumber, TurnOutcome,
+        Attempt, Deadline, Ending, Fact, Phase, Resolution, TurnFact, TurnNumber, TurnOutcome,
     };
 
     fn session() -> SessionID {
         SessionID::from_uuid(uuid::Uuid::from_u128(1))
+    }
+
+    fn others(seed: u128) -> SessionID {
+        SessionID::from_uuid(uuid::Uuid::from_u128(seed))
     }
 
     fn artifact(byte: u8) -> ArtifactRef {
@@ -337,9 +759,13 @@ mod tests {
 
     /// The task record a session commits when it begins.
     fn task() -> TaskRecord {
+        task_of("hold a conversation")
+    }
+
+    fn task_of(goal: &str) -> TaskRecord {
         TaskRecord {
             task: Task {
-                goal: "hold a conversation".to_owned(),
+                goal: goal.to_owned(),
                 setting: Setting {
                     checkout: "/checkout".into(),
                     readable: Vec::new(),
@@ -366,27 +792,176 @@ mod tests {
         records
     }
 
-    /// The screen a case drives by hand: a fixed script of keys and no frame worth keeping.
-    struct Scripted(VecDeque<Key>);
+    /// A fold that has begun, is open, and owes the human nothing.
+    fn idle() -> Vec<Record> {
+        vec![
+            Record::Task(task()),
+            Record::Session {
+                fact: Fact::SessionOpened,
+            },
+        ]
+    }
 
-    impl Screen for Scripted {
-        fn event(&mut self) -> Result<Event, Error> {
-            self.0.pop_front().map_or_else(
-                || {
-                    Err(Error::Terminal(std::io::Error::other(
-                        "the script is spent",
-                    )))
-                },
-                |key| Ok(Event::Key(key)),
-            )
+    /// A fold that has begun, answered one turn, and owes the human the next line.
+    fn awaiting() -> Vec<Record> {
+        let turn = turn_id(session(), 1);
+        let mut records = vec![
+            Record::Task(task()),
+            Record::Session {
+                fact: Fact::SessionOpened,
+            },
+        ];
+        records.extend(opened(turn));
+        records.push(Record::Turn {
+            turn,
+            fact: TurnFact::ModelAnswered,
+        });
+        records.push(answer(turn, Action::Final));
+        records.push(Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled {
+                outcome: TurnOutcome::Completed,
+            },
+        });
+
+        records
+    }
+
+    /// A fold whose session closed.
+    fn closed() -> Vec<Record> {
+        let mut records = idle();
+        records.push(Record::Session {
+            fact: Fact::SessionClosed,
+        });
+
+        records
+    }
+
+    /// An engine over a fold a case wrote, so the keys, the scheduler, and the listing are tested
+    /// without a log, a model, or a terminal.
+    struct Fake {
+        session: SessionID,
+        fold: Transcript,
+    }
+
+    impl Fake {
+        fn new(
+            session: SessionID,
+            records: &[Record],
+        ) -> Self {
+            Self {
+                session,
+                fold: Transcript::replay(session, records).expect("a hand-written history folds"),
+            }
         }
 
-        fn draw(
+        fn awaiting() -> Self {
+            Self::new(session(), &awaiting())
+        }
+    }
+
+    impl Engine for Fake {
+        fn session(&self) -> SessionID {
+            self.session
+        }
+
+        fn fold(&self) -> Result<Transcript, Error> {
+            Ok(self.fold.clone())
+        }
+
+        fn speak(
             &mut self,
-            _view: &View,
+            _line: &str,
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn step(&mut self) -> impl std::future::Future<Output = Result<Progress, Error>> + Send {
+            std::future::ready(Ok(Progress::Awaiting))
+        }
+
+        fn reopen(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// A world whose sessions a case names, so the listing and the two ways of opening a session are
+    /// tested without a log.
+    struct FakeWorld {
+        listed: Vec<Listing>,
+    }
+
+    impl FakeWorld {
+        fn with(listed: Vec<Listing>) -> Self {
+            Self { listed }
+        }
+    }
+
+    impl Roster for FakeWorld {
+        type Engine = Fake;
+
+        fn listed(&self) -> Result<Vec<Listing>, Error> {
+            Ok(self.listed.clone())
+        }
+
+        fn resume(
+            &self,
+            listing: &Listing,
+        ) -> Result<Fake, Error> {
+            Ok(Fake::new(listing.session, &awaiting()))
+        }
+
+        fn create(
+            &self,
+            goal: &str,
+        ) -> Result<Fake, Error> {
+            Ok(Fake::new(
+                others(9),
+                &[
+                    Record::Task(task_of(goal)),
+                    Record::Session {
+                        fact: Fact::SessionOpened,
+                    },
+                ],
+            ))
+        }
+    }
+
+    fn listing(
+        session: SessionID,
+        phase: Phase,
+        goal: Option<&str>,
+    ) -> Listing {
+        Listing {
+            session,
+            phase,
+            goal: goal.map(str::to_owned),
+            checkout: None,
+        }
+    }
+
+    /// A manager holding `engines`, with the human in the last one.
+    fn holding(engines: Vec<Fake>) -> Manager<Fake> {
+        let mut engines = engines.into_iter();
+        let mut manager = Manager::holding(engines.next().expect("one session to start in"));
+        for engine in engines {
+            manager.hold(engine);
+        }
+
+        manager
+    }
+
+    fn folds_of(manager: &Manager<Fake>) -> Vec<Transcript> {
+        manager.folds().expect("the folds read")
+    }
+
+    fn react(
+        manager: &mut Manager<Fake>,
+        key: Key,
+    ) -> Reaction {
+        let folds = folds_of(manager);
+
+        manager.react(key, &folds)
     }
 
     #[test]
@@ -570,52 +1145,74 @@ mod tests {
 
     #[test]
     fn an_empty_line_is_not_sent() {
-        let mut empty = Ui::default();
+        let mut empty = holding(vec![Fake::awaiting()]);
         assert_eq!(
-            empty.react(Key::Enter, Mode::Waiting),
+            react(&mut empty, Key::Enter),
             Reaction::Idle,
             "an empty line must not open a turn",
         );
-        assert_eq!(empty.input, "", "the input is left as the human typed it");
-
-        let mut spaces = Ui {
-            input: "   ".to_owned(),
-            ..Ui::default()
-        };
         assert_eq!(
-            spaces.react(Key::Enter, Mode::Waiting),
+            empty.held[0].input, "",
+            "the input is left as the human typed it",
+        );
+
+        let mut spaces = holding(vec![Fake::awaiting()]);
+        spaces.held[0].input = "   ".to_owned();
+        assert_eq!(
+            react(&mut spaces, Key::Enter),
             Reaction::Idle,
             "a line of spaces holds nothing to say",
         );
         assert_eq!(
-            spaces.input, "   ",
-            "the input is left as the human typed it"
+            spaces.held[0].input, "   ",
+            "the input is left as the human typed it",
         );
 
-        let mut one = Ui {
-            input: "x".to_owned(),
-            ..Ui::default()
-        };
+        let mut one = holding(vec![Fake::awaiting()]);
+        one.held[0].input = "x".to_owned();
         assert_eq!(
-            one.react(Key::Enter, Mode::Waiting),
+            react(&mut one, Key::Enter),
             Reaction::Speak("x".to_owned()),
             "a line with one character still holds something to say",
+        );
+        assert_eq!(
+            one.held[0].input, "",
+            "the line the human submitted leaves the input",
+        );
+    }
+
+    #[test]
+    fn a_line_waits_for_the_session_to_be_the_human_s_turn() {
+        let turn = turn_id(session(), 1);
+        let mut busy = holding(vec![Fake::new(session(), &in_flight(turn))]);
+        busy.held[0].input = "hello".to_owned();
+
+        assert_eq!(
+            react(&mut busy, Key::Enter),
+            Reaction::Idle,
+            "a session whose turn the model holds takes no line",
+        );
+
+        let mut done = holding(vec![Fake::new(session(), &closed())]);
+        done.held[0].input = "hello".to_owned();
+
+        assert_eq!(
+            react(&mut done, Key::Enter),
+            Reaction::Idle,
+            "a session that ended takes no line",
         );
     }
 
     #[test]
     fn an_unopened_session_waits_for_the_human() {
-        assert_eq!(
-            status(&fold_of(&[Record::Task(task())]), &Ui::default()),
-            "your turn"
-        );
+        assert_eq!(status(&fold_of(&[Record::Task(task())]), ""), "your turn");
     }
 
     #[test]
     fn a_session_with_a_turn_in_flight_reports_the_agent_working() {
         let fold = fold_of(&in_flight(turn_id(session(), 1)));
 
-        assert_eq!(status(&fold, &Ui::default()), "the agent is working");
+        assert_eq!(status(&fold, ""), "the agent is working");
     }
 
     #[test]
@@ -630,23 +1227,14 @@ mod tests {
             },
         ];
 
-        assert_eq!(
-            status(&fold_of(&records), &Ui::default()),
-            "closed (Completed)"
-        );
+        assert_eq!(status(&fold_of(&records), ""), "closed (Completed)");
     }
 
     #[test]
     fn a_line_at_the_byte_ceiling_is_reported_as_full() {
         let fold = fold_of(&[Record::Task(task())]);
-        let full = Ui {
-            input: "x".repeat(MAX_SPEECH_BYTES),
-            ..Ui::default()
-        };
-        let almost = Ui {
-            input: "x".repeat(MAX_SPEECH_BYTES - 1),
-            ..Ui::default()
-        };
+        let full = "x".repeat(MAX_SPEECH_BYTES);
+        let almost = "x".repeat(MAX_SPEECH_BYTES - 1);
 
         assert_eq!(status(&fold, &full), "the line is full");
         assert_eq!(
@@ -658,28 +1246,30 @@ mod tests {
 
     #[test]
     fn a_typed_character_extends_the_line() {
-        let mut ui = Ui::default();
+        let mut manager = holding(vec![Fake::awaiting()]);
 
-        assert_eq!(ui.react(Key::Char('a'), Mode::Waiting), Reaction::Idle);
-        assert_eq!(ui.input, "a");
+        assert_eq!(react(&mut manager, Key::Char('a')), Reaction::Idle);
+        assert_eq!(manager.held[0].input, "a");
+
+        assert_eq!(react(&mut manager, Key::Backspace), Reaction::Idle);
+        assert_eq!(
+            manager.held[0].input, "",
+            "a backspace takes the character back"
+        );
     }
 
     #[test]
     fn a_character_the_line_cannot_hold_is_dropped_whole() {
-        let mut full = Ui {
-            input: "x".repeat(MAX_SPEECH_BYTES),
-            ..Ui::default()
-        };
-        assert_eq!(full.react(Key::Char('a'), Mode::Waiting), Reaction::Idle);
-        assert_eq!(full.input.len(), MAX_SPEECH_BYTES);
+        let mut full = holding(vec![Fake::awaiting()]);
+        full.held[0].input = "x".repeat(MAX_SPEECH_BYTES);
+        assert_eq!(react(&mut full, Key::Char('a')), Reaction::Idle);
+        assert_eq!(full.held[0].input.len(), MAX_SPEECH_BYTES);
 
-        let mut almost = Ui {
-            input: "x".repeat(MAX_SPEECH_BYTES - 1),
-            ..Ui::default()
-        };
-        assert_eq!(almost.react(Key::Char('é'), Mode::Waiting), Reaction::Idle);
+        let mut almost = holding(vec![Fake::awaiting()]);
+        almost.held[0].input = "x".repeat(MAX_SPEECH_BYTES - 1);
+        assert_eq!(react(&mut almost, Key::Char('é')), Reaction::Idle);
         assert_eq!(
-            almost.input.len(),
+            almost.held[0].input.len(),
             MAX_SPEECH_BYTES - 1,
             "a two-byte character must not be cut to fit the last byte",
         );
@@ -693,39 +1283,576 @@ mod tests {
     }
 
     #[test]
-    fn read_line_returns_the_line_a_script_typed_and_nothing_when_the_human_leaves() {
-        let fold = fold_of(&[Record::Task(task())]);
-        let mut ui = Ui::default();
-        let mut typed = Scripted(VecDeque::from([Key::Char('a'), Key::Char('b'), Key::Enter]));
+    fn the_transcript_scrolls_one_row_at_a_time_and_stops_at_its_top() {
+        let mut manager = holding(vec![Fake::awaiting()]);
 
+        assert_eq!(react(&mut manager, Key::Down), Reaction::Idle);
         assert_eq!(
-            ui.read_line(&mut typed, &fold).expect("the script is read"),
-            Some("ab".to_owned()),
+            manager.held[0].scroll, 0,
+            "there is nothing above the newest row"
         );
-        assert_eq!(ui.input, "", "a submitted line leaves the input");
+        assert_eq!(react(&mut manager, Key::Up), Reaction::Idle);
+        assert_eq!(react(&mut manager, Key::Up), Reaction::Idle);
+        assert_eq!(manager.held[0].scroll, 2);
+        assert_eq!(react(&mut manager, Key::Down), Reaction::Idle);
+        assert_eq!(manager.held[0].scroll, 1);
+    }
 
-        let mut left = Scripted(VecDeque::from([Key::Interrupt]));
+    #[test]
+    fn the_rotation_steps_the_session_on_screen_and_then_the_ones_behind_it() {
+        let turn = turn_id(session(), 1);
+        let busy = || Fake::new(session(), &in_flight(turn));
+        let other = || Fake::new(others(2), &in_flight(turn_id(others(2), 1)));
+        let waiting = || Fake::new(others(3), &awaiting());
 
+        let focused_busy = holding(vec![busy(), waiting()]);
         assert_eq!(
-            Ui::default()
-                .read_line(&mut left, &fold)
-                .expect("the script is read"),
+            focused_busy.next_to_step(&folds_of(&focused_busy)),
+            Some(0),
+            "the session the human is in moves first",
+        );
+
+        let focused_waiting = holding(vec![busy(), waiting()]);
+        let mut focused_waiting = focused_waiting;
+        focused_waiting.focus = 1;
+        assert_eq!(
+            focused_waiting.next_to_step(&folds_of(&focused_waiting)),
+            Some(0),
+            "a session behind the one on screen still takes its step",
+        );
+
+        let two_busy = holding(vec![busy(), other()]);
+        assert_eq!(
+            two_busy.next_to_step(&folds_of(&two_busy)),
+            Some(1),
+            "the rotation starts at the session on screen",
+        );
+
+        let quiet = holding(vec![waiting(), waiting()]);
+        assert_eq!(
+            quiet.next_to_step(&folds_of(&quiet)),
             None,
+            "nothing moves while every session owes the human something",
         );
+    }
+
+    #[test]
+    fn the_process_is_done_when_every_session_has_ended() {
+        let mut one_closed = holding(vec![Fake::new(session(), &closed()), Fake::awaiting()]);
+        assert!(!settled(&folds_of(&one_closed)));
+
+        one_closed.held[1].engine = Fake::new(others(2), &closed());
+        assert!(settled(&folds_of(&one_closed)));
+
+        let none = holding(vec![Fake::new(session(), &closed())]);
+        assert!(settled(&folds_of(&none)));
+    }
+
+    #[test]
+    fn the_outcome_carries_every_session_it_held_and_how_each_one_stands() {
+        let turn = turn_id(session(), 1);
+        let manager = holding(vec![
+            Fake::new(session(), &in_flight(turn)),
+            Fake::new(others(2), &closed()),
+        ]);
+
+        let outcome = outcome(&folds_of(&manager));
+
+        assert_eq!(outcome.left.len(), 2);
+        assert_eq!(outcome.left[0].session, session());
+        assert_eq!(outcome.left[0].ending, None);
+        assert_eq!(outcome.left[0].lines, vec![Line::Human("hello".to_owned())],);
+        assert_eq!(outcome.left[1].session, others(2));
+        assert_eq!(outcome.left[1].ending, Some(Ending::Completed));
+        assert_eq!(outcome.left[1].lines, Vec::new());
+    }
+
+    #[test]
+    fn tab_shows_the_next_session_and_wraps_at_the_end() {
+        let mut manager = holding(vec![
+            Fake::new(session(), &awaiting()),
+            Fake::new(others(2), &awaiting()),
+        ]);
+        assert_eq!(
+            manager.focus, 1,
+            "the last session opened is the one on screen"
+        );
+
+        assert_eq!(react(&mut manager, Key::Next), Reaction::Idle);
+        assert_eq!(manager.focus, 0, "the next session wraps past the end");
+
+        assert_eq!(react(&mut manager, Key::Next), Reaction::Idle);
+        assert_eq!(manager.focus, 1);
+    }
+
+    #[test]
+    fn the_other_sessions_that_are_working_are_reported_in_the_frame() {
+        let turn = turn_id(session(), 1);
+        let busy = |seed| Fake::new(others(seed), &in_flight(turn_id(others(seed), 1)));
+        let quiet = || Fake::new(others(9), &awaiting());
+
+        let none = vec![fold_of(&awaiting()), fold_of(&awaiting())];
+        assert_eq!(background(&none, 0), None);
+
+        let one = vec![fold_of(&awaiting()), fold_of(&in_flight(turn))];
+        assert_eq!(
+            background(&one, 0),
+            Some("1 other session working".to_owned()),
+        );
+        assert_eq!(
+            background(&one, 1),
+            None,
+            "the session on screen is not counted as the one working elsewhere",
+        );
+
+        let two = vec![fold_of(&in_flight(turn)), fold_of(&in_flight(turn))];
+        assert_eq!(
+            background(&two, 0),
+            Some("1 other session working".to_owned()),
+        );
+
+        let manager = holding(vec![busy(2), busy(3), quiet()]);
+        assert_eq!(
+            manager.focus, 2,
+            "the last session opened is the one on screen"
+        );
+
+        assert_eq!(
+            manager.view(&folds_of(&manager)).background,
+            Some("2 other sessions working".to_owned()),
+        );
+    }
+
+    #[test]
+    fn a_row_for_a_session_this_process_holds_carries_its_own_status_phrase() {
+        let mut manager = holding(vec![
+            Fake::new(session(), &in_flight(turn_id(session(), 1))),
+            Fake::awaiting(),
+        ]);
+        manager.focus = 1;
+
+        let rows = manager.rows(&folds_of(&manager));
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    session: session(),
+                    goal: Some("hold a conversation".to_owned()),
+                    status: "the agent is working".to_owned(),
+                    held: true,
+                    focused: false,
+                },
+                Row {
+                    session: session(),
+                    goal: Some("hold a conversation".to_owned()),
+                    status: "your turn".to_owned(),
+                    held: true,
+                    focused: true,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn every_row_says_whether_this_process_holds_the_session_and_which_one_is_on_screen() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.listed = vec![
+            listing(others(2), Phase::Unopened, None),
+            listing(others(3), Phase::Accepting, Some("count the quokkas")),
+            // A session this process holds is not repeated as one only the log holds.
+            listing(session(), Phase::Accepting, Some("hold a conversation")),
+            listing(
+                others(4),
+                Phase::Closed(Ending::Cancelled),
+                Some("the older one"),
+            ),
+        ];
+
+        let rows = manager.rows(&folds_of(&manager));
+
+        assert_eq!(
+            rows,
+            vec![
+                Row {
+                    session: session(),
+                    goal: Some("hold a conversation".to_owned()),
+                    status: "your turn".to_owned(),
+                    held: true,
+                    focused: true,
+                },
+                Row {
+                    session: others(2),
+                    goal: None,
+                    status: "not opened".to_owned(),
+                    held: false,
+                    focused: false,
+                },
+                Row {
+                    session: others(3),
+                    goal: Some("count the quokkas".to_owned()),
+                    status: "open".to_owned(),
+                    held: false,
+                    focused: false,
+                },
+                Row {
+                    session: others(4),
+                    goal: Some("the older one".to_owned()),
+                    status: "closed (Cancelled)".to_owned(),
+                    held: false,
+                    focused: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_session_that_is_draining_says_so_in_its_row() {
+        assert_eq!(phase_phrase(Phase::Unopened), "not opened");
+        assert_eq!(phase_phrase(Phase::Accepting), "open");
+        assert_eq!(phase_phrase(Phase::Draining), "draining");
+        assert_eq!(
+            phase_phrase(Phase::Closed(Ending::Completed)),
+            "closed (Completed)",
+        );
+    }
+
+    #[test]
+    fn the_listing_opens_on_the_session_on_screen() {
+        let mut manager = holding(vec![Fake::awaiting(), Fake::new(others(2), &awaiting())]);
+        manager.listed = vec![listing(others(3), Phase::Accepting, None)];
+
+        assert_eq!(react(&mut manager, Key::List), Reaction::List);
+
+        let world = FakeWorld::with(manager.listed.clone());
+        let folds = folds_of(&manager);
+        manager
+            .apply(Reaction::List, &folds, &world)
+            .expect("the listing opens");
+
+        assert_eq!(
+            manager.pane,
+            Some(Pane::List { cursor: 1 }),
+            "the cursor starts on the session the human is in",
+        );
+    }
+
+    #[test]
+    fn up_and_down_move_the_listing_cursor_and_clamp_at_both_ends() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.listed = vec![
+            listing(others(2), Phase::Accepting, None),
+            listing(others(3), Phase::Accepting, None),
+        ];
+        manager.pane = Some(Pane::List { cursor: 0 });
+
+        assert_eq!(react(&mut manager, Key::Up), Reaction::Idle);
+        assert_eq!(
+            manager.pane,
+            Some(Pane::List { cursor: 0 }),
+            "the cursor stops at the first row",
+        );
+
+        for _ in 0..4 {
+            assert_eq!(react(&mut manager, Key::Down), Reaction::Idle);
+        }
+        assert_eq!(
+            manager.pane,
+            Some(Pane::List { cursor: 2 }),
+            "the cursor stops at the last row",
+        );
+    }
+
+    #[test]
+    fn enter_in_the_listing_chooses_the_row_the_cursor_is_on() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.listed = vec![listing(others(2), Phase::Accepting, None)];
+        manager.pane = Some(Pane::List { cursor: 1 });
+
+        assert_eq!(
+            react(&mut manager, Key::Enter),
+            Reaction::Adopt(others(2)),
+            "the second row is the log's own session",
+        );
+    }
+
+    #[test]
+    fn a_session_only_the_log_holds_is_opened_and_the_human_is_in_it() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.listed = vec![listing(
+            others(2),
+            Phase::Accepting,
+            Some("count the quokkas"),
+        )];
+        manager.pane = Some(Pane::List { cursor: 1 });
+
+        let world = FakeWorld::with(manager.listed.clone());
+        let folds = folds_of(&manager);
+        manager
+            .apply(Reaction::Adopt(others(2)), &folds, &world)
+            .expect("the session opens");
+
+        assert_eq!(manager.held.len(), 2);
+        assert_eq!(manager.focus, 1);
+        assert_eq!(manager.held[1].engine.session(), others(2));
+        assert_eq!(manager.pane, None, "choosing a session closes the listing");
+    }
+
+    #[test]
+    fn a_session_this_process_holds_is_focused_instead_of_opened_a_second_time() {
+        let mut manager = holding(vec![
+            Fake::new(session(), &awaiting()),
+            Fake::new(others(2), &awaiting()),
+        ]);
+        manager.pane = Some(Pane::List { cursor: 0 });
+
+        let world = FakeWorld::with(Vec::new());
+        let folds = folds_of(&manager);
+        manager
+            .apply(Reaction::Adopt(session()), &folds, &world)
+            .expect("the session is chosen");
+
+        assert_eq!(manager.focus, 0, "the session the human is in is shown");
+        assert_eq!(
+            manager.held.len(),
+            2,
+            "a session this process holds is not opened twice",
+        );
+    }
+
+    #[test]
+    fn ctrl_n_names_a_new_session_and_enter_creates_it() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+
+        assert_eq!(react(&mut manager, Key::New), Reaction::Idle);
+        assert_eq!(
+            manager.pane,
+            Some(Pane::New {
+                goal: String::new()
+            }),
+        );
+
+        assert_eq!(
+            react(&mut manager, Key::Enter),
+            Reaction::Idle,
+            "a goal of nothing creates no session",
+        );
+
+        for character in "count the quokkas".chars() {
+            assert_eq!(react(&mut manager, Key::Char(character)), Reaction::Idle);
+        }
+        assert_eq!(react(&mut manager, Key::Backspace), Reaction::Idle);
+
+        let created = "count the quokka";
+        assert_eq!(
+            react(&mut manager, Key::Enter),
+            Reaction::Create(created.to_owned()),
+        );
+
+        let world = FakeWorld::with(Vec::new());
+        let folds = folds_of(&manager);
+        manager
+            .apply(Reaction::Create(created.to_owned()), &folds, &world)
+            .expect("the new session opens");
+
+        assert_eq!(manager.held.len(), 2);
+        assert_eq!(manager.focus, 1, "the human is in the session he just made");
+        assert_eq!(manager.pane, None);
+        let rows = manager.rows(&folds_of(&manager));
+        assert_eq!(
+            rows[1].goal.as_deref(),
+            Some(created),
+            "the new session carries the goal the human typed",
+        );
+    }
+
+    #[test]
+    fn a_goal_the_pane_cannot_hold_is_dropped_whole() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.pane = Some(Pane::New {
+            goal: "x".repeat(MAX_SPEECH_BYTES - 1),
+        });
+
+        assert_eq!(react(&mut manager, Key::Char('é')), Reaction::Idle);
+        assert_eq!(
+            manager.pane,
+            Some(Pane::New {
+                goal: "x".repeat(MAX_SPEECH_BYTES - 1)
+            }),
+            "a two-byte character must not be cut to fit the last byte",
+        );
+
+        assert_eq!(react(&mut manager, Key::Char('a')), Reaction::Idle);
+        assert_eq!(
+            manager.pane,
+            Some(Pane::New {
+                goal: format!("{}a", "x".repeat(MAX_SPEECH_BYTES - 1))
+            }),
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_open_pane_and_leaves_the_rest_as_it_was() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.pane = Some(Pane::New {
+            goal: "count".to_owned(),
+        });
+
+        assert_eq!(react(&mut manager, Key::Escape), Reaction::Idle);
+        assert_eq!(manager.pane, None);
+        assert_eq!(manager.held.len(), 1);
+        assert_eq!(manager.focus, 0);
+
+        manager.pane = Some(Pane::List { cursor: 0 });
+        assert_eq!(react(&mut manager, Key::List), Reaction::Idle);
+        assert_eq!(
+            manager.pane, None,
+            "the key that opened the listing closes it too",
+        );
+    }
+
+    #[test]
+    fn the_panes_ignore_the_keys_that_are_not_theirs() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.pane = Some(Pane::List { cursor: 0 });
+
+        for key in [Key::Char('a'), Key::Backspace, Key::Next, Key::New] {
+            assert_eq!(react(&mut manager, key), Reaction::Idle);
+        }
+
+        assert_eq!(manager.pane, Some(Pane::List { cursor: 0 }));
+        assert_eq!(manager.held.len(), 1);
+        assert_eq!(manager.focus, 0);
+        assert_eq!(
+            manager.held[0].input, "",
+            "a character typed in the listing does not reach the conversation",
+        );
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_conversation_and_from_every_pane() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        assert_eq!(react(&mut manager, Key::Interrupt), Reaction::Quit);
+
+        for pane in [
+            Pane::List { cursor: 0 },
+            Pane::New {
+                goal: "count".to_owned(),
+            },
+        ] {
+            manager.pane = Some(pane);
+            assert_eq!(react(&mut manager, Key::Interrupt), Reaction::Quit);
+        }
+    }
+
+    #[test]
+    fn a_reported_event_says_whether_the_human_is_leaving() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        let world = FakeWorld::with(Vec::new());
+        let folds = folds_of(&manager);
+
+        assert_eq!(
+            manager
+                .event(Event::Resize, &folds, &world)
+                .expect("a resize asks for a frame"),
+            Keep::Running,
+        );
+        assert_eq!(
+            manager
+                .event(Event::Key(Key::Char('a')), &folds, &world)
+                .expect("a character is typed"),
+            Keep::Running,
+        );
+        assert_eq!(manager.held[0].input, "a");
+        assert_eq!(
+            manager
+                .event(Event::Key(Key::Interrupt), &folds, &world)
+                .expect("the human leaves"),
+            Keep::Leaving,
+        );
+    }
+
+    #[test]
+    fn the_state_row_carries_the_pane_s_own_phrase() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.listed = vec![listing(others(2), Phase::Accepting, None)];
+        let folds = folds_of(&manager);
+
+        assert_eq!(manager.status(&folds), "your turn");
+
+        manager.pane = Some(Pane::List { cursor: 0 });
+        assert_eq!(
+            manager.status(&folds),
+            "2 sessions; * is held; enter opens one, esc closes",
+        );
+
+        manager.pane = Some(Pane::New {
+            goal: String::new(),
+        });
+        assert_eq!(
+            manager.status(&folds),
+            "type a goal; enter creates a session, esc cancels",
+        );
+    }
+
+    #[test]
+    fn the_frame_carries_the_session_the_line_the_scroll_and_the_pane() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.held[0].input = "hello".to_owned();
+        manager.held[0].scroll = 3;
+        let folds = folds_of(&manager);
+
+        let view = manager.view(&folds);
+
+        assert_eq!(view.session, session());
+        assert_eq!(view.input, "hello");
+        assert_eq!(view.scroll, 3);
+        assert_eq!(view.status, "your turn");
+        assert_eq!(view.background, None);
+        assert_eq!(view.sheet, None);
+
+        manager.pane = Some(Pane::New {
+            goal: "count".to_owned(),
+        });
+        let view = manager.view(&folds);
+
+        assert_eq!(
+            view.sheet,
+            Some(crate::port::Sheet::New {
+                goal: "count".to_owned()
+            }),
+        );
+    }
+
+    #[test]
+    fn a_session_this_process_holds_is_named_by_its_own_engine() {
+        let manager = holding(vec![Fake::new(others(4), &awaiting())]);
+
+        assert_eq!(manager.held[0].engine.session(), others(4));
+        assert_eq!(manager.index_of(others(4)), Some(0));
+        assert_eq!(manager.index_of(session()), None);
+    }
+
+    #[test]
+    fn an_unopened_session_that_owes_the_human_nothing_is_waiting() {
+        assert!(matches!(
+            mode(&fold_of(&[Record::Task(task())])),
+            Mode::Waiting
+        ));
     }
 
     proptest! {
         #[test]
         fn typing_never_carries_the_line_past_its_ceiling(typed in prop::collection::vec(any::<char>(), 0..64)) {
-            let mut ui = Ui::default();
+            let mut manager = holding(vec![Fake::awaiting()]);
 
             for character in typed {
-                ui.react(Key::Char(character), Mode::Waiting);
+                let _ = react(&mut manager, Key::Char(character));
             }
 
             prop_assert!(
-                ui.input.len() <= MAX_SPEECH_BYTES,
-                "the input {:?} holds {} bytes", ui.input, ui.input.len(),
+                manager.held[0].input.len() <= MAX_SPEECH_BYTES,
+                "the input {:?} holds {} bytes", manager.held[0].input, manager.held[0].input.len(),
             );
         }
     }

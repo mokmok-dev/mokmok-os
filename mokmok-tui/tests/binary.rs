@@ -244,16 +244,22 @@ mod tests {
         );
     }
 
+    /// The keys a real terminal delivers for the pane keys, for Enter, and for the interrupt.
+    const CTRL_N: &[u8] = b"\x0e";
+    const CTRL_O: &[u8] = b"\x0f";
+    const CARRIAGE_RETURN: &[u8] = b"\r";
+
     /// The real adapter, reached the only way a test can reach it: as a child with the pty's slave
     /// on its own stdin and stdout. In this process the adapter is out of reach, because
     /// `Terminal::open` probes the process's own standard input and output, and a test harness
     /// cannot put a terminal there.
-    #[test]
-    fn a_conversation_on_a_terminal_draws_a_frame_and_hands_the_shell_back() {
-        let scratch = Scratch::new("pty");
-        let script = scratch.0.join("script.json");
-        std::fs::write(&script, b"[]").expect("the script is written");
-
+    ///
+    /// The child, the master made non-blocking, and a slave this process keeps: with every slave
+    /// closed the tty hangs up, and the settings read back at the end would be a fresh terminal's.
+    fn on_a_pty(
+        scratch: &Path,
+        script: &Path,
+    ) -> (Reaped, File, File) {
         // The 80x10 screen the asserted moves belong to.
         let size = Winsize {
             ws_row: 10,
@@ -262,14 +268,12 @@ mod tests {
             ws_ypixel: 0,
         };
         let pty = openpty(Some(&size), None).expect("a pseudo-terminal is opened");
-        // This process keeps a slave of its own: with every slave closed the tty hangs up, and the
-        // settings read back at the end would be a fresh terminal's rather than this child's.
         let kept = pty.slave.try_clone().expect("the slave is kept");
         let input = pty
             .slave
             .try_clone()
             .expect("the slave is cloned for stdin");
-        let mut master = File::from(pty.master);
+        let master = File::from(pty.master);
         let flags = fcntl(&master, FcntlArg::F_GETFL).expect("the master's flags are read");
         fcntl(
             &master,
@@ -277,16 +281,27 @@ mod tests {
         )
         .expect("the master is made non-blocking");
 
-        let mut child = Reaped::new(
+        let child = Reaped::new(
             Command::new(env!("CARGO_BIN_EXE_mokmok-tui"))
-                .env("XDG_CONFIG_HOME", scratch.0.join("config"))
-                .args(args(&scratch.0, &script))
+                .env("XDG_CONFIG_HOME", scratch.join("config"))
+                .args(args(scratch, script))
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::from(pty.slave))
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("the binary runs"),
         );
+
+        (child, master, File::from(kept))
+    }
+
+    #[test]
+    fn a_conversation_on_a_terminal_draws_a_frame_and_hands_the_shell_back() {
+        let scratch = Scratch::new("pty");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, b"[]").expect("the script is written");
+
+        let (mut child, mut master, kept) = on_a_pty(&scratch.0, &script);
 
         let deadline = Instant::now() + PATIENCE;
         let mut transcript = Vec::new();
@@ -352,6 +367,88 @@ mod tests {
         assert!(
             settings.contains(LocalFlags::ECHO),
             "echo is back for the shell: {settings:?}",
+        );
+    }
+
+    /// A session whose turn the model holds is drawn before the human's next key is read, which is
+    /// the state in which the adapter has to ask the terminal what it holds instead of waiting on it.
+    #[test]
+    fn a_working_session_is_drawn_and_the_listing_opens_on_a_real_terminal() {
+        let scratch = Scratch::new("pty-sessions");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, br#"[{"action": "final", "say": "done"}]"#)
+            .expect("the script is written");
+
+        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, &script);
+        let deadline = Instant::now() + PATIENCE;
+        let mut transcript = Vec::new();
+
+        // A key typed before the child has the terminal in raw mode is read by the line discipline,
+        // so the first frame is what says the screen is the conversation's own.
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            "the conversation's own screen is up: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(b"hi").expect("two characters are typed");
+        master
+            .write_all(CARRIAGE_RETURN)
+            .expect("the line is submitted");
+        assert!(
+            await_bytes(
+                &master,
+                &mut transcript,
+                &[b"the agent", b"working"],
+                deadline
+            ),
+            "a frame drawn while the turn is in flight: {}",
+            transcript.escape_ascii(),
+        );
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"done"], deadline),
+            "the answer is drawn, and the step that produced it ran with no key pending: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(CTRL_O).expect("the listing is asked for");
+        assert!(
+            await_bytes(
+                &master,
+                &mut transcript,
+                // The backend writes only the cells that changed, so the status row arrives as its
+                // words rather than as one run.
+                &[b"held;", b"opens", b"closes"],
+                deadline,
+            ),
+            "the listing is drawn on the real terminal: {}",
+            transcript.escape_ascii(),
+        );
+
+        master
+            .write_all(CTRL_O)
+            .expect("the same key closes the listing");
+        master
+            .write_all(CTRL_N)
+            .expect("a new session is asked for");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"goal>"], deadline),
+            "the prompt that names a goal is drawn: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(CTRL_C).expect("the interrupt is typed");
+        let status = await_exit(&mut child, &master, &mut transcript, deadline);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the conversation leaves when the human does: {}",
+            transcript.escape_ascii(),
+        );
+        assert!(
+            found(&transcript, b"--- session", 0).is_some(),
+            "the plain replay names the session it hands back: {}",
+            transcript.escape_ascii(),
         );
     }
 }

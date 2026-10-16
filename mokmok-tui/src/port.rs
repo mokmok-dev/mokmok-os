@@ -1,18 +1,23 @@
-//! The two ports: what the core needs from the world, and where a frame goes.
+//! The ports: what the core needs from one session, from the log, and where a frame goes.
 
 use std::future::Future;
+use std::path::PathBuf;
 
 use mokmok_agent_runtime::{Progress, Transcript};
 use mokmok_protocol::SessionID;
+use mokmok_state_machine::Phase;
 
 use crate::Error;
 
-/// Everything the core needs from the world: the session's past, one human line, one bounded step.
+/// Everything the core needs from one session: its past, one human line, one bounded step.
 ///
 /// The port speaks the domain's language — a [`Transcript`], a [`Progress`] — so an implementation
 /// supplies the world and decides nothing. It hands out values rather than borrows, because the fold
 /// it hands over must outlive the mutable step that follows it.
 pub trait Engine {
+    /// The session this engine works in.
+    fn session(&self) -> SessionID;
+
     /// The session's whole durable past, folded.
     ///
     /// # Errors
@@ -45,11 +50,68 @@ pub trait Engine {
     fn reopen(&mut self) -> Result<(), Error>;
 }
 
+/// One session the log holds, as a chooser shows it.
+///
+/// The choice of fields is the choice of what a human needs before he opens a session he cannot see:
+/// which one it is, where it stands, and what it was asked to do. Nothing here is the session's own
+/// current fold, which only an engine can answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Listing {
+    /// The session's identity, which is also the stream its history lives in.
+    pub session: SessionID,
+    /// The phase its own facts fold to.
+    pub phase: Phase,
+    /// The goal its task named, when it recorded one.
+    pub goal: Option<String>,
+    /// The checkout that task named, when it recorded one.
+    pub checkout: Option<PathBuf>,
+}
+
+/// The sessions the log holds, and how to open one.
+pub trait Roster {
+    /// The engine one session runs on.
+    type Engine: Engine;
+
+    /// The sessions the log holds, the one written most recently first.
+    ///
+    /// # Errors
+    ///
+    /// Returns the log's failure when its listing cannot be read.
+    fn listed(&self) -> Result<Vec<Listing>, Error>;
+
+    /// Opens a session the log already holds, resuming it from the task it recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of opening the session's world: its log, its tool, and its provider.
+    fn resume(
+        &self,
+        listing: &Listing,
+    ) -> Result<Self::Engine, Error>;
+
+    /// Opens a session that does not exist yet, to work on `goal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of opening the session's world: its log, its tool, and its provider.
+    fn create(
+        &self,
+        goal: &str,
+    ) -> Result<Self::Engine, Error>;
+}
+
 /// Where the conversation is drawn and where keys come from.
 ///
-/// Synchronous on purpose: while the screen waits for a key the driver has nothing to do, and a step
-/// in flight is never interrupted, so there is nothing to select between.
+/// Synchronous on purpose: the step of a session runs on the caller's thread, so the terminal is
+/// asked what it holds rather than waited on, and the sessions whose turn it is move in between.
 pub trait Screen {
+    /// Whether the terminal has something for the conversation right now, taking nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the terminal's failure when a reported event cannot be read.
+    fn poll(&mut self) -> Result<Option<Event>, Error>;
+
     /// Waits for the one thing the terminal reported next.
     ///
     /// # Errors
@@ -81,7 +143,15 @@ pub enum Key {
     Up,
     /// The transcript scrolls one line forward.
     Down,
-    /// The human leaves, with the session as it stands.
+    /// The next session this process holds is shown.
+    Next,
+    /// The listing of the log's sessions is opened, or closed when it is open.
+    List,
+    /// The pane that names a new session's goal is opened.
+    New,
+    /// The open pane is closed.
+    Escape,
+    /// The human leaves, with every session as it stands.
     Interrupt,
 }
 
@@ -267,6 +337,78 @@ pub struct View {
     pub status: String,
     /// How many lines back from the newest the transcript is scrolled.
     pub scroll: u16,
+    /// One phrase for the sessions whose turn it is besides the one on screen, when any are.
+    ///
+    /// `None` when nothing else is moving, so the frame of a single session is the frame it was.
+    pub background: Option<String>,
+    /// The pane that replaces the transcript, when the human opened one.
+    pub sheet: Option<Sheet>,
+}
+
+/// A pane the human opened over the conversation.
+///
+/// The cases are the two things he can be doing besides typing a line — choosing a session, and
+/// naming one that does not exist yet — so the screen cannot invent a third.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Sheet {
+    /// The sessions this process holds and the ones the log holds, with the cursor on one row.
+    List {
+        /// The rows, in the order they are drawn.
+        rows: Vec<Row>,
+        /// Which row the cursor is on.
+        cursor: usize,
+    },
+    /// The goal of a session that does not exist yet, as it is being typed.
+    New {
+        /// The goal so far.
+        goal: String,
+    },
+}
+
+/// One row of the listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Row {
+    /// The session the row names.
+    pub session: SessionID,
+    /// The goal the session recorded, when it recorded one.
+    pub goal: Option<String>,
+    /// One phrase for the session's state, the same one the header shows for the session on screen.
+    pub status: String,
+    /// Whether this process holds the session's engine.
+    pub held: bool,
+    /// Whether it is the session the human is in.
+    pub focused: bool,
+}
+
+/// What a row says about a session that recorded no goal.
+const NO_GOAL: &str = "(no goal recorded)";
+
+// Two columns, so the cursor's row and the session the human is in can be told apart at a glance.
+const CURSOR_MARK: &str = "> ";
+
+const NO_CURSOR_MARK: &str = "  ";
+
+const HELD_MARK: &str = "* ";
+
+const NO_HELD_MARK: &str = "  ";
+
+const COLUMN_GAP: &str = "  ";
+
+/// One row of the listing as it is drawn: the cursor, whether this process holds the session, the
+/// session's name, its state, and the goal it was given.
+fn drawn_row(
+    cursor: bool,
+    row: &Row,
+) -> String {
+    let cursor = if cursor { CURSOR_MARK } else { NO_CURSOR_MARK };
+    let held = if row.held { HELD_MARK } else { NO_HELD_MARK };
+    let goal = row.goal.as_deref().unwrap_or(NO_GOAL);
+
+    format!(
+        "{cursor}{held}{}{COLUMN_GAP}{}{COLUMN_GAP}{goal}",
+        row.session.as_uuid(),
+        row.status,
+    )
 }
 
 impl View {
@@ -289,6 +431,42 @@ impl View {
 
         rows[start..end].to_vec()
     }
+
+    /// The rows the body shows: the listing when the human opened it, and the transcript otherwise.
+    ///
+    /// Naming a session's goal leaves the conversation behind the pane, because the goal is usually a
+    /// reading of what is already on screen.
+    #[must_use]
+    pub fn body(
+        &self,
+        height: usize,
+    ) -> Vec<String> {
+        match &self.sheet {
+            Some(Sheet::List { rows, cursor }) => {
+                let drawn: Vec<String> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| drawn_row(index == *cursor, row))
+                    .collect();
+
+                window(&drawn, *cursor, height)
+            },
+            _ => self.visible(height),
+        }
+    }
+}
+
+/// The rows `height` rows tall that hold row `cursor`, as near the middle of them as the ends allow.
+fn window(
+    rows: &[String],
+    cursor: usize,
+    height: usize,
+) -> Vec<String> {
+    let start = cursor
+        .saturating_sub(height / 2)
+        .min(rows.len().saturating_sub(height));
+
+    rows[start..].iter().take(height).cloned().collect()
 }
 
 #[cfg(test)]
@@ -296,7 +474,7 @@ mod tests {
     use proptest::prelude::*;
     use uuid::Uuid;
 
-    use super::{Line, View};
+    use super::{Line, Row, Sheet, View};
     use mokmok_protocol::SessionID;
 
     fn view(
@@ -309,7 +487,133 @@ mod tests {
             input: String::new(),
             status: String::new(),
             scroll,
+            background: None,
+            sheet: None,
         }
+    }
+
+    fn named(seed: u128) -> SessionID {
+        SessionID::from_uuid(Uuid::from_u128(seed))
+    }
+
+    fn row(
+        session: SessionID,
+        goal: Option<&str>,
+        held: bool,
+    ) -> Row {
+        Row {
+            session,
+            goal: goal.map(str::to_owned),
+            status: "your turn".to_owned(),
+            held,
+            focused: false,
+        }
+    }
+
+    /// A view of `count` listing rows with the cursor on `cursor`.
+    fn listing(
+        count: usize,
+        cursor: usize,
+        goals: &[Option<&str>],
+    ) -> View {
+        let rows = (0..count)
+            .map(|index| {
+                row(
+                    named(u128::try_from(index).unwrap() + 1),
+                    goals.get(index).copied().flatten(),
+                    index == 0,
+                )
+            })
+            .collect();
+
+        View {
+            sheet: Some(Sheet::List { rows, cursor }),
+            ..view(Vec::new(), 0)
+        }
+    }
+
+    #[test]
+    fn the_listing_draws_the_cursor_the_held_mark_and_the_goal() {
+        let view = listing(
+            2,
+            1,
+            &[Some("hold a conversation"), Some("count the quokkas")],
+        );
+
+        assert_eq!(
+            view.body(10),
+            vec![
+                "  * 00000000-0000-0000-0000-000000000001  your turn  hold a conversation"
+                    .to_owned(),
+                ">   00000000-0000-0000-0000-000000000002  your turn  count the quokkas".to_owned(),
+            ],
+            "the cursor row, the held row, and each goal are drawn",
+        );
+    }
+
+    #[test]
+    fn a_session_that_recorded_no_goal_says_so_in_its_row() {
+        let view = listing(1, 0, &[None]);
+
+        assert!(
+            view.body(1)[0].ends_with("(no goal recorded)"),
+            "a row with no goal says there is none: {:?}",
+            view.body(1),
+        );
+    }
+
+    #[test]
+    fn the_listing_holds_the_cursor_row_in_a_pane_shorter_than_the_rows() {
+        let goals = [None; 5];
+        let rows = |cursor| {
+            listing(5, cursor, &goals)
+                .body(3)
+                .iter()
+                .map(|row| row.chars().next().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rows(0),
+            vec!['>', ' ', ' '],
+            "the cursor at the top stays there"
+        );
+        assert_eq!(
+            rows(4),
+            vec![' ', ' ', '>'],
+            "the cursor at the bottom stays there",
+        );
+        assert_eq!(
+            rows(2),
+            vec![' ', '>', ' '],
+            "the cursor in the middle is centred"
+        );
+        assert_eq!(
+            listing(5, 0, &goals).body(5).len(),
+            5,
+            "a pane that fits shows every row"
+        );
+        assert!(
+            listing(5, 0, &goals).body(0).is_empty(),
+            "a pane with no room shows no row",
+        );
+    }
+
+    #[test]
+    fn naming_a_goal_leaves_the_conversation_behind_the_pane() {
+        let conversation = view(vec![Line::Human("hello".to_owned())], 0);
+        let naming = View {
+            sheet: Some(Sheet::New {
+                goal: "count the quokkas".to_owned(),
+            }),
+            ..conversation.clone()
+        };
+
+        assert_eq!(
+            naming.body(10),
+            conversation.body(10),
+            "the pane that names a goal draws the conversation it is about",
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
-//! A conversation with the constrained agent, drawn on a terminal.
+//! A conversation with the constrained agent, drawn on a terminal, in as many sessions as the human
+//! holds.
 //!
-//! The screen is a pure function of the durable [`Transcript`]: the crate holds only the line being
-//! typed and how far back the transcript is scrolled, and everything else the screen shows and the
-//! loop does next comes from the fold. [`run`] drives the same kernel loop `mokmokd agent run`
-//! drives, one bounded step at a time.
+//! The screen is a pure function of the durable [`Transcript`]s of the sessions this process holds:
+//! the crate keeps only the lines being typed, how far back each transcript is scrolled, which
+//! session the human is in, and the pane he opened, and everything else the screen shows and the
+//! loop does next comes from the folds. [`run`] drives the same kernel loop `mokmokd agent run`
+//! drives, one bounded step at a time, for whichever session's turn it is.
 //!
 //! [`Transcript`]: mokmok_agent_runtime::Transcript
 
@@ -12,17 +14,27 @@ mod port;
 mod session;
 mod terminal;
 
+use mokmok_protocol::SessionID;
 use mokmok_state_machine::Ending;
 
 pub use crate::core::run;
-pub use crate::port::{Engine, Event, Key, Line, Screen, View};
-pub use crate::session::Session;
+pub use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, View};
+pub use crate::session::{Session, Sessions};
 pub use crate::terminal::Terminal;
 
-/// How a conversation ended, and what it said.
+/// What the process left behind: every session it held, and how each one stands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Outcome {
-    /// The ending the session reached, or `None` when the human left it open and resumable.
+    /// One entry per held session, in roster order.
+    pub left: Vec<Left>,
+}
+
+/// One session the process held, and what it said.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Left {
+    /// The session.
+    pub session: SessionID,
+    /// The ending it reached, or `None` when the human left it open and resumable.
     pub ending: Option<Ending>,
     /// The whole conversation as lines, so a shell keeps it after the terminal is handed back.
     pub lines: Vec<Line>,

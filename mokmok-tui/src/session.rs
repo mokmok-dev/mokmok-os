@@ -1,4 +1,4 @@
-//! The `Engine` over the kernel's own driver.
+//! The `Engine` over the kernel's own driver, and the `Roster` over the kernel's log.
 
 use mokmok_agent_runtime::{Progress, Transcript};
 use mokmok_kernel::agent::Driver;
@@ -6,9 +6,9 @@ use mokmok_kernel::{Config, Run};
 use mokmok_protocol::{Moment, SessionID};
 
 use crate::Error;
-use crate::port::Engine;
+use crate::port::{Engine, Listing, Roster};
 
-/// The engine the conversation runs on: the kernel's own driver, one bounded step at a time.
+/// The engine one session runs on: the kernel's own driver, one bounded step at a time.
 ///
 /// Every value is the one `mokmokd agent run` builds for the same configuration, so a conversation
 /// and a run differ in how often they step and in nothing else.
@@ -41,6 +41,10 @@ impl Session {
 }
 
 impl Engine for Session {
+    fn session(&self) -> SessionID {
+        Self::session(self)
+    }
+
     fn fold(&self) -> Result<Transcript, Error> {
         self.driver.transcript().map_err(Error::from)
     }
@@ -60,6 +64,105 @@ impl Engine for Session {
 
     fn reopen(&mut self) -> Result<(), Error> {
         self.driver.reopen().map_err(Error::from)
+    }
+}
+
+/// The sessions the log holds, as the terminal opens them.
+///
+/// The command line names one session and the budgets every session runs under, and the log itself
+/// answers for the rest: a session it already holds is resumed from the task that session recorded,
+/// so a human can switch to a conversation this process was never told about.
+#[derive(Clone, Debug)]
+pub struct Sessions {
+    config: Config,
+    run: Run,
+    at: Moment,
+}
+
+impl Sessions {
+    #[must_use]
+    pub const fn new(
+        config: Config,
+        run: Run,
+        at: Moment,
+    ) -> Self {
+        Self { config, run, at }
+    }
+
+    /// The session the command line named: the one the conversation starts in.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of opening the session's world.
+    pub fn start(&self) -> Result<Session, Error> {
+        Session::open(&self.config, &self.run, self.at)
+    }
+
+    /// The command line's own run, with a session's identity and, when it has one, the goal and the
+    /// checkout that session recorded.
+    ///
+    /// A session that recorded a task is held to it: the fold prefers the recorded task for the
+    /// prompt the model is handed, so the run only has to name the session and stay inside the
+    /// grants the operator passed.
+    fn run_for(
+        &self,
+        session: SessionID,
+        listing: Option<&Listing>,
+    ) -> Run {
+        let run = Run {
+            session: session.as_uuid().to_string(),
+            ..self.run.clone()
+        };
+
+        match listing {
+            Some(listing) => Run {
+                goal: listing.goal.clone().unwrap_or(run.goal),
+                checkout: listing
+                    .checkout
+                    .clone()
+                    .unwrap_or_else(|| run.checkout.clone()),
+                ..run
+            },
+            None => run,
+        }
+    }
+}
+
+impl Roster for Sessions {
+    type Engine = Session;
+
+    fn listed(&self) -> Result<Vec<Listing>, Error> {
+        Ok(mokmok_kernel::sessions(&self.config)?
+            .into_iter()
+            .map(|summary| Listing {
+                session: summary.session,
+                phase: summary.phase,
+                goal: summary.goal,
+                checkout: summary.checkout,
+            })
+            .collect())
+    }
+
+    fn resume(
+        &self,
+        listing: &Listing,
+    ) -> Result<Self::Engine, Error> {
+        let run = self.run_for(listing.session, Some(listing));
+
+        Session::open(&self.config, &run, self.at)
+    }
+
+    fn create(
+        &self,
+        goal: &str,
+    ) -> Result<Self::Engine, Error> {
+        let session = mokmok_kernel::mint_session(self.at);
+        let run = Run {
+            goal: goal.to_owned(),
+            ..self.run_for(session, None)
+        };
+
+        Session::open(&self.config, &run, self.at)
     }
 }
 
