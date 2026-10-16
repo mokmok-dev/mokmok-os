@@ -18,7 +18,16 @@ readonly PACKAGE="${MUTANTS_PACKAGE:-mokmok-event-bus}"
 readonly LEDGER="${MUTANTS_LEDGER:-mutation.json}"
 
 MODE=single
-JOBS=8
+# Four, not the eight that fits the core count: a suite that takes seconds on an idle machine takes
+# tens of seconds under eight at once, and three of the kernel's integration tests give the daemon
+# five seconds to report readiness. At eight they miss it, the unmutated baseline fails, and the
+# member goes unscored. Measured on a 32-core machine.
+JOBS=4
+# The timeout is what catches a mutant that stops the suite terminating, so it has to sit well above
+# what the suite costs under load or a slow machine reads as a hang. cargo-mutants sets 20s here,
+# which is its floor and not enough: with it, nine mutants across two members were scored as
+# timeouts that a quieter run caught.
+TIMEOUT=60
 ARGUMENTS=()
 
 # The sweep's scratch directory. The EXIT trap reads it, and a trap cannot read a `local` of the
@@ -36,6 +45,11 @@ while [ "$#" -gt 0 ]; do
       ;;
     --jobs)
       JOBS="$2"
+      ARGUMENTS+=("$1" "$2")
+      shift
+      ;;
+    --timeout)
+      TIMEOUT="$2"
       ARGUMENTS+=("$1" "$2")
       shift
       ;;
@@ -150,19 +164,19 @@ sweep_all() {
 
   : > "$scratch/rows.jsonl"
 
-  local swept=()
-  while read -r member; do
-    swept+=("$member")
-  done < <(sweep_targets)
+  local swept
+  if ! swept=$(sweep_targets); then
+    exit 1
+  fi
 
   local member
-  for member in "${swept[@]}"; do
+  for member in $swept; do
     echo "=== $member ==="
 
     local status=0
     set +e
-    cargo mutants --package "$member" --jobs "$JOBS" --output "$scratch/$member" 2>&1 \
-      | tee "$scratch/$member.log"
+    cargo mutants --package "$member" --jobs "$JOBS" --timeout "$TIMEOUT" \
+      --output "$scratch/$member" 2>&1 | tee "$scratch/$member.log"
     status=${PIPESTATUS[0]}
     set -e
 
@@ -175,15 +189,19 @@ sweep_all() {
 }
 
 # Every member, or the ones named on the command line, so one crate can be re-measured without
-# re-running the sweep. `--jobs` and its value are options here, not member names.
+# re-running the sweep. An option and its value are not member names, and a name that is not a
+# workspace member stops the sweep rather than becoming a ledger row of its own.
 sweep_targets() {
   local index=0
   local named=()
 
   while [ "$index" -lt "${#ARGUMENTS[@]}" ]; do
     case "${ARGUMENTS[$index]}" in
-      --jobs)
+      --jobs | --timeout | --re | --file | --exclude-re | --shard)
         index=$((index + 2))
+        ;;
+      -*)
+        index=$((index + 1))
         ;;
       *)
         named+=("${ARGUMENTS[$index]}")
@@ -193,12 +211,33 @@ sweep_targets() {
   done
 
   if [ "${#named[@]}" -gt 0 ]; then
+    local name
+    for name in "${named[@]}"; do
+      if ! member_known "$name"; then
+        echo "$name is not a workspace member" >&2
+
+        return 1
+      fi
+    done
+
     printf '%s\n' "${named[@]}"
 
     return
   fi
 
   members
+}
+
+member_known() {
+  local wanted="$1" member
+
+  for member in $(members); do
+    if [ "$member" = "$wanted" ]; then
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 record_row() {
