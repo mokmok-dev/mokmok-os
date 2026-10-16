@@ -251,3 +251,131 @@ fn path_of(path: &Path) -> Result<String, Error> {
         .map(str::to_owned)
         .ok_or(Error::NotAName("a granted path"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Authority;
+    use crate::config::Config;
+    use mokmok_protocol::Moment;
+    use std::path::{Path, PathBuf};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mokmok-authority-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn config(
+        root: &Path,
+        grants: &[(&str, bool)],
+    ) -> Config {
+        let data = root.join("data");
+        let artifacts = data.join("artifacts");
+        let sandbox_root = data.join("sandbox");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+
+        let mut allow_write = Vec::new();
+        let mut allow_path = Vec::new();
+        for (name, writable) in grants {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            if *writable {
+                allow_write.push(path);
+            } else {
+                allow_path.push(path);
+            }
+        }
+
+        Config {
+            data_dir: data.clone(),
+            events: data.join("events.sqlite"),
+            artifacts,
+            sandbox_root,
+            allow_tool: vec![PathBuf::from("/bin/sh")],
+            allow_path,
+            allow_write,
+            search_root: Vec::new(),
+            search_index: data.join("search"),
+            tool_env: Vec::new(),
+            confiner: PathBuf::from("/bin/sh"),
+            crash_after: None,
+            provider: crate::config::ProviderKind::Scripted,
+            script: None,
+            model: None,
+            endpoint: "https://ollama.com/v1".to_owned(),
+            provider_credential_file: None,
+            max_answer_tokens: 4096,
+        }
+    }
+
+    #[test]
+    fn a_path_under_a_write_root_is_allowed() {
+        let scratch = Scratch::new("write-root");
+        let config = config(&scratch.0, &[("write", true), ("read", false)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(&scratch.0.join("write").join("file.txt"), Moment::EPOCH,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_path_under_a_read_root_is_denied() {
+        let scratch = Scratch::new("read-root");
+        let config = config(&scratch.0, &[("write", true), ("read", false)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(&scratch.0.join("read").join("file.txt"), Moment::EPOCH,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_path_under_no_root_is_denied() {
+        let scratch = Scratch::new("no-root");
+        let config = config(&scratch.0, &[("write", true)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(
+                    &std::env::temp_dir().join("elsewhere").join("file.txt"),
+                    Moment::EPOCH,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_deepest_write_root_wins() {
+        let scratch = Scratch::new("deepest");
+        let config = config(&scratch.0, &[("outer", true), ("outer/inner", true)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(
+                    &scratch.0.join("outer").join("inner").join("file.txt"),
+                    Moment::EPOCH,
+                )
+                .is_ok()
+        );
+    }
+}
