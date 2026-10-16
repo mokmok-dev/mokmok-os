@@ -393,7 +393,7 @@ mod tests {
         assert!(
             report
                 .require("execution=")
-                .ends_with("state=Applied { code: 0 }"),
+                .ends_with("state=Applied { resolution: Finished { code: 0 } }"),
             "{}",
             report.out,
         );
@@ -505,7 +505,7 @@ mod tests {
         );
         assert!(
             report.out.contains(&format!(
-                "execution={first_execution} state=Applied {{ code: 0 }}"
+                "execution={first_execution} state=Applied {{ resolution: Finished {{ code: 0 }} }}"
             )),
             "{}",
             report.out,

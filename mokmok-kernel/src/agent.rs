@@ -27,6 +27,7 @@ use mokmok_state_machine::{Attempt, Ending, Fact, Resolution, Turn, TurnNumber};
 use crate::authority::Authority;
 use crate::config::{Config, ConfigError, CrashPoint, ProviderKind, Run};
 use crate::db::{Db, Entry, Log};
+use crate::editor::Editor;
 use crate::error::Error;
 use crate::execution::{self, Blob, Plan, Ran};
 use crate::index::Index;
@@ -158,6 +159,15 @@ impl Ledger {
                 },
                 Record::Speech(speech) => turn = Some(speech.turn),
                 Record::Find(find) => turn = Some(find.turn),
+                Record::EditIntent(edit) => {
+                    turn = Some(edit.turn);
+                    execution = Some(edit.execution);
+                },
+                Record::EditOutcome(edit) => {
+                    turn = Some(edit.turn);
+                    execution = Some(edit.execution);
+                    resolution = Some(edit.report.outcome.resolution());
+                },
                 Record::Task(_)
                 | Record::Prompt(_)
                 | Record::Answer(_)
@@ -438,6 +448,13 @@ enum Script {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },
+    Edit {
+        patch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
     /// The model is done.
     Final {
         /// The model's own words, when the script supplies them, so an offline run shows prose.
@@ -458,6 +475,7 @@ impl Script {
         match self {
             Self::Command { say, .. }
             | Self::Find { say, .. }
+            | Self::Edit { say, .. }
             | Self::Final { say }
             | Self::Malformed { say, .. } => say.as_deref(),
         }
@@ -469,6 +487,10 @@ impl From<Script> for Action {
         match script {
             Script::Command { command, .. } => Self::Command { command },
             Script::Find { query, .. } => Self::Find { query },
+            Script::Edit { patch, expect, .. } => mokmok_agent_runtime::patch_refusal(&patch)
+                .map_or(Self::Edit { patch, expect }, |reason| Self::Malformed {
+                    reason,
+                }),
             Script::Final { .. } => Self::Final,
             Script::Malformed { reason, .. } => Self::Malformed { reason },
         }
@@ -552,6 +574,7 @@ pub struct Driver {
     ledger: Ledger,
     shell: Shell,
     index: Index,
+    editor: Editor,
     provider: Model,
     config: Config,
     session: SessionID,
@@ -577,6 +600,7 @@ impl Driver {
         let provider = model(config, session)?;
         let shell = Shell::new(config, task.setting.program.clone(), at)?;
         let ledger = Ledger::open(config, session, Some(task.clone()), at)?;
+        let editor = Editor::new(config, &task.setting.checkout, at)?;
         // The task the fold holds, not the one this invocation built: the prompt the model was
         // handed, the tools the provider was given, and the roots the finder opened must all come
         // off the one recorded task, or a resumed session is offered a tool that will not answer
@@ -596,6 +620,7 @@ impl Driver {
             ledger,
             shell,
             index,
+            editor,
             provider,
             config: config.clone(),
             session,
@@ -643,6 +668,7 @@ impl Driver {
             &self.provider,
             &self.shell,
             &self.index,
+            &self.editor,
             self.session,
             self.at,
         )
@@ -784,6 +810,9 @@ fn hash_of(text: &str) -> Result<ContentHash, Error> {
 const fn exit_of(resolution: Resolution) -> Exit {
     match resolution {
         Resolution::Finished { code } => Exit::Finished { code },
+        // An edit runs no process, so `Applied` borrows `Finished { 0 }` as the sentinel the
+        // command vocabulary already has; the edit's own record carries the true outcome.
+        Resolution::Applied => Exit::Finished { code: 0 },
         Resolution::Killed { signal } => Exit::Killed { signal },
         Resolution::TimedOut => Exit::TimedOut,
         Resolution::Refused => Exit::Refused,
@@ -834,6 +863,9 @@ fn step_line(
                 number_of(ledger, session, *turn)
             )
         },
+        Move::Edit { turn, .. } => {
+            format!("move=edit turn={}", number_of(ledger, session, *turn))
+        },
         Move::Close {
             turn,
             outcome,
@@ -867,6 +899,9 @@ fn ask_line(
             Action::Final => format!("move=ask turn={number} attempt={attempt} answer=final"),
             Action::Find { query } => {
                 format!("move=ask turn={number} attempt={attempt} answer=find query={query:?}")
+            },
+            Action::Edit { patch, .. } => {
+                format!("move=ask turn={number} attempt={attempt} answer=edit patch={patch:?}")
             },
             Action::Malformed { reason } => {
                 format!(

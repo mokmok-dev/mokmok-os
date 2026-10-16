@@ -96,6 +96,9 @@ fn lines(fold: &Transcript) -> Vec<Line> {
             Some(ContextAct::Found { query, observation }) => {
                 lines.push(Line::Find { query, observation });
             },
+            Some(ContextAct::Edited { observation }) => {
+                lines.push(Line::Edit { observation });
+            },
             // A settled turn with no act is one the model never finished: the agent opened it, so
             // the human still needs to know it could not.
             None if fold
@@ -123,7 +126,9 @@ fn reason(
         .and_then(|attempt| fold.answers.get(&(turn, attempt)))
         .and_then(|answer| match &answer.action {
             Action::Malformed { reason } => Some(reason.as_str()),
-            Action::Final | Action::Command { .. } | Action::Find { .. } => None,
+            Action::Final | Action::Command { .. } | Action::Find { .. } | Action::Edit { .. } => {
+                None
+            },
         });
 
     malformed.map_or_else(

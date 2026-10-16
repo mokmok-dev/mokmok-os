@@ -450,6 +450,22 @@ fn transcript_line(
             find.query,
             find.report.observation,
         )),
+        mokmok_agent_runtime::Record::EditIntent(edit) => Some(format!(
+            "edit turn={} number={} execution={} patch={:?} relative={:?}",
+            edit.turn.as_uuid(),
+            number(edit.turn),
+            edit.execution.as_uuid(),
+            edit.patch,
+            edit.relative,
+        )),
+        mokmok_agent_runtime::Record::EditOutcome(edit) => Some(format!(
+            "edit turn={} number={} execution={} outcome={:?} observation={:?}",
+            edit.turn.as_uuid(),
+            number(edit.turn),
+            edit.execution.as_uuid(),
+            edit.report.outcome,
+            edit.report.observation,
+        )),
         mokmok_agent_runtime::Record::Session { .. }
         | mokmok_agent_runtime::Record::Turn { .. } => None,
     }
@@ -482,7 +498,7 @@ pub fn reconcile(
 #[must_use]
 pub const fn outcome_of(resolution: Resolution) -> TurnOutcome {
     match resolution {
-        Resolution::Finished { .. } => TurnOutcome::Completed,
+        Resolution::Finished { .. } | Resolution::Applied => TurnOutcome::Completed,
         Resolution::Cancelled => TurnOutcome::Cancelled,
         Resolution::Killed { .. }
         | Resolution::TimedOut
