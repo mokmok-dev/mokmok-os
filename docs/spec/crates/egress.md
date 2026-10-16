@@ -82,7 +82,7 @@ and no other code in the workspace calls it.
 
 The design has DNS and destination checks in this crate. Resolution is a port
 (`src/dns.rs:6-21`) with no implementation here; the kernel supplies `SystemResolver` at
-`mokmok-kernel/src/provider.rs:346`.
+`mokmok-kernel/src/provider.rs:295`.
 
 The design requires that enforcement semantics stay aligned with the capability authority. The
 crate holds no capability dependency, and authorization arrives through the `PolicyClient` port

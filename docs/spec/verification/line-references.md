@@ -8,6 +8,7 @@ status: draft
 generated: { by: grok-build/grok-4.7, at: 2026-10-15T02:00:00Z }
 verified:
   - { by: process:line-references, at: 2026-10-15T03:05:00Z }
+  - { by: process:line-references, at: 2026-10-16T09:10:00Z }
 stale_after: 2026-11-15T00:00:00Z
 parameters:
   - { name: repo, type: string, required: true }
@@ -41,6 +42,13 @@ The symbols named before the citation on the same line pair with its numbers in 
 must find its symbol within three lines of the number it claims. In a table row the symbols come
 from the first column. When a row names fewer symbols than it cites numbers, the weaker rule
 applies: at least one named symbol must appear near each number.
+
+# The run on 2026-10-16
+
+652 pairs were checked across the bundle, and none failed. The credential's move into the environment
+moved every symbol below it in `config.rs` and several in `provider.rs`, so the citations into both
+files were re-derived, and the kernel concept's credential invariant is now two: one for the name a
+key must hold, one for the trimmed value it answers.
 
 # The run on 2026-10-15
 

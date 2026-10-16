@@ -8,6 +8,7 @@ status: draft
 generated: { by: grok-build/grok-4.7, at: 2026-10-15T02:00:00Z }
 verified:
   - { by: process:okf-conformance, at: 2026-10-15T02:20:00Z }
+  - { by: process:okf-conformance, at: 2026-10-16T09:10:00Z }
 stale_after: 2026-11-15T00:00:00Z
 parameters:
   - { name: bundle, type: string, required: true }
@@ -46,6 +47,12 @@ docs/spec/references/attesters/okf-conformance.sh check "$bundle"
 A path-valued field that is a `https` URL is skipped, and so is a value holding a space, which is
 how section 5.1 allows a scope descriptor. Bundle-relative paths begin with `/`, and relative paths
 resolve against the directory of the file that holds them.
+
+# The run on 2026-10-16
+
+The check reported zero problems across 32 files. The bundle grew by one concept after the run below
+was written, so the file count this receipt carried had gone stale; the receipt records the count the
+attester recounted, and the command it was given.
 
 # The run on 2026-10-15
 

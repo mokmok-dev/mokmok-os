@@ -79,7 +79,7 @@ fsyncs per entry, and an audit entry and the decision it records cannot commit t
 
 `src/exporter.rs` holds the port and no implementation, and `Metrics`, `Snapshot`,
 `append_and_export`, and `RedactingFormat` have no caller outside this crate. The daemon reaches the
-audit journal directly: `mokmok-kernel/src/provider.rs:395-413` calls `AuditLog::append` and
+audit journal directly: `mokmok-kernel/src/provider.rs:342-356` calls `AuditLog::append` and
 downgrades a failure to a log line, so a security fact can be lost with a line printed.
 
 The design has redaction remove protected payloads according to policy. `Redaction` is literal

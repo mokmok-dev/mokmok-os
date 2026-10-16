@@ -59,23 +59,57 @@ protocol (`mokmok-kernel/src/notify.rs`), so there is no endpoint to probe and n
 supervision tests bind their own notification socket to assert it.
 
 Crash injection takes two signals. A crash point fires only when the `--crash-after` flag names it
-and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:803`), so a production process cannot be
+and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:953`), so a production process cannot be
 crashed by a flag alone.
 
 The provider group comes from a file, and authority does not. Both binaries read the provider, the
-model, the endpoint, the script, the credential path, and the answer ceiling from
+model, the endpoint, the script, the variable a credential arrives in, and the answer ceiling from
 `$XDG_CONFIG_HOME/mokmok/config.toml`, falling back to `$HOME/.config`, with a flag above the file
-and the file above the built-in default (`mokmok-kernel/src/config.rs:463`). The authority grants,
+and the file above the built-in default (`mokmok-kernel/src/config.rs:521`). The authority grants,
 the data directory, the tool environment, and the agent-run budgets stay on the command line, so a
 file the operator can edit cannot widen what the sandbox lets a workload reach. A value in that file
 may name a variable of the daemon's environment as `$NAME` or `${NAME}`, and the two binaries read
 the environment once at their boundary and hand it to resolution as data. A reference reaches only
-the four keys serde reads as text, so `endpoint` is one of them, and the environment a unit,
-container, or wrapper starts the daemon with picks the host that receives the goal and the
-credential. That is not a new class, because the same command line already carries `--endpoint` and
-`mokmok-egress` validates the destination. The design names no
+the three keys serde reads as text, so `endpoint` is one of them, and the environment a unit,
+container, or wrapper starts the daemon with picks the host that receives the goal. `env_key` is the
+exception that is read literally and names the variable a credential comes from. The design names no
 configuration file at all, and its default-deny authority section assumes every rule arrives as a
 named flag.
+
+# The credential moved into the environment
+
+This one is a reversal of an earlier decision, and the reversal is the point of writing it down.
+
+The credential was a file whose path the operator named, and resolution refused one that was not mode
+0600 or that sat inside a `--allow-write` grant. The mode check protected the value from a second
+user; the write-grant check protected it from the model's own tools, because a run inside such a
+grant could rewrite the file the next invocation would read. The value is now the one the variable
+`env_key` names holds, trimmed, so both checks are gone with the file.
+
+The write-grant check is subsumed rather than dropped. A confined workload can no longer influence
+the daemon's environment at all: `agent run` starts its tools with `Environment::Exact`, so the state
+the check refused is unrepresentable rather than tested for, and `mokmok-kernel/tests/environment.rs`
+pins that a variable the daemon holds does not cross into a tool.
+
+What the mode check protected is not subsumed. The secret now lives in the daemon's own environment,
+which is a worse place for it: every process running as the same user can read it out of
+`/proc/<pid>/environ`, and `systemctl show` prints a unit's environment to anyone who can ask. A
+credential is now as exposed as the daemon's `PATH` is, where before a second user needed the file's
+group or other bits to reach it. The kernel reads `/proc` nowhere, so nothing here exploits that,
+but a hostile same-user process does not need the kernel's help.
+
+The shipped `mokmokd.service` reads no configuration file and opens no provider, so it carries no
+credential and is unaffected. The cost arrives for an operator who gives the daemon a file that
+names `env_key`: the variable has to reach the daemon's own environment through `Environment=` or
+`EnvironmentFile=`, and resolution reads that file before it matches the subcommand, so an absent
+variable refuses `serve` and `status` as well as `agent run`.
+
+One consequence is a loss of compatibility rather than a hazard. systemd's own secret handling is
+`LoadCredential=`, which writes a 0400 file under `$CREDENTIALS_DIRECTORY` and hands the daemon its
+path in an environment variable. That variable holds a path and not a secret, and `env_key` reads a
+variable's value as the credential itself, so a unit that used `LoadCredential=` cannot name what it
+puts there. An operator who wants that shape has to point `env_key` at nothing and arrange the file
+themselves, which is what this change removed the support for.
 
 # New decisions the register should carry
 
