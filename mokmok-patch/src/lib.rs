@@ -134,6 +134,15 @@ pub enum ApplyError {
 impl Patch {
     /// Reads one unified diff. Every header number is kept as stated; nothing is applied.
     ///
+    /// A hunk body is read in two ways. First, the stated old and new counts are used: when
+    /// both counts are reached and the following line starts the next section, the body ends
+    /// there. This is what lets a real diff remove a line beginning with `-- ` or add one
+    /// beginning with `++ ` without confusing it with a file-section header. If the counts do not
+    /// fit, the body is read by prefix scan: it ends on `@@ `, on `diff `, or on `--- ` only
+    /// when that line is followed by `+++ `. The residual limit is a diff whose counts are wrong
+    /// and whose body has a removed line `-- x` immediately before an added line `++ y`: those
+    /// two lines together look like a section header and are read as one.
+    ///
     /// # Errors
     ///
     /// Returns `ParseError::NoFileSection` if no `---`/`+++` pair opens a section,
@@ -305,7 +314,7 @@ impl FilePatch {
                         .saturating_sub(usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX))
                 };
                 let max_idx = n - side_len;
-                let idx = shifted.saturating_sub(1).clamp(0, max_idx);
+                let idx = shifted.saturating_sub(1);
                 let found_idx = (idx..=max_idx)
                     .find(|&candidate| {
                         old_side
@@ -385,11 +394,113 @@ fn parse_hunk<'a>(
     tail: &'a [&'a str],
 ) -> Result<(Hunk, &'a [&'a str]), ParseError> {
     let stated = parse_header(header)?;
+
+    if let Some(result) = body_by_counts(stated, tail) {
+        return Ok(result);
+    }
+
+    body_by_prefix_scan(stated, tail)
+}
+
+fn body_by_counts<'a>(
+    stated: Header,
+    tail: &'a [&'a str],
+) -> Option<(Hunk, &'a [&'a str])> {
+    let mut body: Vec<Line> = Vec::new();
+    let mut rest = tail;
+    let mut old_seen: u64 = 0;
+    let mut new_seen: u64 = 0;
+
+    while let Some((line, after)) = rest.split_first() {
+        if old_seen >= stated.old_len && new_seen >= stated.new_len {
+            return if is_body_boundary(line, after.first()) {
+                Some((
+                    Hunk {
+                        stated,
+                        lines: body,
+                    },
+                    rest,
+                ))
+            } else {
+                None
+            };
+        }
+
+        if *line == "\\ No newline at end of file" {
+            if let Some(last) = body.last_mut() {
+                last.newline = false;
+            }
+            rest = after;
+            continue;
+        }
+
+        if line.is_empty() {
+            body.push(Line {
+                kind: Kind::Context,
+                text: String::new(),
+                newline: true,
+            });
+            old_seen = old_seen.saturating_add(1);
+            new_seen = new_seen.saturating_add(1);
+            rest = after;
+            continue;
+        }
+
+        let (kind, old_delta, new_delta) = match line.as_bytes()[0] {
+            b' ' => (Kind::Context, 1, 1),
+            b'-' => (Kind::Removed, 1, 0),
+            b'+' => (Kind::Added, 0, 1),
+            _ => return None,
+        };
+
+        body.push(Line {
+            kind,
+            text: line[1..].to_string(),
+            newline: true,
+        });
+        old_seen = old_seen.saturating_add(old_delta);
+        new_seen = new_seen.saturating_add(new_delta);
+        rest = after;
+    }
+
+    if old_seen >= stated.old_len && new_seen >= stated.new_len {
+        Some((
+            Hunk {
+                stated,
+                lines: body,
+            },
+            rest,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Whether `line` ends a hunk body.
+///
+/// `@@ ` and `diff ` cannot begin a body line, because a body line carries its leading space, `-`,
+/// or `+`. A `--- ` line can: a diff that removes `-- x` spells that body line `--- x`, and the only
+/// `--- ` a section header puts before a `+++ ` line is a real one. Both readers of a body take
+/// their boundary from here, so a wrong set of counts cannot end a body somewhere the prefix scan
+/// would not.
+fn is_body_boundary(
+    line: &str,
+    next: Option<&&str>,
+) -> bool {
+    line.starts_with("@@ ")
+        || line.starts_with("diff ")
+        || (line.starts_with("--- ") && next.is_some_and(|next| next.starts_with("+++ ")))
+}
+
+fn body_by_prefix_scan<'a>(
+    stated: Header,
+    tail: &'a [&'a str],
+) -> Result<(Hunk, &'a [&'a str]), ParseError> {
     let mut body: Vec<Line> = Vec::new();
     let mut rest = tail;
 
     while let Some((line, after)) = rest.split_first() {
-        if line.starts_with("@@") || line.starts_with("--- ") || line.starts_with("diff ") {
+        if is_body_boundary(line, after.first()) {
             break;
         }
 
@@ -709,6 +820,205 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_count_does_not_end_a_body_at_a_removed_line_that_looks_like_a_header() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n a\n--- x\n b\n";
+        let patch = Patch::parse(diff).unwrap();
+        let hunk = &patch.files[0].hunks[0];
+
+        assert_eq!(
+            hunk.lines,
+            vec![
+                Line {
+                    kind: Kind::Context,
+                    text: "a".to_string(),
+                    newline: true,
+                },
+                Line {
+                    kind: Kind::Removed,
+                    text: "-- x".to_string(),
+                    newline: true,
+                },
+                Line {
+                    kind: Kind::Context,
+                    text: "b".to_string(),
+                    newline: true,
+                },
+            ]
+        );
+        let recounted = patch.recounted();
+        assert_eq!(recounted.files[0].hunks[0].stated.old_len, 3);
+        assert_eq!(recounted.files[0].hunks[0].stated.new_len, 2);
+    }
+
+    #[test]
+    fn the_counts_end_a_body_that_holds_a_line_looking_like_a_section_header() {
+        let diff = [
+            "--- a/f",
+            "+++ b/f",
+            "@@ -1,3 +1,3 @@",
+            " before",
+            "--- foo",
+            "+++ bar",
+            " after",
+            "--- a/g",
+            "+++ b/g",
+            "@@ -1,1 +1,1 @@",
+            "-one",
+            "+ONE",
+            "",
+        ]
+        .join("\n");
+
+        let patch = Patch::parse(&diff).unwrap();
+
+        assert_eq!(patch.files.len(), 2);
+        let first = &patch.files[0].hunks[0];
+        assert_eq!(first.lines.len(), 4);
+        assert_eq!(first.lines[1].text, "-- foo");
+        assert_eq!(first.lines[2].text, "++ bar");
+        let second = &patch.files[1].hunks[0];
+        assert_eq!(second.lines.len(), 2);
+        assert_eq!(second.lines[0].text, "one");
+        assert_eq!(second.lines[1].text, "ONE");
+    }
+
+    #[test]
+    fn a_wrong_count_with_an_ambiguous_pair_is_refused_rather_than_misread() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,3 @@\n before\n--- x\n+++ y\n";
+
+        assert_eq!(
+            Patch::parse(diff),
+            Err(ParseError::InvalidPath(
+                "source \"x\" differs from target \"y\"".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn a_removed_line_before_an_added_one_stays_in_the_body_when_the_counts_need_it() {
+        let diff = "--- a/f\n+++ b/f\n@@ -1,1 +1,2 @@\n before\n--- x\n+++ y\n";
+
+        let patch = Patch::parse(diff).unwrap();
+        let hunk = &patch.files[0].hunks[0];
+
+        assert_eq!(hunk.lines.len(), 3);
+        assert_eq!(hunk.lines[1].kind, Kind::Removed);
+        assert_eq!(hunk.lines[1].text, "-- x");
+        assert_eq!(hunk.lines[2].kind, Kind::Added);
+        assert_eq!(hunk.lines[2].text, "++ y");
+        let recounted = patch.recounted();
+        assert_eq!(recounted.files[0].hunks[0].stated.old_len, 2);
+        assert_eq!(recounted.files[0].hunks[0].stated.new_len, 2);
+    }
+
+    #[test]
+    fn parses_body_line_that_looks_like_a_section_header() {
+        let diff = [
+            "--- a/f",
+            "+++ b/f",
+            "@@ -1,3 +1,3 @@",
+            " before",
+            "--- foo",
+            "+++ bar",
+            " after",
+            "",
+        ]
+        .join("\n");
+
+        let patch = Patch::parse(&diff).unwrap();
+        let hunk = &patch.files[0].hunks[0];
+        assert_eq!(hunk.lines.len(), 4);
+        assert_eq!(
+            hunk.lines[0],
+            Line {
+                kind: Kind::Context,
+                text: "before".to_string(),
+                newline: true,
+            }
+        );
+        assert_eq!(
+            hunk.lines[1],
+            Line {
+                kind: Kind::Removed,
+                text: "-- foo".to_string(),
+                newline: true,
+            }
+        );
+        assert_eq!(
+            hunk.lines[2],
+            Line {
+                kind: Kind::Added,
+                text: "++ bar".to_string(),
+                newline: true,
+            }
+        );
+        assert_eq!(
+            hunk.lines[3],
+            Line {
+                kind: Kind::Context,
+                text: "after".to_string(),
+                newline: true,
+            }
+        );
+
+        let applied = patch.files[0].apply(b"before\n-- foo\nafter\n").unwrap();
+        assert_eq!(applied.bytes, b"before\n++ bar\nafter\n");
+    }
+
+    #[test]
+    fn body_line_that_looks_like_a_section_header_round_trips() {
+        let diff = [
+            "--- a/f",
+            "+++ b/f",
+            "@@ -1,3 +1,3 @@",
+            " before",
+            "--- foo",
+            "+++ bar",
+            " after",
+            "",
+        ]
+        .join("\n");
+
+        let patch = Patch::parse(&diff).unwrap();
+        let rendered = patch.to_unified();
+        let again = Patch::parse(&rendered).unwrap();
+        assert_eq!(again, patch);
+    }
+
+    #[test]
+    fn wrong_counts_with_section_start_use_prefix_scan() {
+        let diff = [
+            "--- a/f",
+            "+++ b/f",
+            "@@ -1,1 +1,1 @@",
+            " one",
+            "-two",
+            "@@ -5,1 +5,1 @@",
+            " five",
+            "+FIVE",
+            "",
+        ]
+        .join("\n");
+
+        let patch = Patch::parse(&diff).unwrap();
+        let hunk = &patch.files[0].hunks[0];
+        assert_eq!(
+            hunk.stated,
+            Header {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1,
+            }
+        );
+        assert_eq!(hunk.lines.len(), 2);
+        assert_eq!(hunk.lines[0].kind, Kind::Context);
+        assert_eq!(hunk.lines[0].text, "one");
+        assert_eq!(hunk.lines[1].kind, Kind::Removed);
+        assert_eq!(hunk.lines[1].text, "two");
+    }
+
+    #[test]
     fn to_unified_round_trips() {
         let diff = [
             "diff --git a/f b/f",
@@ -827,6 +1137,77 @@ mod tests {
                     Line {
                         kind: Kind::Added,
                         text: "extra".to_string(),
+                        newline: true,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            file.apply(b"alpha\nbeta\n"),
+            Err(ApplyError::NotFound { hunk: 0 })
+        );
+    }
+
+    #[test]
+    fn apply_anchor_past_end_is_not_found() {
+        let file = FilePatch {
+            source: Label::Path("f".to_string()),
+            target: Label::Path("f".to_string()),
+            hunks: vec![Hunk {
+                stated: Header {
+                    old_start: 10,
+                    old_len: 1,
+                    new_start: 10,
+                    new_len: 1,
+                },
+                lines: vec![
+                    Line {
+                        kind: Kind::Removed,
+                        text: "beta".to_string(),
+                        newline: true,
+                    },
+                    Line {
+                        kind: Kind::Added,
+                        text: "BETA".to_string(),
+                        newline: true,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            file.apply(b"alpha\nbeta\n"),
+            Err(ApplyError::NotFound { hunk: 0 })
+        );
+    }
+
+    #[test]
+    fn apply_does_not_move_search_backward_to_match() {
+        let file = FilePatch {
+            source: Label::Path("f".to_string()),
+            target: Label::Path("f".to_string()),
+            hunks: vec![Hunk {
+                stated: Header {
+                    old_start: 3,
+                    old_len: 2,
+                    new_start: 3,
+                    new_len: 2,
+                },
+                lines: vec![
+                    Line {
+                        kind: Kind::Context,
+                        text: "alpha".to_string(),
+                        newline: true,
+                    },
+                    Line {
+                        kind: Kind::Context,
+                        text: "beta".to_string(),
+                        newline: true,
+                    },
+                    Line {
+                        kind: Kind::Added,
+                        text: "ALPHA".to_string(),
                         newline: true,
                     },
                 ],
@@ -1121,9 +1502,10 @@ mod tests {
             lines(),
             any::<usize>(),
             any::<usize>(),
+            any::<usize>(),
             prop::collection::vec(line_text(), 0..4),
         )
-            .prop_map(|(old, start_raw, insert_raw, added)| {
+            .prop_map(|(old, start_raw, insert_raw, removed_mask, added)| {
                 let len = old.len();
                 let start = start_raw % (len + 1);
                 let max_end_len = len.saturating_sub(start) + 1;
@@ -1132,9 +1514,18 @@ mod tests {
                 let added_len = added.len();
 
                 let mut hunk_lines = Vec::new();
-                for line in old.iter().skip(start).take(insert - start) {
+                let mut removed_count = 0usize;
+                for (index, line) in old.iter().enumerate().skip(start).take(insert - start) {
+                    let removed = (removed_mask >> (index - start)) & 1 == 1;
+                    if removed {
+                        removed_count = removed_count.saturating_add(1);
+                    }
                     hunk_lines.push(Line {
-                        kind: Kind::Context,
+                        kind: if removed {
+                            Kind::Removed
+                        } else {
+                            Kind::Context
+                        },
                         text: line.clone(),
                         newline: true,
                     });
@@ -1146,9 +1537,17 @@ mod tests {
                         newline: true,
                     });
                 }
-                for line in old.iter().skip(insert).take(end - insert) {
+                for (index, line) in old.iter().enumerate().skip(insert).take(end - insert) {
+                    let removed = (removed_mask >> (index - start)) & 1 == 1;
+                    if removed {
+                        removed_count = removed_count.saturating_add(1);
+                    }
                     hunk_lines.push(Line {
-                        kind: Kind::Context,
+                        kind: if removed {
+                            Kind::Removed
+                        } else {
+                            Kind::Context
+                        },
                         text: line.clone(),
                         newline: true,
                     });
@@ -1163,7 +1562,7 @@ mod tests {
                             old_start: start as u64 + 1,
                             old_len: selected as u64,
                             new_start: start as u64 + 1,
-                            new_len: (selected + added_len) as u64,
+                            new_len: (selected - removed_count + added_len) as u64,
                         },
                         lines: hunk_lines,
                     }],
