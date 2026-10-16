@@ -9,7 +9,11 @@
 //!
 //! The file carries the provider group and nothing else: the authority grants, the data directory,
 //! and the agent-run budgets stay on the command line, where an edited file cannot widen them.
+//!
+//! A value the file writes may name a variable of the process, and the environment that answers it
+//! is read once by a binary and handed to resolution as data.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -171,7 +175,8 @@ pub struct Global {
     ///
     /// The file is `<XDG_CONFIG_HOME>/mokmok/config.toml`, or `$HOME/.config/mokmok/config.toml`
     /// when `XDG_CONFIG_HOME` is unset. A flag beats the file, and the file beats the built-in
-    /// default.
+    /// default. A value in the file may name a variable of the process, written `$NAME` or
+    /// `${NAME}`, answered from the environment the binary was started with.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
     /// The provider group: the flags, and the keys the configuration file may set.
@@ -328,19 +333,23 @@ impl Config {
     ///
     /// The file is read before the subcommand is matched, so one file is valid or invalid for every
     /// command rather than for a subset, and a broken file is reported on the first command the
-    /// operator types.
+    /// operator types. `environment` is the process's own environment, read by the caller: a value
+    /// the file writes as `$NAME` or `${NAME}` is answered from it and from nowhere else.
     ///
     /// # Errors
     ///
     /// Returns a [`ConfigError`] when a directory cannot be created, a program is not absolute or
     /// not a runnable file, a named path is not a directory, a search root no grant covers, or the
-    /// configuration file is missing, unreadable, invalid, or holds a path key that leaves it.
+    /// configuration file is missing, unreadable, invalid, or holds a path key that leaves it, or a
+    /// reference in it names a variable the environment does not answer, is not a reference at all,
+    /// or expands to a path that leaves the file's directory.
     pub fn resolve(
         args: &Args,
         discovered: Option<&Path>,
+        environment: &ProcessEnvironment,
     ) -> Result<Self, ConfigError> {
         let global = &args.global;
-        let file = file_layer(args, discovered)?;
+        let file = file_layer(args, discovered, environment)?;
         let provider = ProviderSettings::merge(&global.provider, &file);
 
         create_directory(&global.data_dir)?;
@@ -431,7 +440,7 @@ impl Config {
             allow_write,
             search_root,
             search_index: global.data_dir.join("search"),
-            tool_env: environment(&global.tool_env)?,
+            tool_env: tool_environment(&global.tool_env)?,
             confiner: runnable(&confiner)?,
             crash_after: global.crash_after,
             provider,
@@ -472,10 +481,203 @@ fn config_path_for(
         .map(|root| root.join("mokmok/config.toml"))
 }
 
+/// The environment this process was started with, read once by a binary and handed to resolution
+/// as data.
+///
+/// The file layer consults it for one thing: the values an operator's file writes as `$NAME` or
+/// `${NAME}`. Nothing else reads it, and [`Config`] does not keep it, so an answer cannot reach a
+/// later invocation.
+///
+/// `Default` is the empty environment, which is what a case hands in: a file that names a variable
+/// and a caller that offers no environment is refused by name, rather than answered from whatever
+/// the developer's shell happens to hold.
+///
+/// It is not `Debug`, because it holds every value this process was given, secrets included.
+#[derive(Default)]
+pub struct ProcessEnvironment(BTreeMap<OsString, OsString>);
+
+impl ProcessEnvironment {
+    /// The one read of this process's own environment for the file layer.
+    #[must_use]
+    pub fn read() -> Self {
+        Self(std::env::vars_os().collect())
+    }
+
+    /// The value `name` holds, or `None` when the environment holds no value for it.
+    ///
+    /// Compared as bytes, so a name that is not UTF-8 simply never matches a reference.
+    fn get(
+        &self,
+        name: &str,
+    ) -> Option<&OsStr> {
+        self.0.get(OsStr::new(name)).map(OsString::as_os_str)
+    }
+
+    #[cfg(test)]
+    fn of(pairs: &[(&str, &OsStr)]) -> Self {
+        Self(
+            pairs
+                .iter()
+                .map(|(name, value)| (OsString::from(name), value.to_os_string()))
+                .collect(),
+        )
+    }
+}
+
+/// What a value the file wrote could not be answered, before a file and a key are named.
+#[derive(Debug, Eq, PartialEq)]
+enum Unanswered {
+    /// The environment holds no value for the name, or holds an empty one.
+    Unset {
+        name: String,
+    },
+    Malformed {
+        reference: String,
+    },
+    NotText {
+        name: String,
+    },
+}
+
+impl Unanswered {
+    fn in_file(
+        self,
+        file: &Path,
+        key: &'static str,
+        written: &str,
+    ) -> ConfigError {
+        match self {
+            Self::Unset { name } => ConfigError::ConfigFileVariableUnset {
+                path: file.to_path_buf(),
+                key,
+                value: written.to_owned(),
+                name,
+            },
+            Self::Malformed { reference } => ConfigError::ConfigFileReferenceMalformed {
+                path: file.to_path_buf(),
+                key,
+                value: written.to_owned(),
+                reference,
+            },
+            Self::NotText { name } => ConfigError::ConfigFileVariableNotText {
+                path: file.to_path_buf(),
+                key,
+                value: written.to_owned(),
+                name,
+            },
+        }
+    }
+}
+
+/// The whole rule a value the file writes follows, in one place.
+///
+/// A reference is `$NAME` or `${NAME}`; a name starts with an ASCII letter or `_` and goes on with
+/// ASCII letters, digits, and `_`. `$$` writes one literal `$`, which is how an operator keeps a
+/// dollar the environment must not answer. Any other `$` is refused rather than passed through,
+/// and a name the environment does not hold, or holds empty, is refused rather than becoming
+/// nothing: no key silently becomes blank, and no mistyped reference silently stays text.
+///
+/// An answer is appended exactly as it came and is never scanned again, so no value the environment
+/// carries can open a second reference or reach a second key.
+fn expand(
+    written: &str,
+    environment: &ProcessEnvironment,
+) -> Result<String, Unanswered> {
+    let mut expanded = String::with_capacity(written.len());
+    let mut rest = written;
+
+    // `rest` shrinks by at least the dollar every turn, so the loop ends.
+    while let Some(dollar) = rest.find('$') {
+        expanded.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+
+        match after.as_bytes().first() {
+            Some(b'$') => {
+                expanded.push('$');
+                rest = &after[1..];
+            },
+            Some(b'{') => {
+                // The name is what lies up to the first `}`. A group that never closes, or whose
+                // name is not a name, is refused as the operator wrote it, because the brace is
+                // part of the reference they typed and its absence is the mistake.
+                let Some(close) = after.find('}') else {
+                    let end = 1 + name_run(&after[1..]);
+
+                    return Err(Unanswered::Malformed {
+                        reference: format!("${}", &after[..end]),
+                    });
+                };
+                let name = &after[1..close];
+                if !variable_name(name) {
+                    return Err(Unanswered::Malformed {
+                        reference: format!("${}", &after[..=close]),
+                    });
+                }
+                expanded.push_str(answered(name, environment)?);
+                rest = &after[close + 1..];
+            },
+            // `$NAME`, and the lone `$` at the end, which takes this arm with an empty run: a run
+            // that is empty or starts with a digit opens no name the environment can hold.
+            _ => {
+                let end = name_run(after);
+                let name = &after[..end];
+                if !variable_name(name) {
+                    return Err(Unanswered::Malformed {
+                        reference: format!("${}", &after[..end]),
+                    });
+                }
+                expanded.push_str(answered(name, environment)?);
+                rest = &after[end..];
+            },
+        }
+    }
+    expanded.push_str(rest);
+
+    Ok(expanded)
+}
+
+fn answered<'a>(
+    name: &str,
+    environment: &'a ProcessEnvironment,
+) -> Result<&'a str, Unanswered> {
+    match environment.get(name) {
+        Some(value) if !value.is_empty() => value.to_str().ok_or_else(|| Unanswered::NotText {
+            name: name.to_owned(),
+        }),
+        _ => Err(Unanswered::Unset {
+            name: name.to_owned(),
+        }),
+    }
+}
+
+/// Whether `name` is a name the environment can hold: a letter or `_`, then letters, digits, and
+/// `_`. The empty text is not one, which is what makes a lone `$` and a `$2` refusals rather than
+/// silence.
+fn variable_name(name: &str) -> bool {
+    let mut characters = name.chars();
+
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => characters.all(name_char),
+        _ => false,
+    }
+}
+
+const fn name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// How many bytes of `text` begin the run of name characters. Bytes, because the caller slices with
+/// it, and every name character is ASCII.
+fn name_run(text: &str) -> usize {
+    text.find(|character: char| !name_char(character))
+        .unwrap_or(text.len())
+}
+
 /// The layer the configuration file contributes, or an empty one when there is no file to read.
 fn file_layer(
     args: &Args,
     discovered: Option<&Path>,
+    environment: &ProcessEnvironment,
 ) -> Result<ProviderLayer, ConfigError> {
     let named = args.global.config.as_deref();
     let Some(path) = named
@@ -505,49 +707,80 @@ fn file_layer(
             source,
         })?;
 
-    rebased(layer, &path)
+    answered_layer(layer, &path, environment)
 }
 
-/// Joins the file's two path keys to the directory that holds it, or refuses a value that leaves it.
-fn rebased(
+/// The layer the file contributes once the environment has answered it.
+///
+/// Serde has already refused a key the group does not own, a value of the wrong type, and a
+/// provider the binary does not have, so this stage sees only the keys the file owns, each already
+/// of its own type. The keys are answered in the struct's own field order, which is the order a
+/// file with two bad references names them in.
+fn answered_layer(
     layer: ProviderLayer,
     file: &Path,
+    environment: &ProcessEnvironment,
 ) -> Result<ProviderLayer, ConfigError> {
     let base = file.parent().unwrap_or_else(|| Path::new("."));
 
     Ok(ProviderLayer {
-        script: beneath(layer.script, "script", base, file)?,
-        credential_file: beneath(
+        model: answered_text(layer.model, "model", file, environment)?,
+        endpoint: answered_text(layer.endpoint, "endpoint", file, environment)?,
+        script: answered_path(layer.script, "script", base, file, environment)?,
+        credential_file: answered_path(
             layer.credential_file,
             "provider_credential_file",
             base,
             file,
+            environment,
         )?,
         ..layer
     })
 }
 
-/// One path key, held to the same rule an artifact path follows and then resolved beside the file.
-///
-/// The credential has to become absolute here: `private_credential` compares it against the absolute
-/// write grants, and a relative value would match none of them and skip that refusal in silence.
-fn beneath(
-    value: Option<PathBuf>,
+fn answered_text(
+    written: Option<String>,
+    key: &'static str,
+    file: &Path,
+    environment: &ProcessEnvironment,
+) -> Result<Option<String>, ConfigError> {
+    written
+        .map(|written| {
+            expand(&written, environment).map_err(|cost| cost.in_file(file, key, &written))
+        })
+        .transpose()
+}
+
+fn answered_path(
+    written: Option<PathBuf>,
     key: &'static str,
     base: &Path,
     file: &Path,
+    environment: &ProcessEnvironment,
 ) -> Result<Option<PathBuf>, ConfigError> {
-    let Some(value) = value else {
+    let Some(written) = written else {
         return Ok(None);
     };
-    let text = value.to_string_lossy().into_owned();
-    let relative = relative_path(&text).map_err(|_| ConfigError::ConfigFileNotRelative {
-        path: file.to_path_buf(),
-        key,
-        value: text,
-    })?;
+    let written = written.to_string_lossy().into_owned();
+    let text = expand(&written, environment).map_err(|cost| cost.in_file(file, key, &written))?;
 
-    Ok(Some(base.join(relative)))
+    match relative_path(&text) {
+        Ok(relative) => Ok(Some(base.join(relative))),
+        // A written path keeps its own message; only an answer gets the sentence that quotes both.
+        // A path that carries no `$` expands to itself, so the two texts differ exactly when the
+        // environment changed the value.
+        Err(_) if text == written => Err(ConfigError::ConfigFileNotRelative {
+            path: file.to_path_buf(),
+            key,
+            value: written,
+        }),
+        Err(_) => Err(ConfigError::ConfigFileNotRelativeAfterExpansion {
+            path: file.to_path_buf(),
+            key,
+            value: written,
+            expanded: text,
+        }),
+    }
 }
 
 /// Stops the process at a boundary between two durable commits when the run asked for it.
@@ -679,7 +912,7 @@ fn reachable_directory(path: &Path) -> Result<PathBuf, ConfigError> {
 /// # Errors
 ///
 /// Returns [`ConfigError::NotAnAssignment`] when an entry carries no `=`.
-fn environment(entries: &[String]) -> Result<Vec<(OsString, OsString)>, ConfigError> {
+fn tool_environment(entries: &[String]) -> Result<Vec<(OsString, OsString)>, ConfigError> {
     let mut environment: Vec<(OsString, OsString)> = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
         environment.push((OsString::from("PATH"), path));
@@ -778,6 +1011,46 @@ pub enum ConfigError {
         key: &'static str,
         value: String,
     },
+    #[error(
+        "the configuration file {path} sets {key} to {value}, and {name} is unset or empty in the \
+         environment this process was started with"
+    )]
+    ConfigFileVariableUnset {
+        path: PathBuf,
+        key: &'static str,
+        value: String,
+        name: String,
+    },
+    #[error(
+        "the configuration file {path} sets {key} to {value}, and {reference} is not a reference: \
+         a reference is $NAME or ${{NAME}}, and a literal dollar is written $$"
+    )]
+    ConfigFileReferenceMalformed {
+        path: PathBuf,
+        key: &'static str,
+        value: String,
+        reference: String,
+    },
+    #[error(
+        "the configuration file {path} sets {key} to {value}, and {name} is set to bytes that are \
+         not text"
+    )]
+    ConfigFileVariableNotText {
+        path: PathBuf,
+        key: &'static str,
+        value: String,
+        name: String,
+    },
+    #[error(
+        "the configuration file {path} sets {key} to {value}, which the environment expands to \
+         {expanded}, and a path in the file is a plain relative path inside the file's own directory"
+    )]
+    ConfigFileNotRelativeAfterExpansion {
+        path: PathBuf,
+        key: &'static str,
+        value: String,
+        expanded: String,
+    },
     #[error("the agent runs one program, but {count} --allow-tool grants are named")]
     MultipleTools { count: usize },
 }
@@ -785,11 +1058,12 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, Args, Command, Config, ConfigError, Global, ProviderKind, ProviderLayer, Submit,
-        config_path_for, relative_path, uuid_of,
+        Agent, Args, Command, Config, ConfigError, Global, ProcessEnvironment, ProviderKind,
+        ProviderLayer, Submit, config_path_for, relative_path, uuid_of,
     };
     use clap::{CommandFactory as _, Parser as _, ValueEnum as _};
     use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
@@ -841,7 +1115,8 @@ mod tests {
     #[test]
     fn a_resolved_configuration_creates_the_directories_it_names() {
         let scratch = Scratch::new("resolve");
-        let config = Config::resolve(&args(&scratch.0), None).unwrap();
+        let config =
+            Config::resolve(&args(&scratch.0), None, &ProcessEnvironment::default()).unwrap();
 
         assert!(config.data_dir.is_dir());
         assert!(config.artifacts.is_dir());
@@ -857,7 +1132,7 @@ mod tests {
         args.global.allow_tool = vec![PathBuf::from("sh")];
 
         assert!(matches!(
-            Config::resolve(&args, None),
+            Config::resolve(&args, None, &ProcessEnvironment::default()),
             Err(ConfigError::NotAbsolute(_)),
         ));
     }
@@ -869,7 +1144,7 @@ mod tests {
         args.global.allow_tool = vec![PathBuf::from("/bin/no-such-tool-mokmok")];
 
         assert!(matches!(
-            Config::resolve(&args, None),
+            Config::resolve(&args, None, &ProcessEnvironment::default()),
             Err(ConfigError::NotRunnable(_)),
         ));
     }
@@ -881,7 +1156,7 @@ mod tests {
         args.global.allow_path = vec![PathBuf::from("/bin/sh")];
 
         assert!(matches!(
-            Config::resolve(&args, None),
+            Config::resolve(&args, None, &ProcessEnvironment::default()),
             Err(ConfigError::NotADirectory(_)),
         ));
     }
@@ -916,7 +1191,7 @@ mod tests {
         args.global.tool_env = vec!["LANG".to_owned()];
 
         assert!(matches!(
-            Config::resolve(&args, None),
+            Config::resolve(&args, None, &ProcessEnvironment::default()),
             Err(ConfigError::NotAnAssignment(entry)) if entry == "LANG",
         ));
     }
@@ -938,7 +1213,7 @@ mod tests {
         let mut args = args(&scratch.0);
         args.global.tool_env = vec!["LANG=C".to_owned(), "PATH=/operator".to_owned()];
 
-        let config = Config::resolve(&args, None).unwrap();
+        let config = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap();
 
         assert_eq!(value(&config.tool_env, "LANG").as_deref(), Some("C"));
         assert_eq!(
@@ -1067,7 +1342,7 @@ mod tests {
         };
         run.checkout = PathBuf::from("/srv/elsewhere");
 
-        let refusal = Config::resolve(&parsed, None).unwrap_err();
+        let refusal = Config::resolve(&parsed, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(
@@ -1088,7 +1363,7 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.search_root = vec![elsewhere.clone()];
 
-        let refusal = Config::resolve(&parsed, None).unwrap_err();
+        let refusal = Config::resolve(&parsed, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(
@@ -1116,7 +1391,7 @@ mod tests {
         parsed.global.search_root = vec![granted.clone()];
         parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
 
-        let config = Config::resolve(&parsed, None).unwrap();
+        let config = Config::resolve(&parsed, None, &ProcessEnvironment::default()).unwrap();
 
         assert_eq!(config.search_root, vec![granted]);
         assert_eq!(config.search_index, config.data_dir.join("search"));
@@ -1128,7 +1403,7 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.search_root = vec![PathBuf::from("/bin/sh")];
 
-        match Config::resolve(&parsed, None) {
+        match Config::resolve(&parsed, None, &ProcessEnvironment::default()) {
             Err(ConfigError::NotADirectory(path)) => assert_eq!(path, PathBuf::from("/bin/sh")),
             other => panic!("a file named as a search root is refused: {other:?}"),
         }
@@ -1140,7 +1415,7 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
 
-        let config = Config::resolve(&parsed, None).unwrap();
+        let config = Config::resolve(&parsed, None, &ProcessEnvironment::default()).unwrap();
 
         assert_eq!(config.search_root, Vec::<PathBuf>::new());
         assert_eq!(config.search_index, config.data_dir.join("search"));
@@ -1244,7 +1519,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            Config::resolve(&parsed, None),
+            Config::resolve(&parsed, None, &ProcessEnvironment::default()),
             Err(ConfigError::NoScript),
         ));
     }
@@ -1254,13 +1529,18 @@ mod tests {
         let scratch = Scratch::new("no-model");
 
         assert!(matches!(
-            Config::resolve(&ollama_args(&scratch.0, &[]), None),
+            Config::resolve(
+                &ollama_args(&scratch.0, &[]),
+                None,
+                &ProcessEnvironment::default()
+            ),
             Err(ConfigError::NoModel),
         ));
         assert!(matches!(
             Config::resolve(
                 &ollama_args(&scratch.0, &["--model", "kimi-k2.7-code"]),
-                None
+                None,
+                &ProcessEnvironment::default()
             ),
             Err(ConfigError::NoCredentialFile),
         ));
@@ -1294,6 +1574,7 @@ mod tests {
                 ],
             ),
             None,
+            &ProcessEnvironment::default(),
         )
         .unwrap_err();
 
@@ -1351,7 +1632,7 @@ mod tests {
         ])
         .unwrap();
 
-        let refusal = Config::resolve(&parsed, None).unwrap_err();
+        let refusal = Config::resolve(&parsed, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(
@@ -1400,7 +1681,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            Config::resolve(&parsed, None),
+            Config::resolve(&parsed, None, &ProcessEnvironment::default()),
             Err(ConfigError::MultipleTools { count: 2 }),
         ));
     }
@@ -1453,7 +1734,12 @@ mod tests {
              max_answer_tokens = 8192\n",
         );
 
-        let config = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap();
+        let config = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.provider.kind, ProviderKind::Ollama);
         assert_eq!(config.provider.model.as_deref(), Some("kimi-k2.7-code"));
@@ -1478,6 +1764,7 @@ mod tests {
         let config = Config::resolve(
             &run_args(&scratch.0, &["--endpoint", "https://from-the-flag.test/v1"]),
             Some(&file),
+            &ProcessEnvironment::default(),
         )
         .unwrap();
 
@@ -1496,7 +1783,8 @@ mod tests {
             &["--script", "/bin/sh", "--config", named.to_str().unwrap()],
         );
 
-        let config = Config::resolve(&args, Some(&discovered)).unwrap();
+        let config =
+            Config::resolve(&args, Some(&discovered), &ProcessEnvironment::default()).unwrap();
 
         assert_eq!(config.provider.max_answer_tokens, 222);
     }
@@ -1504,8 +1792,12 @@ mod tests {
     #[test]
     fn no_file_leaves_the_built_in_provider_group() {
         let scratch = Scratch::new("no-file");
-        let config =
-            Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), None).unwrap();
+        let config = Config::resolve(
+            &run_args(&scratch.0, &["--script", "/bin/sh"]),
+            None,
+            &ProcessEnvironment::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             (
@@ -1525,6 +1817,7 @@ mod tests {
         let config = Config::resolve(
             &run_args(&scratch.0, &["--script", "/bin/sh"]),
             Some(&absent),
+            &ProcessEnvironment::default(),
         )
         .unwrap();
 
@@ -1540,7 +1833,7 @@ mod tests {
             &["--script", "/bin/sh", "--config", named.to_str().unwrap()],
         );
 
-        let refusal = Config::resolve(&args, None).unwrap_err();
+        let refusal = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(&refusal, ConfigError::ConfigFileMissing { path } if path == &named),
@@ -1563,7 +1856,7 @@ mod tests {
             ],
         );
 
-        let refusal = Config::resolve(&args, None).unwrap_err();
+        let refusal = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(&refusal, ConfigError::ConfigFileUnreadable { path, .. } if path == &directory),
@@ -1580,7 +1873,7 @@ mod tests {
             &["--script", "/bin/sh", "--config", wanted.to_str().unwrap()],
         );
 
-        let refusal = Config::resolve(&args, None).unwrap_err();
+        let refusal = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(&refusal, ConfigError::ConfigFileInvalid { path, .. } if path == &wanted),
@@ -1593,8 +1886,12 @@ mod tests {
         let scratch = Scratch::new("unknown-key");
         let file = config_file(&scratch, "allow_write = [\"/\"]\n");
 
-        let refusal = Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), Some(&file))
-            .unwrap_err();
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &["--script", "/bin/sh"]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(refusal, ConfigError::ConfigFileInvalid { .. }),
@@ -1608,8 +1905,12 @@ mod tests {
         let scratch = Scratch::new("wrong-type");
         let file = config_file(&scratch, "max_answer_tokens = \"many\"\n");
 
-        let refusal = Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), Some(&file))
-            .unwrap_err();
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &["--script", "/bin/sh"]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
 
         assert!(
             refusal.to_string().contains("max_answer_tokens"),
@@ -1623,7 +1924,11 @@ mod tests {
         let file = config_file(&scratch, "provider = \"openai\"\n");
 
         assert!(matches!(
-            Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), Some(&file)),
+            Config::resolve(
+                &run_args(&scratch.0, &["--script", "/bin/sh"]),
+                Some(&file),
+                &ProcessEnvironment::default()
+            ),
             Err(ConfigError::ConfigFileInvalid { .. }),
         ));
     }
@@ -1633,7 +1938,12 @@ mod tests {
         let scratch = Scratch::new("absolute-script");
         let file = config_file(&scratch, "script = \"/bin/sh\"\n");
 
-        let refusal = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap_err();
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(&refusal, ConfigError::ConfigFileNotRelative { key, .. } if *key == "script"),
@@ -1646,7 +1956,12 @@ mod tests {
         let scratch = Scratch::new("climbing-credential");
         let file = config_file(&scratch, "provider_credential_file = \"../credential\"\n");
 
-        let refusal = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap_err();
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -1672,7 +1987,8 @@ mod tests {
         let mut args = run_args(&scratch.0, &[]);
         args.global.allow_write.push(granted.clone());
 
-        let refusal = Config::resolve(&args, Some(&file)).unwrap_err();
+        let refusal =
+            Config::resolve(&args, Some(&file), &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(
@@ -1692,7 +2008,12 @@ mod tests {
             "provider = \"scripted\"\nscript = \"answers.json\"\n",
         );
 
-        let config = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap();
+        let config = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap();
 
         assert_eq!(config.provider.script, Some(scratch.0.join("answers.json")));
     }
@@ -1703,7 +2024,11 @@ mod tests {
         let file = config_file(&scratch, "provider = \"ollama\"\n");
 
         assert!(matches!(
-            Config::resolve(&run_args(&scratch.0, &[]), Some(&file)),
+            Config::resolve(
+                &run_args(&scratch.0, &[]),
+                Some(&file),
+                &ProcessEnvironment::default()
+            ),
             Err(ConfigError::NoModel),
         ));
     }
@@ -1714,7 +2039,11 @@ mod tests {
         let file = config_file(&scratch, "provider = \"scripted\"\n");
 
         assert!(matches!(
-            Config::resolve(&run_args(&scratch.0, &[]), Some(&file)),
+            Config::resolve(
+                &run_args(&scratch.0, &[]),
+                Some(&file),
+                &ProcessEnvironment::default()
+            ),
             Err(ConfigError::NoScript),
         ));
     }
@@ -1726,11 +2055,399 @@ mod tests {
         let mut args = args(&scratch.0);
         args.global.config = Some(file.clone());
 
-        let refusal = Config::resolve(&args, None).unwrap_err();
+        let refusal = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap_err();
 
         assert!(
             matches!(&refusal, ConfigError::ConfigFileInvalid { path, .. } if path == &file),
             "{refusal}",
+        );
+    }
+
+    /// The environment one case pins: the names its file references, and nothing the developer's
+    /// shell happens to hold.
+    fn pinned(pairs: &[(&str, &str)]) -> ProcessEnvironment {
+        let pairs: Vec<(&str, &OsStr)> = pairs
+            .iter()
+            .map(|(name, value)| (*name, OsStr::new(*value)))
+            .collect();
+
+        ProcessEnvironment::of(&pairs)
+    }
+
+    #[test]
+    fn a_reference_is_answered_from_the_environment_the_caller_hands_in() {
+        let scratch = Scratch::new("reference-answered");
+        let file = config_file(
+            &scratch,
+            "model = \"${MOKMOK_MODEL}\"\n\
+             endpoint = \"$MOKMOK_ENDPOINT\"\n\
+             script = \"answers.json\"\n",
+        );
+        let environment = pinned(&[
+            ("MOKMOK_MODEL", "kimi-k2.7-code"),
+            ("MOKMOK_ENDPOINT", "https://example.test/v1"),
+        ]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(config.provider.model.as_deref(), Some("kimi-k2.7-code"));
+        assert_eq!(config.provider.endpoint, "https://example.test/v1");
+        assert_eq!(config.provider.script, Some(scratch.0.join("answers.json")));
+    }
+
+    #[test]
+    fn a_bare_reference_ends_at_the_first_character_that_cannot_continue_a_name() {
+        let scratch = Scratch::new("reference-bare-run");
+        let file = config_file(
+            &scratch,
+            "endpoint = \"$MOKMOK_ENDPOINT/v1\"\nscript = \"answers.json\"\n",
+        );
+        let environment = pinned(&[("MOKMOK_ENDPOINT", "https://example.test")]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(config.provider.endpoint, "https://example.test/v1");
+    }
+
+    #[test]
+    fn a_second_dollar_writes_the_dollar_the_environment_does_not_answer() {
+        let scratch = Scratch::new("reference-dollar-dollar");
+        let file = config_file(
+            &scratch,
+            "endpoint = \"https://host/v1?token=$$raw\"\nscript = \"answers.json\"\n",
+        );
+        let environment = pinned(&[("raw", "answered")]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(config.provider.endpoint, "https://host/v1?token=$raw");
+    }
+
+    #[test]
+    fn an_answer_the_environment_gives_is_not_scanned_again() {
+        let scratch = Scratch::new("reference-not-rescanned");
+        let file = config_file(
+            &scratch,
+            "model = \"${MOKMOK_MODEL}\"\nscript = \"answers.json\"\n",
+        );
+        let environment = pinned(&[
+            ("MOKMOK_MODEL", "$MOKMOK_ENDPOINT"),
+            ("MOKMOK_ENDPOINT", "https://elsewhere.test/v1"),
+        ]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(config.provider.model.as_deref(), Some("$MOKMOK_ENDPOINT"));
+        assert_eq!(config.provider.endpoint, "https://ollama.com/v1");
+    }
+
+    #[test]
+    fn a_value_with_no_dollar_is_left_exactly_as_the_file_wrote_it() {
+        let scratch = Scratch::new("reference-absent");
+        let file = config_file(
+            &scratch,
+            "model = \"literal-model\"\nscript = \"answers.json\"\n",
+        );
+        let environment = pinned(&[("MOKMOK_MODEL", "from-the-environment")]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(config.provider.model.as_deref(), Some("literal-model"));
+    }
+
+    #[test]
+    fn an_unset_variable_is_refused_by_file_key_and_name() {
+        let scratch = Scratch::new("reference-unset");
+        let file = config_file(
+            &scratch,
+            "model = \"${MOKMOK_MODEL}\"\nscript = \"answers.json\"\n",
+        );
+
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileVariableUnset { path, key, value, name }
+                    if path == &file
+                        && *key == "model"
+                        && value == "${MOKMOK_MODEL}"
+                        && name == "MOKMOK_MODEL",
+            ),
+            "{refusal}",
+        );
+        for expected in [
+            file.display().to_string(),
+            "model".to_owned(),
+            "MOKMOK_MODEL".to_owned(),
+        ] {
+            assert!(refusal.to_string().contains(&expected), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn an_empty_variable_is_refused_like_an_unset_one() {
+        let scratch = Scratch::new("reference-empty");
+        let file = config_file(
+            &scratch,
+            "endpoint = \"${MOKMOK_ENDPOINT}\"\nscript = \"answers.json\"\n",
+        );
+        let environment = pinned(&[("MOKMOK_ENDPOINT", "")]);
+
+        let refusal =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileVariableUnset { key, name, .. }
+                    if *key == "endpoint" && name == "MOKMOK_ENDPOINT",
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_dollar_that_opens_no_name_is_refused_as_written() {
+        let scratch = Scratch::new("reference-malformed");
+
+        for (body, reference) in [("$2", "$2"), ("trailing$", "$")] {
+            let file = config_file(
+                &scratch,
+                &format!("endpoint = \"{body}\"\nscript = \"answers.json\"\n"),
+            );
+            let refusal = Config::resolve(
+                &run_args(&scratch.0, &[]),
+                Some(&file),
+                &ProcessEnvironment::default(),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    &refusal,
+                    ConfigError::ConfigFileReferenceMalformed { reference: held, key, .. }
+                        if held == reference && *key == "endpoint",
+                ),
+                "{refusal}",
+            );
+            assert!(refusal.to_string().contains("$NAME"), "{refusal}");
+            assert!(refusal.to_string().contains("$$"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_braced_reference_that_names_nothing_is_refused_as_written() {
+        let scratch = Scratch::new("reference-braced-empty");
+
+        for (body, reference) in [("${}", "${}"), ("${MOKMOK_MODEL", "${MOKMOK_MODEL")] {
+            let file = config_file(
+                &scratch,
+                &format!("model = \"{body}\"\nscript = \"answers.json\"\n"),
+            );
+            let refusal = Config::resolve(
+                &run_args(&scratch.0, &[]),
+                Some(&file),
+                &ProcessEnvironment::default(),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    &refusal,
+                    ConfigError::ConfigFileReferenceMalformed { reference: held, key, .. }
+                        if held == reference && *key == "model",
+                ),
+                "{refusal}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_whose_value_is_not_text_is_refused_by_name() {
+        let scratch = Scratch::new("reference-not-text");
+        let file = config_file(
+            &scratch,
+            "model = \"${MOKMOK_MODEL}\"\nscript = \"answers.json\"\n",
+        );
+        let environment = ProcessEnvironment::of(&[("MOKMOK_MODEL", OsStr::from_bytes(b"\xff"))]);
+
+        let refusal =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileVariableNotText { key, name, .. }
+                    if *key == "model" && name == "MOKMOK_MODEL",
+            ),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("not text"), "{refusal}");
+    }
+
+    #[test]
+    fn a_reference_in_a_path_key_resolves_beside_the_file() {
+        let scratch = Scratch::new("reference-path");
+        let file = config_file(&scratch, "script = \"${MOKMOK_SCRIPT}\"\n");
+        let environment = pinned(&[("MOKMOK_SCRIPT", "answers.json")]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(config.provider.script, Some(scratch.0.join("answers.json")));
+    }
+
+    #[test]
+    fn an_expanded_path_that_leaves_the_file_directory_is_refused_by_key_and_variable() {
+        let scratch = Scratch::new("reference-path-escape");
+        let file = config_file(
+            &scratch,
+            "provider_credential_file = \"${MOKMOK_CREDENTIAL}\"\n",
+        );
+        let environment = pinned(&[("MOKMOK_CREDENTIAL", "/run/secrets/ollama")]);
+
+        let refusal =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileNotRelativeAfterExpansion { key, value, expanded, .. }
+                    if *key == "provider_credential_file"
+                        && value == "${MOKMOK_CREDENTIAL}"
+                        && expanded == "/run/secrets/ollama",
+            ),
+            "{refusal}",
+        );
+        for expected in [
+            "provider_credential_file",
+            "${MOKMOK_CREDENTIAL}",
+            "/run/secrets/ollama",
+        ] {
+            assert!(refusal.to_string().contains(expected), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_written_path_with_no_reference_keeps_its_existing_refusal() {
+        let scratch = Scratch::new("reference-path-written");
+        let file = config_file(&scratch, "script = \"/bin/sh\"\n");
+        let environment = pinned(&[("MOKMOK_SCRIPT", "answers.json")]);
+
+        let refusal =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileNotRelative { key, value, .. }
+                    if *key == "script" && value == "/bin/sh",
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_reference_in_the_provider_or_the_token_ceiling_is_refused_by_the_parse() {
+        let scratch = Scratch::new("reference-wrong-key");
+
+        for (body, key) in [
+            ("provider = \"${MOKMOK_PROVIDER}\"\n", "provider"),
+            (
+                "max_answer_tokens = \"${MOKMOK_TOKENS}\"\n",
+                "max_answer_tokens",
+            ),
+        ] {
+            let file = config_file(&scratch, body);
+            let refusal = Config::resolve(
+                &run_args(&scratch.0, &["--script", "/bin/sh"]),
+                Some(&file),
+                &ProcessEnvironment::default(),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(refusal, ConfigError::ConfigFileInvalid { .. }),
+                "{refusal}",
+            );
+            assert!(refusal.to_string().contains(key), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_flag_keeps_its_dollar() {
+        let scratch = Scratch::new("reference-flag-dollar");
+        let file = config_file(&scratch, "endpoint = \"https://file.test/v1\"\n");
+
+        let config = Config::resolve(
+            &run_args(
+                &scratch.0,
+                &["--endpoint", "https://flag.test/$2", "--script", "/bin/sh"],
+            ),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap();
+
+        assert_eq!(config.provider.endpoint, "https://flag.test/$2");
+    }
+
+    #[test]
+    fn an_unset_variable_refuses_a_command_that_asks_no_model() {
+        let scratch = Scratch::new("reference-submit");
+        let file = config_file(&scratch, "model = \"${MOKMOK_MODEL}\"\n");
+        let mut args = args(&scratch.0);
+        args.global.config = Some(file.clone());
+
+        let refusal = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileVariableUnset { path, key, name, .. }
+                    if path == &file && *key == "model" && name == "MOKMOK_MODEL",
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_flag_still_beats_a_value_the_environment_answered() {
+        let scratch = Scratch::new("reference-flag-beats");
+        let file = config_file(
+            &scratch,
+            "model = \"${MOKMOK_MODEL}\"\nscript = \"answers.json\"\n",
+        );
+        let environment = pinned(&[("MOKMOK_MODEL", "from-the-environment")]);
+
+        let config = Config::resolve(
+            &run_args(&scratch.0, &["--model", "from-the-flag"]),
+            Some(&file),
+            &environment,
+        )
+        .unwrap();
+
+        assert_eq!(config.provider.model.as_deref(), Some("from-the-flag"));
+    }
+
+    #[test]
+    fn the_help_says_a_value_may_name_a_variable() {
+        let help = Args::command().render_long_help().to_string();
+
+        assert!(
+            help.contains("$NAME") && help.contains("${NAME}"),
+            "the help omits the reference syntax:\n{help}",
         );
     }
 

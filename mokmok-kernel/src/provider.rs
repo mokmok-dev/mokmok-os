@@ -1390,7 +1390,12 @@ mod tests {
             credential.to_str().unwrap(),
         ])
         .unwrap();
-        let config = crate::config::Config::resolve(&args, None).unwrap();
+        let config = crate::config::Config::resolve(
+            &args,
+            None,
+            &crate::config::ProcessEnvironment::default(),
+        )
+        .unwrap();
         let session = mokmok_protocol::SessionID::from_uuid(uuid::Uuid::nil());
         let provider = super::Ollama::open(&config, session).unwrap();
         let prompt = Context {

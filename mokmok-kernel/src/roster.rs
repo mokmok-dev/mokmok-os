@@ -78,7 +78,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::sessions;
-    use crate::config::{Args, Config};
+    use crate::config::{Args, Config, ProcessEnvironment};
     use crate::db::{Db, Entry};
 
     struct Scratch(PathBuf);
@@ -134,7 +134,8 @@ mod tests {
         ])
         .expect("the command line parses");
 
-        Config::resolve(&args, None).expect("the configuration resolves")
+        Config::resolve(&args, None, &ProcessEnvironment::default())
+            .expect("the configuration resolves")
     }
 
     fn session(seed: u128) -> SessionID {

@@ -51,7 +51,8 @@ fn conversation(cli: Cli) -> Result<(), Error> {
         command: Command::Agent(Agent::Run(cli.run.clone())),
     };
     let discovered = mokmok_kernel::config_path();
-    let config = Config::resolve(&args, discovered.as_deref())?;
+    let environment = mokmok_kernel::ProcessEnvironment::read();
+    let config = Config::resolve(&args, discovered.as_deref(), &environment)?;
     let at = now();
 
     let runtime = tokio::runtime::Builder::new_current_thread()

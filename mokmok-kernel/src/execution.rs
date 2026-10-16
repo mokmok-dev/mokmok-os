@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn the_exposure_list_opens_what_the_operator_named_and_the_standard_input() {
-        use crate::config::{Args, Command, Config};
+        use crate::config::{Args, Command, Config, ProcessEnvironment};
         use clap::Parser as _;
         use std::path::PathBuf;
 
@@ -294,7 +294,7 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(args.command, Command::Submit(_)));
-        let config = Config::resolve(&args, None).unwrap();
+        let config = Config::resolve(&args, None, &ProcessEnvironment::default()).unwrap();
 
         assert_eq!(
             super::exposures(&config),

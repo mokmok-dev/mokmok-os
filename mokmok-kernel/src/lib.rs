@@ -26,8 +26,9 @@ mod slice;
 
 pub use authority::{AGENT, Authority};
 pub use config::{
-    Agent, Args, Command, Config, ConfigError, CrashPoint, Global, ProviderKind, ProviderLayer,
-    ProviderSettings, Run, Submit, config_path, relative_path, uuid_of,
+    Agent, Args, Command, Config, ConfigError, CrashPoint, Global, ProcessEnvironment,
+    ProviderKind, ProviderLayer, ProviderSettings, Run, Submit, config_path, relative_path,
+    uuid_of,
 };
 pub use db::{Db, Entry, Log, ResultRecord, TurnRecord};
 pub use error::Error;

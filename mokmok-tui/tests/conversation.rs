@@ -12,7 +12,7 @@ mod tests {
     use clap::Parser as _;
     use mokmok_agent_runtime::{Progress, turn_id};
     use mokmok_artifact::{BlobStore, ContentHash};
-    use mokmok_kernel::{Agent, Args, Command, Config, Run};
+    use mokmok_kernel::{Agent, Args, Command, Config, ProcessEnvironment, Run};
     use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Phase, Turn, TurnOutcome};
     use mokmok_tui::{
@@ -242,7 +242,8 @@ mod tests {
         ]);
         args.extend(extra.iter().map(|value| (*value).to_owned()));
         let parsed = Args::try_parse_from(&args).expect("the command line parses");
-        let config = Config::resolve(&parsed, None).expect("the configuration resolves");
+        let config = Config::resolve(&parsed, None, &ProcessEnvironment::default())
+            .expect("the configuration resolves");
         let Command::Agent(Agent::Run(run)) = parsed.command else {
             panic!("the command line named an agent run");
         };
