@@ -230,10 +230,12 @@ impl EditorPort for Editor {
         if let Some(expected) = &call.expect {
             let actual = before_hash.to_string();
             if actual != *expected {
+                // The call carries the expected hash and no expected size, so the refusal may not
+                // name one; the size it prints is the file's own.
                 return Ok(Plan::Refused(format!(
-                    "{relative} is {} bytes (sha256 {actual}), not the {}-byte file (sha256 \
-                     {expected}) the call expected",
-                    before.bytes, before.bytes,
+                    "{relative} is {} bytes (sha256 {actual}), not the file (sha256 {expected}) the \
+                     call expected",
+                    before.bytes,
                 )));
             }
         }
@@ -459,7 +461,7 @@ fn read_target(
 /// Where a write stopped, because the bytes and the directory entry do not land together.
 #[derive(Debug)]
 enum WriteFailure {
-    /// No byte of the target changed: the temporary file was removed, or the rename never happened.
+    /// No byte of the target changed, because the rename never happened.
     NothingWritten(io::Error),
     /// `renameat` installed the bytes and the directory's own sync failed, so the file holds the
     /// post-image while the edit's survival across a crash is unproven.
