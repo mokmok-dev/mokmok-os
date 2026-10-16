@@ -65,6 +65,12 @@ fn settled(outcome: TurnOutcome) -> Turn {
 }
 
 #[test]
+fn a_number_and_an_attempt_report_the_value_they_carry() {
+    assert_eq!(TurnNumber::new(7).get(), 7);
+    assert_eq!(Attempt::new(3).get(), 3);
+}
+
+#[test]
 fn a_tool_before_a_model_answer_is_refused() {
     let mut turn = opened();
 
@@ -239,6 +245,20 @@ fn an_execution_is_resolved_at_most_once() {
         turn.tool(e()).unwrap().resolution(),
         Some(Resolution::Finished { code: 0 }),
     );
+}
+
+#[test]
+fn a_resolution_after_the_turn_settled_is_refused() {
+    let mut turn = settled(TurnOutcome::Cancelled);
+
+    assert_eq!(
+        turn.apply(TurnFact::ToolResolved {
+            execution: e(),
+            resolution: Resolution::Finished { code: 0 },
+        }),
+        Err(Rejection::TurnOver),
+    );
+    assert_eq!(turn.tool(e()).unwrap().resolution(), None);
 }
 
 #[test]
