@@ -83,6 +83,12 @@ linked() {
 	edges "$1" | awk -F'\t' '$1 != "dev" && $1 != "build" { print $2 }'
 }
 
+# The dev table as well. A test that composes the kernel records the same layering edge a dependency
+# does, and that is the edge `kernel-dependents-are-applications` is about.
+linked_and_tested() {
+	edges "$1" | awk -F'\t' '$1 != "build" { print $2 }'
+}
+
 forbidden_hit() {
 	local dir=$1 list=$2
 	linked "$dir" | grep -x -F -f <(printf '%s\n' "$list") | paste -sd, -
@@ -228,7 +234,7 @@ rule_kernel-dependents-are-applications() {
 	local repo=$1 dir hit
 	while IFS= read -r dir; do
 		[[ $dir == mokmok-kernel ]] && continue
-		hit=$(linked "$dir" | grep -x 'mokmok-kernel')
+		hit=$(linked_and_tested "$dir" | grep -x 'mokmok-kernel')
 		[[ -n $hit ]] || continue
 		is_composition_root "$dir" || {
 			printf '%s depends on mokmok-kernel and is outside the composition roots\n' "$dir"
@@ -412,6 +418,9 @@ nix = "0.31"
 		an-application-outside-the-roots) write_manifest "$root/mokmok-alpha/Cargo.toml" pure '[dependencies]
 mokmok-kernel = { path = "../mokmok-kernel" }
 ' ;;
+		a-test-outside-the-roots) write_manifest "$root/mokmok-alpha/Cargo.toml" pure '[dev-dependencies]
+mokmok-kernel = { path = "../mokmok-kernel" }
+' ;;
 		renamed-io-dependency) write_manifest "$root/mokmok-capability/Cargo.toml" pure '[dependencies]
 tokio_rt = { package = "tokio", version = "1" }
 ' ;;
@@ -468,6 +477,7 @@ scheduler-with-a-model-client|scheduler-has-no-model-dependency|mokmok-scheduler
 capability-with-an-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on nix
 capability-reaching-the-os|capability-performs-no-enforcement-io|mokmok-capability reaches the operating system
 an-application-outside-the-roots|kernel-dependents-are-applications|mokmok-alpha depends on mokmok-kernel and is outside
+a-test-outside-the-roots|kernel-dependents-are-applications|mokmok-alpha depends on mokmok-kernel and is outside
 renamed-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on tokio
 target-table-io-dependency|capability-performs-no-enforcement-io|mokmok-capability depends on tokio
 dotted-table-kernel-dependency|kernel-dependents-are-applications|mokmok-alpha depends on mokmok-kernel and is outside
