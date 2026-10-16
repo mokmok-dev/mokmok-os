@@ -96,6 +96,23 @@
               }
             );
 
+            # `mokmok-os-architecture.md` section 9 asks CI to enforce its dependency rules, and
+            # until this check existed the only reader of them was an operator running the attester
+            # by hand, so the role division was a document rather than a fact.
+            dependencyRules =
+              pkgs.runCommand "dependency-rules"
+                {
+                  nativeBuildInputs = with pkgs; [
+                    bash
+                    coreutils
+                    gawk
+                    gnugrep
+                  ];
+                }
+                ''
+                  bash ${src}/docs/spec/references/attesters/dependency-rules.sh check ${src} > $out
+                '';
+
             mokmokdUnit =
               let
                 mokmokd = config.packages.default;

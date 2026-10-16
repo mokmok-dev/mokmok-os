@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-tui"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "shell"
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 mokmok-agent-runtime = { workspace = true }

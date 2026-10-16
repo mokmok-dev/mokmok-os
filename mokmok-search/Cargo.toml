@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-search"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "adapter"
+
 [dependencies]
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }

@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-patch"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "adapter"
+
 [dependencies]
 thiserror = { workspace = true }
 
