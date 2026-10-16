@@ -954,6 +954,37 @@ mod tests {
     }
 
     #[test]
+    fn commit_refuses_a_file_that_disappeared_since_the_plan() {
+        let scratch = Scratch::new("disappeared");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        std::fs::write(&target, "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+        assert!(!ready.creates, "the plan read the file");
+        std::fs::remove_file(&target).unwrap();
+
+        let report = editor.commit(&ready).unwrap();
+        let EditOutcome::Refused { reason } = &report.outcome else {
+            panic!("expected Refused, got {:?}", report.outcome);
+        };
+        assert!(reason.contains("disappeared"), "{reason}");
+        assert!(
+            !target.exists(),
+            "a file the patch does not create stays gone"
+        );
+    }
+
+    #[test]
     fn commit_creates_the_file_a_patch_names_as_absent() {
         let scratch = Scratch::new("create-commits");
         let checkout = checkout(&scratch);
