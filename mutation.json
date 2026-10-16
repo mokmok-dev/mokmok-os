@@ -1,31 +1,26 @@
 {
-  "harness": "c21cc434239e60ae58717f68a3d98008ec3ebe024b575824e5479b578a45ac17",
-  "generated": "2026-10-16T02:33:51Z",
+  "harness": "ba35a092f260e4450b22bf2c8e24a6344c33e99652cbdad560791e4304a2589e",
+  "generated": "2026-10-16T04:10:47Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
-      "score": 99.2,
-      "target": 99.2,
-      "tested": 141,
-      "caught": 140,
-      "missed": [
-        "mokmok-agent-runtime/src/context.rs:283:33: replace > with >= in keep_newest"
-      ],
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 135,
+      "caught": 135,
+      "missed": [],
       "timeout": 0,
-      "digest": "98668ca835f481c1128e04dbd091624e343f894145d1f4cffe0e2404e3cbdaaf"
+      "digest": "c92d709451ca9ab65f5ba1913389ea7164aac378d6eb24a0369371d9d514a4f3"
     },
     {
       "name": "mokmok-artifact",
-      "score": 96.2,
-      "target": 96.2,
-      "tested": 53,
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 51,
       "caught": 51,
-      "missed": [
-        "mokmok-artifact/src/content_hash.rs:88:49: replace | with ^ in <impl FromStr for ContentHash>::from_str",
-        "mokmok-artifact/src/gc.rs:86:13: delete field bytes from struct Report expression in Collector<'a>::sweep"
-      ],
+      "missed": [],
       "timeout": 0,
-      "digest": "9dc6684941d13e47d28193fb771df7db4a1a1fc22e52bfb0552687cc6187f958"
+      "digest": "81bca9b020f3745816a1526e5efb575a2047151ba1e09d214602c6ee50d52973"
     },
     {
       "name": "mokmok-capability",
@@ -39,29 +34,23 @@
     },
     {
       "name": "mokmok-egress",
-      "score": 97.8,
-      "target": 97.8,
-      "tested": 47,
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 46,
       "caught": 46,
-      "missed": [
-        "mokmok-egress/src/rate_limit.rs:58:18: replace > with >= in RateLimit::acquire"
-      ],
+      "missed": [],
       "timeout": 0,
       "digest": "43ac3068353652741a9468b354ffd9c99028e9b325d2437ae1e9518c8b85f006"
     },
     {
       "name": "mokmok-event-bus",
-      "score": 98.3,
-      "target": 98.3,
-      "tested": 186,
-      "caught": 183,
-      "missed": [
-        "mokmok-event-bus/src/bus.rs:212:17: replace && with || in Bus::sweep",
-        "mokmok-event-bus/src/server.rs:413:5: replace window_changed with ()",
-        "mokmok-event-bus/src/store.rs:616:32: replace > with >= in advance"
-      ],
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 185,
+      "caught": 185,
+      "missed": [],
       "timeout": 0,
-      "digest": "06ef14056cdeee4181eb741ac6ff08f4e4b2b3d9310ba61ea5e0717d913bbf9b"
+      "digest": "a10d8bb335582fc2567e44f466b263984deac67fa4dc87935e01c1e66a354930"
     },
     {
       "name": "mokmok-event-store",
@@ -75,41 +64,13 @@
     },
     {
       "name": "mokmok-kernel",
-      "score": 86.4,
-      "target": 95.0,
-      "tested": 199,
-      "caught": 172,
-      "missed": [
-        "mokmok-kernel/src/agent.rs:345:9: replace Shell::read -> Result<Vec<u8>, Error> with Ok(vec![])",
-        "mokmok-kernel/src/agent.rs:345:9: replace Shell::read -> Result<Vec<u8>, Error> with Ok(vec![0])",
-        "mokmok-kernel/src/agent.rs:345:9: replace Shell::read -> Result<Vec<u8>, Error> with Ok(vec![1])",
-        "mokmok-kernel/src/agent.rs:650:9: replace Driver::reopen -> Result<(), Error> with Ok(())",
-        "mokmok-kernel/src/agent.rs:700:21: delete match arm Move::Close{ending:Some(ending), ..} in run",
-        "mokmok-kernel/src/agent.rs:847:5: replace ask_line -> String with String::new()",
-        "mokmok-kernel/src/agent.rs:877:5: replace number_of -> u64 with 0",
-        "mokmok-kernel/src/agent.rs:847:5: replace ask_line -> String with \"xyzzy\".into()",
-        "mokmok-kernel/src/agent.rs:877:5: replace number_of -> u64 with 1",
-        "mokmok-kernel/src/config.rs:423:37: replace || with && in relative_path",
-        "mokmok-kernel/src/config.rs:423:27: replace || with && in relative_path",
-        "mokmok-kernel/src/db.rs:213:9: replace Log::verify -> Result<(), Error> with Ok(())",
-        "mokmok-kernel/src/execution.rs:185:13: delete match arm Outcome::Exited(code) in store",
-        "mokmok-kernel/src/execution.rs:189:13: delete match arm Outcome::Signalled(signal) in store",
-        "mokmok-kernel/src/provider.rs:375:42: replace && with || in <impl PolicyClient for Permit>::check",
-        "mokmok-kernel/src/provider.rs:375:9: replace <impl PolicyClient for Permit>::check -> Result<(), Refusal> with Ok(())",
-        "mokmok-kernel/src/provider.rs:403:9: replace <impl AuditSink for AuditToLog>::record with ()",
-        "mokmok-kernel/src/provider.rs:429:5: replace detail_of -> String with String::new()",
-        "mokmok-kernel/src/provider.rs:446:5: replace model_audit_id -> Uuid with Default::default()",
-        "mokmok-kernel/src/provider.rs:429:5: replace detail_of -> String with \"xyzzy\".into()",
-        "mokmok-kernel/src/serve.rs:127:9: replace Relay::forget with ()",
-        "mokmok-kernel/src/serve.rs:305:35: replace + with - in wait_for_bus",
-        "mokmok-kernel/src/serve.rs:311:27: replace >= with < in wait_for_bus",
-        "mokmok-kernel/src/slice.rs:177:13: delete match arm Phase::Draining in resume",
-        "mokmok-kernel/src/slice.rs:178:13: delete match arm Phase::Closed(_) in resume",
-        "mokmok-kernel/src/db.rs:241:9: replace Log::absorb with ()",
-        "mokmok-kernel/src/serve.rs:220:60: replace + with - in serve_until_stopped"
-      ],
-      "timeout": 2,
-      "digest": "06a12fa0e3c3cdcc3e0574e2b1e583cb2d82bec06eb50c782256885f991283ba"
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 197,
+      "caught": 197,
+      "missed": [],
+      "timeout": 0,
+      "digest": "ac5a71f7b9d1941feb7182c6b138d3585c41649895a1553b037c7debf67e2ce7"
     },
     {
       "name": "mokmok-observability",
@@ -133,46 +94,23 @@
     },
     {
       "name": "mokmok-protocol",
-      "score": 98.6,
-      "target": 98.6,
-      "tested": 74,
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 73,
       "caught": 73,
-      "missed": [
-        "mokmok-protocol/src/envelope.rs:264:36: replace | with ^ in parse_hex"
-      ],
+      "missed": [],
       "timeout": 0,
       "digest": "bf9ff6b785352c5c14f360467515b92908baf3ce645c75a868da1ea7511077f8"
     },
     {
       "name": "mokmok-sandbox",
-      "score": 84.7,
-      "target": 95.0,
-      "tested": 131,
-      "caught": 111,
-      "missed": [
-        "mokmok-sandbox/src/config.rs:27:5: replace default_root -> PathBuf with Default::default()",
-        "mokmok-sandbox/src/confine.rs:83:25: replace match guard enforced.ruleset == RulesetStatus::FullyEnforced with true in confine",
-        "mokmok-sandbox/src/limits.rs:35:34: replace * with + in mib",
-        "mokmok-sandbox/src/output.rs:62:25: replace * with +",
-        "mokmok-sandbox/src/output.rs:86:27: replace < with <= in drain",
-        "mokmok-sandbox/src/plan.rs:153:34: replace | with ^ in open_resolved",
-        "mokmok-sandbox/src/plan.rs:153:34: replace | with & in open_resolved",
-        "mokmok-sandbox/src/plan.rs:178:5: replace probe -> Result<(), Failure> with Ok(())",
-        "mokmok-sandbox/src/run.rs:34:9: replace Signal::raw -> i32 with 0",
-        "mokmok-sandbox/src/run.rs:34:9: replace Signal::raw -> i32 with -1",
-        "mokmok-sandbox/src/run.rs:34:9: replace Signal::raw -> i32 with 1",
-        "mokmok-sandbox/src/run.rs:365:9: replace Completed::cleanup -> Result<(), Error> with Ok(())",
-        "mokmok-sandbox/src/run.rs:379:9: replace <impl Drop for Completed>::drop with ()",
-        "mokmok-sandbox/src/run.rs:379:12: delete ! in <impl Drop for Completed>::drop",
-        "mokmok-sandbox/src/run.rs:448:5: replace present -> bool with true",
-        "mokmok-sandbox/src/run.rs:461:18: replace != with == in escalate",
-        "mokmok-sandbox/src/sandbox.rs:370:50: replace && with || in is_executable_file",
-        "mokmok-sandbox/src/sandbox.rs:370:83: replace & with | in is_executable_file",
-        "mokmok-sandbox/src/sandbox.rs:370:83: replace & with ^ in is_executable_file",
-        "mokmok-sandbox/src/workspace.rs:100:23: replace match guard error.kind() == io::ErrorKind::NotFound with true in remove_directory"
-      ],
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 128,
+      "caught": 128,
+      "missed": [],
       "timeout": 0,
-      "digest": "9a934c686ffd08afa05d062bbb18a56ec1a1391a6b42915d3f2ed6633bcd3395"
+      "digest": "a22db1249fd24c6ad8d85e433aed402bc46b501e278005f98cb9b4ef93cd87df"
     },
     {
       "name": "mokmok-scheduler",
@@ -196,33 +134,23 @@
     },
     {
       "name": "mokmok-state-machine",
-      "score": 91.9,
-      "target": 95.0,
+      "score": 100.0,
+      "target": 100.0,
       "tested": 62,
-      "caught": 57,
-      "missed": [
-        "mokmok-state-machine/src/turn.rs:25:9: replace TurnNumber::get -> u64 with 0",
-        "mokmok-state-machine/src/turn.rs:25:9: replace TurnNumber::get -> u64 with 1",
-        "mokmok-state-machine/src/turn.rs:47:9: replace Attempt::get -> u32 with 0",
-        "mokmok-state-machine/src/turn.rs:47:9: replace Attempt::get -> u32 with 1",
-        "mokmok-state-machine/src/turn.rs:258:21: replace match guard settled with false in Turn::resolve"
-      ],
+      "caught": 62,
+      "missed": [],
       "timeout": 0,
-      "digest": "00008d66027e33bfe730e3af4d00082952911c75de54da8968740552663cb65b"
+      "digest": "b4c2cc359dc9838c0ef3d45fdcb8308ec7248547ef0bb02c8ba03c1bf71426e7"
     },
     {
       "name": "mokmok-tui",
-      "score": 95.5,
-      "target": 95.5,
+      "score": 100.0,
+      "target": 100.0,
       "tested": 68,
-      "caught": 65,
-      "missed": [
-        "mokmok-tui/src/terminal.rs:52:9: replace Terminal::leave -> std::io::Result<()> with Ok(())",
-        "mokmok-tui/src/terminal.rs:63:9: replace <impl Drop for Terminal>::drop with ()",
-        "mokmok-tui/src/terminal.rs:80:9: replace <impl Screen for Terminal>::draw -> Result<(), Error> with Ok(())"
-      ],
+      "caught": 68,
+      "missed": [],
       "timeout": 0,
-      "digest": "117c75548f87e7215a2293a3227004c39398c51c4b4cb591bbb0f50d3339778c"
+      "digest": "fd458d61d9065f73af072c25bff94f13eb0f70a10d229532a07f59b10d8a346d"
     }
   ]
 }
