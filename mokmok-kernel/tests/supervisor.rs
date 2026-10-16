@@ -710,6 +710,46 @@ mod tests {
     }
 
     #[test]
+    fn a_bus_that_answers_late_is_waited_for_rather_than_given_up_on() {
+        let scratch = Scratch::new("late-bus");
+        seed(&scratch.data(), 0xa5, 1);
+
+        // A peer that accepts and closes at once answers no handshake, so the daemon's own bus
+        // cannot bind the path and every readiness probe fails immediately. Waiting for the socket
+        // file to appear is not enough: it is already there.
+        let path = scratch.socket();
+        let refusing = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = refusing.accept() {
+                drop(stream);
+            }
+        });
+
+        let daemon = Daemon::spawn(&scratch, &[], &["--once"]);
+        std::thread::sleep(Duration::from_secs(1));
+
+        std::fs::remove_file(&path).unwrap();
+        let bus = mokmok_event_bus::Config {
+            path: path.clone(),
+            store: scratch.data().join("bus.sqlite"),
+            ..mokmok_event_bus::Config::default()
+        };
+        std::thread::spawn(move || {
+            let _ = runtime().block_on(mokmok_event_bus::serve(bus, std::future::pending::<()>()));
+        });
+        wait_for_socket(&path, Duration::from_secs(5));
+
+        let finished = daemon.finish(Duration::from_secs(10));
+
+        assert_eq!(finished.code, Some(0), "{}\n{}", finished.out, finished.err);
+        assert_eq!(
+            finished.out,
+            format!("published=1 socket={}\n", path.display()),
+            "the notice the daemon held was relayed once the bus answered",
+        );
+    }
+
+    #[test]
     fn a_stop_is_honoured_while_a_publish_goes_unanswered() {
         let scratch = Scratch::new("wedged-publish");
         let supervisor = Supervisor::bind("wedged-publish");

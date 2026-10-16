@@ -671,6 +671,52 @@ mod tests {
     }
 
     #[test]
+    fn a_step_the_machines_refuse_is_refused_before_it_can_be_written() {
+        let scratch = Scratch::new("verify-refusal");
+        let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
+        db.append(
+            CommandId::new(),
+            Db::stream(session()),
+            Expected::New,
+            &[Entry::Session(Fact::SessionOpened)],
+            Vec::new(),
+        )
+        .unwrap();
+        let log = db.log(session()).unwrap();
+
+        // A turn nobody opened cannot settle, so a settlement with no turn to settle is the one
+        // history the kernel's own reasoning can produce and a reader could not replay.
+        let refused = log.verify(
+            session(),
+            &[Entry::Turn(
+                turn(),
+                TurnFact::TurnSettled {
+                    outcome: TurnOutcome::Completed,
+                },
+            )],
+        );
+
+        assert!(
+            matches!(refused, Err(crate::error::Error::WriteRefused(_))),
+            "{refused:?}",
+        );
+        // The control the refusal is read against: the same call with the turn's own opening fact
+        // is accepted, so the log refuses the settlement rather than every entry it is handed.
+        assert!(
+            log.verify(
+                session(),
+                &[Entry::Turn(
+                    turn(),
+                    TurnFact::TurnOpened {
+                        number: TurnNumber::new(1),
+                    },
+                )],
+            )
+            .is_ok(),
+        );
+    }
+
+    #[test]
     fn an_unexpected_expectation_is_conflicted_and_writes_nothing() {
         let scratch = Scratch::new("conflict");
         let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();

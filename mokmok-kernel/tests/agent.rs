@@ -12,16 +12,20 @@ mod tests {
 
     use clap::Parser as _;
     use mokmok_agent_runtime::{
-        Action, NO_SEARCH_ROOT, Progress, Record, UNKNOWN_WARNING, turn_id,
+        Action, NO_SEARCH_ROOT, Progress, Record, UNKNOWN_WARNING, speak, turn_id,
     };
     use mokmok_artifact::{BlobStore, ContentHash};
-    use mokmok_kernel::agent::Driver;
+    use mokmok_kernel::agent::{Driver, Ledger};
     use mokmok_kernel::{Config, Db, Run, uuid_of};
     use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Phase, TurnOutcome};
     use serde_json::json;
 
     const SESSION: &str = "018f2f1e-0000-7000-8000-000000000000";
+    /// A second session, for a run whose step count is read before the run that asserts on it.
+    const COUNTED: &str = "018f2f1e-0000-7000-8000-0000000000e5";
+    /// The idempotency identity one `submit` in this file runs under.
+    const KEY: &str = "018f2f1e-0000-7000-8000-0000000000f1";
 
     /// A directory of this test's own, removed when the test ends.
     struct Scratch(PathBuf);
@@ -214,12 +218,22 @@ mod tests {
         script_path: &Path,
         extra: &[&str],
     ) -> Vec<String> {
+        agent_args_of(SESSION, scratch, script_path, extra)
+    }
+
+    /// One `agent run` for `session`.
+    fn agent_args_of(
+        session: &str,
+        scratch: &Scratch,
+        script_path: &Path,
+        extra: &[&str],
+    ) -> Vec<String> {
         let mut args = base(scratch);
         args.extend([
             "agent".to_owned(),
             "run".to_owned(),
             "--session".to_owned(),
-            SESSION.to_owned(),
+            session.to_owned(),
             "--goal".to_owned(),
             "write hello into out.txt".to_owned(),
             "--checkout".to_owned(),
@@ -243,6 +257,34 @@ mod tests {
         ]);
 
         run(&args)
+    }
+
+    /// One `submit` of `body` through the operator's shell, which is the path the kernel takes
+    /// before the agent's own loop is ever opened.
+    fn submit_args(
+        scratch: &Scratch,
+        body: &str,
+    ) -> Vec<String> {
+        let mut args = base(scratch);
+        args.extend([
+            "submit".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+            "--idempotency-key".to_owned(),
+            KEY.to_owned(),
+            "--program".to_owned(),
+            shell().display().to_string(),
+            "--arg".to_owned(),
+            "-c".to_owned(),
+            "--arg".to_owned(),
+            body.to_owned(),
+            "--artifact".to_owned(),
+            "out.txt".to_owned(),
+            "--deadline-seconds".to_owned(),
+            "30".to_owned(),
+        ]);
+
+        args
     }
 
     fn prompt_context(
@@ -396,6 +438,40 @@ mod tests {
             status(&scratch).value("phase").as_deref(),
             Some("Closed(Cancelled)"),
         );
+
+        let refused = run(&submit_args(&scratch, "printf hello > out.txt"));
+        assert!(
+            refused.err.contains("the session is \"closed\""),
+            "a closed session admits no new turn and names the phase it is in:\n{}",
+            refused.err,
+        );
+    }
+
+    #[test]
+    fn a_submit_into_a_cancelled_session_is_refused_and_names_the_phase() {
+        let scratch = Scratch::new("submit-draining");
+        let submitted = run(&submit_args(&scratch, "printf hello > out.txt"));
+        assert!(submitted.ok, "{}\n{}", submitted.out, submitted.err);
+        assert_eq!(submitted.value("phase").as_deref(), Some("Accepting"));
+
+        let mut cancel = base(&scratch);
+        cancel.extend([
+            "agent".to_owned(),
+            "cancel".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+        ]);
+        let cancelled = run(&cancel);
+        assert!(cancelled.ok, "{}\n{}", cancelled.out, cancelled.err);
+
+        // The cancel landed while the session was open, so the next invocation is the one that
+        // refuses a new turn rather than the run that closes what the cancel left behind.
+        let again = run(&submit_args(&scratch, "printf hello > out.txt"));
+        assert!(
+            again.err.contains("the session is \"draining\""),
+            "a cancelled session admits no new turn and names the phase it is in:\n{}",
+            again.err,
+        );
     }
 
     #[test]
@@ -490,6 +566,21 @@ mod tests {
         );
     }
 
+    /// Steps `driver` until it waits for the human or closes, and says which happened. A bound is
+    /// what keeps a driver that never advances from spinning here forever: a test that hangs
+    /// reports neither what it expected nor what it saw.
+    async fn settled(driver: &mut Driver) -> bool {
+        for _ in 0..20 {
+            match driver.step().await.expect("the step runs") {
+                Progress::Awaiting => return true,
+                Progress::Terminal(_) => return false,
+                Progress::Yielded | Progress::Advanced(_) => {},
+            }
+        }
+
+        panic!("the driver neither waited nor closed within twenty steps");
+    }
+
     /// The validated configuration and run one scripted `agent run` invocation names.
     fn driver_config(
         scratch: &Scratch,
@@ -530,13 +621,7 @@ mod tests {
 
         driver.speak("hello").expect("the line opens turn 1");
 
-        let awaiting = loop {
-            match driver.step().await.expect("the step runs") {
-                Progress::Awaiting => break true,
-                Progress::Terminal(_) => break false,
-                Progress::Yielded | Progress::Advanced(_) => {},
-            }
-        };
+        let awaiting = settled(&mut driver).await;
         assert!(awaiting, "the driver waits for the human's next line");
 
         let transcript = driver.transcript().expect("the fold reads");
@@ -579,13 +664,7 @@ mod tests {
 
         driver.speak("hello").expect("the line opens turn 1");
 
-        let awaiting = loop {
-            match driver.step().await.expect("the step runs") {
-                Progress::Awaiting => break true,
-                Progress::Terminal(_) => break false,
-                Progress::Yielded | Progress::Advanced(_) => {},
-            }
-        };
+        let awaiting = settled(&mut driver).await;
         assert!(awaiting, "a spent ceiling waits rather than closing");
 
         let transcript = driver.transcript().expect("the fold reads");
@@ -835,6 +914,179 @@ mod tests {
             !scratch.data().join("search").exists(),
             "the run was refused before any index opened:\n{}",
             refused.out,
+        );
+    }
+
+    #[test]
+    fn a_crashed_agent_run_leaves_its_workspace_under_the_configured_root() {
+        let scratch = Scratch::new("sandbox-root");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[json!({"action": "command", "command": "printf hello"})],
+        );
+
+        let crashed = run(&agent_args(
+            &scratch,
+            &path,
+            &["--crash-after", "after-dispatch"],
+        ));
+
+        assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
+        let left =
+            std::fs::read_dir(scratch.data().join("sandbox")).map_or(0, std::fs::ReadDir::count);
+        assert_eq!(
+            left, 1,
+            "the one workspace the crash left behind is under the root the operator's data directory names",
+        );
+    }
+
+    #[test]
+    fn a_commands_standard_output_reaches_the_observation_the_model_is_shown() {
+        let scratch = Scratch::new("observation");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "command", "command": "printf hello"}),
+                json!({"action": "final"}),
+            ],
+        );
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+
+        let (log, _) = log_of(&scratch);
+        let observation = log
+            .ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::Result { report, .. } => Some(report.observation.as_str()),
+                _ => None,
+            })
+            .expect("the log holds the command's report");
+
+        assert!(
+            observation.contains("stdout: hello"),
+            "the bytes the workload wrote are what the model is shown: {observation}",
+        );
+    }
+
+    #[test]
+    fn the_step_lines_name_the_answer_and_the_turn_the_log_gave_them() {
+        let scratch = Scratch::new("step-lines");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "command", "command": "printf hello"}),
+                json!({"action": "command", "command": "printf world"}),
+                json!({"action": "final"}),
+            ],
+        );
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+
+        assert!(
+            ran.out
+                .contains("move=ask turn=1 attempt=1 answer=command command="),
+            "the first step names the command the scripted model answered with:\n{}",
+            ran.out,
+        );
+        assert!(
+            ran.out.contains("move=act turn=1 "),
+            "the first command ran under the turn the log opened for it:\n{}",
+            ran.out,
+        );
+        assert!(
+            ran.out.contains("move=act turn=2 "),
+            "and the second command ran under the second turn:\n{}",
+            ran.out,
+        );
+    }
+
+    #[test]
+    fn the_close_step_reports_the_ending_it_carried() {
+        let scratch = Scratch::new("close-ending");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "command", "command": "printf hello"}),
+                json!({"action": "final"}),
+            ],
+        );
+
+        // A first run over a session of its own says how many steps the loop takes. The second run
+        // stops on the step that carried the ending, because the step after it reaches the terminal
+        // progress and answers the same ending whatever the close step recorded.
+        let counted = run(&agent_args_of(COUNTED, &scratch, &path, &["--steps", "20"]));
+        assert!(counted.ok, "{}\n{}", counted.out, counted.err);
+        assert_eq!(counted.value("phase").as_deref(), Some("Closed(Completed)"));
+        let close = counted
+            .out
+            .lines()
+            // The session line is the one line the binary prints that is not a step.
+            .skip(1)
+            .position(|line| line.starts_with("move=close") && line.contains("ending=Some("))
+            .expect("the counted run closed the session")
+            + 1;
+
+        let pinned = {
+            let steps = close.to_string();
+
+            run(&agent_args_of(
+                SESSION,
+                &scratch,
+                &path,
+                &["--steps", steps.as_str()],
+            ))
+        };
+
+        assert_eq!(
+            pinned.value("phase").as_deref(),
+            Some("Closed(Completed)"),
+            "the step that carried the ending reported it:\n{}",
+            pinned.out,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reopened_driver_reads_what_another_writer_committed() {
+        let scratch = Scratch::new("reopen");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "final", "say": "hi there"})]);
+        let (config, run) = driver_config(&scratch, &path);
+        let mut driver =
+            Driver::open(&config, &run, Moment::from_millis(0)).expect("the driver opens");
+        let session = driver.session();
+
+        driver.speak("hello").expect("the line opens turn 1");
+        assert!(settled(&mut driver).await, "the first line settled");
+
+        let mut other =
+            Ledger::open(&config, session, None, Moment::from_millis(0)).expect("the ledger opens");
+        speak(&mut other, session, "from elsewhere").expect("the second line lands");
+
+        assert_eq!(
+            driver
+                .transcript()
+                .expect("the fold reads")
+                .speech(turn_id(session, 2)),
+            None,
+            "a driver that opened before the write does not see it",
+        );
+
+        driver.reopen().expect("the ledger re-opens");
+
+        assert_eq!(
+            driver
+                .transcript()
+                .expect("the fold reads")
+                .speech(turn_id(session, 2)),
+            Some("from elsewhere"),
+            "and re-opening is what reads it",
         );
     }
 }

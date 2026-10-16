@@ -118,14 +118,6 @@ impl Relay {
 
         Ok(())
     }
-
-    /// Drops every open connection, so the next pass dials afresh.
-    ///
-    /// A cut pass may have left a frame in flight whose answer is still coming, and reusing that
-    /// connection would make the next publish read that answer as its own.
-    fn forget(&mut self) {
-        self.publishers.clear();
-    }
 }
 
 /// Serves the bus on `socket` and relays what the log has committed.
@@ -245,7 +237,6 @@ async fn serve_until_stopped(
             result = relay.once(&mut db) => Some(result),
         };
         let Some(pass) = pass else {
-            relay.forget();
             break;
         };
 
