@@ -142,8 +142,9 @@ impl Patch {
     /// that line is followed by `+++ `. Two limits follow from reading by counts. A diff whose
     /// counts are wrong and whose body removes a line `-- x` immediately before adding a line
     /// `++ y` has those two lines read as a section header. A count reached exactly at a section's
-    /// own `--- ` and `+++ ` label pair reads those two labels as body lines and joins the two
-    /// sections into one body, and `Patch::recounted` then reports the counts that body holds.
+    /// own `--- ` and `+++ ` label pair reads those two labels as body lines, so the second
+    /// section joins the first, and `Patch::recounted` then reports the counts the merged section
+    /// holds.
     ///
     /// # Errors
     ///
