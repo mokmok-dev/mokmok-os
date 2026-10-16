@@ -1,16 +1,21 @@
-//! Reads the command line into the one configuration the kernel runs on.
+//! Reads the command line and the operator's configuration file into the one configuration the
+//! kernel runs on.
 //!
 //! The command line is a system boundary, so every field is checked here and the rest of the
 //! kernel trusts [`Config`]. A program must be absolute and present, because the sandbox resolves
 //! a name before it gates and refuses what it cannot resolve. A directory named as reachable must
 //! be one. Nothing is allowed by default: an empty allow list yields an empty policy, and an empty
 //! policy denies every request.
+//!
+//! The file carries the provider group and nothing else: the authority grants, the data directory,
+//! and the agent-run budgets stay on the command line, where an edited file cannot widen them.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 use uuid::Uuid;
 
 /// Where a run stops short of finishing, so that recovery can be exercised against a real crash.
@@ -28,12 +33,103 @@ pub enum CrashPoint {
 }
 
 /// Which provider answers a session's model calls.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+///
+/// The file and the command line write this the same way, because serde reproduces the kebab case
+/// `ValueEnum` already uses. `every_provider_spelling_parses_from_both_surfaces` holds the two
+/// together.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     /// Answers from a JSON file, so no network is reached.
     Scripted,
     /// Calls an OpenAI-compatible chat-completions endpoint over TLS.
     Ollama,
+}
+
+/// One layer of the provider group: the flags, and the keys `config.toml` may set.
+///
+/// Every key is optional, so a layer says only what it set. `deny_unknown_fields` refuses a key the
+/// group does not own, which is what keeps an authority grant out of the file. One struct serves
+/// both surfaces, so a key the file accepts is a key the command line accepts and the two cannot
+/// drift apart.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, clap::Args)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderLayer {
+    /// Which provider answers a session's model calls. Defaults to `scripted`.
+    #[arg(long = "provider", global = true, value_enum, value_name = "PROVIDER")]
+    #[serde(rename = "provider")]
+    pub kind: Option<ProviderKind>,
+    /// The model id the endpoint is asked for. Required for `--provider ollama`.
+    #[arg(long, global = true, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// The OpenAI-compatible endpoint root. Defaults to `https://ollama.com/v1`.
+    #[arg(long, global = true, value_name = "URL")]
+    pub endpoint: Option<String>,
+    /// The scripted provider's answers, as a JSON file. A path in the file is relative to it.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub script: Option<PathBuf>,
+    /// A file holding the endpoint credential, read at open and never from the environment. A path
+    /// in the file is relative to it.
+    #[arg(long = "provider-credential-file", global = true, value_name = "PATH")]
+    #[serde(rename = "provider_credential_file")]
+    pub credential_file: Option<PathBuf>,
+    /// How many answer tokens one model call may spend. Defaults to `4096`.
+    #[arg(long, global = true)]
+    pub max_answer_tokens: Option<u64>,
+}
+
+/// The provider group once every layer has spoken: every key holds a value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderSettings {
+    pub kind: ProviderKind,
+    pub model: Option<String>,
+    pub endpoint: String,
+    pub script: Option<PathBuf>,
+    pub credential_file: Option<PathBuf>,
+    pub max_answer_tokens: u64,
+}
+
+impl Default for ProviderSettings {
+    fn default() -> Self {
+        Self {
+            kind: ProviderKind::Scripted,
+            model: None,
+            endpoint: "https://ollama.com/v1".to_owned(),
+            script: None,
+            credential_file: None,
+            max_answer_tokens: 4096,
+        }
+    }
+}
+
+impl ProviderSettings {
+    /// The whole precedence rule in one place: the flag, then the file, then the built-in default.
+    #[must_use]
+    pub fn merge(
+        flags: &ProviderLayer,
+        file: &ProviderLayer,
+    ) -> Self {
+        let default = Self::default();
+
+        Self {
+            kind: flags.kind.or(file.kind).unwrap_or(default.kind),
+            model: flags.model.clone().or_else(|| file.model.clone()),
+            endpoint: flags
+                .endpoint
+                .clone()
+                .or_else(|| file.endpoint.clone())
+                .unwrap_or(default.endpoint),
+            script: flags.script.clone().or_else(|| file.script.clone()),
+            credential_file: flags
+                .credential_file
+                .clone()
+                .or_else(|| file.credential_file.clone()),
+            max_answer_tokens: flags
+                .max_answer_tokens
+                .or(file.max_answer_tokens)
+                .unwrap_or(default.max_answer_tokens),
+        }
+    }
 }
 
 /// The options every invocation shares, whichever subcommand runs. Split out of [`Args`] so a
@@ -71,29 +167,16 @@ pub struct Global {
     /// daemon between two commits by passing it.
     #[arg(long, value_enum, global = true, hide = true)]
     pub crash_after: Option<CrashPoint>,
-    /// Which provider answers a session's model calls.
-    #[arg(long, global = true, value_enum, default_value = "scripted")]
-    pub provider: ProviderKind,
-    /// The scripted provider's answers, as a JSON file.
+    /// The provider settings in a file, instead of the one discovery finds.
+    ///
+    /// The file is `<XDG_CONFIG_HOME>/mokmok/config.toml`, or `$HOME/.config/mokmok/config.toml`
+    /// when `XDG_CONFIG_HOME` is unset. A flag beats the file, and the file beats the built-in
+    /// default.
     #[arg(long, global = true, value_name = "PATH")]
-    pub script: Option<PathBuf>,
-    /// The model id the endpoint is asked for. Required for `--provider ollama`.
-    #[arg(long, global = true, value_name = "MODEL")]
-    pub model: Option<String>,
-    /// The OpenAI-compatible endpoint root.
-    #[arg(
-        long,
-        global = true,
-        default_value = "https://ollama.com/v1",
-        value_name = "URL"
-    )]
-    pub endpoint: String,
-    /// A file holding the endpoint credential, read at open and never from the environment.
-    #[arg(long, global = true, value_name = "PATH")]
-    pub provider_credential_file: Option<PathBuf>,
-    /// How many answer tokens one model call may spend.
-    #[arg(long, global = true, default_value_t = 4096)]
-    pub max_answer_tokens: u64,
+    pub config: Option<PathBuf>,
+    /// The provider group: the flags, and the keys the configuration file may set.
+    #[command(flatten)]
+    pub provider: ProviderLayer,
 }
 
 /// The CLI surface of `mokmokd`.
@@ -236,29 +319,30 @@ pub struct Config {
     /// The confiner the sandbox supervises with.
     pub confiner: PathBuf,
     pub crash_after: Option<CrashPoint>,
-    /// Which provider answers the model calls.
-    pub provider: ProviderKind,
-    /// The scripted provider's answers, when it is the one selected.
-    pub script: Option<PathBuf>,
-    /// The model id the provider asks for.
-    pub model: Option<String>,
-    /// The provider endpoint root.
-    pub endpoint: String,
-    /// The path of the credential file, never the credential itself.
-    pub provider_credential_file: Option<PathBuf>,
-    /// How many answer tokens one model call may spend.
-    pub max_answer_tokens: u64,
+    /// The provider group every invocation carries; only an agent run asks it a question.
+    pub provider: ProviderSettings,
 }
 
 impl Config {
     /// Turns parsed arguments into a configuration, creating the directories it names.
     ///
+    /// The file is read before the subcommand is matched, so one file is valid or invalid for every
+    /// command rather than for a subset, and a broken file is reported on the first command the
+    /// operator types.
+    ///
     /// # Errors
     ///
     /// Returns a [`ConfigError`] when a directory cannot be created, a program is not absolute or
-    /// not a runnable file, a named path is not a directory, or a search root no grant covers.
-    pub fn resolve(args: &Args) -> Result<Self, ConfigError> {
+    /// not a runnable file, a named path is not a directory, a search root no grant covers, or the
+    /// configuration file is missing, unreadable, invalid, or holds a path key that leaves it.
+    pub fn resolve(
+        args: &Args,
+        discovered: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
         let global = &args.global;
+        let file = file_layer(args, discovered)?;
+        let provider = ProviderSettings::merge(&global.provider, &file);
+
         create_directory(&global.data_dir)?;
 
         let artifacts = global.data_dir.join("artifacts");
@@ -315,17 +399,17 @@ impl Config {
                 return Err(ConfigError::SearchUngranted { path: root.clone() });
             }
 
-            match global.provider {
+            match provider.kind {
                 ProviderKind::Scripted => {
-                    if global.script.is_none() {
+                    if provider.script.is_none() {
                         return Err(ConfigError::NoScript);
                     }
                 },
                 ProviderKind::Ollama => {
-                    if global.model.as_deref().unwrap_or_default().is_empty() {
+                    if provider.model.as_deref().unwrap_or_default().is_empty() {
                         return Err(ConfigError::NoModel);
                     }
-                    let Some(credential) = global.provider_credential_file.as_deref() else {
+                    let Some(credential) = provider.credential_file.as_deref() else {
                         return Err(ConfigError::NoCredentialFile);
                     };
                     private_credential(credential, &allow_write)?;
@@ -350,12 +434,7 @@ impl Config {
             tool_env: environment(&global.tool_env)?,
             confiner: runnable(&confiner)?,
             crash_after: global.crash_after,
-            provider: global.provider,
-            script: global.script.clone(),
-            model: global.model.clone(),
-            endpoint: global.endpoint.clone(),
-            provider_credential_file: global.provider_credential_file.clone(),
-            max_answer_tokens: global.max_answer_tokens,
+            provider,
         })
     }
 
@@ -364,6 +443,111 @@ impl Config {
     pub fn socket(&self) -> PathBuf {
         self.data_dir.join("bus.sock")
     }
+}
+
+/// Where the operator's configuration file is, under the XDG rules.
+///
+/// `None` when neither root is set: a service has no home, and a file with no place to live is not a
+/// missing file. Only the two binaries call it; every test hands [`Config::resolve`] its own path
+/// instead, so the operator's own file cannot reach a test.
+#[must_use]
+pub fn config_path() -> Option<PathBuf> {
+    config_path_for(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Decides the file location from the two roots alone, so the fallback is reachable from a test even
+/// though `set_var` is unsafe and denied here.
+fn config_path_for(
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    // An XDG variable counts only when it names something, which is what the spec says about empty.
+    let root = |value: Option<&OsStr>| value.filter(|value| !value.is_empty()).map(PathBuf::from);
+
+    root(xdg)
+        .or_else(|| root(home).map(|home| home.join(".config")))
+        .map(|root| root.join("mokmok/config.toml"))
+}
+
+/// The layer the configuration file contributes, or an empty one when there is no file to read.
+fn file_layer(
+    args: &Args,
+    discovered: Option<&Path>,
+) -> Result<ProviderLayer, ConfigError> {
+    let named = args.global.config.as_deref();
+    let Some(path) = named
+        .map(Path::to_path_buf)
+        .or_else(|| discovered.map(Path::to_path_buf))
+    else {
+        return Ok(ProviderLayer::default());
+    };
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // A file nobody named is simply not there. One the operator named and that is not there is
+        // a typo, and every other refusal in this function names its path.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            if named.is_some() {
+                return Err(ConfigError::ConfigFileMissing { path });
+            }
+
+            return Ok(ProviderLayer::default());
+        },
+        Err(source) => return Err(ConfigError::ConfigFileUnreadable { path, source }),
+    };
+
+    let layer: ProviderLayer =
+        toml::from_str(&text).map_err(|source| ConfigError::ConfigFileInvalid {
+            path: path.clone(),
+            source,
+        })?;
+
+    rebased(layer, &path)
+}
+
+/// Joins the file's two path keys to the directory that holds it, or refuses a value that leaves it.
+fn rebased(
+    layer: ProviderLayer,
+    file: &Path,
+) -> Result<ProviderLayer, ConfigError> {
+    let base = file.parent().unwrap_or_else(|| Path::new("."));
+
+    Ok(ProviderLayer {
+        script: beneath(layer.script, "script", base, file)?,
+        credential_file: beneath(
+            layer.credential_file,
+            "provider_credential_file",
+            base,
+            file,
+        )?,
+        ..layer
+    })
+}
+
+/// One path key, held to the same rule an artifact path follows and then resolved beside the file.
+///
+/// The credential has to become absolute here: `private_credential` compares it against the absolute
+/// write grants, and a relative value would match none of them and skip that refusal in silence.
+fn beneath(
+    value: Option<PathBuf>,
+    key: &'static str,
+    base: &Path,
+    file: &Path,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = value.to_string_lossy().into_owned();
+    let relative = relative_path(&text).map_err(|_| ConfigError::ConfigFileNotRelative {
+        path: file.to_path_buf(),
+        key,
+        value: text,
+    })?;
+
+    Ok(Some(base.join(relative)))
 }
 
 /// Stops the process at a boundary between two durable commits when the run asked for it.
@@ -571,6 +755,29 @@ pub enum ConfigError {
          model run could rewrite it before the next invocation reads it"
     )]
     CredentialInWriteGrant { path: PathBuf, grant: PathBuf },
+    #[error("--config names {path}, and no file is there to read")]
+    ConfigFileMissing { path: PathBuf },
+    #[error("the configuration file {path} could not be read: {source}")]
+    ConfigFileUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the configuration file {path} is not one mokmok can read: {source}")]
+    ConfigFileInvalid {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error(
+        "the configuration file {path} sets {key} to {value}, and a path in the file is a plain \
+         relative path inside the file's own directory"
+    )]
+    ConfigFileNotRelative {
+        path: PathBuf,
+        key: &'static str,
+        value: String,
+    },
     #[error("the agent runs one program, but {count} --allow-tool grants are named")]
     MultipleTools { count: usize },
 }
@@ -578,11 +785,11 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, Args, Command, Config, ConfigError, Global, ProviderKind, Submit, relative_path,
-        uuid_of,
+        Agent, Args, Command, Config, ConfigError, Global, ProviderKind, ProviderLayer, Submit,
+        config_path_for, relative_path, uuid_of,
     };
-    use clap::Parser as _;
-    use std::ffi::OsString;
+    use clap::{CommandFactory as _, Parser as _, ValueEnum as _};
+    use std::ffi::{OsStr, OsString};
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
@@ -617,12 +824,8 @@ mod tests {
                 tool_env: Vec::new(),
                 confiner: Some(PathBuf::from("/bin/sh")),
                 crash_after: None,
-                provider: ProviderKind::Scripted,
-                script: None,
-                model: None,
-                endpoint: "https://ollama.com/v1".to_owned(),
-                provider_credential_file: None,
-                max_answer_tokens: 4096,
+                config: None,
+                provider: ProviderLayer::default(),
             },
             command: Command::Submit(Submit {
                 session: "018f2f1e-0000-7000-8000-000000000000".to_owned(),
@@ -638,7 +841,7 @@ mod tests {
     #[test]
     fn a_resolved_configuration_creates_the_directories_it_names() {
         let scratch = Scratch::new("resolve");
-        let config = Config::resolve(&args(&scratch.0)).unwrap();
+        let config = Config::resolve(&args(&scratch.0), None).unwrap();
 
         assert!(config.data_dir.is_dir());
         assert!(config.artifacts.is_dir());
@@ -654,7 +857,7 @@ mod tests {
         args.global.allow_tool = vec![PathBuf::from("sh")];
 
         assert!(matches!(
-            Config::resolve(&args),
+            Config::resolve(&args, None),
             Err(ConfigError::NotAbsolute(_)),
         ));
     }
@@ -666,7 +869,7 @@ mod tests {
         args.global.allow_tool = vec![PathBuf::from("/bin/no-such-tool-mokmok")];
 
         assert!(matches!(
-            Config::resolve(&args),
+            Config::resolve(&args, None),
             Err(ConfigError::NotRunnable(_)),
         ));
     }
@@ -678,7 +881,7 @@ mod tests {
         args.global.allow_path = vec![PathBuf::from("/bin/sh")];
 
         assert!(matches!(
-            Config::resolve(&args),
+            Config::resolve(&args, None),
             Err(ConfigError::NotADirectory(_)),
         ));
     }
@@ -713,7 +916,7 @@ mod tests {
         args.global.tool_env = vec!["LANG".to_owned()];
 
         assert!(matches!(
-            Config::resolve(&args),
+            Config::resolve(&args, None),
             Err(ConfigError::NotAnAssignment(entry)) if entry == "LANG",
         ));
     }
@@ -735,7 +938,7 @@ mod tests {
         let mut args = args(&scratch.0);
         args.global.tool_env = vec!["LANG=C".to_owned(), "PATH=/operator".to_owned()];
 
-        let config = Config::resolve(&args).unwrap();
+        let config = Config::resolve(&args, None).unwrap();
 
         assert_eq!(value(&config.tool_env, "LANG").as_deref(), Some("C"));
         assert_eq!(
@@ -827,12 +1030,16 @@ mod tests {
         assert_eq!(run.context_turns, 16);
         assert_eq!(run.context_bytes, 131_072);
         assert_eq!(run.observation_bytes, 4096);
-        assert_eq!(parsed.global.provider, ProviderKind::Scripted);
-        assert_eq!(parsed.global.script, Some(PathBuf::from("/bin/sh")));
-        assert_eq!(parsed.global.endpoint, "https://ollama.com/v1");
-        assert_eq!(parsed.global.max_answer_tokens, 4096);
-        assert_eq!(parsed.global.model, None);
-        assert_eq!(parsed.global.provider_credential_file, None);
+        assert_eq!(parsed.global.provider.kind, None);
+        assert_eq!(
+            parsed.global.provider.script,
+            Some(PathBuf::from("/bin/sh"))
+        );
+        assert_eq!(parsed.global.provider.endpoint, None);
+        assert_eq!(parsed.global.provider.max_answer_tokens, None);
+        assert_eq!(parsed.global.provider.model, None);
+        assert_eq!(parsed.global.provider.credential_file, None);
+        assert_eq!(parsed.global.config, None);
 
         let cancel = Args::try_parse_from([
             "mokmokd",
@@ -860,7 +1067,7 @@ mod tests {
         };
         run.checkout = PathBuf::from("/srv/elsewhere");
 
-        let refusal = Config::resolve(&parsed).unwrap_err();
+        let refusal = Config::resolve(&parsed, None).unwrap_err();
 
         assert!(
             matches!(
@@ -881,7 +1088,7 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.search_root = vec![elsewhere.clone()];
 
-        let refusal = Config::resolve(&parsed).unwrap_err();
+        let refusal = Config::resolve(&parsed, None).unwrap_err();
 
         assert!(
             matches!(
@@ -909,7 +1116,7 @@ mod tests {
         parsed.global.search_root = vec![granted.clone()];
         parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
 
-        let config = Config::resolve(&parsed).unwrap();
+        let config = Config::resolve(&parsed, None).unwrap();
 
         assert_eq!(config.search_root, vec![granted]);
         assert_eq!(config.search_index, config.data_dir.join("search"));
@@ -921,7 +1128,7 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.search_root = vec![PathBuf::from("/bin/sh")];
 
-        match Config::resolve(&parsed) {
+        match Config::resolve(&parsed, None) {
             Err(ConfigError::NotADirectory(path)) => assert_eq!(path, PathBuf::from("/bin/sh")),
             other => panic!("a file named as a search root is refused: {other:?}"),
         }
@@ -933,7 +1140,7 @@ mod tests {
         let mut parsed = agent_args(&scratch.0);
         parsed.global.confiner = Some(PathBuf::from("/bin/sh"));
 
-        let config = Config::resolve(&parsed).unwrap();
+        let config = Config::resolve(&parsed, None).unwrap();
 
         assert_eq!(config.search_root, Vec::<PathBuf>::new());
         assert_eq!(config.search_index, config.data_dir.join("search"));
@@ -972,8 +1179,8 @@ mod tests {
         );
     }
 
-    /// The parsed shape of one `--provider ollama` run, with `extra` appended.
-    fn ollama_args(
+    /// The parsed shape of one `agent run` over `data`, with `extra` appended.
+    fn run_args(
         data: &Path,
         extra: &[&str],
     ) -> Args {
@@ -995,12 +1202,21 @@ mod tests {
             "goal",
             "--checkout",
             "/bin",
-            "--provider",
-            "ollama",
         ];
         args.extend_from_slice(extra);
 
         Args::try_parse_from(args).unwrap()
+    }
+
+    /// The same run with `--provider ollama` named, which is the shape the credential cases use.
+    fn ollama_args(
+        data: &Path,
+        extra: &[&str],
+    ) -> Args {
+        let mut named = vec!["--provider", "ollama"];
+        named.extend_from_slice(extra);
+
+        run_args(data, &named)
     }
 
     #[test]
@@ -1028,7 +1244,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            Config::resolve(&parsed),
+            Config::resolve(&parsed, None),
             Err(ConfigError::NoScript),
         ));
     }
@@ -1038,11 +1254,14 @@ mod tests {
         let scratch = Scratch::new("no-model");
 
         assert!(matches!(
-            Config::resolve(&ollama_args(&scratch.0, &[])),
+            Config::resolve(&ollama_args(&scratch.0, &[]), None),
             Err(ConfigError::NoModel),
         ));
         assert!(matches!(
-            Config::resolve(&ollama_args(&scratch.0, &["--model", "kimi-k2.7-code"])),
+            Config::resolve(
+                &ollama_args(&scratch.0, &["--model", "kimi-k2.7-code"]),
+                None
+            ),
             Err(ConfigError::NoCredentialFile),
         ));
     }
@@ -1064,15 +1283,18 @@ mod tests {
         let scratch = Scratch::new("cred-mode");
         let path = credential(&scratch.0.join("credential"), 0o644);
 
-        let refusal = Config::resolve(&ollama_args(
-            &scratch.0,
-            &[
-                "--model",
-                "kimi-k2.7-code",
-                "--provider-credential-file",
-                path.to_str().unwrap(),
-            ],
-        ))
+        let refusal = Config::resolve(
+            &ollama_args(
+                &scratch.0,
+                &[
+                    "--model",
+                    "kimi-k2.7-code",
+                    "--provider-credential-file",
+                    path.to_str().unwrap(),
+                ],
+            ),
+            None,
+        )
         .unwrap_err();
 
         assert!(
@@ -1129,7 +1351,7 @@ mod tests {
         ])
         .unwrap();
 
-        let refusal = Config::resolve(&parsed).unwrap_err();
+        let refusal = Config::resolve(&parsed, None).unwrap_err();
 
         assert!(
             matches!(
@@ -1178,8 +1400,360 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            Config::resolve(&parsed),
+            Config::resolve(&parsed, None),
             Err(ConfigError::MultipleTools { count: 2 }),
         ));
+    }
+
+    /// Writes `body` as `<scratch>/config.toml`, returning its path.
+    fn config_file(
+        scratch: &Scratch,
+        body: &str,
+    ) -> PathBuf {
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let path = scratch.0.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+
+        path
+    }
+
+    #[test]
+    fn the_given_config_root_scopes_the_file() {
+        assert_eq!(
+            config_path_for(Some(OsStr::new("/x/cfg")), Some(OsStr::new("/home/me"))),
+            Some(PathBuf::from("/x/cfg/mokmok/config.toml")),
+        );
+    }
+
+    #[test]
+    fn an_empty_config_root_falls_back_to_the_home_directory() {
+        assert_eq!(
+            config_path_for(Some(OsStr::new("")), Some(OsStr::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.config/mokmok/config.toml")),
+        );
+    }
+
+    #[test]
+    fn neither_root_names_no_file() {
+        assert_eq!(config_path_for(None, None), None);
+        assert_eq!(config_path_for(Some(OsStr::new("")), None), None);
+    }
+
+    #[test]
+    fn a_file_fills_every_key_the_flags_left_out() {
+        let scratch = Scratch::new("file-every-key");
+        let credential = credential(&scratch.0.join("credential"), 0o600);
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"kimi-k2.7-code\"\n\
+             endpoint = \"https://example.test/v1\"\n\
+             script = \"answers.json\"\n\
+             provider_credential_file = \"credential\"\n\
+             max_answer_tokens = 8192\n",
+        );
+
+        let config = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap();
+
+        assert_eq!(config.provider.kind, ProviderKind::Ollama);
+        assert_eq!(config.provider.model.as_deref(), Some("kimi-k2.7-code"));
+        assert_eq!(config.provider.endpoint, "https://example.test/v1");
+        assert_eq!(config.provider.script, Some(scratch.0.join("answers.json")));
+        assert_eq!(config.provider.credential_file, Some(credential));
+        assert_eq!(config.provider.max_answer_tokens, 8192);
+    }
+
+    #[test]
+    fn a_flag_beats_the_file_for_the_key_it_names() {
+        let scratch = Scratch::new("flag-beats-file");
+        credential(&scratch.0.join("credential"), 0o600);
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"from-the-file\"\n\
+             endpoint = \"https://from-the-file.test/v1\"\n\
+             provider_credential_file = \"credential\"\n",
+        );
+
+        let config = Config::resolve(
+            &run_args(&scratch.0, &["--endpoint", "https://from-the-flag.test/v1"]),
+            Some(&file),
+        )
+        .unwrap();
+
+        assert_eq!(config.provider.endpoint, "https://from-the-flag.test/v1");
+        assert_eq!(config.provider.model.as_deref(), Some("from-the-file"));
+    }
+
+    #[test]
+    fn a_file_config_named_beats_the_discovered_one() {
+        let scratch = Scratch::new("named-beats-discovered");
+        let discovered = config_file(&scratch, "max_answer_tokens = 111\n");
+        let named = scratch.0.join("named.toml");
+        std::fs::write(&named, "max_answer_tokens = 222\n").unwrap();
+        let args = run_args(
+            &scratch.0,
+            &["--script", "/bin/sh", "--config", named.to_str().unwrap()],
+        );
+
+        let config = Config::resolve(&args, Some(&discovered)).unwrap();
+
+        assert_eq!(config.provider.max_answer_tokens, 222);
+    }
+
+    #[test]
+    fn no_file_leaves_the_built_in_provider_group() {
+        let scratch = Scratch::new("no-file");
+        let config =
+            Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), None).unwrap();
+
+        assert_eq!(
+            (
+                config.provider.kind,
+                config.provider.endpoint.as_str(),
+                config.provider.max_answer_tokens,
+            ),
+            (ProviderKind::Scripted, "https://ollama.com/v1", 4096),
+        );
+    }
+
+    #[test]
+    fn a_discovered_file_that_is_not_there_is_not_read() {
+        let scratch = Scratch::new("discovered-absent");
+        let absent = scratch.0.join("absent.toml");
+
+        let config = Config::resolve(
+            &run_args(&scratch.0, &["--script", "/bin/sh"]),
+            Some(&absent),
+        )
+        .unwrap();
+
+        assert_eq!(config.provider.max_answer_tokens, 4096);
+    }
+
+    #[test]
+    fn a_file_config_named_and_not_there_is_refused_by_path() {
+        let scratch = Scratch::new("named-absent");
+        let named = scratch.0.join("absent.toml");
+        let args = run_args(
+            &scratch.0,
+            &["--script", "/bin/sh", "--config", named.to_str().unwrap()],
+        );
+
+        let refusal = Config::resolve(&args, None).unwrap_err();
+
+        assert!(
+            matches!(&refusal, ConfigError::ConfigFileMissing { path } if path == &named),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_config_path_that_is_a_directory_is_refused_by_path() {
+        let scratch = Scratch::new("config-is-dir");
+        let directory = scratch.0.join("config");
+        std::fs::create_dir_all(&directory).unwrap();
+        let args = run_args(
+            &scratch.0,
+            &[
+                "--script",
+                "/bin/sh",
+                "--config",
+                directory.to_str().unwrap(),
+            ],
+        );
+
+        let refusal = Config::resolve(&args, None).unwrap_err();
+
+        assert!(
+            matches!(&refusal, ConfigError::ConfigFileUnreadable { path, .. } if path == &directory),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_toml_is_refused_by_path() {
+        let scratch = Scratch::new("not-toml");
+        let wanted = config_file(&scratch, "provider = \n");
+        let args = run_args(
+            &scratch.0,
+            &["--script", "/bin/sh", "--config", wanted.to_str().unwrap()],
+        );
+
+        let refusal = Config::resolve(&args, None).unwrap_err();
+
+        assert!(
+            matches!(&refusal, ConfigError::ConfigFileInvalid { path, .. } if path == &wanted),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_key_the_file_does_not_own_is_refused_by_name() {
+        let scratch = Scratch::new("unknown-key");
+        let file = config_file(&scratch, "allow_write = [\"/\"]\n");
+
+        let refusal = Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), Some(&file))
+            .unwrap_err();
+
+        assert!(
+            matches!(refusal, ConfigError::ConfigFileInvalid { .. }),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("allow_write"), "{refusal}");
+    }
+
+    #[test]
+    fn a_key_of_the_wrong_type_is_refused_by_name() {
+        let scratch = Scratch::new("wrong-type");
+        let file = config_file(&scratch, "max_answer_tokens = \"many\"\n");
+
+        let refusal = Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), Some(&file))
+            .unwrap_err();
+
+        assert!(
+            refusal.to_string().contains("max_answer_tokens"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_provider_the_file_does_not_have_is_refused() {
+        let scratch = Scratch::new("unknown-provider");
+        let file = config_file(&scratch, "provider = \"openai\"\n");
+
+        assert!(matches!(
+            Config::resolve(&run_args(&scratch.0, &["--script", "/bin/sh"]), Some(&file)),
+            Err(ConfigError::ConfigFileInvalid { .. }),
+        ));
+    }
+
+    #[test]
+    fn an_absolute_script_in_the_file_is_refused_by_key() {
+        let scratch = Scratch::new("absolute-script");
+        let file = config_file(&scratch, "script = \"/bin/sh\"\n");
+
+        let refusal = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap_err();
+
+        assert!(
+            matches!(&refusal, ConfigError::ConfigFileNotRelative { key, .. } if *key == "script"),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_climbing_credential_in_the_file_is_refused_by_key() {
+        let scratch = Scratch::new("climbing-credential");
+        let file = config_file(&scratch, "provider_credential_file = \"../credential\"\n");
+
+        let refusal = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileNotRelative { key, .. } if *key == "provider_credential_file"
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_credential_the_file_names_inside_a_write_grant_is_refused_by_both_names() {
+        let scratch = Scratch::new("file-credential-grant");
+        let granted = scratch.0.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let credential = credential(&granted.join("credential"), 0o600);
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"kimi-k2.7-code\"\n\
+             provider_credential_file = \"granted/credential\"\n",
+        );
+        let mut args = run_args(&scratch.0, &[]);
+        args.global.allow_write.push(granted.clone());
+
+        let refusal = Config::resolve(&args, Some(&file)).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::CredentialInWriteGrant { path, grant }
+                    if path == &credential && grant == &granted,
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn a_path_in_the_file_resolves_beside_the_file() {
+        let scratch = Scratch::new("beside-the-file");
+        let file = config_file(
+            &scratch,
+            "provider = \"scripted\"\nscript = \"answers.json\"\n",
+        );
+
+        let config = Config::resolve(&run_args(&scratch.0, &[]), Some(&file)).unwrap();
+
+        assert_eq!(config.provider.script, Some(scratch.0.join("answers.json")));
+    }
+
+    #[test]
+    fn a_file_that_names_ollama_still_refuses_without_a_model() {
+        let scratch = Scratch::new("file-no-model");
+        let file = config_file(&scratch, "provider = \"ollama\"\n");
+
+        assert!(matches!(
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file)),
+            Err(ConfigError::NoModel),
+        ));
+    }
+
+    #[test]
+    fn a_scripted_file_that_names_no_script_still_refuses() {
+        let scratch = Scratch::new("file-no-script");
+        let file = config_file(&scratch, "provider = \"scripted\"\n");
+
+        assert!(matches!(
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file)),
+            Err(ConfigError::NoScript),
+        ));
+    }
+
+    #[test]
+    fn a_malformed_file_refuses_a_command_that_asks_no_model() {
+        let scratch = Scratch::new("malformed-submit");
+        let file = config_file(&scratch, "model =\n");
+        let mut args = args(&scratch.0);
+        args.global.config = Some(file.clone());
+
+        let refusal = Config::resolve(&args, None).unwrap_err();
+
+        assert!(
+            matches!(&refusal, ConfigError::ConfigFileInvalid { path, .. } if path == &file),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn every_provider_spelling_parses_from_both_surfaces() {
+        for kind in ProviderKind::value_variants() {
+            let spelling = kind.to_possible_value().unwrap().get_name().to_owned();
+            let layer: ProviderLayer =
+                toml::from_str(&format!("provider = \"{spelling}\"")).unwrap();
+
+            assert_eq!(layer.kind, Some(*kind), "{spelling}");
+        }
+    }
+
+    #[test]
+    fn the_help_names_the_built_in_defaults() {
+        let help = Args::command().render_help().to_string();
+
+        for expected in ["scripted", "https://ollama.com/v1", "4096"] {
+            assert!(
+                help.contains(expected),
+                "the help omits {expected}:\n{help}"
+            );
+        }
     }
 }

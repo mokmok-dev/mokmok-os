@@ -147,7 +147,7 @@ mod tests {
             script.display().to_string(),
         ];
         let parsed = Args::try_parse_from(&args).expect("the command line parses");
-        let config = Config::resolve(&parsed).expect("the configuration resolves");
+        let config = Config::resolve(&parsed, None).expect("the configuration resolves");
         let Command::Agent(Agent::Run(run)) = parsed.command else {
             panic!("the command line named an agent run");
         };

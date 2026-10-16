@@ -260,7 +260,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&scratch, &args)
+        run(scratch, &args)
     }
 
     /// One `submit` of `body` through the operator's shell, which is the path the kernel takes
@@ -365,6 +365,50 @@ mod tests {
                 report.out,
             );
         }
+    }
+
+    #[test]
+    fn a_run_takes_the_provider_group_from_the_configuration_file() {
+        let scratch = Scratch::new("config-file");
+        let directory = scratch.0.join("config/mokmok");
+        std::fs::create_dir_all(&directory).expect("the config directory is made");
+        script(
+            &directory.join("answers.json"),
+            &[
+                json!({
+                    "action": "command",
+                    "command": format!("cd {} && printf hello > out.txt", scratch.checkout().display()),
+                }),
+                json!({"action": "final"}),
+            ],
+        );
+        std::fs::write(
+            directory.join("config.toml"),
+            "provider = \"scripted\"\nscript = \"answers.json\"\n",
+        )
+        .expect("the config file is written");
+
+        let mut args = base(&scratch);
+        args.extend([
+            "agent".to_owned(),
+            "run".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+            "--goal".to_owned(),
+            "write hello into out.txt".to_owned(),
+            "--checkout".to_owned(),
+            scratch.checkout().display().to_string(),
+            "--max-turns".to_owned(),
+            "6".to_owned(),
+        ]);
+
+        let ran = run(&scratch, &args);
+
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(
+            std::fs::read_to_string(scratch.checkout().join("out.txt")).expect("the command wrote"),
+            "hello",
+        );
     }
 
     #[test]
@@ -608,7 +652,7 @@ mod tests {
             script_path.display().to_string(),
         ]);
         let parsed = mokmok_kernel::Args::try_parse_from(&args).expect("the command line parses");
-        let config = Config::resolve(&parsed).expect("the configuration resolves");
+        let config = Config::resolve(&parsed, None).expect("the configuration resolves");
         let mokmok_kernel::Command::Agent(mokmok_kernel::Agent::Run(run)) = parsed.command else {
             panic!("the command line named an agent run");
         };

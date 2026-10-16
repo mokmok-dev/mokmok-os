@@ -187,7 +187,7 @@ mod tests {
             "before-dispatch".to_owned(),
         ]);
 
-        let ran = run(&scratch, &args);
+        let ran = run(scratch, &args);
         assert_eq!(ran.code, Some(97), "{}\n{}", ran.out, ran.err);
     }
 
@@ -199,7 +199,7 @@ mod tests {
         let mut args = base(scratch);
         args.extend(["status".to_owned(), "--session".to_owned(), session(index)]);
 
-        let ran = run(&scratch, &args);
+        let ran = run(scratch, &args);
         assert!(
             ran.code == Some(0),
             "status failed for {}: {}\n{}",

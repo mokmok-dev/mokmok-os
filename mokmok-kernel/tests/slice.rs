@@ -285,7 +285,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&scratch, &args)
+        run(scratch, &args)
     }
 
     fn reconcile(scratch: &Scratch) -> Ran {
@@ -296,7 +296,7 @@ mod tests {
             SESSION.to_owned(),
         ]);
 
-        run(&scratch, &args)
+        run(scratch, &args)
     }
 
     /// The arguments of one `submit` that writes `body` into `out.txt` in the workload's own
@@ -337,7 +337,7 @@ mod tests {
         extra: &[&str],
     ) -> Ran {
         run(
-            &scratch,
+            scratch,
             &submit_args(scratch, key, "printf hello > out.txt", extra),
         )
     }
@@ -348,7 +348,7 @@ mod tests {
         key: &str,
         body: &str,
     ) -> Ran {
-        run(&scratch, &submit_args(scratch, key, body, &[]))
+        run(scratch, &submit_args(scratch, key, body, &[]))
     }
 
     #[test]

@@ -500,9 +500,13 @@ fn model(
     config: &Config,
     session: SessionID,
 ) -> Result<Model, Error> {
-    match config.provider {
+    match config.provider.kind {
         ProviderKind::Scripted => {
-            let path = config.script.as_deref().ok_or(ConfigError::NoScript)?;
+            let path = config
+                .provider
+                .script
+                .as_deref()
+                .ok_or(ConfigError::NoScript)?;
 
             Ok(Model::Scripted(Scripted::open(config, path)?))
         },
@@ -884,7 +888,7 @@ fn number_of(
 #[cfg(test)]
 mod tests {
     use super::Ledger;
-    use crate::config::Config;
+    use crate::config::{Config, ProviderSettings};
     use crate::db::Db;
     use mokmok_agent_runtime::{
         Budget, Journal, Receipt, Record, Setting, Step, StepId, StepKey, Task, TaskRecord,
@@ -934,12 +938,7 @@ mod tests {
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
-            provider: crate::config::ProviderKind::Scripted,
-            script: None,
-            model: None,
-            endpoint: "https://ollama.com/v1".to_owned(),
-            provider_credential_file: None,
-            max_answer_tokens: 4096,
+            provider: ProviderSettings::default(),
         }
     }
 
