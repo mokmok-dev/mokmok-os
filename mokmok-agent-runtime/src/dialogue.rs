@@ -3,14 +3,13 @@
 use std::collections::BTreeMap;
 
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
-use mokmok_state_machine::{
-    Ack, Attempt, Rejection, Resolution, Session, State, Turn, TurnFact, TurnNumber,
-};
+use mokmok_state_machine::{Ack, Attempt, Rejection, Session, State, Turn, TurnFact, TurnNumber};
 
+use crate::edit::{EditOutcome, EditReport};
 use crate::model::Action;
 use crate::record::{
-    AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, Record, RecordKey, Refusal,
-    SpeechRecord, TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
+    PromptRecord, Record, RecordKey, Refusal, SpeechRecord, TaskRecord,
 };
 use crate::task::Task;
 use crate::tool::{self, ToolReport};
@@ -43,6 +42,10 @@ pub struct Transcript {
     /// The report each result record carried, so a redelivery is compared as the whole record and
     /// the observation it holds is what the model was shown.
     pub runs: BTreeMap<ExecutionID, ToolReport>,
+    /// The edit one turn asked for, when its answer asked for one.
+    pub edit_intents: BTreeMap<ExecutionID, EditIntentRecord>,
+    /// The outcome of one edit.
+    pub edit_outcomes: BTreeMap<ExecutionID, EditReport>,
 }
 
 impl Transcript {
@@ -59,6 +62,8 @@ impl Transcript {
             calls: BTreeMap::new(),
             finds: BTreeMap::new(),
             runs: BTreeMap::new(),
+            edit_intents: BTreeMap::new(),
+            edit_outcomes: BTreeMap::new(),
         }
     }
 
@@ -155,6 +160,26 @@ impl Transcript {
         self.finds.get(&turn)
     }
 
+    /// The edit intent one turn recorded, if any.
+    #[must_use]
+    pub fn edit_of(
+        &self,
+        turn: TurnID,
+    ) -> Option<&EditIntentRecord> {
+        self.edit_intents
+            .values()
+            .find(|intent| intent.turn == turn)
+    }
+
+    /// The edit outcome for one execution, if any.
+    #[must_use]
+    pub fn edit_outcome_of(
+        &self,
+        execution: ExecutionID,
+    ) -> Option<&EditReport> {
+        self.edit_outcomes.get(&execution)
+    }
+
     /// The newest attempt's answer for one turn, if the fold holds one.
     #[must_use]
     pub fn newest_answer(
@@ -215,6 +240,8 @@ impl Record {
             Self::Answer(record) => apply_answer(into, record),
             Self::Call(record) => apply_call(into, record),
             Self::Find(record) => apply_find(into, record),
+            Self::EditIntent(record) => apply_edit_intent(into, record),
+            Self::EditOutcome(record) => apply_edit_outcome(into, record),
             Self::Speech(record) => apply_speech(into, record),
         }
     }
@@ -263,8 +290,12 @@ fn apply_result(
 
     let resolution = report.exit.resolution();
     let settled = match into.session.execution(execution).map(|held| held.state()) {
-        Some(State::Settled(recorded)) => recorded == resolution,
-        Some(State::Applied { code }) => resolution == Resolution::Finished { code },
+        Some(
+            State::Settled(recorded)
+            | State::Applied {
+                resolution: recorded,
+            },
+        ) => recorded == resolution,
         Some(State::InFlight) | None => false,
     };
     if !settled {
@@ -395,12 +426,18 @@ fn apply_call(
                 call: record.command.clone(),
             });
         },
-        // A find's query stands where a call's command would, so an answer that asked the finder
-        // admits no call.
+        // A find's query or an edit's patch stands where a call's command would.
         Some(Action::Find { query }) => {
             return Err(Refusal::CommandMismatch {
                 turn: record.turn,
                 answer: query.clone(),
+                call: record.command.clone(),
+            });
+        },
+        Some(Action::Edit { patch, .. }) => {
+            return Err(Refusal::CommandMismatch {
+                turn: record.turn,
+                answer: patch.clone(),
                 call: record.command.clone(),
             });
         },
@@ -429,6 +466,7 @@ fn apply_find(
     };
     let named = match named {
         Action::Find { query } => query,
+        Action::Edit { patch, .. } => patch,
         Action::Command { .. } | Action::Final | Action::Malformed { .. } => "",
     };
     if named != record.query {
@@ -440,6 +478,115 @@ fn apply_find(
     }
 
     into.finds.insert(record.turn, record.clone());
+    Ok(Ack::Applied)
+}
+
+fn apply_edit_intent(
+    into: &mut Transcript,
+    record: &EditIntentRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::EditIntent(record.execution);
+    if let Some(recorded) = into.edit_intents.get(&record.execution) {
+        return if recorded == record {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let requested = into
+        .turn(record.turn)
+        .is_some_and(|turn| turn.tool(record.execution).is_some());
+    if !requested {
+        return Err(Refusal::Floating(key));
+    }
+
+    match into.newest_answer(record.turn).map(|answer| &answer.action) {
+        Some(Action::Edit { patch, .. }) if patch != &record.patch => {
+            return Err(Refusal::EditMismatch {
+                turn: record.turn,
+                answer: patch.clone(),
+                edit: record.patch.clone(),
+            });
+        },
+        Some(Action::Command { command }) => {
+            return Err(Refusal::EditMismatch {
+                turn: record.turn,
+                answer: command.clone(),
+                edit: record.patch.clone(),
+            });
+        },
+        Some(Action::Find { query }) => {
+            return Err(Refusal::EditMismatch {
+                turn: record.turn,
+                answer: query.clone(),
+                edit: record.patch.clone(),
+            });
+        },
+        None | Some(Action::Final | Action::Malformed { .. }) => {
+            return Err(Refusal::Floating(key));
+        },
+        Some(Action::Edit { .. }) => {},
+    }
+
+    into.edit_intents.insert(record.execution, record.clone());
+    Ok(Ack::Applied)
+}
+
+fn apply_edit_outcome(
+    into: &mut Transcript,
+    record: &EditOutcomeRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::EditOutcome(record.execution);
+    if let Some(recorded) = into.edit_outcomes.get(&record.execution) {
+        return if recorded == &record.report {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let Some(turn) = into
+        .turns
+        .iter()
+        .find(|(_, state)| state.tool(record.execution).is_some())
+        .map(|(turn, _)| *turn)
+    else {
+        return Err(Refusal::Floating(key));
+    };
+    if turn != record.turn {
+        return Err(Refusal::Floating(key));
+    }
+
+    let resolution = record.report.outcome.resolution();
+    let settled = match into
+        .session
+        .execution(record.execution)
+        .map(|held| held.state())
+    {
+        Some(
+            State::Settled(recorded)
+            | State::Applied {
+                resolution: recorded,
+            },
+        ) => recorded == resolution,
+        Some(State::InFlight) | None => false,
+    };
+    if !settled {
+        return Err(Refusal::Floating(key));
+    }
+
+    match record.report.outcome {
+        EditOutcome::Applied | EditOutcome::Stale { .. }
+            if !into.edit_intents.contains_key(&record.execution) =>
+        {
+            return Err(Refusal::Unprepared(record.execution));
+        },
+        EditOutcome::Applied | EditOutcome::Stale { .. } | EditOutcome::Refused { .. } => {},
+    }
+
+    into.edit_outcomes
+        .insert(record.execution, record.report.clone());
     Ok(Ack::Applied)
 }
 
@@ -458,11 +605,12 @@ pub fn number_of(
 #[cfg(test)]
 mod tests {
     use super::{Record, Transcript, number_of};
+    use crate::edit::{EditOutcome, EditReport};
     use crate::find::FindReport;
     use crate::model::{Action, Usage};
     use crate::record::{
-        AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, RecordKey, Refusal,
-        SpeechRecord, TaskRecord,
+        AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
+        PromptRecord, RecordKey, Refusal, SpeechRecord, TaskRecord,
     };
     use crate::task::{Budget, Setting, Task};
     use crate::test_support::{artifact, execution_id, session, task, turn_id};
@@ -1042,6 +1190,297 @@ mod tests {
                 "the find for turn {} asks \"tantivy\" but its answer named \"bm25\"",
                 turn_id(1).as_uuid(),
             ),
+        );
+    }
+
+    fn edit_answer(
+        turn: TurnID,
+        patch: &str,
+    ) -> Record {
+        Record::Answer(AnswerRecord {
+            turn,
+            attempt: Attempt::new(1),
+            action: Action::Edit {
+                patch: patch.to_owned(),
+                expect: None,
+            },
+            prose: String::new(),
+            text: artifact(0xaa),
+            model: "test".to_owned(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+            },
+        })
+    }
+
+    fn edit_intent(
+        turn: TurnID,
+        execution: ExecutionID,
+        patch: &str,
+        relative: &str,
+    ) -> Record {
+        Record::EditIntent(EditIntentRecord {
+            turn,
+            execution,
+            patch: patch.to_owned(),
+            expect: None,
+            relative: relative.to_owned(),
+            before: artifact(0x01),
+            after: artifact(0x02),
+            placement: "hunk 1 matched at line 1 (offset 0)".to_owned(),
+        })
+    }
+
+    fn edit_outcome(
+        turn: TurnID,
+        execution: ExecutionID,
+        outcome: EditOutcome,
+    ) -> Record {
+        Record::EditOutcome(EditOutcomeRecord {
+            turn,
+            execution,
+            report: EditReport {
+                outcome,
+                observation: String::new(),
+            },
+        })
+    }
+
+    fn an_edit_answered_turn(patch: &str) -> (Transcript, TurnID, ExecutionID) {
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        transcript
+            .apply(&Record::Session {
+                fact: Fact::SessionOpened,
+            })
+            .unwrap();
+        open(&mut transcript, turn, 1);
+        request(&mut transcript, turn, 1);
+        answered(&mut transcript, turn);
+        transcript.apply(&edit_answer(turn, patch)).unwrap();
+        transcript
+            .apply(&Record::Session {
+                fact: Fact::ExecutionLaunched {
+                    execution,
+                    deadline: Deadline::Unbounded,
+                },
+            })
+            .unwrap();
+        transcript
+            .apply(&Record::Turn {
+                turn,
+                fact: TurnFact::ToolRequested {
+                    execution,
+                    deadline: Deadline::Unbounded,
+                },
+            })
+            .unwrap();
+        (transcript, turn, execution)
+    }
+
+    #[test]
+    fn an_edit_intent_is_floating_without_its_request() {
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        open(&mut transcript, turn, 1);
+
+        assert_eq!(
+            transcript.apply(&edit_intent(
+                turn,
+                execution,
+                "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+y\n",
+                "a"
+            )),
+            Err(Refusal::Floating(RecordKey::EditIntent(execution))),
+        );
+    }
+
+    #[test]
+    fn an_edit_intent_refuses_a_different_patch() {
+        let (mut transcript, turn, execution) =
+            an_edit_answered_turn("--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+y\n");
+
+        assert_eq!(
+            transcript.apply(&edit_intent(
+                turn,
+                execution,
+                "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+z\n",
+                "a"
+            )),
+            Err(Refusal::EditMismatch {
+                turn,
+                answer: "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+y\n".to_owned(),
+                edit: "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+z\n".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn an_edit_intent_refuses_a_command_answer() {
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = a_requested_turn(execution);
+        transcript
+            .apply(&answer(
+                turn,
+                Action::Command {
+                    command: "ls".to_owned(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(
+            transcript.apply(&edit_intent(turn, execution, "p", "a")),
+            Err(Refusal::EditMismatch {
+                turn,
+                answer: "ls".to_owned(),
+                edit: "p".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn an_edit_intent_refuses_a_find_answer() {
+        let (mut transcript, turn, execution) = {
+            let (mut t, turn) = a_find_answered_turn("bm25");
+            let execution = execution_id(turn);
+            requested(&mut t, turn, execution);
+            (t, turn, execution)
+        };
+
+        assert_eq!(
+            transcript.apply(&edit_intent(turn, execution, "p", "a")),
+            Err(Refusal::EditMismatch {
+                turn,
+                answer: "bm25".to_owned(),
+                edit: "p".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_call_after_an_answer_that_asked_for_an_edit_is_refused() {
+        let (mut transcript, turn, execution) = an_edit_answered_turn("p");
+
+        assert_eq!(
+            transcript.apply(&call(turn, execution)),
+            Err(Refusal::CommandMismatch {
+                turn,
+                answer: "p".to_owned(),
+                call: "ls".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_find_after_an_answer_that_asked_for_an_edit_is_refused() {
+        let (mut transcript, turn, _) = an_edit_answered_turn("p");
+
+        assert_eq!(
+            transcript.apply(&find(turn, "bm25")),
+            Err(Refusal::QueryMismatch {
+                turn,
+                answer: "p".to_owned(),
+                find: "bm25".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn an_applied_edit_outcome_is_unprepared_without_its_intent() {
+        let (mut transcript, turn, execution) = an_edit_answered_turn("p");
+        settle(&mut transcript, execution, Resolution::Applied);
+
+        assert_eq!(
+            transcript.apply(&edit_outcome(turn, execution, EditOutcome::Applied)),
+            Err(Refusal::Unprepared(execution)),
+        );
+    }
+
+    #[test]
+    fn an_edit_outcome_is_refused_when_the_settlement_disagrees() {
+        let (mut transcript, turn, execution) = an_edit_answered_turn("p");
+        transcript
+            .apply(&edit_intent(turn, execution, "p", "a"))
+            .unwrap();
+        settle(&mut transcript, execution, Resolution::Refused);
+
+        assert_eq!(
+            transcript.apply(&edit_outcome(turn, execution, EditOutcome::Applied)),
+            Err(Refusal::Floating(RecordKey::EditOutcome(execution))),
+        );
+    }
+
+    #[test]
+    fn an_applied_edit_outcome_folds_when_its_intent_exists() {
+        let (mut transcript, turn, execution) = an_edit_answered_turn("p");
+        transcript
+            .apply(&edit_intent(turn, execution, "p", "a"))
+            .unwrap();
+        settle(&mut transcript, execution, Resolution::Applied);
+        transcript
+            .apply(&Record::Session {
+                fact: Fact::ResultApplied { execution },
+            })
+            .unwrap();
+
+        assert_eq!(
+            transcript.apply(&edit_outcome(turn, execution, EditOutcome::Applied)),
+            Ok(Ack::Applied),
+        );
+        assert_eq!(
+            transcript
+                .edit_outcome_of(execution)
+                .map(|report| report.outcome.clone()),
+            Some(EditOutcome::Applied),
+        );
+    }
+
+    #[test]
+    fn a_refused_edit_outcome_folds_with_no_intent() {
+        let (mut transcript, turn, execution) = an_edit_answered_turn("p");
+        settle(&mut transcript, execution, Resolution::Refused);
+
+        assert_eq!(
+            transcript.apply(&edit_outcome(
+                turn,
+                execution,
+                EditOutcome::Refused {
+                    reason: "no file".to_owned(),
+                },
+            )),
+            Ok(Ack::Applied),
+        );
+    }
+
+    #[test]
+    fn an_edit_outcome_redelivered_is_a_duplicate_and_a_different_one_is_a_conflict() {
+        let (mut transcript, turn, execution) = an_edit_answered_turn("p");
+        transcript
+            .apply(&edit_intent(turn, execution, "p", "a"))
+            .unwrap();
+        settle(&mut transcript, execution, Resolution::Applied);
+        transcript
+            .apply(&Record::Session {
+                fact: Fact::ResultApplied { execution },
+            })
+            .unwrap();
+        let record = edit_outcome(turn, execution, EditOutcome::Applied);
+        transcript.apply(&record).unwrap();
+
+        assert_eq!(transcript.apply(&record), Ok(Ack::Duplicate));
+        assert_eq!(
+            transcript.apply(&edit_outcome(
+                turn,
+                execution,
+                EditOutcome::Refused {
+                    reason: "no".to_owned(),
+                },
+            )),
+            Err(Refusal::Conflict(RecordKey::EditOutcome(execution))),
         );
     }
 

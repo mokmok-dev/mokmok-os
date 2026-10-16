@@ -19,6 +19,10 @@ pub struct Context {
     /// prompt names it, because both are built from the same recorded task.
     #[serde(default)]
     pub search: bool,
+    /// Whether the session holds a writable checkout. The body offers the edit tool exactly when
+    /// this flag is true, because both are built from the same recorded task.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// One turn the model may see: what opened it and what the agent did with it.
@@ -56,6 +60,10 @@ pub enum ContextAct {
         query: String,
         observation: String,
     },
+    /// The agent asked for an edit. The rendering names the file itself, so no path rides beside it.
+    Edited {
+        observation: String,
+    },
 }
 
 impl Context {
@@ -82,6 +90,7 @@ impl Context {
                                     observation,
                                 },
                             ) => command.len() + observation.len(),
+                            Some(ContextAct::Edited { observation }) => observation.len(),
                             Some(ContextAct::Said { reply }) => reply.len(),
                             None => 0,
                         }
@@ -99,17 +108,34 @@ impl Context {
 pub fn system_prompt(task: &Task) -> String {
     // A session granted no root is handed the words it was handed before the finder existed. The
     // task is durable, so a resumed session must rebuild its first prompt byte for byte.
-    let tooling = if task.setting.search.is_empty() {
-        "You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n"
-            .to_owned()
+    let shell = "run_shell takes a command string and runs `sh -c`";
+    let find = if task.setting.search.is_empty() {
+        None
     } else {
-        format!(
-            "You have two tools. run_shell takes a command string and runs `sh -c`. find_files \
-             takes a query string and searches the names and contents of the files under {}; it \
-             enters no directory whose name begins with a dot, and it reads and changes nothing, so \
-             a find never changes the checkout.\n",
+        Some(format!(
+            "find_files takes a query string and searches the names and contents of the files \
+             under {}; it enters no directory whose name begins with a dot, and it reads and \
+             changes nothing, so a find never changes the checkout",
             paths(&task.setting.search),
-        )
+        ))
+    };
+    let edit = if task.setting.writable.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "apply_patch takes a unified diff and rewrites one file under {}; one file per call, \
+             and the patch applies cleanly or nothing is written",
+            task.setting.checkout.display(),
+        ))
+    };
+
+    let mut tools = vec![shell.to_owned()];
+    tools.extend(find);
+    tools.extend(edit);
+    let tooling = if tools.is_empty() {
+        String::new()
+    } else {
+        format!("You have these tools: {}.\n", tools.join("; "))
     };
 
     format!(
@@ -196,6 +222,24 @@ impl Transcript {
             });
         }
 
+        // A refusal decided before anything was written records an outcome and no intent, so the
+        // outcome is what the turn is shown by, whether or not an intent stands beside it.
+        let execution = crate::advance::execution_id(turn);
+        if let Some(report) = self.edit_outcome_of(execution) {
+            return Some(ContextAct::Edited {
+                observation: clip(report.observation.as_bytes(), self.observation_limit()),
+            });
+        }
+
+        if let Some(intent) = self.edit_of(turn) {
+            return Some(ContextAct::Edited {
+                observation: clip(
+                    crate::edit::unproven(intent).as_bytes(),
+                    self.observation_limit(),
+                ),
+            });
+        }
+
         if let Some(answer) = self.newest_answer(turn)
             && answer.action == crate::model::Action::Final
         {
@@ -248,6 +292,7 @@ pub fn context(transcript: &Transcript) -> Context {
             goal: String::new(),
             turns: Vec::new(),
             search: false,
+            writable: false,
         };
     };
 
@@ -259,6 +304,7 @@ pub fn context(transcript: &Transcript) -> Context {
         goal: task.goal.clone(),
         turns,
         search: !task.setting.search.is_empty(),
+        writable: !task.setting.writable.is_empty(),
     };
     while context.bytes() > bytes_of(task.budget.context_bytes) && !context.turns.is_empty() {
         context.turns.remove(0);
@@ -307,13 +353,14 @@ mod tests {
         system_prompt,
     };
     use crate::dialogue::Transcript;
+    use crate::edit::EditOutcome;
     use crate::find::FindReport;
     use crate::model::{Action, Usage};
     use crate::record::{AnswerRecord, CallRecord, PromptRecord, Record, SpeechRecord};
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
-        begin_records, execution_id, find_records, open_records, session, speech_records, task,
-        turn_id,
+        begin_records, edit_intent_records, edit_outcome_records, edit_refusal_records,
+        execution_id, find_records, open_records, session, speech_records, task, turn_id,
     };
     use crate::tool::{Exit, ToolReport, UNKNOWN_WARNING, observation};
     use mokmok_protocol::{ExecutionID, TurnID};
@@ -458,6 +505,7 @@ mod tests {
             goal: "goal!!".to_owned(),
             turns: vec![turn_of(1)],
             search: false,
+            writable: false,
         };
 
         assert_eq!(
@@ -979,8 +1027,10 @@ mod tests {
         }
     }
 
-    const PROMPT_WITHOUT_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
-         You have one tool, run_shell, whose only argument is a command string; it runs `sh -c`.\n\
+    const PROMPT_WITH_EDIT: &str = "You are a coding agent working in a scratch checkout.\n\
+         You have these tools: run_shell takes a command string and runs `sh -c`; apply_patch \
+         takes a unified diff and rewrites one file under /srv/checkout; one file per call, and the \
+         patch applies cleanly or nothing is written.\n\
          The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
          There is no TCP network. Reach the checkout by absolute path, for example \
          `cd /srv/checkout && ...`.\n\
@@ -989,11 +1039,13 @@ mod tests {
          rather than run, so work inside the grants.\n\
          When the goal is met, answer without calling the tool.";
 
-    const PROMPT_WITH_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
-         You have two tools. run_shell takes a command string and runs `sh -c`. find_files takes a \
-         query string and searches the names and contents of the files under /srv/checkout; it \
-         enters no directory whose name begins with a dot, and it reads and changes nothing, so a \
-         find never changes the checkout.\n\
+    const PROMPT_WITH_EDIT_AND_FINDER: &str = "You are a coding agent working in a scratch checkout.\n\
+         You have these tools: run_shell takes a command string and runs `sh -c`; find_files \
+         takes a query string and searches the names and contents of the files under /srv/checkout; \
+         it enters no directory whose name begins with a dot, and it reads and changes nothing, so a \
+         find never changes the checkout; apply_patch takes a unified diff and rewrites one file \
+         under /srv/checkout; one file per call, and the patch applies cleanly or nothing is \
+         written.\n\
          The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
          There is no TCP network. Reach the checkout by absolute path, for example \
          `cd /srv/checkout && ...`.\n\
@@ -1035,16 +1087,40 @@ mod tests {
     }
 
     #[test]
-    fn a_task_with_no_granted_root_gets_the_prompt_it_got_before_the_finder() {
+    fn a_task_with_no_granted_root_but_a_writable_checkout_gets_the_edit_tool() {
         let mut task = task(4);
         task.setting.search.clear();
 
-        assert_eq!(system_prompt(&task), PROMPT_WITHOUT_FINDER);
+        assert_eq!(system_prompt(&task), PROMPT_WITH_EDIT);
+    }
+
+    #[test]
+    fn a_task_with_no_writable_checkout_gets_only_the_shell_tool() {
+        let mut task = task(4);
+        task.setting.writable.clear();
+        task.setting.search.clear();
+        let prompt = system_prompt(&task);
+
+        assert!(prompt.contains("run_shell"), "{prompt}");
+        assert!(!prompt.contains("apply_patch"), "{prompt}");
+        assert!(!prompt.contains("find_files"), "{prompt}");
+        assert!(prompt.contains("writable paths are none"), "{prompt}");
     }
 
     #[test]
     fn a_task_with_a_granted_root_is_offered_the_finder_over_that_root() {
-        assert_eq!(system_prompt(&task(4)), PROMPT_WITH_FINDER);
+        let mut task = task(4);
+        task.setting.writable.clear();
+        let prompt = system_prompt(&task);
+
+        assert!(prompt.contains("run_shell"), "{prompt}");
+        assert!(prompt.contains("find_files"), "{prompt}");
+        assert!(!prompt.contains("apply_patch"), "{prompt}");
+    }
+
+    #[test]
+    fn a_task_with_both_tools_is_offered_both() {
+        assert_eq!(system_prompt(&task(4)), PROMPT_WITH_EDIT_AND_FINDER);
     }
 
     #[test]
@@ -1071,6 +1147,7 @@ mod tests {
                 goal: "goal".to_owned(),
                 turns: Vec::new(),
                 search: false,
+                writable: false,
             },
         );
     }
@@ -1112,6 +1189,137 @@ mod tests {
             Some(ContextAct::Found {
                 query: "bm25".to_owned(),
                 observation: format!("{}\n… 30 bytes elided …\n{}", "x".repeat(5), "x".repeat(5)),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_recorded_edit_is_shown_as_an_edited_act() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Edit {
+                    patch: "p".to_owned(),
+                    expect: None,
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &edit_intent_records(
+                turn,
+                execution,
+                "p",
+                "src/x.rs",
+                &artifact(0x01),
+                &artifact(0x02),
+                "hunk 1 matched at line 1 (offset 0)",
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &edit_outcome_records(turn, execution, EditOutcome::Applied, "edit applied"),
+        );
+
+        let built = context(&transcript);
+
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Edited {
+                observation: "edit applied".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn an_interrupted_edit_shows_the_unproven_warning() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Edit {
+                    patch: "p".to_owned(),
+                    expect: None,
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &edit_intent_records(
+                turn,
+                execution,
+                "p",
+                "src/x.rs",
+                &artifact(0x01),
+                &artifact(0x02),
+                "hunk 1 matched at line 1 (offset 0)",
+            ),
+        );
+        // Recovery settles the turn failed, so the in-flight edit stays visible.
+        apply_all(&mut transcript, &recovery_facts(turn, execution));
+
+        let built = context(&transcript);
+
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Edited {
+                observation: crate::edit::unproven(transcript.edit_of(turn).unwrap(),),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_refused_edit_is_shown_by_its_outcome_rather_than_by_a_command() {
+        let task = task(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Edit {
+                    patch: "p".to_owned(),
+                    expect: None,
+                },
+            ),
+        );
+        // A refusal decided before anything was written records an outcome and no intent, so the
+        // rendering has to come from the outcome or the turn reads as a command that never ran.
+        apply_all(
+            &mut transcript,
+            &edit_refusal_records(
+                turn,
+                execution,
+                "the patch names two files",
+                "the edit was refused: the patch names two files",
+            ),
+        );
+
+        let built = context(&transcript);
+
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Edited {
+                observation: "the edit was refused: the patch names two files".to_owned(),
             }),
         );
     }
