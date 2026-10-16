@@ -79,6 +79,13 @@ mod tests {
     }
 
     #[test]
+    fn the_default_root_is_what_the_runtime_directory_decides() {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+
+        assert_eq!(Config::default().root, root_for(runtime.as_deref()));
+    }
+
+    #[test]
     fn the_confiner_is_the_sibling_of_the_running_executable() {
         assert_eq!(
             confiner_for(Some(Path::new("/usr/libexec/mokmok-bus"))),
