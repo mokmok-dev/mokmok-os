@@ -144,7 +144,7 @@ injection (`src/config.rs:555`), and the workspace's only wall-clock read
 
 # Tests
 
-160 cases: 112 in `#[cfg(test)]` modules, one of them ignored, and 48 across five integration files.
+162 cases: 114 in `#[cfg(test)]` modules, one of them ignored, and 48 across five integration files.
 
 `src/provider.rs` holds 32 cases for the measured model exchange, malformed output, the request
 body, endpoint parsing, credential secrecy, and not following a redirect. `src/config.rs` holds 44

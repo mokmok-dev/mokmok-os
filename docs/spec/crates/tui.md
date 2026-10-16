@@ -129,7 +129,7 @@ another process.
 
 # Tests
 
-81 cases: 9 in `tests/` and 72 across four `#[cfg(test)]` modules, two of them property cases.
+88 cases: 9 in `tests/` and 79 across four `#[cfg(test)]` modules, two of them property cases.
 
 Six of the nine cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -146,15 +146,17 @@ that a frame drawn while a turn is in flight, the listing, and the prompt that n
 a real terminal (`tests/binary.rs:374`).
 
 Four modules hold the rest.
-One holds 38 cases and one property case for the trouble row, the work row, a dispatched command with
+One holds 39 cases and one property case for the trouble row, the work row, a dispatched command with
 no call record, the empty-line guard, the byte ceiling of the typed line and of a named goal, the
 status phrase of each mode, the rotation and its order, the listing's rows and cursor, adopting and
-creating a session, each pane's keys, and the frame the manager builds (`src/core.rs:681`).
+creating a session, each pane's keys, and the frame the manager builds (`src/core.rs:676`).
 One holds 17 cases and one property case for gutters, multi-row replies, row-wise windowing, the
 trouble row, a find row, escaped control characters, the replay, and the rows of the listing
-(`src/port.rs:472`).
-One holds one case for a step another writer committed becoming visible after the engine reopens the
-ledger (`src/session.rs:169`).
+(`src/port.rs:468`).
+One holds 7 cases for a step another writer committed becoming visible after the engine reopens the
+ledger, the goal and the checkout the log holds being the ones a resumed session runs under, a
+session with no task being refused, a created session running under the goal the human typed, and the
+listing mapping onto what the kernel holds (`src/session.rs:194`).
 One holds 16 cases for the layout, scrollback, the key map, the press rule, the event
 classification, the terminal check, a find row, and the two panes (`src/terminal.rs:208`).
 
