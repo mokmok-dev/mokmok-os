@@ -96,7 +96,8 @@
               }
             );
 
-            # `mokmok-os-architecture.md` section 9 asks CI to enforce these dependency rules.
+            # Six of these come from `mokmok-os-architecture.md` section 9, which asks CI to check
+            # them, and three hold the role each member declares.
             dependencyRules =
               pkgs.runCommand "dependency-rules"
                 {

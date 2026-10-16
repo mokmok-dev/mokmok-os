@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The dependency rules `mokmok-os-architecture.md` section 9 asks CI to check.
+# The rules for this workspace. Six come from `mokmok-os-architecture.md` section 9, which asks CI to
+# check them, and three arrived with the roles each member declares.
 
 set -uo pipefail
 
