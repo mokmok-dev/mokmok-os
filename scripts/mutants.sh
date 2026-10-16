@@ -70,6 +70,17 @@ counts_of() {
   ' "$1"
 }
 
+# One of cargo-mutants' per-summary name files as a JSON array, or `[]` when the file is absent.
+list_of() {
+  if [ ! -f "$1" ]; then
+    echo '[]'
+
+    return
+  fi
+
+  jq -R -s 'split("\n") | map(select(length > 0))' "$1"
+}
+
 # Tenths of a percent, so the printed score and any comparison agree.
 score_of() {
   local caught="$1" tested="$2"
@@ -109,12 +120,6 @@ report_single() {
 
   cargo mutants --package "$PACKAGE" "${ARGUMENTS[@]}" || status=$?
 
-  if [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then
-    echo "cargo mutants failed with status $status" >&2
-
-    exit "$status"
-  fi
-
   for argument in "${ARGUMENTS[@]}"; do
     if [ "$argument" = "--list" ]; then
       # A listing writes no outcomes, so scoring here would report a previous run.
@@ -122,10 +127,12 @@ report_single() {
     fi
   done
 
+  # As in `--all`: exit 3 means a mutant timed out, and the outcomes are written anyway. Only a run
+  # that left no outcomes at all, such as one whose unmutated baseline failed, is unscoreable.
   if [ ! -f mutants.out/outcomes.json ]; then
-    echo "cargo mutants left no mutants.out/outcomes.json to score" >&2
+    echo "cargo mutants exited $status without mutants.out/outcomes.json to score" >&2
 
-    exit 1
+    exit "$status"
   fi
 
   local caught missed timeout unviable tested tenths
@@ -284,13 +291,16 @@ record_row() {
     printf "%.1f", t
   }')
 
-  local missed_list
-  missed_list=$(jq -R -s 'split("\n") | map(select(length > 0))' \
-    <(cat "$scratch/$member/mutants.out/missed.txt" "$scratch/$member/mutants.out/timeout.txt" 2>/dev/null || true))
+  # One array per summary, so each count in the row matches its own list and
+  # `tested == caught + len(missed) + timeout` holds. Folding timeouts into `missed` would make that
+  # arithmetic double-count them.
+  local missed_list timed_out_list
+  missed_list=$(list_of "$scratch/$member/mutants.out/missed.txt")
+  timed_out_list=$(list_of "$scratch/$member/mutants.out/timeout.txt")
 
-  printf '{"name":%s,"score":%s,"target":%s,"tested":%s,"caught":%s,"missed":%s,"timeout":%s,"digest":%s}\n' \
+  printf '{"name":%s,"score":%s,"target":%s,"tested":%s,"caught":%s,"missed":%s,"timeout":%s,"timed_out":%s,"digest":%s}\n' \
     "$(jq -n --arg v "$member" '$v')" "$score" "$target" "$tested" "$caught" "$missed_list" "$timeout" \
-    "$(jq -n --arg v "$digest" '$v')" \
+    "$timed_out_list" "$(jq -n --arg v "$digest" '$v')" \
     >> "$scratch/rows.jsonl"
 
   echo "$member: caught=$caught missed=$missed timeout=$timeout unviable=$unviable score=$score% target=$target%"
@@ -361,6 +371,18 @@ check_baseline() {
       failures=$((failures + 1))
 
       continue
+    fi
+
+    # The row is a measurement this script wrote, so its own arithmetic has to hold: the counts add
+    # up to what was tested, each list is as long as its count, and the score is the one those
+    # counts give. A row that fails this was edited by hand.
+    if ! jq -e '
+      (.tested == .caught + (.missed | length) + .timeout)
+      and (.timeout == (.timed_out | length))
+      and ((.score * 10 | round) == ((.caught * 1000 / .tested) | floor))
+    ' <<< "$(jq -c --arg n "$name" '.members[] | select(.name == $n)' "$LEDGER")" > /dev/null; then
+      echo "$name: the row's own numbers disagree with each other" >&2
+      failures=$((failures + 1))
     fi
 
     if awk -v s="$score" -v t="$target" 'BEGIN { exit !(s + 0 < t + 0) }'; then
