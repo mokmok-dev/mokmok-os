@@ -162,6 +162,24 @@ fn phase_phrase(phase: Phase) -> String {
     }
 }
 
+/// One phrase for a session only the log holds, saying when its task is the thing the log does not
+/// hold.
+///
+/// The runtime continues a session under the task its log recorded and has no other goal to continue
+/// one under, so a session this build reads no task from is marked where the human chooses it rather
+/// than after he has chosen it.
+fn listed_phrase(listing: &Listing) -> String {
+    let phase = phase_phrase(listing.phase);
+
+    match listing.goal {
+        None => format!("{phase} {NO_TASK}"),
+        Some(_) => phase,
+    }
+}
+
+/// What a session the log holds no task for says about itself.
+const NO_TASK: &str = "(no task recorded)";
+
 fn background(
     folds: &[Transcript],
     focus: usize,
@@ -303,7 +321,7 @@ impl<E: Engine> Manager<E> {
                 .map(|listing| Row {
                     session: listing.session,
                     goal: listing.goal.clone(),
-                    status: phase_phrase(listing.phase),
+                    status: listed_phrase(listing),
                     held: false,
                     focused: false,
                 }),
@@ -486,8 +504,12 @@ impl<E: Engine> Manager<E> {
                 Reaction::Idle
             },
             Key::Enter => match &mut self.pane {
+                // A session the log holds no task for is not opened: the run would carry the command
+                // line's goal into it and the runtime would close it on the model's first answer, so
+                // the row says what it is and choosing it does nothing.
                 Some(Pane::List { cursor }) => rows
                     .get(*cursor)
+                    .filter(|row| row.goal.is_some())
                     .map_or(Reaction::Idle, |row| Reaction::Adopt(row.session)),
                 Some(Pane::New { goal }) if !goal.trim().is_empty() => {
                     Reaction::Create(mem::take(goal))
@@ -1465,7 +1487,7 @@ mod tests {
                 Row {
                     session: others(2),
                     goal: None,
-                    status: "not opened".to_owned(),
+                    status: "not opened (no task recorded)".to_owned(),
                     held: false,
                     focused: false,
                 },
@@ -1547,13 +1569,35 @@ mod tests {
     #[test]
     fn enter_in_the_listing_chooses_the_row_the_cursor_is_on() {
         let mut manager = holding(vec![Fake::awaiting()]);
-        manager.listed = vec![listing(others(2), Phase::Accepting, None)];
+        manager.listed = vec![listing(
+            others(2),
+            Phase::Accepting,
+            Some("count the quokkas"),
+        )];
         manager.pane = Some(Pane::List { cursor: 1 });
 
         assert_eq!(
             react(&mut manager, Key::Enter),
             Reaction::Adopt(others(2)),
             "the second row is the log's own session",
+        );
+    }
+
+    #[test]
+    fn a_session_the_log_holds_no_task_for_is_not_opened() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.listed = vec![listing(others(2), Phase::Accepting, None)];
+        manager.pane = Some(Pane::List { cursor: 1 });
+
+        assert_eq!(
+            react(&mut manager, Key::Enter),
+            Reaction::Idle,
+            "opening it would carry the command line's goal into a session that recorded none",
+        );
+        assert_eq!(
+            manager.rows(&folds_of(&manager))[1].status,
+            "open (no task recorded)",
+            "and the row says why before the human chooses it",
         );
     }
 
