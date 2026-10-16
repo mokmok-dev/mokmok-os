@@ -49,6 +49,8 @@ pub enum Resolution {
     Cancelled,
     /// The workload never ran: the sandbox refused it, or confined it away before exec.
     Refused,
+    /// The effect ran, but it was not a process's exit; used for edits the daemon wrote.
+    Applied,
     /// The executor could not prove what the workload did.
     ///
     /// This settles the execution like any other resolution, so it no longer blocks the close, but
