@@ -377,7 +377,16 @@ impl std::fmt::Display for RecordKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_QUERY_BYTES, clip_prose, clip_query};
+    use super::{MAX_PROSE_BYTES, MAX_QUERY_BYTES, MAX_SPEECH_BYTES, clip_prose, clip_query};
+
+    // The values are the durable log's byte bounds, and the kernel's provider clips prose to the
+    // second one. Every other consumer reads them by name, so this suite is the only place a drift
+    // in either number shows.
+    #[test]
+    fn the_log_bounds_hold_the_declared_byte_counts() {
+        assert_eq!(MAX_SPEECH_BYTES, 4096);
+        assert_eq!(MAX_PROSE_BYTES, 8192);
+    }
 
     #[test]
     fn a_query_at_the_ceiling_is_kept_whole_and_a_longer_one_is_clipped_to_its_head() {

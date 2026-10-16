@@ -28,34 +28,45 @@ the kernel keeps.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `core::run` | `src/core.rs:173` | The driver loop |
+| `core::run` | `src/core.rs:213` | The driver loop |
 | `Engine` | `src/port.rs:15` | `fold`, `speak`, `step`, `reopen` |
 | `Screen` | `src/port.rs:52` | `event`, `draw` |
-| `Key`, `Event`, `Line`, `View` | `src/port.rs:73,90,99,250` | Input, the four line kinds, and the rendered rows |
+| `Key`, `Event`, `Line`, `View` | `src/port.rs:73,90,103,259` | Input, the five line kinds, and the rendered rows |
 | `Session` | `src/session.rs:15` | The kernel-backed engine |
 | `Terminal` | `src/terminal.rs:22` | The terminal mode, its restoration, and the key reader |
 | `Outcome` | `src/lib.rs:24` | The ending and the printed transcript |
 
 # Owned state
 
-Two in-memory fields, the input line and the scroll offset (`src/core.rs:13-16`). `Terminal` also
+Two in-memory fields, the input line and the scroll offset (`src/core.rs:16-18`). `Terminal` also
 owns the terminal mode it entered, raw mode and the alternate screen, and restores both in its
-`Drop` (`src/terminal.rs:57`). The crate holds no file, no directory, and no database. The log,
+`Drop` (`src/terminal.rs:60-64`). The crate holds no file, no directory, and no database. The log,
 the artifact store, and the sandbox belong to the kernel.
 
 # Invariants
 
 - `Terminal::open` refuses when standard input or standard output is not a terminal, so a run in a
   pipe leaves the screen alone (`src/terminal.rs:34-38`).
-- Raw mode and the alternate screen are left even on an early return (`src/terminal.rs:56-61`).
+- Raw mode and the alternate screen are left even on an early return (`src/terminal.rs:52-54`).
 - A control or alt chord other than `Ctrl-C` is dropped instead of being typed as its letter
-  (`src/terminal.rs:96-101`).
-- An empty or whitespace-only line does not open a turn (`src/core.rs:122-127`).
-- The typed line is capped at `MAX_SPEECH_BYTES` (`src/core.rs:110-116`).
+  (`src/terminal.rs:124-126`).
+- Only a key press is the conversation's key; a release and a repeat are dropped
+  (`src/terminal.rs:116-118`).
+- An event the conversation does not act on is dropped where the terminal's report is classified,
+  so the driver only ever sees a key or a resize (`src/terminal.rs:101-107`).
+- An empty or whitespace-only line does not open a turn (`src/core.rs:161-163`).
+- The typed line is capped at `MAX_SPEECH_BYTES` (`src/core.rs:150-151`).
 - A yielded step, or a draining halt, reopens the ledger so recovery settles what is in flight
-  before the next step (`src/core.rs:197-199`).
+  before the next step (`src/core.rs:234-239`).
+- A provider failure does not end the conversation: the turn spends its next attempt, and the
+  attempt ceiling settles it failed (`src/core.rs:240-246`).
+- A settled turn that renders no act is one the model never finished, and it draws `Line::Trouble`
+  (`src/core.rs:83`) naming the reason its highest attempt answered with, or the attempts it spent
+  without answering.
+- The trouble row renders through `prose_rows` with the gutter `TROUBLE_GUTTER` (`src/port.rs:128`),
+  so the frame and the plain replay show the same text.
 - The library reads no clock; the binary reads one once and passes it in
-  (`src/bin/mokmok-tui.rs:81-88`).
+  (`src/bin/mokmok-tui.rs:77-85`).
 
 # Dependencies
 
@@ -75,23 +86,40 @@ on `mokmok-kernel`, and it sits above it as an application. It is also the only 
 `mokmok-kernel/src/bin/mokmokd.rs` that reads a clock.
 
 Behaviour the document does not describe: the alternate-screen presentation with a plain replay
-printed after the terminal is handed back (`src/bin/mokmok-tui.rs:65-76`), scrollback, `Ctrl-C` as
+printed after the terminal is handed back (`src/bin/mokmok-tui.rs:61-70`), scrollback, `Ctrl-C` as
 the only way out of a live session, `--steps` accepted and ignored, and the `Engine` port that lets
 the loop be driven without a terminal (`src/port.rs:12-16`).
 
 # Tests
 
-22 cases: 3 in `tests/conversation.rs` and 19 across three `#[cfg(test)]` modules.
+45 cases: 5 in `tests/` and 40 across four `#[cfg(test)]` modules, two of them property cases.
 
-All three conversation cases are asynchronous. One asserts that a conversation shows the line it
-answers and survives two exchanges (`tests/conversation.rs:217`), one asserts that a line is refused
-while the turn is in flight (`tests/conversation.rs:305`), and one asserts that a find reaches the
-screen as its own line kind rather than as a command (`tests/conversation.rs:333`). `src/port.rs`
-holds 10 cases for gutters, multi-row replies, row-wise windowing, and the replay.
-`src/terminal.rs` holds 8 cases for the layout, scrollback, and control keys.
+Four of the five cases in `tests/` are asynchronous conversation cases.
+One asserts that a conversation shows the line it answers and survives two exchanges
+(`tests/conversation.rs:215`).
+One asserts that a provider holding no answer settles turn 1 failed and leaves the conversation
+open, with the human's line and a trouble line on screen (`tests/conversation.rs:303`).
+One asserts that a line is refused while the turn is in flight (`tests/conversation.rs:370`).
+One asserts that a find reaches the screen as its own line kind rather than as a command
+(`tests/conversation.rs:398`).
+One asserts that a binary with a pipe on each standard stream refuses the run and says why
+(`tests/binary.rs:76`).
+
+Four modules hold the rest.
+One holds 14 cases and one property case for the empty-line guard, the byte ceiling of the typed
+line, the status phrase of each mode, a settled turn the model never finished, a recorded call's
+work row, a dispatched command with no call record, and an answer that went stale at a later
+attempt (`src/core.rs:265`).
+One holds 13 cases and one property case for gutters, multi-row replies, row-wise windowing, the
+trouble row, a find row, escaped control characters, and the replay (`src/port.rs:294`).
+One holds one case for a step another writer committed becoming visible after the engine reopens
+the ledger (`src/session.rs:66`).
+One holds 12 cases for the layout, scrollback, the key map, the press rule, the event
+classification, the terminal check, and a find row (`src/terminal.rs:171`).
 
 ```
 cargo test -p mokmok-tui
+MUTANTS_PACKAGE=mokmok-tui ./scripts/mutants.sh --jobs 8
 ```
 
 [^architecture]: `mokmok-os-architecture.md` carries no `mokmok-tui` section, so the only claim

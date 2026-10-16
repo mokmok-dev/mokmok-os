@@ -1747,6 +1747,7 @@ dependencies = [
  "mokmok-kernel",
  "mokmok-protocol",
  "mokmok-state-machine",
+ "proptest",
  "ratatui",
  "serde_json",
  "thiserror 2.0.21",

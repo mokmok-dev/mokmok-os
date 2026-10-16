@@ -14,7 +14,7 @@ mod tests {
     use mokmok_artifact::{BlobStore, ContentHash};
     use mokmok_kernel::{Agent, Args, Command, Config, Run};
     use mokmok_protocol::Moment;
-    use mokmok_state_machine::Phase;
+    use mokmok_state_machine::{Phase, Turn, TurnOutcome};
     use mokmok_tui::{Engine, Error, Event, Key, Line, Screen, Session, View, run};
     use serde_json::json;
 
@@ -95,6 +95,10 @@ mod tests {
     }
 
     /// A `cargo mutants` run names the confiner with `MOKMOK_CONFINER`.
+    ///
+    /// The workspace's own confiner sits beside this crate's binary, and a package-scoped build
+    /// leaves it out, because it belongs to another package. No case here dispatches a tool, so the
+    /// path only has to name a runnable file, and `Config::resolve` refuses every grant without one.
     fn confiner() -> PathBuf {
         if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
             let path = PathBuf::from(named);
@@ -103,18 +107,12 @@ mod tests {
             return path;
         }
 
-        let path = PathBuf::from(env!("CARGO_BIN_EXE_mokmok-tui"))
+        let sibling = PathBuf::from(env!("CARGO_BIN_EXE_mokmok-tui"))
             .parent()
             .expect("the binary has a directory")
             .join("mokmok-sandbox-confine");
-        assert!(
-            path.is_file(),
-            "{} is missing: build the workspace (cargo build --workspace) before running this \
-             package's tests alone, or name the confiner with MOKMOK_CONFINER",
-            path.display(),
-        );
 
-        path
+        if sibling.is_file() { sibling } else { shell() }
     }
 
     /// The first shell on `PATH`, which is where a confined workload can find one.
@@ -298,6 +296,73 @@ mod tests {
         assert!(
             text.contains("line 1"),
             "the prompt for turn 1 carries the line it answers:\n{text}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_never_answers_settles_the_turn_and_leaves_the_conversation_open() {
+        let scratch = Scratch::new("unanswered");
+        let path = scratch.0.join("script.json");
+        script(&path, &[]);
+        let (config, spec) = config_and_run(&scratch, &path, &[]);
+
+        let mut session =
+            Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
+        let session_id = session.session();
+        let mut screen = ScriptedScreen {
+            keys: typed(&["line 1"]),
+            frames: Vec::new(),
+        };
+
+        let outcome = run(&mut session, &mut screen)
+            .await
+            .expect("a provider failure does not end the conversation");
+        assert!(
+            outcome.ending.is_none(),
+            "Ctrl-C leaves the session open: {:?}",
+            outcome.ending,
+        );
+
+        let shown: Vec<&Line> = screen
+            .frames
+            .iter()
+            .flat_map(|frame| frame.lines.iter())
+            .collect();
+        assert!(
+            shown
+                .iter()
+                .any(|line| **line == Line::Human("line 1".to_owned())),
+            "the human's line is on screen",
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|line| **line
+                    == Line::Trouble("the model did not answer in 3 attempts".to_owned())),
+            "the spent attempts are on screen as trouble: {shown:?}",
+        );
+
+        let fold = session.fold().expect("the fold reads");
+        assert_eq!(
+            fold.session.phase(),
+            Phase::Accepting,
+            "a failed model call leaves the conversation open for its human",
+        );
+
+        let first = turn_id(session_id, 1);
+        let prompts = fold
+            .prompts
+            .keys()
+            .filter(|(turn, _)| *turn == first)
+            .count();
+        assert_eq!(
+            prompts, 3,
+            "the model is re-asked until the turn's attempt ceiling is spent",
+        );
+        assert_eq!(
+            fold.turn(first).and_then(Turn::outcome),
+            Some(TurnOutcome::Failed),
+            "the turn settles failed rather than the session closing",
         );
     }
 

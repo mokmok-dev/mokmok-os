@@ -95,6 +95,10 @@ pub enum Event {
 }
 
 /// One line of the conversation.
+///
+/// The cases are the things one turn can hold — what the human said, what the agent said, the one
+/// command it ran, what the finder answered, and a turn it could not finish with the reason why —
+/// so a renderer cannot invent a sixth.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Line {
     /// What the human said.
@@ -113,11 +117,15 @@ pub enum Line {
     /// A find is its own line kind rather than a [`Line::Work`]: nothing ran, and a `command` field
     /// would tell the human a program had.
     Find { query: String, observation: String },
+    /// A turn the agent could not finish, and why.
+    Trouble(String),
 }
 
 const HUMAN_GUTTER: &str = "you    ";
 
 const AGENT_GUTTER: &str = "agent  ";
+
+const TROUBLE_GUTTER: &str = "!      ";
 
 // Seven columns, so a continuation row aligns under the first row's text.
 const CONTINUATION_PREFIX: &str = "       ";
@@ -161,6 +169,7 @@ fn rows_of(line: &Line) -> Vec<String> {
     match line {
         Line::Human(text) => prose_rows(HUMAN_GUTTER, text),
         Line::Agent(text) => prose_rows(AGENT_GUTTER, text),
+        Line::Trouble(text) => prose_rows(TROUBLE_GUTTER, text),
         Line::Work {
             command,
             observation,
@@ -284,6 +293,7 @@ impl View {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use uuid::Uuid;
 
     use super::{Line, View};
@@ -515,6 +525,21 @@ mod tests {
     }
 
     #[test]
+    fn a_trouble_row_carries_its_gutter_and_the_replay_carries_the_same_text() {
+        let line = Line::Trouble(
+            "the model did not answer in 3 attempts\nthe turn stopped at that".to_owned(),
+        );
+
+        let drawn = vec![
+            "!      the model did not answer in 3 attempts".to_owned(),
+            "       the turn stopped at that".to_owned(),
+        ];
+
+        assert_eq!(view(vec![line.clone()], 0).visible(2), drawn);
+        assert_eq!(format!("{line}"), drawn.join("\n"));
+    }
+
+    #[test]
     fn a_carriage_return_before_a_line_break_is_one_break() {
         let crlf = view(vec![Line::Agent("one\r\ntwo".to_owned())], 0);
 
@@ -531,5 +556,64 @@ mod tests {
             vec!["agent  a\\rb".to_owned()],
             "a carriage return inside a line is still shown as the escape",
         );
+    }
+
+    #[test]
+    fn a_control_character_that_is_not_a_break_is_drawn_as_a_question_mark() {
+        let line = Line::Agent("bell\u{7}here".to_owned());
+
+        assert_eq!(
+            view(vec![line.clone()], 0).visible(1),
+            vec!["agent  bell?here".to_owned()],
+        );
+        assert_eq!(format!("{line}"), "agent  bell?here");
+    }
+
+    /// Any text a line can hold, its line breaks and control characters among the choices.
+    fn any_text() -> impl Strategy<Value = String> {
+        let piece = prop_oneof![
+            any::<char>(),
+            Just('\n'),
+            Just('\r'),
+            Just('\t'),
+            Just('\u{7}'),
+        ];
+
+        prop::collection::vec(piece, 0..12)
+            .prop_map(|pieces| pieces.into_iter().collect::<String>())
+    }
+
+    proptest! {
+        #[test]
+        fn a_drawn_row_holds_no_control_character_and_matches_the_replay(text in any_text()) {
+            let lines = [
+                Line::Human(text.clone()),
+                Line::Agent(text.clone()),
+                Line::Trouble(text.clone()),
+                Line::Work {
+                    command: text.clone(),
+                    observation: text.clone(),
+                },
+            ];
+
+            for line in &lines {
+                for row in view(vec![line.clone()], 0).visible(usize::MAX) {
+                    prop_assert!(
+                        !row.chars().any(char::is_control),
+                        "the drawn row {row:?} of {text:?} holds a control character",
+                    );
+                }
+            }
+
+            for line in &lines[..3] {
+                let replayed: Vec<String> =
+                    format!("{line}").split('\n').map(str::to_owned).collect();
+                prop_assert_eq!(
+                    view(vec![line.clone()], 0).visible(replayed.len()),
+                    replayed,
+                    "the frame and the replay of {:?} differ", text,
+                );
+            }
+        }
     }
 }

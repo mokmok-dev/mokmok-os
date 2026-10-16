@@ -101,3 +101,65 @@ fn extend_step(
         records,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SPEECH_BYTES, speak};
+    use crate::error::Error;
+    use crate::model::Journal;
+    use crate::record::Receipt;
+    use crate::test_support::{TestJournal, session, task, turn_id};
+    use proptest::prelude::*;
+
+    /// Lines spread across the bound and lines exactly on it, so a case lands where an off-by-one shows.
+    fn arb_line() -> impl Strategy<Value = String> {
+        prop_oneof![
+            8 => 0usize..=MAX_SPEECH_BYTES + 1,
+            1 => Just(MAX_SPEECH_BYTES - 1),
+            1 => Just(MAX_SPEECH_BYTES),
+            1 => Just(MAX_SPEECH_BYTES + 1),
+        ]
+        .prop_map(|len| "x".repeat(len))
+    }
+
+    // The accepted line repeats the bound's own arithmetic instead of reading `MAX_SPEECH_BYTES`,
+    // so a mutated bound has to refuse a line the log holds.
+    #[test]
+    fn a_line_the_log_holds_is_spoken_whole_and_one_byte_more_is_refused() {
+        let session = session();
+        let mut journal = TestJournal::new(session, task(4));
+        let line = "x".repeat(4 * 1024);
+
+        assert_eq!(
+            speak(&mut journal, session, &line).unwrap(),
+            Receipt::Written,
+        );
+        let opened = journal.transcript(session).unwrap();
+        assert_eq!(opened.speech(turn_id(1)), Some(line.as_str()));
+
+        let refused = speak(&mut journal, session, &"x".repeat(MAX_SPEECH_BYTES + 1)).unwrap_err();
+        assert!(
+            matches!(refused, Error::TooMuch { limit, found }
+                if limit == MAX_SPEECH_BYTES && found == MAX_SPEECH_BYTES + 1),
+            "{refused}",
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn speak_accepts_a_line_exactly_when_the_log_can_hold_it(line in arb_line()) {
+            let session = session();
+            let mut journal = TestJournal::new(session, task(4));
+
+            let accepted = speak(&mut journal, session, &line).is_ok();
+
+            prop_assert_eq!(accepted, line.len() <= MAX_SPEECH_BYTES);
+            let transcript = journal.transcript(session).unwrap();
+            if accepted {
+                prop_assert_eq!(transcript.speech(turn_id(1)), Some(line.as_str()));
+            } else {
+                prop_assert_eq!(transcript.speech(turn_id(1)), None);
+            }
+        }
+    }
+}

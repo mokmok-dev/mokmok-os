@@ -1,5 +1,6 @@
 //! Builders the unit tests share, so a hand-written history is written once.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -12,8 +13,8 @@ use crate::error::Error;
 use crate::find::{FindReport, Finder};
 use crate::model::{Action, Usage};
 use crate::record::{
-    AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, Record, SpeechRecord,
-    TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, Receipt, Record, SpeechRecord,
+    Step, StepId, TaskRecord,
 };
 use crate::task::{Budget, Setting, Task};
 use crate::tool::{Exit, ToolReport, observation};
@@ -335,5 +336,95 @@ impl Finder for FakeFinder {
         Ok(FindReport {
             observation: self.observation.clone(),
         })
+    }
+}
+
+/// A journal over a hand-written history: a test seeds it, drives one move, and folds the result.
+pub struct TestJournal {
+    session: SessionID,
+    task: Task,
+    records: Vec<Record>,
+    // The journal lives outside the tests that read its write log, so the field crosses the module
+    // boundary.
+    pub(crate) written: BTreeSet<StepId>,
+    puts: usize,
+}
+
+impl TestJournal {
+    /// A journal for `session` whose transcript names `task` even before its record commits.
+    #[must_use]
+    pub fn new(
+        session: SessionID,
+        task: Task,
+    ) -> Self {
+        Self {
+            session,
+            task,
+            records: Vec::new(),
+            written: BTreeSet::new(),
+            puts: 0,
+        }
+    }
+
+    /// Adds `records` to the history the next transcript folds.
+    pub fn seed(
+        &mut self,
+        records: &[Record],
+    ) {
+        self.records.extend_from_slice(records);
+    }
+
+    /// Marks `id` durable without committing its records, so the step that derives it replays.
+    pub fn mark(
+        &mut self,
+        id: StepId,
+    ) {
+        self.written.insert(id);
+    }
+}
+
+impl crate::model::Journal for TestJournal {
+    fn transcript(
+        &self,
+        session: SessionID,
+    ) -> Result<Transcript, Error> {
+        let mut transcript = Transcript::replay(session, &self.records).map_err(Error::Refused)?;
+        if transcript.task.is_none() {
+            transcript.task = Some(self.task.clone());
+        }
+        Ok(transcript)
+    }
+
+    fn put(
+        &mut self,
+        bytes: &[u8],
+        truncated: bool,
+    ) -> Result<ArtifactRef, Error> {
+        self.puts += 1;
+        let hash = format!("{:016x}", self.puts);
+        Ok(ArtifactRef {
+            hash,
+            bytes: bytes.len() as u64,
+            truncated,
+        })
+    }
+
+    fn append(
+        &mut self,
+        step: Step,
+    ) -> Result<Receipt, Error> {
+        if self.written.contains(&step.id) {
+            return Ok(Receipt::Replayed);
+        }
+
+        let mut transcript =
+            Transcript::replay(self.session, &self.records).map_err(Error::Refused)?;
+        for record in &step.records {
+            transcript.apply(record).map_err(Error::Refused)?;
+        }
+
+        self.written.insert(step.id);
+        self.records.extend(step.records);
+        Ok(Receipt::Written)
     }
 }

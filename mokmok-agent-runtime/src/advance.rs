@@ -717,18 +717,18 @@ mod tests {
     use crate::error::Error;
     use crate::find::{FindReport, NO_SEARCH_ROOT};
     use crate::model::{Action, Answer, Journal, Provider, Usage};
-    use crate::record::{ArtifactRef, MAX_SPEECH_BYTES, Receipt, Record, Step, StepId, StepKey};
+    use crate::record::{MAX_SPEECH_BYTES, Receipt, Record, StepId, StepKey};
     use crate::speech::speak;
     use crate::task::Task;
     use crate::test_support::{
-        FakeFinder, act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
-        begin_records, execution_id, find_records, open_records, report, session, speech_records,
-        task, turn_id,
+        FakeFinder, TestJournal, act_intent_records, act_outcome_records, answer_records,
+        apply_all, artifact, begin_records, execution_id, find_records, open_records, report,
+        session, speech_records, task, turn_id,
     };
     use crate::tool::{Exit, ToolCall, ToolReport, Tools};
-    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_protocol::Moment;
     use mokmok_state_machine::{Attempt, Ending, Fact, Phase, TurnNumber, TurnOutcome};
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -836,90 +836,6 @@ mod tests {
             next(&transcript),
             Move::Halt(Halt::Closed(Ending::Completed)),
         );
-    }
-
-    struct TestJournal {
-        session: SessionID,
-        task: Task,
-        records: Vec<Record>,
-        written: BTreeSet<StepId>,
-        puts: usize,
-    }
-
-    impl TestJournal {
-        fn new(
-            session: SessionID,
-            task: Task,
-        ) -> Self {
-            Self {
-                session,
-                task,
-                records: Vec::new(),
-                written: BTreeSet::new(),
-                puts: 0,
-            }
-        }
-
-        fn seed(
-            &mut self,
-            records: &[Record],
-        ) {
-            self.records.extend_from_slice(records);
-        }
-
-        fn mark(
-            &mut self,
-            id: StepId,
-        ) {
-            self.written.insert(id);
-        }
-    }
-
-    impl crate::model::Journal for TestJournal {
-        fn transcript(
-            &self,
-            session: SessionID,
-        ) -> Result<Transcript, Error> {
-            let mut transcript =
-                Transcript::replay(session, &self.records).map_err(Error::Refused)?;
-            if transcript.task.is_none() {
-                transcript.task = Some(self.task.clone());
-            }
-            Ok(transcript)
-        }
-
-        fn put(
-            &mut self,
-            bytes: &[u8],
-            truncated: bool,
-        ) -> Result<ArtifactRef, Error> {
-            self.puts += 1;
-            let hash = format!("{:016x}", self.puts);
-            Ok(ArtifactRef {
-                hash,
-                bytes: bytes.len() as u64,
-                truncated,
-            })
-        }
-
-        fn append(
-            &mut self,
-            step: Step,
-        ) -> Result<Receipt, Error> {
-            if self.written.contains(&step.id) {
-                return Ok(Receipt::Replayed);
-            }
-
-            let mut transcript =
-                Transcript::replay(self.session, &self.records).map_err(Error::Refused)?;
-            for record in &step.records {
-                transcript.apply(record).map_err(Error::Refused)?;
-            }
-
-            self.written.insert(step.id);
-            self.records.extend(step.records);
-            Ok(Receipt::Written)
-        }
     }
 
     struct ScriptedProvider {
