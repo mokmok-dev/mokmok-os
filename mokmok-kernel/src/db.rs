@@ -377,6 +377,39 @@ impl Db {
         }
     }
 
+    /// Every stream the commit log holds, the stream written most recently first.
+    ///
+    /// The position of a stream's newest commit is the order a chooser wants, and one read over the
+    /// commit log is where it comes from: no registry beside the log has to agree with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the log cannot be read.
+    pub fn streams(&self) -> Result<Vec<StreamId>, Error> {
+        let mut newest: BTreeMap<StreamId, u64> = BTreeMap::new();
+        let mut from = CommitPosition::FIRST;
+
+        loop {
+            let commits = self.store.log(from, PAGE)?;
+            let Some(last) = commits.last() else {
+                break;
+            };
+
+            for committed in &commits {
+                for event in committed.events() {
+                    newest.insert(event.stream(), committed.position().get());
+                }
+            }
+
+            from = last.position().next();
+        }
+
+        let mut streams: Vec<(StreamId, u64)> = newest.into_iter().collect();
+        streams.sort_by_key(|(_, position)| std::cmp::Reverse(*position));
+
+        Ok(streams.into_iter().map(|(stream, _)| stream).collect())
+    }
+
     /// The sessions whose log still holds an execution with no recorded outcome.
     ///
     /// Every event carries the stream that owns it, and a session's stream is its id, so the commit
@@ -897,5 +930,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(db.unsettled_sessions().unwrap(), vec![session()]);
+    }
+
+    #[test]
+    fn streams_answers_every_stream_the_commit_log_holds_newest_first() {
+        let scratch = Scratch::new("streams");
+        let path = scratch.0.join("events.sqlite");
+        let mut db = Db::open(&path).unwrap();
+
+        assert!(
+            db.streams().unwrap().is_empty(),
+            "a log with nothing committed holds no stream",
+        );
+
+        let older = SessionID::from_uuid(Uuid::from_u128(4));
+        let newer = SessionID::from_uuid(Uuid::from_u128(5));
+        for session in [older, newer] {
+            db.append(
+                CommandId::new(),
+                Db::stream(session),
+                Expected::New,
+                &[Entry::Session(Fact::SessionOpened)],
+                Vec::new(),
+            )
+            .unwrap();
+        }
+        // The older stream is written once more, so the order cannot be the order of first writes.
+        db.append(
+            CommandId::new(),
+            Db::stream(older),
+            Expected::At(db.version(Db::stream(older)).unwrap()),
+            &[Entry::Session(Fact::CancelRequested)],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.streams().unwrap(),
+            vec![Db::stream(older), Db::stream(newer)],
+        );
     }
 }

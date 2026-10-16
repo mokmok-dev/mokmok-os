@@ -548,6 +548,16 @@ fn timestamp(at: Moment) -> uuid::Timestamp {
     )
 }
 
+/// A fresh session identity, for a caller that opens a session nothing has opened yet.
+///
+/// The clock reading is the caller's, because no crate below a binary in this workspace reads one.
+/// Two identities minted from the same reading differ in their random bits, so a caller cannot
+/// collide with itself by minting twice before its clock moves.
+#[must_use]
+pub fn mint_session(at: Moment) -> SessionID {
+    SessionID::new(timestamp(at))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Notice, outcome_of, timestamp};
@@ -584,6 +594,32 @@ mod tests {
 
         assert_eq!(seconds, 1_700_000_000);
         assert_eq!(nanos, 500_000_000);
+    }
+
+    #[test]
+    fn a_minted_session_is_a_version_7_identity_two_calls_do_not_repeat() {
+        let at = Moment::from_millis(1_700_000_000_500);
+        let first = super::mint_session(at);
+        let second = super::mint_session(at);
+
+        assert_ne!(
+            first, second,
+            "two sessions minted from one clock reading are two identities",
+        );
+        assert_eq!(first.as_uuid().get_version_num(), 7);
+        assert_eq!(
+            first
+                .as_uuid()
+                .get_timestamp()
+                .map(|stamp| stamp.to_unix().0),
+            Some(1_700_000_000),
+            "the identity carries the moment it was minted from",
+        );
+        assert_eq!(
+            crate::config::uuid_of(&first.as_uuid().to_string(), "session").unwrap(),
+            first.as_uuid(),
+            "the command line reads the identity back as a session",
+        );
     }
 
     #[test]
