@@ -51,7 +51,6 @@ mod tests {
         }
     }
 
-    /// One step of a scripted human: a key he pressed, or a moment he pressed nothing.
     #[derive(Clone, Copy, Debug)]
     enum Step {
         Key(Key),
@@ -60,7 +59,6 @@ mod tests {
         Think(usize),
     }
 
-    /// A screen driven by a script of keys and silences, remembering every frame it was handed.
     struct ScriptedScreen {
         script: VecDeque<Step>,
         frames: Vec<View>,
@@ -547,9 +545,7 @@ mod tests {
         for character in "line 1".chars() {
             script.push_back(Step::Key(Key::Char(character)));
         }
-        // The line opens the session's turn, and nothing else is typed into it again.
         script.push_back(Step::Key(Key::Enter));
-        // A session of the human's own, named and created: from here he is in that one.
         script.push_back(Step::Key(Key::New));
         for character in "second".chars() {
             script.push_back(Step::Key(Key::Char(character)));

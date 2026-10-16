@@ -380,7 +380,6 @@ pub struct Row {
     pub focused: bool,
 }
 
-/// What a row says about a session that recorded no goal.
 const NO_GOAL: &str = "(no goal recorded)";
 
 // Two columns, so the cursor's row and the session the human is in can be told apart at a glance.
@@ -394,8 +393,6 @@ const NO_HELD_MARK: &str = "  ";
 
 const COLUMN_GAP: &str = "  ";
 
-/// One row of the listing as it is drawn: the cursor, whether this process holds the session, the
-/// session's name, its state, and the goal it was given.
 fn drawn_row(
     cursor: bool,
     row: &Row,
@@ -456,7 +453,6 @@ impl View {
     }
 }
 
-/// The rows `height` rows tall that hold row `cursor`, as near the middle of them as the ends allow.
 fn window(
     rows: &[String],
     cursor: usize,
@@ -510,7 +506,6 @@ mod tests {
         }
     }
 
-    /// A view of `count` listing rows with the cursor on `cursor`.
     fn listing(
         count: usize,
         cursor: usize,

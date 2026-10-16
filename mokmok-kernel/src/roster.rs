@@ -81,7 +81,6 @@ mod tests {
     use crate::config::{Args, Config};
     use crate::db::{Db, Entry};
 
-    /// A directory of this case's own, removed when it ends.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -122,7 +121,6 @@ mod tests {
         panic!("no shell on PATH");
     }
 
-    /// The configuration one listing reads, resolved the way the command line resolves it.
     fn config(data: &Path) -> Config {
         let args = Args::try_parse_from([
             "mokmokd",
@@ -158,7 +156,6 @@ mod tests {
         }
     }
 
-    /// Appends `entries` to `session`'s stream, the first write creating it.
     fn write(
         db: &mut Db,
         session: SessionID,

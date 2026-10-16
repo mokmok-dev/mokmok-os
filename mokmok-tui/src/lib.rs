@@ -32,7 +32,6 @@ pub struct Outcome {
 /// One session the process held, and what it said.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Left {
-    /// The session.
     pub session: SessionID,
     /// The ending it reached, or `None` when the human left it open and resumable.
     pub ending: Option<Ending>,

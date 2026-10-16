@@ -36,26 +36,17 @@ enum Mode {
 /// What one keystroke asked the shell to do.
 #[derive(Debug, Eq, PartialEq)]
 enum Reaction {
-    /// Nothing beyond a redraw.
     Idle,
-    /// The line the human submitted.
     Speak(String),
-    /// Leave, with every session as it stands.
     Quit,
-    /// Show the sessions the log holds.
     List,
-    /// Open the session the listing's cursor is on.
     Adopt(SessionID),
-    /// Open a session that does not exist yet, with this goal.
     Create(String),
 }
 
-/// The pane the human opened, and where he is in it.
 #[derive(Debug, Eq, PartialEq)]
 enum Pane {
-    /// The sessions this process holds and the ones the log holds, with the cursor on a row.
     List { cursor: usize },
-    /// The goal of a session that does not exist yet, as it is being typed.
     New { goal: String },
 }
 
@@ -145,7 +136,6 @@ fn reason(
     )
 }
 
-/// One phrase for a session's state and whose turn it is.
 fn status(
     fold: &Transcript,
     input: &str,
@@ -158,7 +148,6 @@ fn status(
     }
 }
 
-/// One phrase for a session that ended.
 fn closed_phrase(ending: Ending) -> String {
     format!("closed ({ending:?})")
 }
@@ -173,7 +162,6 @@ fn phase_phrase(phase: Phase) -> String {
     }
 }
 
-/// One phrase for the sessions whose turn it is besides the one on screen, when any are.
 fn background(
     folds: &[Transcript],
     focus: usize,
@@ -191,23 +179,18 @@ fn background(
     }
 }
 
-/// What answering one reported event left the process doing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Keep {
-    /// Every session is as it was, and the loop carries on.
     Running,
-    /// The human left, with every session as it stands.
     Leaving,
 }
 
-/// Whether every held session has ended, which is when the process is done.
 fn settled(folds: &[Transcript]) -> bool {
     folds
         .iter()
         .all(|fold| matches!(mode(fold), Mode::Ended(_)))
 }
 
-/// What the process leaves behind, one entry per held session in roster order.
 fn outcome(folds: &[Transcript]) -> Outcome {
     Outcome {
         left: folds
@@ -224,11 +207,9 @@ fn outcome(folds: &[Transcript]) -> Outcome {
     }
 }
 
-/// The legend the listing's status row carries for the mark its held rows take.
 const HELD_LEGEND: &str = "* is held";
 
 impl<E: Engine> Manager<E> {
-    /// A manager holding one session, with the human in it and no pane open.
     fn holding(engine: E) -> Self {
         Self {
             held: vec![Held {
@@ -268,7 +249,6 @@ impl<E: Engine> Manager<E> {
         }
     }
 
-    /// The state row: the pane's own phrase when one is open, and the session's otherwise.
     fn status(
         &self,
         folds: &[Transcript],
@@ -299,7 +279,6 @@ impl<E: Engine> Manager<E> {
         }
     }
 
-    /// The listing's rows: every session this process holds, then every one only the log holds.
     fn rows(
         &self,
         folds: &[Transcript],
@@ -333,7 +312,6 @@ impl<E: Engine> Manager<E> {
         rows
     }
 
-    /// The index of the held session `session` names, when this process holds it.
     fn index_of(
         &self,
         session: SessionID,
@@ -358,7 +336,6 @@ impl<E: Engine> Manager<E> {
             .find(|index| matches!(mode(&folds[*index]), Mode::Working))
     }
 
-    /// Adds a session this process just opened, and puts the human in it.
     fn hold(
         &mut self,
         engine: E,
@@ -372,12 +349,10 @@ impl<E: Engine> Manager<E> {
         self.pane = None;
     }
 
-    /// Shows the next session this process holds, wrapping at the end.
     const fn cycle(&mut self) {
         self.focus = (self.focus + 1) % self.held.len();
     }
 
-    /// Opens the listing, with the cursor on the session the human is in.
     fn open_list(
         &mut self,
         folds: &[Transcript],
@@ -484,7 +459,6 @@ impl<E: Engine> Manager<E> {
         }
     }
 
-    /// The keys the pane the human opened answers.
     fn react_pane(
         &mut self,
         key: Key,
@@ -592,7 +566,6 @@ impl<E: Engine> Manager<E> {
         Ok(Keep::Running)
     }
 
-    /// Reaches the line of the session on screen.
     fn line(
         &mut self,
         change: impl FnOnce(&mut String),
@@ -792,7 +765,6 @@ mod tests {
         records
     }
 
-    /// A fold that has begun, is open, and owes the human nothing.
     fn idle() -> Vec<Record> {
         vec![
             Record::Task(task()),
@@ -802,7 +774,6 @@ mod tests {
         ]
     }
 
-    /// A fold that has begun, answered one turn, and owes the human the next line.
     fn awaiting() -> Vec<Record> {
         let turn = turn_id(session(), 1);
         let mut records = vec![
@@ -827,7 +798,6 @@ mod tests {
         records
     }
 
-    /// A fold whose session closed.
     fn closed() -> Vec<Record> {
         let mut records = idle();
         records.push(Record::Session {

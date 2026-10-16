@@ -244,7 +244,6 @@ mod tests {
         );
     }
 
-    /// The keys a real terminal delivers for the pane keys, and for the interrupt.
     const CTRL_N: &[u8] = b"\x0e";
     const CTRL_O: &[u8] = b"\x0f";
 

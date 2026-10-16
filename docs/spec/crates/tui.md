@@ -29,7 +29,7 @@ session the human is not looking at still moves, between his keystrokes.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:645` | The driver loop over every session the process holds |
+| `run` | `src/core.rs:618` | The driver loop over every session the process holds |
 | `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `reopen` |
 | `Roster` | `src/port.rs:71` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:107` | `poll`, `event`, `draw` |
@@ -61,14 +61,14 @@ artifact store, and the sandbox belong to the kernel.
 - An event the conversation does not act on is dropped where the terminal's report is classified,
   so the driver only ever sees a key or a resize (`src/terminal.rs:115-119`).
 - A step is taken only when the terminal reports nothing, so a keystroke is answered before another
-  session moves (`src/core.rs:645-676`).
+  session moves (`src/core.rs:618-649`).
 - The rotation starts at the session on screen, so it moves first and the ones behind it take their
   turns in between the human's keystrokes (`src/core.rs:350-359`).
 - A session this process already holds is focused instead of opened a second time: two engines on one
   session would make the second one's recovery report the first one's work in flight as unknown
   (`src/core.rs:400-421`).
 - The process ends when every session it holds has ended, or when the human leaves
-  (`src/core.rs:204-206`, `src/core.rs:571-592`).
+  (`src/core.rs:174-176`, `src/core.rs:544-565`).
 - An empty or whitespace-only line does not open a turn (`src/core.rs:423-446`).
 - The typed line, and the goal a session is named with, are capped at `MAX_SPEECH_BYTES`, and a
   character that does not fit whole is dropped (`src/core.rs:488-546`).

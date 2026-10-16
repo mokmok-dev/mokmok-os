@@ -588,7 +588,6 @@ mod tests {
         }
     }
 
-    /// A view of a listing of `rows`, with the cursor on `cursor`.
     fn listing(
         rows: Vec<Row>,
         cursor: usize,
