@@ -82,10 +82,8 @@ impl<'a> Collector<'a> {
                 .then_with(|| left.path.cmp(&right.path))
         });
 
-        let mut report = Report {
-            bytes: used,
-            ..Report::default()
-        };
+        let mut collected = Vec::new();
+        let mut temporaries = 0;
         let mut remaining = used;
 
         for candidate in candidates {
@@ -103,9 +101,9 @@ impl<'a> Collector<'a> {
             match candidate.hash {
                 Some(hash) => {
                     remaining = remaining.saturating_sub(candidate.bytes);
-                    report.collected.push(hash);
+                    collected.push(hash);
                 },
-                None => report.temporaries += 1,
+                None => temporaries += 1,
             }
 
             if under_pressure && remaining <= self.retention.max_bytes {
@@ -113,10 +111,12 @@ impl<'a> Collector<'a> {
             }
         }
 
-        report.bytes = remaining;
-        report.over_budget = remaining > self.retention.max_bytes;
-
-        Ok(report)
+        Ok(Report {
+            collected,
+            temporaries,
+            bytes: remaining,
+            over_budget: remaining > self.retention.max_bytes,
+        })
     }
 
     fn mark(
