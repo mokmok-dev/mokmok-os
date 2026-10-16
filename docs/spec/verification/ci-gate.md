@@ -45,16 +45,16 @@ The receipt below is what the run returned, and
 | --- | --- |
 | `command` | `nix flake check --print-build-logs` |
 | `exit_code` | 0 |
-| `tests_run` | 832 |
+| `tests_run` | 858 |
 | `failed` | 0 |
-| nextest summary | `832 tests run: 832 passed, 1 skipped` |
+| nextest summary | `858 tests run: 858 passed, 1 skipped` |
 
 Every check attribute reported pass: `cargoClippy`, `cargoDocTest`, `pre-commit`, `cargoTest`,
 `treefmt`, `nixosModule`, `dependencyRules`, and `mokmokdUnit`.
 
 # What this proves
 
-832 test cases compile and pass in the nix build sandbox at the head of `feat/tui-sessions`. The
+858 test cases compile and pass in the nix build sandbox at the head of `feat/tui-sessions`. The
 sandbox has a real SQLite, a real Unix socket, and a real Landlock kernel, so the cases that need
 those are running against them.
 
