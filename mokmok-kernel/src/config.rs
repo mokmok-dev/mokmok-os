@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::PermissionsExt;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -72,11 +72,13 @@ pub struct ProviderLayer {
     /// The scripted provider's answers, as a JSON file. A path in the file is relative to it.
     #[arg(long, global = true, value_name = "PATH")]
     pub script: Option<PathBuf>,
-    /// A file holding the endpoint credential, read at open and never from the environment. A path
-    /// in the file is relative to it.
-    #[arg(long = "provider-credential-file", global = true, value_name = "PATH")]
-    #[serde(rename = "provider_credential_file")]
-    pub credential_file: Option<PathBuf>,
+    /// The name of the environment variable holding the endpoint credential.
+    ///
+    /// Unlike the other text keys, this one is read literally: it holds a bare variable name and
+    /// takes no `$NAME` or `${NAME}` reference, so `env_key = "$X"` is refused as not a name. The
+    /// named variable's value is trimmed, and an empty or whitespace-only one is refused.
+    #[arg(long = "env-key", global = true, value_name = "NAME")]
+    pub env_key: Option<String>,
     /// How many answer tokens one model call may spend. Defaults to `4096`.
     #[arg(long, global = true)]
     pub max_answer_tokens: Option<u64>,
@@ -89,7 +91,7 @@ pub struct ProviderSettings {
     pub model: Option<String>,
     pub endpoint: String,
     pub script: Option<PathBuf>,
-    pub credential_file: Option<PathBuf>,
+    pub credential: Option<Credential>,
     pub max_answer_tokens: u64,
 }
 
@@ -100,7 +102,7 @@ impl Default for ProviderSettings {
             model: None,
             endpoint: "https://ollama.com/v1".to_owned(),
             script: None,
-            credential_file: None,
+            credential: None,
             max_answer_tokens: 4096,
         }
     }
@@ -108,31 +110,88 @@ impl Default for ProviderSettings {
 
 impl ProviderSettings {
     /// The whole precedence rule in one place: the flag, then the file, then the built-in default.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns the `env_key` refusal of the surface that named the winning variable, and nothing
+    /// else. A name the flag supplied is refused as [`ConfigError::EnvKeyVariableUnset`],
+    /// [`ConfigError::EnvKeyVariableNotText`], or [`ConfigError::EnvKeyNotAName`]; a name the file
+    /// supplied is refused as the `ConfigFileVariable*` twin that names the file and its key.
     pub fn merge(
         flags: &ProviderLayer,
-        file: &ProviderLayer,
-    ) -> Self {
+        file: Option<&FileLayer>,
+        environment: &ProcessEnvironment,
+    ) -> Result<Self, ConfigError> {
         let default = Self::default();
+        let keys = file.map(|file| &file.keys);
 
-        Self {
-            kind: flags.kind.or(file.kind).unwrap_or(default.kind),
-            model: flags.model.clone().or_else(|| file.model.clone()),
+        Ok(Self {
+            kind: flags
+                .kind
+                .or_else(|| keys.and_then(|keys| keys.kind))
+                .unwrap_or(default.kind),
+            model: flags
+                .model
+                .clone()
+                .or_else(|| keys.and_then(|keys| keys.model.clone())),
             endpoint: flags
                 .endpoint
                 .clone()
-                .or_else(|| file.endpoint.clone())
+                .or_else(|| keys.and_then(|keys| keys.endpoint.clone()))
                 .unwrap_or(default.endpoint),
-            script: flags.script.clone().or_else(|| file.script.clone()),
-            credential_file: flags
-                .credential_file
+            script: flags
+                .script
                 .clone()
-                .or_else(|| file.credential_file.clone()),
+                .or_else(|| keys.and_then(|keys| keys.script.clone())),
+            credential: credential(flags, file, environment)?,
             max_answer_tokens: flags
                 .max_answer_tokens
-                .or(file.max_answer_tokens)
+                .or_else(|| keys.and_then(|keys| keys.max_answer_tokens))
                 .unwrap_or(default.max_answer_tokens),
-        }
+        })
+    }
+}
+
+/// The provider keys one configuration file wrote, with the file they were read from.
+///
+/// A refusal names both the file and the text the operator wrote for the key it refused, so the two
+/// travel together.
+pub struct FileLayer {
+    /// The file the keys were read from.
+    pub path: PathBuf,
+    /// The keys the file wrote.
+    pub keys: ProviderLayer,
+}
+
+/// The key an endpoint credential's variable is named by.
+const ENV_KEY: &str = "env_key";
+
+/// The endpoint credential, answered from the environment variable a key names.
+///
+/// It belongs here rather than beside the provider because resolution is the one place that reads
+/// what the environment holds, and because it is the field type of [`ProviderSettings`]. Its
+/// [`Debug`] prints `REDACTED`, and it exposes its bytes only to the crate.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Credential(String);
+
+impl Credential {
+    /// The credential the named variable answered.
+    pub(crate) const fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
+    /// The secret itself, for the one caller that writes an `Authorization` header.
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(
+        &self,
+        formatter: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        formatter.write_str("REDACTED")
     }
 }
 
@@ -350,7 +409,7 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let global = &args.global;
         let file = file_layer(args, discovered, environment)?;
-        let provider = ProviderSettings::merge(&global.provider, &file);
+        let provider = ProviderSettings::merge(&global.provider, file.as_ref(), environment)?;
 
         create_directory(&global.data_dir)?;
 
@@ -418,10 +477,9 @@ impl Config {
                     if provider.model.as_deref().unwrap_or_default().is_empty() {
                         return Err(ConfigError::NoModel);
                     }
-                    let Some(credential) = provider.credential_file.as_deref() else {
-                        return Err(ConfigError::NoCredentialFile);
-                    };
-                    private_credential(credential, &allow_write)?;
+                    if provider.credential.is_none() {
+                        return Err(ConfigError::NoCredential);
+                    }
                 },
             }
         }
@@ -524,46 +582,82 @@ impl ProcessEnvironment {
     }
 }
 
-/// What a value the file wrote could not be answered, before a file and a key are named.
+/// Where a variable name the operator wrote was written.
+///
+/// The two surfaces word a refusal differently, and each carries the text only it can render, so a
+/// name and its origin travel together rather than as parallel options that must stay in step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Configured {
+    /// In the configuration file, with the text the operator wrote there.
+    File { path: PathBuf, written: String },
+    /// On its derived command-line flag, `--env-key`.
+    Flag,
+}
+
+/// What a variable name the operator wrote could not be turned into.
 #[derive(Debug, Eq, PartialEq)]
 enum Unanswered {
     /// The environment holds no value for the name, or holds an empty one.
-    Unset {
-        name: String,
-    },
+    Unset { name: String, source: Configured },
+    /// The environment holds a value that is not text.
+    NotText { name: String, source: Configured },
+    /// The value is not a variable name.
+    NotAName { name: String, source: Configured },
+    /// A `$` reference the file wrote is not one. Only a file writes a reference, so this carries
+    /// the file and the text directly rather than a [`Configured`].
     Malformed {
+        path: PathBuf,
+        written: String,
         reference: String,
-    },
-    NotText {
-        name: String,
     },
 }
 
 impl Unanswered {
-    fn in_file(
+    /// The refusal this cost became, worded for the surface that wrote the name.
+    ///
+    /// A configuration file's key is named with the file, the key, and the text the operator wrote
+    /// there; a name the command line supplied has none of those, so it is named as `--env-key`.
+    fn refused(
         self,
-        file: &Path,
         key: &'static str,
-        written: &str,
     ) -> ConfigError {
         match self {
-            Self::Unset { name } => ConfigError::ConfigFileVariableUnset {
-                path: file.to_path_buf(),
+            Self::Malformed {
+                path,
+                written,
+                reference,
+            } => ConfigError::ConfigFileReferenceMalformed {
+                path,
                 key,
-                value: written.to_owned(),
-                name,
-            },
-            Self::Malformed { reference } => ConfigError::ConfigFileReferenceMalformed {
-                path: file.to_path_buf(),
-                key,
-                value: written.to_owned(),
+                value: written,
                 reference,
             },
-            Self::NotText { name } => ConfigError::ConfigFileVariableNotText {
-                path: file.to_path_buf(),
-                key,
-                value: written.to_owned(),
-                name,
+            Self::Unset { name, source } => match source {
+                Configured::File { path, written } => ConfigError::ConfigFileVariableUnset {
+                    path,
+                    key,
+                    value: written,
+                    name,
+                },
+                Configured::Flag => ConfigError::EnvKeyVariableUnset { name },
+            },
+            Self::NotText { name, source } => match source {
+                Configured::File { path, written } => ConfigError::ConfigFileVariableNotText {
+                    path,
+                    key,
+                    value: written,
+                    name,
+                },
+                Configured::Flag => ConfigError::EnvKeyVariableNotText { name },
+            },
+            Self::NotAName { name, source } => match source {
+                Configured::File { path, written } => ConfigError::ConfigFileVariableNotAName {
+                    path,
+                    key,
+                    value: written,
+                    name,
+                },
+                Configured::Flag => ConfigError::EnvKeyNotAName { name },
             },
         }
     }
@@ -582,7 +676,17 @@ impl Unanswered {
 fn expand(
     written: &str,
     environment: &ProcessEnvironment,
+    file: &Path,
 ) -> Result<String, Unanswered> {
+    let malformed = |reference: String| Unanswered::Malformed {
+        path: file.to_path_buf(),
+        written: written.to_owned(),
+        reference,
+    };
+    let source = Configured::File {
+        path: file.to_path_buf(),
+        written: written.to_owned(),
+    };
     let mut expanded = String::with_capacity(written.len());
     let mut rest = written;
 
@@ -603,17 +707,13 @@ fn expand(
                 let Some(close) = after.find('}') else {
                     let end = 1 + name_run(&after[1..]);
 
-                    return Err(Unanswered::Malformed {
-                        reference: format!("${}", &after[..end]),
-                    });
+                    return Err(malformed(format!("${}", &after[..end])));
                 };
                 let name = &after[1..close];
                 if !variable_name(name) {
-                    return Err(Unanswered::Malformed {
-                        reference: format!("${}", &after[..=close]),
-                    });
+                    return Err(malformed(format!("${}", &after[..=close])));
                 }
-                expanded.push_str(answered(name, environment)?);
+                expanded.push_str(answered(name, environment, source.clone())?);
                 rest = &after[close + 1..];
             },
             // `$NAME`, and the lone `$` at the end, which takes this arm with an empty run: a run
@@ -622,11 +722,9 @@ fn expand(
                 let end = name_run(after);
                 let name = &after[..end];
                 if !variable_name(name) {
-                    return Err(Unanswered::Malformed {
-                        reference: format!("${}", &after[..end]),
-                    });
+                    return Err(malformed(format!("${}", &after[..end])));
                 }
-                expanded.push_str(answered(name, environment)?);
+                expanded.push_str(answered(name, environment, source.clone())?);
                 rest = &after[end..];
             },
         }
@@ -639,13 +737,16 @@ fn expand(
 fn answered<'a>(
     name: &str,
     environment: &'a ProcessEnvironment,
+    source: Configured,
 ) -> Result<&'a str, Unanswered> {
     match environment.get(name) {
         Some(value) if !value.is_empty() => value.to_str().ok_or_else(|| Unanswered::NotText {
             name: name.to_owned(),
+            source,
         }),
         _ => Err(Unanswered::Unset {
             name: name.to_owned(),
+            source,
         }),
     }
 }
@@ -673,18 +774,18 @@ fn name_run(text: &str) -> usize {
         .unwrap_or(text.len())
 }
 
-/// The layer the configuration file contributes, or an empty one when there is no file to read.
+/// The provider layer the configuration file contributes, or `None` when there is no file to read.
 fn file_layer(
     args: &Args,
     discovered: Option<&Path>,
     environment: &ProcessEnvironment,
-) -> Result<ProviderLayer, ConfigError> {
+) -> Result<Option<FileLayer>, ConfigError> {
     let named = args.global.config.as_deref();
     let Some(path) = named
         .map(Path::to_path_buf)
         .or_else(|| discovered.map(Path::to_path_buf))
     else {
-        return Ok(ProviderLayer::default());
+        return Ok(None);
     };
 
     let text = match std::fs::read_to_string(&path) {
@@ -696,7 +797,7 @@ fn file_layer(
                 return Err(ConfigError::ConfigFileMissing { path });
             }
 
-            return Ok(ProviderLayer::default());
+            return Ok(None);
         },
         Err(source) => return Err(ConfigError::ConfigFileUnreadable { path, source }),
     };
@@ -706,8 +807,9 @@ fn file_layer(
             path: path.clone(),
             source,
         })?;
+    let keys = answered_layer(layer, &path, environment)?;
 
-    answered_layer(layer, &path, environment)
+    Ok(Some(FileLayer { path, keys }))
 }
 
 /// The layer the file contributes once the environment has answered it.
@@ -715,7 +817,8 @@ fn file_layer(
 /// Serde has already refused a key the group does not own, a value of the wrong type, and a
 /// provider the binary does not have, so this stage sees only the keys the file owns, each already
 /// of its own type. The keys are answered in the struct's own field order, which is the order a
-/// file with two bad references names them in.
+/// file with two bad references names them in. `env_key` is not among them: it holds a bare name,
+/// read literally, and resolution answers it only once precedence has chosen it.
 fn answered_layer(
     layer: ProviderLayer,
     file: &Path,
@@ -727,15 +830,65 @@ fn answered_layer(
         model: answered_text(layer.model, "model", file, environment)?,
         endpoint: answered_text(layer.endpoint, "endpoint", file, environment)?,
         script: answered_path(layer.script, "script", base, file, environment)?,
-        credential_file: answered_path(
-            layer.credential_file,
-            "provider_credential_file",
-            base,
-            file,
-            environment,
-        )?,
         ..layer
     })
+}
+
+/// The credential the winning `env_key` names, answered from the environment.
+///
+/// A flag beats the file, so only the winning name is answered: a name a flag overrode never
+/// reaches the environment, and refusing it would refuse a run that never needed it. The value is
+/// trimmed, because a file's trailing newline was once trimmed here, and a value that is empty or
+/// whitespace after the trim is refused as an unset one rather than becoming bytes in an
+/// `Authorization` header.
+///
+/// # Errors
+///
+/// Returns the `env_key` refusal of the surface that named the winning variable, and nothing else.
+fn credential(
+    flags: &ProviderLayer,
+    file: Option<&FileLayer>,
+    environment: &ProcessEnvironment,
+) -> Result<Option<Credential>, ConfigError> {
+    let file_key = file.and_then(|file| {
+        file.keys
+            .env_key
+            .as_ref()
+            .map(|name| (file.path.as_path(), name))
+    });
+
+    let (name, source) = match (&flags.env_key, file_key) {
+        (Some(name), _) => (name.as_str(), Configured::Flag),
+        (None, Some((path, written))) => (
+            written.as_str(),
+            Configured::File {
+                path: path.to_path_buf(),
+                written: written.clone(),
+            },
+        ),
+        (None, None) => return Ok(None),
+    };
+
+    if !variable_name(name) {
+        return Err(Unanswered::NotAName {
+            name: name.to_owned(),
+            source,
+        }
+        .refused(ENV_KEY));
+    }
+
+    let value =
+        answered(name, environment, source.clone()).map_err(|cost| cost.refused(ENV_KEY))?;
+    let secret = value.trim();
+    if secret.is_empty() {
+        return Err(Unanswered::Unset {
+            name: name.to_owned(),
+            source,
+        }
+        .refused(ENV_KEY));
+    }
+
+    Ok(Some(Credential::new(secret.to_owned())))
 }
 
 fn answered_text(
@@ -745,9 +898,7 @@ fn answered_text(
     environment: &ProcessEnvironment,
 ) -> Result<Option<String>, ConfigError> {
     written
-        .map(|written| {
-            expand(&written, environment).map_err(|cost| cost.in_file(file, key, &written))
-        })
+        .map(|written| expand(&written, environment, file).map_err(|cost| cost.refused(key)))
         .transpose()
 }
 
@@ -762,7 +913,7 @@ fn answered_path(
         return Ok(None);
     };
     let written = written.to_string_lossy().into_owned();
-    let text = expand(&written, environment).map_err(|cost| cost.in_file(file, key, &written))?;
+    let text = expand(&written, environment, file).map_err(|cost| cost.refused(key))?;
 
     match relative_path(&text) {
         Ok(relative) => Ok(Some(base.join(relative))),
@@ -849,36 +1000,6 @@ fn create_directory(path: &Path) -> Result<(), ConfigError> {
         path: path.to_path_buf(),
         source,
     })
-}
-
-/// Refuses a credential file the interface promises is a `0600` file: its mode must admit no group
-/// or other access, and no `--allow-write` grant may cover it, because a model run inside such a
-/// grant could rewrite the file the next invocation reads.
-fn private_credential(
-    path: &Path,
-    writable: &[PathBuf],
-) -> Result<(), ConfigError> {
-    let metadata = std::fs::metadata(path).map_err(|source| ConfigError::CredentialUnreadable {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mode = metadata.permissions().mode() & 0o777;
-
-    if mode & 0o077 != 0 {
-        return Err(ConfigError::CredentialNotPrivate {
-            path: path.to_path_buf(),
-            mode,
-        });
-    }
-
-    if let Some(grant) = writable.iter().find(|grant| path.starts_with(grant)) {
-        return Err(ConfigError::CredentialInWriteGrant {
-            path: path.to_path_buf(),
-            grant: grant.clone(),
-        });
-    }
-
-    Ok(())
 }
 
 fn runnable(program: &Path) -> Result<PathBuf, ConfigError> {
@@ -970,24 +1091,8 @@ pub enum ConfigError {
     NoScript,
     #[error("no --model is named, and the ollama provider has nothing to ask")]
     NoModel,
-    #[error("no --provider-credential-file is named, and the ollama provider has no credential")]
-    NoCredentialFile,
-    #[error("the credential file {path} could not be examined")]
-    CredentialUnreadable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error(
-        "the credential file {path} is mode {mode:o}, which lets group or others read it, and the \
-         credential must be 0600"
-    )]
-    CredentialNotPrivate { path: PathBuf, mode: u32 },
-    #[error(
-        "the credential file {path} lies inside the --allow-write grant {grant}, so an earlier \
-         model run could rewrite it before the next invocation reads it"
-    )]
-    CredentialInWriteGrant { path: PathBuf, grant: PathBuf },
+    #[error("provider = \"ollama\" needs a credential, and no --env-key or env_key names one")]
+    NoCredential,
     #[error("--config names {path}, and no file is there to read")]
     ConfigFileMissing { path: PathBuf },
     #[error("the configuration file {path} could not be read: {source}")]
@@ -1042,6 +1147,28 @@ pub enum ConfigError {
         name: String,
     },
     #[error(
+        "the configuration file {path} sets {key} to {value}, and {name} is not a variable name: \
+         a name starts with a letter or `_` and goes on with letters, digits, and `_`"
+    )]
+    ConfigFileVariableNotAName {
+        path: PathBuf,
+        key: &'static str,
+        value: String,
+        name: String,
+    },
+    #[error(
+        "--env-key names {name}, which is unset or empty in the environment this process was \
+         started with"
+    )]
+    EnvKeyVariableUnset { name: String },
+    #[error("--env-key names {name}, which is set to bytes that are not text")]
+    EnvKeyVariableNotText { name: String },
+    #[error(
+        "--env-key names {name}, and an environment variable name starts with a letter or `_` and \
+         goes on with letters, digits, and `_`"
+    )]
+    EnvKeyNotAName { name: String },
+    #[error(
         "the configuration file {path} sets {key} to {value}, which the environment expands to \
          {expanded}, and a path in the file is a plain relative path inside the file's own directory"
     )]
@@ -1058,13 +1185,12 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, Args, Command, Config, ConfigError, Global, ProcessEnvironment, ProviderKind,
-        ProviderLayer, Submit, config_path_for, relative_path, uuid_of,
+        Agent, Args, Command, Config, ConfigError, Credential, Global, ProcessEnvironment,
+        ProviderKind, ProviderLayer, Submit, config_path_for, relative_path, uuid_of,
     };
     use clap::{CommandFactory as _, Parser as _, ValueEnum as _};
     use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
     struct Scratch(PathBuf);
@@ -1313,7 +1439,7 @@ mod tests {
         assert_eq!(parsed.global.provider.endpoint, None);
         assert_eq!(parsed.global.provider.max_answer_tokens, None);
         assert_eq!(parsed.global.provider.model, None);
-        assert_eq!(parsed.global.provider.credential_file, None);
+        assert_eq!(parsed.global.provider.env_key, None);
         assert_eq!(parsed.global.config, None);
 
         let cancel = Args::try_parse_from([
@@ -1542,114 +1668,8 @@ mod tests {
                 None,
                 &ProcessEnvironment::default()
             ),
-            Err(ConfigError::NoCredentialFile),
+            Err(ConfigError::NoCredential),
         ));
-    }
-
-    /// Writes a credential file with `mode`, returning the path it landed at.
-    fn credential(
-        path: &Path,
-        mode: u32,
-    ) -> PathBuf {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "s3cr3t").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-
-        path.to_path_buf()
-    }
-
-    #[test]
-    fn a_credential_file_group_or_others_can_read_is_refused_by_path_and_mode() {
-        let scratch = Scratch::new("cred-mode");
-        let path = credential(&scratch.0.join("credential"), 0o644);
-
-        let refusal = Config::resolve(
-            &ollama_args(
-                &scratch.0,
-                &[
-                    "--model",
-                    "kimi-k2.7-code",
-                    "--provider-credential-file",
-                    path.to_str().unwrap(),
-                ],
-            ),
-            None,
-            &ProcessEnvironment::default(),
-        )
-        .unwrap_err();
-
-        assert!(
-            matches!(
-                &refusal,
-                ConfigError::CredentialNotPrivate { path: held, mode }
-                    if held == &path && *mode == 0o644,
-            ),
-            "{refusal}",
-        );
-        assert!(
-            refusal.to_string().contains(&path.display().to_string()),
-            "{refusal}",
-        );
-        assert!(refusal.to_string().contains("644"), "{refusal}");
-    }
-
-    #[test]
-    fn a_credential_file_inside_a_write_grant_is_refused_by_both_names() {
-        let scratch = Scratch::new("cred-write-grant");
-        let data = scratch.0.join("data");
-        let granted = scratch.0.join("granted");
-        let checkout = scratch.0.join("checkout");
-        std::fs::create_dir_all(&granted).unwrap();
-        std::fs::create_dir_all(&checkout).unwrap();
-        let path = credential(&granted.join("credential"), 0o600);
-
-        let parsed = Args::try_parse_from([
-            "mokmokd",
-            "--data-dir",
-            data.to_str().unwrap(),
-            "--allow-tool",
-            "/bin/sh",
-            "--allow-write",
-            granted.to_str().unwrap(),
-            "--allow-write",
-            checkout.to_str().unwrap(),
-            "--confiner",
-            "/bin/sh",
-            "agent",
-            "run",
-            "--session",
-            "018f2f1e-0000-7000-8000-000000000000",
-            "--goal",
-            "goal",
-            "--checkout",
-            checkout.to_str().unwrap(),
-            "--provider",
-            "ollama",
-            "--model",
-            "kimi-k2.7-code",
-            "--provider-credential-file",
-            path.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        let refusal = Config::resolve(&parsed, None, &ProcessEnvironment::default()).unwrap_err();
-
-        assert!(
-            matches!(
-                &refusal,
-                ConfigError::CredentialInWriteGrant { path: held, grant }
-                    if held == &path && grant == &granted,
-            ),
-            "{refusal}",
-        );
-        assert!(
-            refusal.to_string().contains(&path.display().to_string()),
-            "{refusal}",
-        );
-        assert!(
-            refusal.to_string().contains(&granted.display().to_string()),
-            "{refusal}",
-        );
     }
 
     #[test]
@@ -1684,6 +1704,233 @@ mod tests {
             Config::resolve(&parsed, None, &ProcessEnvironment::default()),
             Err(ConfigError::MultipleTools { count: 2 }),
         ));
+    }
+
+    /// The credential one resolved configuration holds, as the `Authorization` header sees it.
+    fn credential_of(config: &Config) -> Option<&str> {
+        config.provider.credential.as_ref().map(Credential::expose)
+    }
+
+    #[test]
+    fn the_credential_never_prints_its_value() {
+        let credential = Credential::new("s3cr3t".to_owned());
+
+        assert_eq!(format!("{credential:?}"), "REDACTED");
+        assert_eq!(credential.expose(), "s3cr3t");
+    }
+
+    #[test]
+    fn an_env_key_the_flag_names_is_answered_from_the_environment() {
+        let scratch = Scratch::new("env-key-flag");
+        let parsed = ollama_args(
+            &scratch.0,
+            &[
+                "--model",
+                "kimi-k2.7-code",
+                "--env-key",
+                "MOKMOK_CREDENTIAL",
+            ],
+        );
+        // A trailing newline and a leading space are trimmed, because the file this replaced was.
+        let environment = pinned(&[("MOKMOK_CREDENTIAL", " s3cr3t\n")]);
+
+        let config = Config::resolve(&parsed, None, &environment).unwrap();
+
+        assert_eq!(credential_of(&config), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn an_env_key_the_file_names_is_answered_from_the_environment() {
+        let scratch = Scratch::new("env-key-file");
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"kimi-k2.7-code\"\n\
+             env_key = \"MOKMOK_CREDENTIAL\"\n",
+        );
+        let environment = pinned(&[("MOKMOK_CREDENTIAL", "s3cr3t")]);
+
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
+
+        assert_eq!(credential_of(&config), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn an_env_key_that_is_not_a_variable_name_is_refused_from_both_surfaces() {
+        let scratch = Scratch::new("env-key-not-a-name");
+        let flag = ollama_args(
+            &scratch.0,
+            &[
+                "--model",
+                "kimi-k2.7-code",
+                "--env-key",
+                "$MOKMOK_CREDENTIAL",
+            ],
+        );
+
+        let refusal = Config::resolve(&flag, None, &ProcessEnvironment::default()).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::EnvKeyNotAName { name } if name == "$MOKMOK_CREDENTIAL",
+            ),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("--env-key"), "{refusal}");
+        // The key holds a bare name, so its refusal must not teach the `$NAME` reference another
+        // key takes.
+        assert!(!refusal.to_string().contains("$NAME"), "{refusal}");
+
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"kimi-k2.7-code\"\n\
+             env_key = \"$MOKMOK_CREDENTIAL\"\n",
+        );
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileVariableNotAName { path, key, value, name }
+                    if path == &file
+                        && *key == "env_key"
+                        && value == "$MOKMOK_CREDENTIAL"
+                        && name == "$MOKMOK_CREDENTIAL",
+            ),
+            "{refusal}",
+        );
+        assert!(!refusal.to_string().contains("$NAME"), "{refusal}");
+    }
+
+    #[test]
+    fn an_env_key_the_environment_does_not_answer_is_refused_from_both_surfaces() {
+        let scratch = Scratch::new("env-key-unset");
+        let flag = ollama_args(
+            &scratch.0,
+            &[
+                "--model",
+                "kimi-k2.7-code",
+                "--env-key",
+                "MOKMOK_CREDENTIAL",
+            ],
+        );
+
+        let refusal = Config::resolve(&flag, None, &ProcessEnvironment::default()).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::EnvKeyVariableUnset { name } if name == "MOKMOK_CREDENTIAL",
+            ),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("--env-key"), "{refusal}");
+
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"kimi-k2.7-code\"\n\
+             env_key = \"MOKMOK_CREDENTIAL\"\n",
+        );
+        let refusal = Config::resolve(
+            &run_args(&scratch.0, &[]),
+            Some(&file),
+            &ProcessEnvironment::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::ConfigFileVariableUnset { path, key, value, name }
+                    if path == &file
+                        && *key == "env_key"
+                        && value == "MOKMOK_CREDENTIAL"
+                        && name == "MOKMOK_CREDENTIAL",
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn an_env_key_holding_whitespace_is_refused_like_an_unset_one() {
+        let scratch = Scratch::new("env-key-whitespace");
+        let parsed = ollama_args(
+            &scratch.0,
+            &[
+                "--model",
+                "kimi-k2.7-code",
+                "--env-key",
+                "MOKMOK_CREDENTIAL",
+            ],
+        );
+        let environment = pinned(&[("MOKMOK_CREDENTIAL", " \n\t ")]);
+
+        let refusal = Config::resolve(&parsed, None, &environment).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::EnvKeyVariableUnset { name } if name == "MOKMOK_CREDENTIAL",
+            ),
+            "{refusal}",
+        );
+    }
+
+    #[test]
+    fn an_env_key_whose_value_is_not_text_is_refused_by_name() {
+        let scratch = Scratch::new("env-key-not-text");
+        let parsed = ollama_args(
+            &scratch.0,
+            &[
+                "--model",
+                "kimi-k2.7-code",
+                "--env-key",
+                "MOKMOK_CREDENTIAL",
+            ],
+        );
+        let environment =
+            ProcessEnvironment::of(&[("MOKMOK_CREDENTIAL", OsStr::from_bytes(b"\xff"))]);
+
+        let refusal = Config::resolve(&parsed, None, &environment).unwrap_err();
+
+        assert!(
+            matches!(
+                &refusal,
+                ConfigError::EnvKeyVariableNotText { name } if name == "MOKMOK_CREDENTIAL",
+            ),
+            "{refusal}",
+        );
+        assert!(refusal.to_string().contains("not text"), "{refusal}");
+    }
+
+    #[test]
+    fn a_flag_env_key_beats_the_file_and_leaves_its_variable_unanswered() {
+        let scratch = Scratch::new("env-key-flag-beats");
+        let file = config_file(
+            &scratch,
+            "provider = \"ollama\"\n\
+             model = \"kimi-k2.7-code\"\n\
+             env_key = \"FROM_THE_FILE\"\n",
+        );
+        let environment = pinned(&[("FROM_THE_FLAG", "flag-secret")]);
+
+        let config = Config::resolve(
+            &run_args(&scratch.0, &["--env-key", "FROM_THE_FLAG"]),
+            Some(&file),
+            &environment,
+        )
+        .unwrap();
+
+        assert_eq!(credential_of(&config), Some("flag-secret"));
     }
 
     /// Writes `body` as `<scratch>/config.toml`, returning its path.
@@ -1723,53 +1970,58 @@ mod tests {
     #[test]
     fn a_file_fills_every_key_the_flags_left_out() {
         let scratch = Scratch::new("file-every-key");
-        let credential = credential(&scratch.0.join("credential"), 0o600);
         let file = config_file(
             &scratch,
             "provider = \"ollama\"\n\
              model = \"kimi-k2.7-code\"\n\
              endpoint = \"https://example.test/v1\"\n\
              script = \"answers.json\"\n\
-             provider_credential_file = \"credential\"\n\
+             env_key = \"MOKMOK_CREDENTIAL\"\n\
              max_answer_tokens = 8192\n",
         );
+        let environment = pinned(&[("MOKMOK_CREDENTIAL", "s3cr3t")]);
 
-        let config = Config::resolve(
-            &run_args(&scratch.0, &[]),
-            Some(&file),
-            &ProcessEnvironment::default(),
-        )
-        .unwrap();
+        let config =
+            Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap();
 
         assert_eq!(config.provider.kind, ProviderKind::Ollama);
         assert_eq!(config.provider.model.as_deref(), Some("kimi-k2.7-code"));
         assert_eq!(config.provider.endpoint, "https://example.test/v1");
         assert_eq!(config.provider.script, Some(scratch.0.join("answers.json")));
-        assert_eq!(config.provider.credential_file, Some(credential));
+        assert_eq!(credential_of(&config), Some("s3cr3t"));
         assert_eq!(config.provider.max_answer_tokens, 8192);
     }
 
     #[test]
     fn a_flag_beats_the_file_for_the_key_it_names() {
         let scratch = Scratch::new("flag-beats-file");
-        credential(&scratch.0.join("credential"), 0o600);
         let file = config_file(
             &scratch,
             "provider = \"ollama\"\n\
              model = \"from-the-file\"\n\
              endpoint = \"https://from-the-file.test/v1\"\n\
-             provider_credential_file = \"credential\"\n",
+             env_key = \"FROM_THE_FILE\"\n",
         );
+        let environment = pinned(&[("FROM_THE_FLAG", "from-the-flag")]);
 
         let config = Config::resolve(
-            &run_args(&scratch.0, &["--endpoint", "https://from-the-flag.test/v1"]),
+            &run_args(
+                &scratch.0,
+                &[
+                    "--endpoint",
+                    "https://from-the-flag.test/v1",
+                    "--env-key",
+                    "FROM_THE_FLAG",
+                ],
+            ),
             Some(&file),
-            &ProcessEnvironment::default(),
+            &environment,
         )
         .unwrap();
 
         assert_eq!(config.provider.endpoint, "https://from-the-flag.test/v1");
         assert_eq!(config.provider.model.as_deref(), Some("from-the-file"));
+        assert_eq!(credential_of(&config), Some("from-the-flag"));
     }
 
     #[test]
@@ -1947,55 +2199,6 @@ mod tests {
 
         assert!(
             matches!(&refusal, ConfigError::ConfigFileNotRelative { key, .. } if *key == "script"),
-            "{refusal}",
-        );
-    }
-
-    #[test]
-    fn a_climbing_credential_in_the_file_is_refused_by_key() {
-        let scratch = Scratch::new("climbing-credential");
-        let file = config_file(&scratch, "provider_credential_file = \"../credential\"\n");
-
-        let refusal = Config::resolve(
-            &run_args(&scratch.0, &[]),
-            Some(&file),
-            &ProcessEnvironment::default(),
-        )
-        .unwrap_err();
-
-        assert!(
-            matches!(
-                &refusal,
-                ConfigError::ConfigFileNotRelative { key, .. } if *key == "provider_credential_file"
-            ),
-            "{refusal}",
-        );
-    }
-
-    #[test]
-    fn a_credential_the_file_names_inside_a_write_grant_is_refused_by_both_names() {
-        let scratch = Scratch::new("file-credential-grant");
-        let granted = scratch.0.join("granted");
-        std::fs::create_dir_all(&granted).unwrap();
-        let credential = credential(&granted.join("credential"), 0o600);
-        let file = config_file(
-            &scratch,
-            "provider = \"ollama\"\n\
-             model = \"kimi-k2.7-code\"\n\
-             provider_credential_file = \"granted/credential\"\n",
-        );
-        let mut args = run_args(&scratch.0, &[]);
-        args.global.allow_write.push(granted.clone());
-
-        let refusal =
-            Config::resolve(&args, Some(&file), &ProcessEnvironment::default()).unwrap_err();
-
-        assert!(
-            matches!(
-                &refusal,
-                ConfigError::CredentialInWriteGrant { path, grant }
-                    if path == &credential && grant == &granted,
-            ),
             "{refusal}",
         );
     }
@@ -2311,11 +2514,8 @@ mod tests {
     #[test]
     fn an_expanded_path_that_leaves_the_file_directory_is_refused_by_key_and_variable() {
         let scratch = Scratch::new("reference-path-escape");
-        let file = config_file(
-            &scratch,
-            "provider_credential_file = \"${MOKMOK_CREDENTIAL}\"\n",
-        );
-        let environment = pinned(&[("MOKMOK_CREDENTIAL", "/run/secrets/ollama")]);
+        let file = config_file(&scratch, "script = \"${MOKMOK_SCRIPT}\"\n");
+        let environment = pinned(&[("MOKMOK_SCRIPT", "/run/secrets/ollama")]);
 
         let refusal =
             Config::resolve(&run_args(&scratch.0, &[]), Some(&file), &environment).unwrap_err();
@@ -2324,17 +2524,13 @@ mod tests {
             matches!(
                 &refusal,
                 ConfigError::ConfigFileNotRelativeAfterExpansion { key, value, expanded, .. }
-                    if *key == "provider_credential_file"
-                        && value == "${MOKMOK_CREDENTIAL}"
+                    if *key == "script"
+                        && value == "${MOKMOK_SCRIPT}"
                         && expanded == "/run/secrets/ollama",
             ),
             "{refusal}",
         );
-        for expected in [
-            "provider_credential_file",
-            "${MOKMOK_CREDENTIAL}",
-            "/run/secrets/ollama",
-        ] {
+        for expected in ["script", "${MOKMOK_SCRIPT}", "/run/secrets/ollama"] {
             assert!(refusal.to_string().contains(expected), "{refusal}");
         }
     }

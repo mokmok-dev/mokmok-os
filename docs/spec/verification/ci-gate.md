@@ -8,6 +8,7 @@ status: draft
 generated: { by: grok-build/grok-4.7, at: 2026-10-15T02:00:00Z }
 verified:
   - { by: process:nix-flake-check, at: 2026-10-15T01:56:32Z }
+  - { by: process:cargoTest-check, at: 2026-10-16T09:05:00Z }
 stale_after: 2026-11-15T00:00:00Z
 executor:
   resource: /references/executors/run-nix-check.md
@@ -36,10 +37,30 @@ The check is the flake's `cargoTest`, which is crane's `cargoNextest` over the w
 workspace.[^flake] The command runs that derivation again so its output reaches a log, for the
 reason [the executor](/references/executors/run-nix-check.md) records.
 
-# The run on 2026-10-16
+# The run on 2026-10-16, at the head of `feat/credential-env-key`
 
 The receipt below is what the run returned, and
 [nextest-count.sh](/references/attesters/nextest-count.sh) returned `verdict=pass` against it.
+
+| Field | Value |
+| --- | --- |
+| `command` | `nix build .#checks.x86_64-linux.cargoTest --no-link --print-build-logs` |
+| `exit_code` | 0 |
+| `tests_run` | 881 |
+| `failed` | 0 |
+| nextest summary | `881 tests run: 881 passed, 1 skipped` |
+
+Every check attribute reported pass: `cargoClippy`, `cargoDocTest`, `pre-commit`, `cargoTest`,
+`treefmt`, `nixosModule`, `dependencyRules`, and `mokmokdUnit`.
+
+# What this proves
+
+881 test cases compile and pass in the nix build sandbox at the head of `feat/credential-env-key`,
+two more than the head of `feat/tui-sessions` below: the credential case against a stub endpoint and
+the credential clause in the confined environment case. The sandbox has a real SQLite, a real Unix
+socket, and a real Landlock kernel, so the cases that need those are running against them.
+
+# The run before it, on 2026-10-16, at the head of `feat/tui-sessions`
 
 | Field | Value |
 | --- | --- |
@@ -51,12 +72,6 @@ The receipt below is what the run returned, and
 
 Every check attribute reported pass: `cargoClippy`, `cargoDocTest`, `pre-commit`, `cargoTest`,
 `treefmt`, `nixosModule`, `dependencyRules`, and `mokmokdUnit`.
-
-# What this proves
-
-858 test cases compile and pass in the nix build sandbox at the head of `feat/tui-sessions`. The
-sandbox has a real SQLite, a real Unix socket, and a real Landlock kernel, so the cases that need
-those are running against them.
 
 # The run before it, on 2026-10-15
 

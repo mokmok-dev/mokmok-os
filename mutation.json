@@ -1,6 +1,6 @@
 {
   "harness": "d2f2570e412004701c9725b61fff25e1ab23ba8e14c0336e511caf9b6e55d542",
-  "generated": "2026-10-16T08:29:28Z",
+  "generated": "2026-10-16T09:55:50Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
@@ -72,12 +72,12 @@
       "name": "mokmok-kernel",
       "score": 100.0,
       "target": 100.0,
-      "tested": 255,
-      "caught": 255,
+      "tested": 250,
+      "caught": 250,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "efada04391f4ec6f77321c0b707cf9cb2655f04b037200853757c08754f6db04"
+      "digest": "ad0e2552d3843f86b6e0acb9a315009079eb358c144904a499003edcd53a5993"
     },
     {
       "name": "mokmok-observability",

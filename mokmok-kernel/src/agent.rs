@@ -511,7 +511,12 @@ fn model(
             Ok(Model::Scripted(Scripted::open(config, path)?))
         },
         ProviderKind::Ollama => {
-            let provider = crate::provider::Ollama::open(config, session)
+            let credential = config
+                .provider
+                .credential
+                .clone()
+                .ok_or(ConfigError::NoCredential)?;
+            let provider = crate::provider::Ollama::open(config, credential, session)
                 .map_err(|error| Error::Agent(AgentError::Provider(Box::new(error))))?;
 
             Ok(Model::Ollama(provider))

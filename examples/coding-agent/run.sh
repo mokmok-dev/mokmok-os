@@ -2,9 +2,12 @@
 # Drives one coding task through `mokmokd agent run` against a real provider, and asserts the file
 # the task asked for rather than a log line.
 #
-# The credential comes from `OLLAMA_API_KEY` and is written to a 0600 file the daemon reads, never
-# set in the daemon's own environment: every confined tool inherits that environment unless the
-# caller says otherwise, and `agent run` passes `Environment::Exact` for exactly that reason.
+# The credential is the value of `OLLAMA_API_KEY`, which the daemon reads from its own environment
+# because `--env-key OLLAMA_API_KEY` names that variable: a file the daemon read at open was the
+# other way, and it cost a 0600 mode and a place outside every write grant to keep the value out of
+# an environment any same-user process can read. What a confined tool sees is still only `PATH` and
+# the operator's `--tool-env` entries, because `agent run` passes `Environment::Exact`, and
+# `mokmok-kernel/tests/environment.rs` pins that the daemon's own variables do not cross.
 #
 # The gate cannot run this, because the gate has no network. `mokmok-kernel/tests/agent.rs` drives
 # the same loop with a scripted provider, including the crash between an intent and its outcome and
@@ -55,7 +58,6 @@ fi
 [ -x "$daemon" ] || fail "no built mokmokd; build the workspace or set MOKMOKD to one"
 
 scratch="$(mktemp -d)"
-keyfile="$scratch/credential"
 checkout="$scratch/checkout"
 data="$scratch/data"
 mkdir -p "$checkout"
@@ -71,8 +73,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-umask 077
-printf '%s' "${OLLAMA_API_KEY:-ollama}" > "$keyfile"
+export OLLAMA_API_KEY="${OLLAMA_API_KEY:-ollama}"
 
 # The grants a coding tool needs: the shell it runs, the store every nix binary lives in, and the
 # one directory it may change.
@@ -102,7 +103,7 @@ echo "run.sh: session=$session model=$MODEL endpoint=$ENDPOINT" >&2
   --provider ollama \
   --model "$MODEL" \
   --endpoint "$ENDPOINT" \
-  --provider-credential-file "$keyfile" || fail "the run failed"
+  --env-key OLLAMA_API_KEY || fail "the run failed"
 
 status="$("$daemon" "$@" status --session "$session")"
 printf '%s\n' "$status"

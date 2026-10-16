@@ -3,13 +3,13 @@
 //! The provider is trusted configuration rather than a capability, so its destination is validated
 //! through [`mokmok_egress`] before any socket exists and the validated addresses are pinned into
 //! the HTTP client. Nothing of the wire crosses the runtime's [`Provider`] port: the request is
-//! built here, the answer is parsed back into the runtime's [`Answer`], and the credential lives in
-//! a value whose [`Debug`] prints `REDACTED`.
+//! built here, the answer is parsed back into the runtime's [`Answer`], and the credential
+//! resolution answered for `env_key` arrives as the [`Config`]'s own field, in a value whose
+//! [`Debug`] prints `REDACTED`.
 
-use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,7 +28,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use uuid::Uuid;
 
 use crate::authority::AGENT;
-use crate::config::Config;
+use crate::config::{Config, Credential};
 
 const SHELL_TOOL: &str = "run_shell";
 
@@ -65,19 +65,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Why the provider could not be built or one call could not complete.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The credential file could not be read.
-    #[error("the provider credential file {path} could not be read")]
-    Credential {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    /// The credential file held no value.
-    #[error("the provider credential file {path} is empty")]
-    CredentialEmpty { path: PathBuf },
-    /// No credential file was named.
-    #[error("no --provider-credential-file is named, so the provider has no credential")]
-    NoCredential,
     /// No model id was named.
     #[error("no --model is named, so the provider has nothing to ask")]
     NoModel,
@@ -130,49 +117,6 @@ pub enum Error {
     /// The answer text could not be stored.
     #[error("the provider could not store the answer text")]
     Artifact(#[source] mokmok_artifact::Error),
-}
-
-/// The provider credential, read from the file `--provider-credential-file` names.
-///
-/// The value is deliberately not a [`Config`] field and never enters the process environment, so
-/// nothing the daemon logs or a child inherits can carry it. Its [`Debug`] prints `REDACTED`.
-pub struct Credential(String);
-
-impl Credential {
-    /// Reads the credential from `path`, refusing a missing or empty file.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Credential`] naming the path when the file cannot be read, and
-    /// [`Error::CredentialEmpty`] naming the path when it holds nothing but whitespace.
-    pub fn read(path: &Path) -> Result<Self, Error> {
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Credential {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let secret = text.trim();
-
-        if secret.is_empty() {
-            return Err(Error::CredentialEmpty {
-                path: path.to_path_buf(),
-            });
-        }
-
-        Ok(Self(secret.to_owned()))
-    }
-
-    fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Credential {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        formatter.write_str("REDACTED")
-    }
 }
 
 /// An endpoint parsed by hand from the `--endpoint` value.
@@ -457,27 +401,25 @@ pub struct Ollama {
 }
 
 impl Ollama {
-    /// Builds the provider: reads the credential, resolves and validates the endpoint before any
-    /// socket exists, and pins the validated addresses into the HTTP client.
+    /// Builds the provider: resolves and validates the endpoint before any socket exists, and pins
+    /// the validated addresses into the HTTP client.
+    ///
+    /// `credential` is the value resolution answered for `env_key`, handed in rather than read here:
+    /// the provider has no configuration file, so it cannot name the key a refusal would have to,
+    /// and the environment is read at the binary's boundary and nowhere else.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NoCredential`]/[`Error::NoModel`] when a flag is missing,
-    /// [`Error::Credential`]/[`Error::CredentialEmpty`] for the credential file, the errors of
-    /// [`parse_endpoint`], [`Error::Resolve`] when the host cannot be resolved,
-    /// [`Error::Destination`] when validation refuses the destination, [`Error::Audit`] when the
-    /// audit journal cannot be opened, [`Error::Artifact`] when the answer store cannot be opened,
-    /// and [`Error::Client`] when the HTTP client cannot be built.
+    /// Returns [`Error::NoModel`] when no model is named, the errors of [`parse_endpoint`],
+    /// [`Error::Resolve`] when the host cannot be resolved, [`Error::Destination`] when validation
+    /// refuses the destination, [`Error::Audit`] when the audit journal cannot be opened,
+    /// [`Error::Artifact`] when the answer store cannot be opened, and [`Error::Client`] when the
+    /// HTTP client cannot be built.
     pub fn open(
         config: &Config,
+        credential: Credential,
         session: SessionID,
     ) -> Result<Self, Error> {
-        let path = config
-            .provider
-            .credential_file
-            .as_deref()
-            .ok_or(Error::NoCredential)?;
-        let credential = Credential::read(path)?;
         let model = config
             .provider
             .model
@@ -886,7 +828,6 @@ mod tests {
     use mokmok_state_machine::TurnNumber;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1318,31 +1259,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_credential_never_prints_its_value() {
-        let directory = scratch("credential");
-        let path = directory.join("credential");
-        std::fs::write(&path, "s3cr3t\n").unwrap();
-
-        let credential = Credential::read(&path).unwrap();
-
-        assert_eq!(format!("{credential:?}"), "REDACTED");
-        assert_eq!(credential.expose(), "s3cr3t");
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn an_empty_credential_file_is_refused_by_name() {
-        let directory = scratch("empty");
-        let path = directory.join("credential");
-        std::fs::write(&path, "   \n").unwrap();
-
-        let refused = Credential::read(&path).unwrap_err();
-
-        assert!(refused.to_string().contains(&path.display().to_string()));
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
     /// Calls the real endpoint over TLS and checks it answers with the runtime's vocabulary.
     ///
     /// Ignored by default so the gate stays network-free. Run it by hand with a key in the
@@ -1354,15 +1270,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "reaches the network; run by hand with OLLAMA_API_KEY set"]
     async fn a_live_endpoint_answers_one_action() {
-        let Ok(key) = std::env::var("OLLAMA_API_KEY") else {
+        if std::env::var_os("OLLAMA_API_KEY").is_none() {
             return;
-        };
+        }
         let directory = scratch("live");
         let checkout = directory.join("checkout");
         std::fs::create_dir_all(&checkout).unwrap();
-        let credential = directory.join("credential");
-        std::fs::write(&credential, key).unwrap();
-        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let args = crate::config::Args::try_parse_from([
             "mokmokd",
@@ -1386,18 +1299,22 @@ mod tests {
             "ollama",
             "--model",
             "kimi-k2.7-code",
-            "--provider-credential-file",
-            credential.to_str().unwrap(),
+            "--env-key",
+            "OLLAMA_API_KEY",
         ])
         .unwrap();
-        let config = crate::config::Config::resolve(
-            &args,
-            None,
-            &crate::config::ProcessEnvironment::default(),
-        )
-        .unwrap();
+        // The key is the test process's own, and resolution is handed the environment the process
+        // was started with rather than a copy of one variable.
+        let config =
+            crate::config::Config::resolve(&args, None, &crate::config::ProcessEnvironment::read())
+                .unwrap();
         let session = mokmok_protocol::SessionID::from_uuid(uuid::Uuid::nil());
-        let provider = super::Ollama::open(&config, session).unwrap();
+        let credential = config
+            .provider
+            .credential
+            .clone()
+            .expect("the run named the key it holds");
+        let provider = super::Ollama::open(&config, credential, session).unwrap();
         let prompt = Context {
             system: "You are a coding agent. List the current directory with the run_shell tool."
                 .to_owned(),
@@ -1415,20 +1332,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Writes a `0600` credential file in `directory`, returning its path.
-    fn credential_file(directory: &Path) -> PathBuf {
-        let path = directory.join("credential");
-        std::fs::write(&path, "s3cr3t").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        path
-    }
-
-    /// A provider configuration over `directory`, pointing at `endpoint`.
+    /// A provider configuration over `directory`, pointing at `endpoint`, with a hardcoded
+    /// credential.
     fn provider_config(
         directory: &Path,
         endpoint: &str,
-        credential: &Path,
     ) -> Config {
         let data = directory.join("data");
         let artifacts = data.join("artifacts");
@@ -1451,7 +1359,7 @@ mod tests {
                 kind: ProviderKind::Ollama,
                 model: Some("m".to_owned()),
                 endpoint: endpoint.to_owned(),
-                credential_file: Some(credential.to_path_buf()),
+                credential: Some(Credential::new("s3cr3t".to_owned())),
                 max_answer_tokens: 16,
                 ..ProviderSettings::default()
             },
@@ -1461,7 +1369,6 @@ mod tests {
     #[tokio::test]
     async fn a_redirect_is_not_followed_off_the_validated_destination() {
         let directory = scratch("redirect");
-        let credential = credential_file(&directory);
 
         let target = TcpListener::bind("127.0.0.1:0").unwrap();
         let target_port = target.local_addr().unwrap().port();
@@ -1499,12 +1406,10 @@ mod tests {
             let _ = stream.write_all(response.as_bytes());
         });
 
-        let config = provider_config(
-            &directory,
-            &format!("http://127.0.0.1:{origin_port}/v1"),
-            &credential,
-        );
-        let provider = Ollama::open(&config, SessionID::from_uuid(Uuid::nil())).unwrap();
+        let config = provider_config(&directory, &format!("http://127.0.0.1:{origin_port}/v1"));
+        let credential = config.provider.credential.clone().unwrap();
+        let provider =
+            Ollama::open(&config, credential, SessionID::from_uuid(Uuid::nil())).unwrap();
 
         let refused = provider.complete(&context()).await.unwrap_err();
 
@@ -1560,15 +1465,16 @@ mod tests {
     #[test]
     fn opening_the_provider_audits_the_destination_it_validated() {
         let directory = scratch("provider-audit");
-        let credential = credential_file(&directory);
         // A bound port is a free one. Nothing connects to it: opening the provider only resolves and
         // validates the destination.
         let bound = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = bound.local_addr().unwrap().port();
         let endpoint = format!("http://127.0.0.1:{port}/v1");
-        let config = provider_config(&directory, &endpoint, &credential);
+        let config = provider_config(&directory, &endpoint);
+        let credential = config.provider.credential.clone().unwrap();
 
-        let _provider = Ollama::open(&config, SessionID::from_uuid(Uuid::nil())).unwrap();
+        let _provider =
+            Ollama::open(&config, credential, SessionID::from_uuid(Uuid::nil())).unwrap();
 
         let journal = Journal::open(config.data_dir.join("audit.jsonl")).unwrap();
         let entries = journal.read(Moment::from_millis(0)).unwrap();

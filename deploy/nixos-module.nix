@@ -179,6 +179,15 @@ in
         ProtectProc = "invisible";
         RestrictRealtime = true;
         SystemCallArchitectures = "native";
+        # The credential a provider needs is the value of the variable `env_key` names, and it has
+        # to reach the daemon's own environment to be answered. This unit passes no `--config` and
+        # a system service is given no `XDG_CONFIG_HOME`, so discovery finds no configuration file
+        # and `serve` opens no provider: the unit carries no credential and needs no
+        # `Environment=`. An operator who gives the daemon a file that names `env_key` must set the
+        # variable here with `Environment=` or `EnvironmentFile=`, because resolution reads that
+        # file before it matches the subcommand and refuses every one of them, `serve` included,
+        # when the variable is absent.
+        #
         # clap global options go before the subcommand and subcommand options after it, so
         # --data-dir and the allow options precede `serve` and --socket follows it.
         ExecStart = lib.escapeShellArgs (

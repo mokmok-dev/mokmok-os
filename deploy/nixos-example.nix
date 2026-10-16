@@ -30,28 +30,31 @@
 # the same data directory the service serves, so it takes its own grants, and it runs as whoever
 # invokes it rather than as the service user:
 #
-#   mokmokd --data-dir /var/lib/mokmokd \
+#   MOKMOK_CREDENTIAL=... mokmokd --data-dir /var/lib/mokmokd \
 #     --allow-tool /bin/sh --allow-path /nix/store --allow-write /srv/checkout \
 #     agent run --session "$(cat /proc/sys/kernel/random/uuid)" \
 #       --goal 'make the failing test in src/parse.rs pass' \
 #       --checkout /srv/checkout --max-turns 24 --token-budget 400000 \
 #       --provider ollama --model kimi-k2.7-code \
-#       --provider-credential-file /run/secrets/ollama
+#       --env-key MOKMOK_CREDENTIAL
 #
-# Two things about that command are deliberate. The credential is a file, never an environment
-# variable: the daemon's environment is inherited by nothing today, but a file cannot reach a
-# confined tool by accident, and a file is what a secret manager can hand over. And the tool's
-# environment is exactly `PATH` plus every `--tool-env NAME=VALUE`, so a command sees no variable
-# the operator did not name. Add `--tool-env CARGO_HOME=/srv/cargo` and grant `/srv/cargo` the same
-# way as the checkout if the task builds Rust.
+# Two things about that command are deliberate. The credential is the value of the variable
+# `--env-key` names, so it lives in the daemon's own environment and nowhere else: every same-user
+# process can read it there out of `/proc/<pid>/environ`, and `systemctl show` prints a unit's
+# environment, which is the cost the 0600 file this replaced paid a path check to avoid. What the
+# variable buys is that a confined tool can neither influence nor reach it: the tool's environment
+# is exactly `PATH` plus every `--tool-env NAME=VALUE`, so a command sees no variable the operator
+# did not name, and `mokmok-kernel/tests/environment.rs` pins it. Add `--tool-env CARGO_HOME=/srv/cargo`
+# and grant `/srv/cargo` the same way as the checkout if the task builds Rust.
 #
-# The provider, the model, the endpoint, the script, the credential path, and the answer ceiling can
+# The provider, the model, the endpoint, the script, the variable name, and the answer ceiling can
 # instead live in `$XDG_CONFIG_HOME/mokmok/config.toml`, which an invocation reads when no flag names
 # them: a flag beats the file, and the file beats the built-in default. A value in that file may name
-# a variable of the daemon's environment, so the environment may say which credential file to read
-# and never what it holds. A variable must reach the daemon's own environment to be answered, so
-# with the shipped unit that means an `Environment=` line or `systemctl --user set-environment`, and
-# a variable exported in an interactive shell does not arrive.
+# a variable of the daemon's environment, and `env_key` is the exception that holds a bare variable
+# name and takes no `$NAME` reference. Either way a variable must reach the daemon's own environment
+# to be answered, so with the shipped unit that means an `Environment=` or `EnvironmentFile=` line or
+# `systemctl --user set-environment`, and a variable exported in an interactive shell does not
+# arrive.
 #
 # A tool cannot reach the network: the sandbox denies TCP `bind` and `connect` to every workload,
 # which needs Linux 6.7 or newer. The model call is the daemon's own, validated against the

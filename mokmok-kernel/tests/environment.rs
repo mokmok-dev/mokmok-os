@@ -6,6 +6,10 @@
 //! `--tool-env` entries. The assertion is on the bytes the workload captured, read back out of the
 //! artifact store, so it fails if the daemon passes anything through.
 //!
+//! The credential is the variable this matters most for. A daemon that answers `env_key` holds the
+//! secret in its own environment, and the sandbox's `Environment::Default` extends rather than
+//! clears, so a forgotten `Exact` would leak that secret where it once leaked `PATH`.
+//!
 //! The harness lives inside a `#[cfg(test)]` module because that is what tells the workspace's
 //! clippy settings that this is test code, where `unwrap` and `panic!` are allowed.
 
@@ -20,6 +24,8 @@ mod tests {
     const KEY: &str = "018f2f1e-0000-7000-8000-0000000000e5";
     const MARKER: &str = "MOKMOK_INHERITED_MARKER";
     const TOOL: &str = "MOKMOK_TOOL_VAR";
+    /// The variable a provider credential arrives in, which the daemon holds and a tool must not.
+    const CREDENTIAL: &str = "MOKMOK_CREDENTIAL";
 
     /// A directory of this test's own, removed when the test ends.
     struct Scratch(PathBuf);
@@ -128,9 +134,10 @@ mod tests {
     fn a_tool_sees_the_operators_environment_and_nothing_of_the_daemons() {
         let scratch = Scratch::new("exact");
         let script = concat!(
-            r#"printf 'marker=%s path=%s extra=%s'"#,
+            r#"printf 'marker=%s path=%s extra=%s credential=%s'"#,
             r#" "${MOKMOK_INHERITED_MARKER:-absent}" "$(command -v sh || echo none)""#,
             r#" "${MOKMOK_TOOL_VAR:-unset}""#,
+            r#" "${MOKMOK_CREDENTIAL:-absent}""#,
         );
         let mut args = vec![
             "--data-dir".to_owned(),
@@ -161,9 +168,12 @@ mod tests {
         ]);
 
         // The marker is set on the daemon alone: it is what the tool path has to clear, and an
-        // environment the daemon never held would make the absence below prove nothing.
+        // environment the daemon never held would make the absence below prove nothing. The
+        // credential is set the same way, because the daemon that answers `env_key` holds it in
+        // exactly this place.
         let output = Command::new(binary())
             .env(MARKER, "present")
+            .env(CREDENTIAL, "s3cr3t")
             .env("XDG_CONFIG_HOME", scratch.0.join("config"))
             .args(&args)
             .output()
@@ -193,6 +203,10 @@ mod tests {
         assert!(
             stdout.contains("extra=set"),
             "the operator's --tool-env entry did not reach the workload: {stdout:?}",
+        );
+        assert!(
+            stdout.contains("credential=absent"),
+            "the daemon's credential reached the workload: {stdout:?}",
         );
         let path = field(&stdout, "path").expect("the workload named the shell it found");
         assert!(
