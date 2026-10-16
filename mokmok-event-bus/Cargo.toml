@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-event-bus"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "adapter"
+
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
 futures-util = { workspace = true }

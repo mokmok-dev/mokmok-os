@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-sandbox"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "adapter"
+
 [dependencies]
 landlock = { workspace = true }
 mokmok-protocol = { workspace = true }

@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-artifact"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "adapter"
+
 [dependencies]
 mokmok-protocol = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

@@ -96,6 +96,20 @@
               }
             );
 
+            # Six of these come from `mokmok-os-architecture.md` section 9, which asks CI to check
+            # them, and three hold the role each member declares.
+            dependencyRules =
+              pkgs.runCommand "dependency-rules"
+                {
+                  nativeBuildInputs = [
+                    pkgs.jq
+                    rustToolchain
+                  ];
+                }
+                ''
+                  bash ${src}/docs/spec/references/attesters/dependency-rules.sh check ${src} > $out
+                '';
+
             mokmokdUnit =
               let
                 mokmokd = config.packages.default;

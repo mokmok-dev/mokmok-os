@@ -3,6 +3,9 @@ edition.workspace = true
 name = "mokmok-capability"
 version.workspace = true
 
+[package.metadata.mokmok]
+purity = "pure"
+
 [dependencies]
 mokmok-protocol = { workspace = true }
 serde = { workspace = true, features = ["alloc", "derive"] }
