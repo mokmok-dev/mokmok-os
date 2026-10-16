@@ -167,6 +167,9 @@ pub fn open_resolved(path: &Path) -> io::Result<OwnedFd> {
 /// planning cannot move the directory the caller will read and write through. Refuses with
 /// `ENOTDIR` when the path is not a directory and with `ELOOP` when any component is a symlink.
 ///
+/// The descriptor is opened read-only rather than `O_PATH` so the caller may `fsync` it after an
+/// atomic rename, which `O_PATH` refuses with `EBADF`.
+///
 /// # Errors
 ///
 /// Returns the `openat2` error: `ELOOP` for a symlink, `ENOTDIR` when the path is not a directory,
@@ -176,7 +179,7 @@ pub fn open_resolved_dir(path: &Path) -> io::Result<OwnedFd> {
         AT_FDCWD,
         path,
         OpenHow::new()
-            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
             .mode(Mode::empty())
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )
