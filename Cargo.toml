@@ -8,6 +8,7 @@ members = [
   "mokmok-event-store",
   "mokmok-kernel",
   "mokmok-observability",
+  "mokmok-patch",
   "mokmok-protocol",
   "mokmok-sandbox",
   "mokmok-scheduler",
@@ -30,6 +31,7 @@ mokmok-event-bus = { path = "mokmok-event-bus" }
 mokmok-event-store = { path = "mokmok-event-store" }
 mokmok-kernel = { path = "mokmok-kernel" }
 mokmok-observability = { path = "mokmok-observability" }
+mokmok-patch = { path = "mokmok-patch" }
 mokmok-protocol = { path = "mokmok-protocol" }
 mokmok-sandbox = { path = "mokmok-sandbox" }
 mokmok-scheduler = { path = "mokmok-scheduler" }

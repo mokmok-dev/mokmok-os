@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f3bea3cdb042e27f25dde6268e6d80be0e4e7a24b5434e6f9564de37110f0679 # shrinks to (old, hunk) = ([], FilePatch { source: Path("f"), target: Path("f"), hunks: [Hunk { stated: Header { old_start: 1, old_len: 0, new_start: 1, new_len: 0 }, lines: [] }] })
+cc 75fa03b1b232e3b80e5daef54a03e6be46f181c67154de9f6b9b70a7a4ac376c # shrinks to (old, mut patch) = (["", "", "\u{b}", "", ""], FilePatch { source: Path("f"), target: Path("f"), hunks: [Hunk { stated: Header { old_start: 3, old_len: 1, new_start: 3, new_len: 1 }, lines: [Line { kind: Context, text: "\u{b}", newline: true }, Line { kind: Context, text: "\u{b}", newline: true }] }] })
+cc d5292c3564ccef5f1cd9dddea09570bd0025a4085210360e093d8a485988ca58 # shrinks to (old, hunk) = (["", "", "", "", "", "", "", ""], FilePatch { source: Path("f"), target: Path("f"), hunks: [Hunk { stated: Header { old_start: 9, old_len: 0, new_start: 9, new_len: 0 }, lines: [] }] })
