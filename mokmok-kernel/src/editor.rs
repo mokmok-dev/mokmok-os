@@ -177,14 +177,14 @@ impl EditorPort for Editor {
             )));
         }
 
-        let (before_bytes, _mode) = match read_target(&parent_fd, name, &relative) {
+        let (before_bytes, _mode, creates) = match read_target(&parent_fd, name, &relative) {
             Ok(Some(value)) => {
                 if matches!(section.source, Label::Absent) {
                     return Ok(Plan::Refused(format!(
                         "{relative} already exists; patch it instead of creating it"
                     )));
                 }
-                value
+                (value.0, value.1, false)
             },
             Ok(None) => {
                 if !matches!(section.source, Label::Absent) {
@@ -192,7 +192,7 @@ impl EditorPort for Editor {
                         "{relative} does not exist; create it with a command before patching it"
                     )));
                 }
-                (Vec::new(), DEFAULT_MODE)
+                (Vec::new(), DEFAULT_MODE, true)
             },
             Err(reason) => return Ok(Plan::Refused(reason)),
         };
@@ -246,6 +246,7 @@ impl EditorPort for Editor {
             after,
             bytes: applied.bytes,
             placement,
+            creates,
         }))
     }
 
@@ -281,6 +282,9 @@ impl EditorPort for Editor {
 
         let (current_bytes, mode) = match read_target(&parent_fd, name, &ready.relative) {
             Ok(Some(value)) => value,
+            // The plan read no file because the patch creates it, so there is no pre-image to
+            // compare against and the staging file is what lands.
+            Ok(None) if ready.creates => (Vec::new(), DEFAULT_MODE),
             Ok(None) => {
                 return Ok(Self::refused_report(
                     &ready.relative,
@@ -487,6 +491,7 @@ fn write_atomic(
     drop(tmp);
 
     if let Err(error) = nix::fcntl::renameat(parent_fd, tmp_name, parent_fd, name) {
+        let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
         return Err(WriteFailure::NothingWritten(io::Error::from(error)));
     }
 
@@ -941,6 +946,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed\n");
     }
 
+    #[test]
+    fn commit_creates_the_file_a_patch_names_as_absent() {
+        let scratch = Scratch::new("create-commits");
+        let checkout = checkout(&scratch);
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- /dev/null\n+++ b/x.rs\n@@ -0,0 +1,1 @@\n+new\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+        assert!(ready.creates, "the plan read no file");
+
+        let report = editor.commit(&ready).unwrap();
+        assert!(
+            matches!(report.outcome, EditOutcome::Applied),
+            "report was not Applied: {}",
+            report.observation
+        );
+        let target = checkout.join("x.rs");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "mode was {mode:o}");
+    }
+
     /// `O_PATH` carries `renameat` and refuses `fsync`, which is the one way to fail the directory
     /// sync with the bytes already in place.
     #[test]
@@ -972,5 +1006,34 @@ mod tests {
             "{failure:?}"
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "two\n");
+    }
+
+    /// A directory on the `newpath` side is what a `renameat` fails on, and the staging file has to
+    /// go with it or the refusal leaves a copy of the post-image in the operator's checkout.
+    #[test]
+    fn a_rename_that_fails_leaves_no_staging_file() {
+        let scratch = Scratch::new("rename-fails");
+        std::fs::create_dir(scratch.0.join("sub")).unwrap();
+        let dir = mokmok_sandbox::open_resolved_dir(&scratch.0).unwrap();
+
+        let failure = write_atomic(
+            &dir,
+            OsStr::new("sub"),
+            ".mokmok-edit-rehearsal",
+            b"two\n",
+            0o644,
+        )
+        .expect_err("renaming a file over a directory fails");
+
+        assert!(
+            matches!(failure, WriteFailure::NothingWritten(_)),
+            "{failure:?}"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["sub".to_owned()], "the staging file is gone");
     }
 }

@@ -36,6 +36,9 @@ pub struct Ready {
     pub bytes: Vec<u8>,
     /// Where each hunk landed.
     pub placement: String,
+    /// The plan read no file because the patch creates it, so a commit that finds none writes one
+    /// rather than treating the absence as a file that moved.
+    pub creates: bool,
 }
 
 /// How one edit ended.

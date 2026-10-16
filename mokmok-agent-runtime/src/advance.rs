@@ -1124,6 +1124,7 @@ mod tests {
             after: artifact(0x02),
             bytes: b"after".to_vec(),
             placement: "hunk 1 matched at line 1 (offset 0)".to_owned(),
+            creates: false,
         }
     }
 
