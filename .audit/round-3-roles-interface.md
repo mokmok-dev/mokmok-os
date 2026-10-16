@@ -64,7 +64,7 @@ being silently treated as std.
 
 ```toml
 [package.metadata.mokmok]
-purity = "pure"      # or "adapter", or "shell"
+purity = "pure"
 ```
 
 - `pure` means the crate is `#![no_std]`, so rustc rejects `std` and no convention has to hold the

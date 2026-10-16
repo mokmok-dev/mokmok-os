@@ -96,9 +96,7 @@
               }
             );
 
-            # `mokmok-os-architecture.md` section 9 asks CI to enforce its dependency rules, and
-            # until this check existed the only reader of them was an operator running the attester
-            # by hand, so the role division was a document rather than a fact.
+            # `mokmok-os-architecture.md` section 9 asks CI to enforce these dependency rules.
             dependencyRules =
               pkgs.runCommand "dependency-rules"
                 {

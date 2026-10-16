@@ -3,9 +3,8 @@
 
 set -uo pipefail
 
-# The composition roots. `mokmok-kernel` assembles every other crate and `mokmok-tui` is an
-# application above it, the way the `mokmokd` binary is. Two rules read this one list, so a third
-# root is one reviewed edit here.
+# The composition roots: the crates that compose others rather than being composed. Two rules read
+# this one list, so a third root is one reviewed edit here rather than a second list to keep in step.
 COMPOSITION_ROOTS="mokmok-kernel
 mokmok-tui"
 
@@ -63,10 +62,6 @@ forbidden_hit() {
 	selected "$dir" "$section" | grep -x -F -f <(printf '%s\n' "$list") | paste -sd, -
 }
 
-# The role a member declares for itself, from `[package.metadata.mokmok]` in its own manifest. A
-# member that declares nothing prints nothing, which is what the first rule reports. The old rule
-# took its subjects from `#![no_std]` in the source, so it asked only the crates that had already
-# answered and nothing counted the ones that had not.
 declared_role() {
 	awk '
 		/^\[/ { section = $0; gsub(/[][[:space:]]/, "", section); next }
@@ -318,8 +313,8 @@ write_manifest() {
 	} > "$path"
 }
 
-# The members of a fabricated tree. The names matter for the rules that hardcode a crate, and
-# `mokmok-alpha` and `mokmok-beta` stand in for the members whose only role is to be a role.
+# `mokmok-alpha` and `mokmok-beta` stand in for members whose only job is to hold a role. The rest
+# keep their real names, because three rules name those crates outright.
 FAKE_MEMBERS="mokmok-alpha
 mokmok-beta
 mokmok-capability
@@ -340,8 +335,6 @@ write_root() {
 	} > "$root/Cargo.toml"
 }
 
-# The base tree every fault is one edit away from, so a fault case has a control as well as a
-# subject: the base passes all nine rules, and one edit makes exactly one of them fail.
 lay_down_base() {
 	local root=$1 member
 	mkdir -p "$root"
@@ -402,8 +395,6 @@ mokmok-kernel = { path = "../mokmok-kernel" }
 	esac
 }
 
-# A passing check means nothing unless it can fail, and a rule that fails for the wrong reason is not
-# the control it looks like. Each case asserts the rule reports `status=fail` and names the offender.
 faults() {
 	local root fault rule expected detail status failures=0
 	root=$(mktemp -d)

@@ -54,10 +54,10 @@ names, which are the values the `rule` parameter takes.
 | `kernel-dependents-are-applications` | A dependency on `mokmok-kernel` from any crate outside the composition roots |
 
 The design states these rules as constraints on which crate may depend on what, and asks CI to
-check them.[^architecture] For four rules the check is the flake's `dependencyRules` attribute. Each
-member declares its own role, so a member added without one fails rather than being silently treated
-as std, and `kernel-dependents-are-applications` reads the same list of composition roots that
-`every-member-declares-its-role` holds the `shell` role to.
+check them.[^architecture] The check is the flake's `dependencyRules` attribute, which runs all nine
+because it passes no rule name. Each member declares its own role, so a member added without one
+fails rather than being silently treated as std, and `kernel-dependents-are-applications` reads the
+same list of composition roots that `every-member-declares-its-role` holds the `shell` role to.
 
 # The run on 2026-10-15
 
