@@ -9,11 +9,11 @@
 # MOKMOK_PROVIDER=ollama swaps the script for a real OpenAI-compatible endpoint, the route
 # examples/coding-agent/run.sh takes, where the model answers for itself:
 #   OLLAMA_API_KEY=... MOKMOK_PROVIDER=ollama sh examples/chat/run.sh
-# It reads `OLLAMA_API_KEY`, writes it to a 0600 file outside every write grant, and passes
-# `--provider ollama --model "$MOKMOK_MODEL" --endpoint "$MOKMOK_ENDPOINT"
-# --provider-credential-file <that file>`. MOKMOK_MODEL defaults to kimi-k2.7-code and MOKMOK_ENDPOINT
-# to https://ollama.com/v1; point MOKMOK_ENDPOINT at http://127.0.0.1:11434/v1 for a server on this
-# host.
+# It passes `--provider ollama --model "$MOKMOK_MODEL" --endpoint "$MOKMOK_ENDPOINT"
+# --env-key OLLAMA_API_KEY`, so the key arrives as a variable of the daemon's own environment,
+# named rather than written down in a file. MOKMOK_MODEL defaults to kimi-k2.7-code and
+# MOKMOK_ENDPOINT to https://ollama.com/v1; point MOKMOK_ENDPOINT at http://127.0.0.1:11434/v1 for
+# a server on this host.
 #
 # `mokmok-tui` drives the agent loop in its own process, exactly as `mokmokd agent run` does, and
 # opens the event log directly. It connects to no bus, because the bus has no inbound command:
@@ -92,17 +92,15 @@ case "$provider" in
     set -- "$@" --script "$data_dir/script.json"
     ;;
   ollama)
-    # The credential is read from a file at open and never from the environment: every confined tool
-    # inherits that environment unless the caller says otherwise. The file sits outside every
-    # --allow-write grant, and the kernel refuses one that does not.
-    credential_dir="$(mktemp -d)"
-    umask 077
-    printf '%s' "${OLLAMA_API_KEY:-ollama}" > "$credential_dir/credential"
+    # The credential is a variable of the daemon's own environment, named by `env_key`, and this
+    # process hands it to the tui by inheriting it. A confined tool still sees only `PATH` and the
+    # `--tool-env` entries, because `agent run` passes `Environment::Exact`.
+    export OLLAMA_API_KEY="${OLLAMA_API_KEY:-ollama}"
     set -- "$@" \
       --provider ollama \
       --model "${MOKMOK_MODEL:-kimi-k2.7-code}" \
       --endpoint "${MOKMOK_ENDPOINT:-https://ollama.com/v1}" \
-      --provider-credential-file "$credential_dir/credential"
+      --env-key OLLAMA_API_KEY
     ;;
   *)
     printf 'run.sh: MOKMOK_PROVIDER must be scripted or ollama, not %s\n' "$provider" >&2
