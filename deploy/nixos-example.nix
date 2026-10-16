@@ -48,11 +48,10 @@
 # The provider, the model, the endpoint, the script, the credential path, and the answer ceiling can
 # instead live in `$XDG_CONFIG_HOME/mokmok/config.toml`, which an invocation reads when no flag names
 # them: a flag beats the file, and the file beats the built-in default. A value in that file may name
-# a variable of the daemon's environment, so the configuration file can name the credential path
-# through a variable, and the environment says where the secret lives and never what it is. A
-# variable must reach the daemon's own environment to be answered, so with the shipped unit that
-# means an `Environment=` line or `systemctl --user set-environment`, and a variable exported in an
-# interactive shell does not arrive.
+# a variable of the daemon's environment, so the environment may say which credential file to read
+# and never what it holds. A variable must reach the daemon's own environment to be answered, so
+# with the shipped unit that means an `Environment=` line or `systemctl --user set-environment`, and
+# a variable exported in an interactive shell does not arrive.
 #
 # A tool cannot reach the network: the sandbox denies TCP `bind` and `connect` to every workload,
 # which needs Linux 6.7 or newer. The model call is the daemon's own, validated against the

@@ -68,10 +68,10 @@ publisher per topic in `Relay` (`src/serve.rs:54`), the scripted model's answer 
 - A session that committed no task is listed with no goal and no checkout, and a stream that
   committed no session fact at all folds to the phase an empty history reaches rather than being
   skipped (`src/roster.rs:43-64`).
-- A credential file must be mode 0600 (`src/config.rs:863`) and must not sit inside a write grant
-  (`src/config.rs:881`).
+- A credential file must be mode 0600 (`src/config.rs:867`) and must not sit inside a write grant
+  (`src/config.rs:875`).
 - An artifact path must be plain and relative. A parent-directory component, a root component, and
-  the empty string are refused (`src/config.rs:837-850`).
+  the empty string are refused (`src/config.rs:831-844`).
 - The configuration file supplies the provider group and nothing else, so an edited file cannot widen
   the sandbox: `ProviderLayer` is the flag surface and the file's key set at once (`src/config.rs:61`).
 - A value the file writes may name a variable of the process as `$NAME` or `${NAME}`, and `expand` is
@@ -84,12 +84,12 @@ publisher per topic in `Relay` (`src/serve.rs:54`), the scripted model's answer 
   there is refused, while a file discovery looked for and did not find is silence
   (`src/config.rs:463`).
 - The file is read for every command, so one file is valid or invalid for the whole CLI rather than
-  for a subset (`src/config.rs:680`).
+  for a subset (`src/config.rs:677`).
 - A path key in the file must be plain and relative, and `answered_path` expands the written key and
   resolves it beside the file, which is what keeps the credential meeting the write-grant refusal
-  once it is absolute (`src/config.rs:760`).
+  once it is absolute (`src/config.rs:754`).
 - Crash injection needs two signals, the `--crash-after` flag and a set `MOKMOKD_CRASH`
-  (`src/config.rs:798-809`).
+  (`src/config.rs:792-803`).
 - Every append carries the version it read back from the stream, so a moved stream is a conflict
   (`src/slice.rs:487-497`).
 - One command identity commits once, and a retry is answered from the deduplication record
@@ -145,7 +145,7 @@ policy content from flags (`src/authority.rs:56-107`) and owns the provider's eg
 
 The kernel owns more than the design's list: the agent loop (`src/agent.rs:665`), the systemd
 notification protocol (`src/notify.rs`), the egress-backed model provider (`src/provider.rs`), crash
-injection (`src/config.rs:798`), and the workspace's only wall-clock read
+injection (`src/config.rs:792`), and the workspace's only wall-clock read
 (`src/bin/mokmokd.rs:80-88`).
 
 # Tests

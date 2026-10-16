@@ -513,7 +513,6 @@ impl ProcessEnvironment {
         self.0.get(OsStr::new(name)).map(OsString::as_os_str)
     }
 
-    /// The environment one case pins, so the file it writes is answered from the case's own data.
     #[cfg(test)]
     fn of(pairs: &[(&str, &OsStr)]) -> Self {
         Self(
@@ -529,15 +528,18 @@ impl ProcessEnvironment {
 #[derive(Debug, Eq, PartialEq)]
 enum Unanswered {
     /// The environment holds no value for the name, or holds an empty one.
-    Unset { name: String },
-    /// A dollar that opens neither a name nor a brace, as the operator wrote it.
-    Malformed { reference: String },
-    /// The name is set, and its value is not text a value of a text file can carry.
-    NotText { name: String },
+    Unset {
+        name: String,
+    },
+    Malformed {
+        reference: String,
+    },
+    NotText {
+        name: String,
+    },
 }
 
 impl Unanswered {
-    /// The refusal this becomes: the file, the key, and the value as the operator wrote it.
     fn in_file(
         self,
         file: &Path,
@@ -577,8 +579,6 @@ impl Unanswered {
 ///
 /// An answer is appended exactly as it came and is never scanned again, so no value the environment
 /// carries can open a second reference or reach a second key.
-///
-/// It knows of no file and no key: [`Unanswered`] says what was wrong, and the layer says where.
 fn expand(
     written: &str,
     environment: &ProcessEnvironment,
@@ -592,7 +592,6 @@ fn expand(
         let after = &rest[dollar + 1..];
 
         match after.as_bytes().first() {
-            // The one way to write a dollar the environment does not answer.
             Some(b'$') => {
                 expanded.push('$');
                 rest = &after[1..];
@@ -637,7 +636,6 @@ fn expand(
     Ok(expanded)
 }
 
-/// The text `name` answers with, or what the environment's silence costs.
 fn answered<'a>(
     name: &str,
     environment: &'a ProcessEnvironment,
@@ -664,7 +662,6 @@ fn variable_name(name: &str) -> bool {
     }
 }
 
-/// Whether `character` continues a name.
 const fn name_char(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
@@ -741,7 +738,6 @@ fn answered_layer(
     })
 }
 
-/// One text key: the environment answers every reference the operator wrote in it.
 fn answered_text(
     written: Option<String>,
     key: &'static str,
@@ -755,8 +751,6 @@ fn answered_text(
         .transpose()
 }
 
-/// One path key: the environment answers it first, and the answer is then held to the same
-/// plain-relative rule a written path follows and joined below the file's own directory.
 fn answered_path(
     written: Option<PathBuf>,
     key: &'static str,

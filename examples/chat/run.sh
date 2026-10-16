@@ -93,8 +93,7 @@ case "$provider" in
     ;;
   ollama)
     # The credential is read from a file at open and never from the environment: every confined tool
-    # inherits that environment unless the caller says otherwise, so the environment may say where
-    # the file is and never what it holds. The file sits outside every
+    # inherits that environment unless the caller says otherwise. The file sits outside every
     # --allow-write grant, and the kernel refuses one that does not.
     credential_dir="$(mktemp -d)"
     umask 077
