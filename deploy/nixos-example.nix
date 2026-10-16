@@ -45,6 +45,10 @@
 # the operator did not name. Add `--tool-env CARGO_HOME=/srv/cargo` and grant `/srv/cargo` the same
 # way as the checkout if the task builds Rust.
 #
+# The provider, the model, the endpoint, the script, the credential path, and the answer ceiling can
+# instead live in `$XDG_CONFIG_HOME/mokmok/config.toml`, which an invocation reads when no flag names
+# them: a flag beats the file, and the file beats the built-in default.
+#
 # A tool cannot reach the network: the sandbox denies TCP `bind` and `connect` to every workload,
 # which needs Linux 6.7 or newer. The model call is the daemon's own, validated against the
 # configured destination, and `--endpoint http://127.0.0.1:11434/v1` keeps the checkout on the host.
