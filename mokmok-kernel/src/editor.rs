@@ -18,7 +18,7 @@ use mokmok_agent_runtime::{
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_patch::{ApplyError, Label, ParseError, Patch, Placed};
 use mokmok_protocol::Moment;
-use nix::fcntl::{OFlag, openat};
+use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::authority::Authority;
@@ -31,7 +31,13 @@ const MAX_EDIT_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// The adapter that turns one patch into one atomic file write.
 pub struct Editor {
     config: Config,
+    /// The resolved checkout path, which every open, read, and write goes through, so no symlink is
+    /// followed during I/O.
     checkout: PathBuf,
+    /// The checkout path as the operator wrote it. `Authority` compares this against the literal
+    /// `--allow-write` roots, so a checkout the operator reached through a symlink is still covered
+    /// by the grant that names that symlink.
+    checkout_literal: PathBuf,
     store: BlobStore,
     at: Moment,
 }
@@ -51,6 +57,7 @@ impl Editor {
         Ok(Self {
             config: config.clone(),
             checkout: mokmok_sandbox::resolve(checkout)?,
+            checkout_literal: checkout.to_path_buf(),
             store: BlobStore::open(&config.artifacts)?,
             at,
         })
@@ -80,10 +87,16 @@ impl Editor {
                 "the source is absent, so a hunk with an old side has nothing to match".to_owned()
             },
             PatchError::Apply(ApplyError::ZeroStart { hunk }) => {
-                format!("hunk {hunk} starts at 0 in a file that exists")
+                format!(
+                    "hunk {} starts at 0 in a file that exists",
+                    hunk.saturating_add(1)
+                )
             },
             PatchError::Apply(ApplyError::NotFound { hunk }) => {
-                format!("hunk {hunk} does not match the file from its stated line forward")
+                format!(
+                    "hunk {} does not match the file from its stated line forward",
+                    hunk.saturating_add(1)
+                )
             },
             PatchError::TooManyFiles => {
                 "the patch must name exactly one file, and it named more than one".to_owned()
@@ -164,13 +177,17 @@ impl EditorPort for Editor {
             Err(error) => {
                 return Ok(Plan::Refused(open_reason(
                     &error,
+                    &relative,
                     parent,
                     &format!("{relative} could not be opened"),
                 )));
             },
         };
 
-        if let Err(denial) = authority.may_write_at(&target, self.at) {
+        // The authority answers for the path the operator wrote, because `--allow-write` is
+        // compared literally; every open below uses the resolved one.
+        if let Err(denial) = authority.may_write_at(&self.checkout_literal.join(&relative), self.at)
+        {
             return Ok(Plan::Refused(format!(
                 "{relative} is not under a directory the operator granted for writing, so nothing \
                  was written: {denial}"
@@ -228,8 +245,13 @@ impl EditorPort for Editor {
         );
 
         if let Some(expected) = &call.expect {
+            if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Ok(Plan::Refused(format!(
+                    "{relative}: expect is not a 64-character hexadecimal sha256 hash"
+                )));
+            }
             let actual = before_hash.to_string();
-            if actual != *expected {
+            if !actual.eq_ignore_ascii_case(expected) {
                 // The call carries the expected hash and no expected size, so the refusal may not
                 // name one; the size it prints is the file's own.
                 return Ok(Plan::Refused(format!(
@@ -277,7 +299,12 @@ impl EditorPort for Editor {
             Err(error) => {
                 return Ok(Self::refused_report(
                     &ready.relative,
-                    open_reason(&error, parent, "the parent directory could not be opened"),
+                    open_reason(
+                        &error,
+                        &ready.relative,
+                        parent,
+                        "the parent directory could not be opened",
+                    ),
                 ));
             },
         };
@@ -311,8 +338,15 @@ impl EditorPort for Editor {
             });
         }
 
-        let tmp_name = format!(".mokmok-edit-{}-{}", std::process::id(), ready.after.hash);
-        match write_atomic(&parent_fd, name, &tmp_name, &ready.bytes, mode) {
+        let tmp_name = format!(".mokmok-edit-{}", uuid::Uuid::now_v7());
+        match write_atomic(
+            &parent_fd,
+            name,
+            &tmp_name,
+            &ready.bytes,
+            mode,
+            ready.creates,
+        ) {
             Ok(()) => {
                 crate::config::crash(&self.config, CrashPoint::AfterDispatch);
                 Ok(EditReport {
@@ -399,6 +433,7 @@ fn render_placement(hunks: &[Placed]) -> String {
 
 fn open_reason(
     error: &io::Error,
+    relative: &str,
     path: &Path,
     fallback: &str,
 ) -> String {
@@ -408,7 +443,11 @@ fn open_reason(
             path.display()
         )
     } else if error.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32) {
-        "the target is a symbolic link, and this tool never follows one".to_owned()
+        // This open is of the parent, so the link is on the way to the file rather than the file.
+        format!(
+            "a directory on the way to {relative} is a symbolic link, and this tool never follows \
+             one"
+        )
     } else {
         format!("{fallback}: {error}")
     }
@@ -474,6 +513,7 @@ fn write_atomic(
     tmp_name: &str,
     bytes: &[u8],
     mode: u32,
+    creates: bool,
 ) -> Result<(), WriteFailure> {
     let mode = Mode::from_bits_truncate(mode & 0o777);
     let tmp = match openat(
@@ -497,13 +537,31 @@ fn write_atomic(
     }
     drop(tmp);
 
-    if let Err(error) = nix::fcntl::renameat(parent_fd, tmp_name, parent_fd, name) {
-        let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
-        return Err(WriteFailure::NothingWritten(io::Error::from(error)));
-    }
+    // A patch that creates a file may take the target's name only while the target is still absent,
+    // or a file that appeared meanwhile would be replaced rather than refused. A patch of an
+    // existing file means to replace it, so that path renames.
+    let landed = if creates {
+        nix::unistd::linkat(parent_fd, tmp_name, parent_fd, name, AtFlags::empty()).map_err(
+            |error| match error {
+                nix::errno::Errno::EEXIST => io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the file appeared while the edit was being written",
+                ),
+                other => io::Error::from(other),
+            },
+        )
+    } else {
+        nix::fcntl::renameat(parent_fd, tmp_name, parent_fd, name).map_err(io::Error::from)
+    };
 
-    // Past the rename the target holds the post-image, so what fails here is the durability of the
-    // directory entry and not the write.
+    if let Err(error) = landed {
+        let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
+        return Err(WriteFailure::NothingWritten(error));
+    }
+    let _ = nix::unistd::unlinkat(parent_fd, tmp_name, nix::unistd::UnlinkatFlags::NoRemoveDir);
+
+    // Past the link or the rename the target holds the post-image, so what fails here is the
+    // durability of the directory entry and not the write.
     nix::unistd::fsync(parent_fd)
         .map_err(|error| WriteFailure::LandedUnsynced(io::Error::from(error)))
 }
@@ -782,6 +840,65 @@ mod tests {
             panic!("expected Refused");
         };
         assert!(reason.contains("hunk"), "{reason}");
+        assert!(
+            reason.contains("hunk 1"),
+            "the first hunk is the one the model wrote: {reason}"
+        );
+    }
+
+    #[test]
+    fn plan_accepts_a_checkout_the_operator_reached_through_a_symlink() {
+        let scratch = Scratch::new("symlinked-grant");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let link = scratch.0.join("link");
+        std::os::unix::fs::symlink(&checkout, &link).unwrap();
+        // The grant names the symlink, which is the path `--allow-write` was handed.
+        let config = config(&scratch.0, std::slice::from_ref(&link), &[]);
+        let editor = Editor::new(&config, &link, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n",
+            ))
+            .unwrap();
+
+        assert!(matches!(plan, Plan::Ready(_)), "{plan:?}");
+    }
+
+    #[test]
+    fn plan_refuses_an_expect_that_is_not_a_hash() {
+        let scratch = Scratch::new("expect-shape");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
+        // 64 characters, one of them not hexadecimal.
+        call.expect = Some(format!("{}z", "0".repeat(63)));
+
+        let Plan::Refused(reason) = editor.plan(&call).unwrap() else {
+            panic!("expected Refused");
+        };
+        assert!(
+            reason.contains("64-character hexadecimal sha256 hash"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn plan_accepts_an_uppercase_expect() {
+        let scratch = Scratch::new("expect-case");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
+        call.expect = Some(ContentHash::of(b"one\n").to_string().to_uppercase());
+
+        assert!(matches!(editor.plan(&call).unwrap(), Plan::Ready(_)));
     }
 
     #[test]
@@ -850,6 +967,7 @@ mod tests {
     fn open_reason_renders_exact_sentences() {
         let not_found = open_reason(
             &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            "src/x.rs",
             std::path::Path::new("/tmp/missing"),
             "the parent directory could not be opened",
         );
@@ -860,16 +978,20 @@ mod tests {
 
         let symlink = open_reason(
             &std::io::Error::from_raw_os_error(nix::errno::Errno::ELOOP as i32),
+            "src/x.rs",
             std::path::Path::new("/tmp/link"),
             "the parent directory could not be opened",
         );
         assert_eq!(
             symlink,
-            "the target is a symbolic link, and this tool never follows one".to_owned(),
+            "a directory on the way to src/x.rs is a symbolic link, and this tool never follows \
+             one"
+            .to_owned(),
         );
 
         let other = open_reason(
             &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            "src/x.rs",
             std::path::Path::new("/tmp/dir"),
             "/tmp/dir could not be opened",
         );
@@ -1036,6 +1158,7 @@ mod tests {
             ".mokmok-edit-rehearsal",
             b"two\n",
             0o644,
+            false,
         )
         .expect_err("a directory sync fails on an O_PATH descriptor");
 
@@ -1060,6 +1183,7 @@ mod tests {
             ".mokmok-edit-rehearsal",
             b"two\n",
             0o644,
+            false,
         )
         .expect_err("renaming a file over a directory fails");
 
@@ -1073,5 +1197,42 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec!["sub".to_owned()], "the staging file is gone");
+    }
+
+    /// A patch that creates a file takes the target's name only while the target is absent, so a
+    /// writer that arrived first keeps its bytes.
+    #[test]
+    fn a_create_refuses_a_target_that_appeared() {
+        let scratch = Scratch::new("create-race");
+        let target = scratch.0.join("x.rs");
+        std::fs::write(&target, "theirs\n").unwrap();
+        let dir = mokmok_sandbox::open_resolved_dir(&scratch.0).unwrap();
+
+        let failure = write_atomic(
+            &dir,
+            OsStr::new("x.rs"),
+            ".mokmok-edit-rehearsal",
+            b"mine\n",
+            0o644,
+            true,
+        )
+        .expect_err("a create must not replace a file that appeared");
+
+        let WriteFailure::NothingWritten(error) = failure else {
+            panic!("expected NothingWritten");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("appeared while the edit was being written"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs\n");
+        let mut left: Vec<String> = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["x.rs".to_owned()], "the staging file is gone");
     }
 }

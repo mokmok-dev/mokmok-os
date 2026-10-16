@@ -451,12 +451,17 @@ fn transcript_line(
             find.report.observation,
         )),
         mokmok_agent_runtime::Record::EditIntent(edit) => Some(format!(
-            "edit turn={} number={} execution={} patch={:?} relative={:?}",
+            "edit turn={} number={} execution={} patch={:?} relative={:?} before={} bytes \
+             (sha256 {}) after={} bytes (sha256 {})",
             edit.turn.as_uuid(),
             number(edit.turn),
             edit.execution.as_uuid(),
             edit.patch,
             edit.relative,
+            edit.before.bytes,
+            edit.before.hash,
+            edit.after.bytes,
+            edit.after.hash,
         )),
         mokmok_agent_runtime::Record::EditOutcome(edit) => Some(format!(
             "edit turn={} number={} execution={} outcome={:?} observation={:?}",
@@ -578,7 +583,7 @@ pub fn mint_session(at: Moment) -> SessionID {
 mod tests {
     use super::{Notice, outcome_of, timestamp};
     use mokmok_event_store::CommandId;
-    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
     use mokmok_state_machine::{Resolution, TurnOutcome};
     use uuid::Uuid;
 
@@ -676,5 +681,44 @@ mod tests {
             command,
         );
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn the_edit_intent_line_names_both_hashes() {
+        use super::transcript_line;
+        use mokmok_agent_runtime::{ArtifactRef, EditIntentRecord};
+
+        let intent = mokmok_agent_runtime::Record::EditIntent(EditIntentRecord {
+            turn: TurnID::from_uuid(uuid::Uuid::from_u128(8)),
+            execution: ExecutionID::from_uuid(uuid::Uuid::from_u128(9)),
+            patch: String::new(),
+            expect: None,
+            relative: "src/x.rs".to_owned(),
+            before: ArtifactRef {
+                hash: "01".to_owned(),
+                bytes: 1,
+                truncated: false,
+            },
+            after: ArtifactRef {
+                hash: "02".to_owned(),
+                bytes: 2,
+                truncated: false,
+            },
+            placement: String::new(),
+        });
+        let turn = TurnID::from_uuid(uuid::Uuid::from_u128(8));
+        let line = transcript_line(
+            &intent,
+            &std::collections::BTreeMap::from([(
+                turn,
+                Some(mokmok_state_machine::TurnNumber::new(1)),
+            )]),
+        )
+        .expect("an intent renders a line");
+
+        assert!(line.contains("before=1 bytes"), "{line}");
+        assert!(line.contains("sha256 01"), "{line}");
+        assert!(line.contains("after=2 bytes"), "{line}");
+        assert!(line.contains("sha256 02"), "{line}");
     }
 }
