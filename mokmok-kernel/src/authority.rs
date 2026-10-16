@@ -10,7 +10,7 @@
 //! translates what was granted into the sandbox's own narrow types, so the sandbox enforces
 //! mechanically what the decision allowed.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mokmok_capability::{
     Action, ActionSet, Authority as Decisions, Context, Decision, Denial, DenialReason, Name,
@@ -44,6 +44,7 @@ pub const DEV_NULL: &str = "/dev/null";
 /// Authority as this round's configuration states it.
 pub struct Authority {
     decisions: Decisions,
+    write_roots: Vec<PathBuf>,
 }
 
 impl Authority {
@@ -59,8 +60,10 @@ impl Authority {
     ) -> Result<Self, Error> {
         let mut policy = Policy::new();
         let mut roots = Vec::new();
+        let mut write_roots = Vec::new();
 
         for path in &config.allow_write {
+            write_roots.push(path.clone());
             let resource = Resource::Path(path_of(path)?);
             policy = policy
                 .with(rule(Action::Read, resource.clone()))
@@ -105,7 +108,47 @@ impl Authority {
             );
         }
 
-        Ok(Self { decisions })
+        Ok(Self {
+            decisions,
+            write_roots,
+        })
+    }
+
+    /// Whether the agent principal may write at one path, from the deepest write grant that covers it.
+    ///
+    /// The path is compared to the `--allow-write` roots the policy was built from, so a path
+    /// outside every grant is denied before the policy is asked. The grant that covers it is then
+    /// asked for `Action::Write`, and the answer is the one the policy gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Denial`] when no write root covers the path, or when the policy denies write
+    /// on the root that does.
+    pub fn may_write_at(
+        &self,
+        path: &Path,
+        at: Moment,
+    ) -> Result<Access, Denial> {
+        let root = self
+            .write_roots
+            .iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .ok_or_else(|| Denial::new(DenialReason::NotGranted))?;
+        let text = root
+            .to_str()
+            .ok_or_else(|| Denial::new(DenialReason::NotGranted))?
+            .to_owned();
+        let resource = Resource::Path(text);
+        let request = Self::request(Action::Write, &resource, Self::agent());
+
+        match self.decisions.decide(&request, at) {
+            Decision::Allow(grant) if grant.permission().actions().covers(ActionSet::WRITE) => {
+                Ok(Access::WRITE)
+            },
+            Decision::Allow(_) | Decision::Approve(_) => Err(Denial::new(DenialReason::NotGranted)),
+            Decision::Deny(denial) => Err(denial),
+        }
     }
 
     /// The sandbox authority for one path, from what the policy and a live grant allow there.
@@ -207,4 +250,127 @@ fn path_of(path: &Path) -> Result<String, Error> {
     path.to_str()
         .map(str::to_owned)
         .ok_or(Error::NotAName("a granted path"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Authority;
+    use crate::config::Config;
+    use mokmok_protocol::Moment;
+    use std::path::{Path, PathBuf};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mokmok-authority-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn config(
+        root: &Path,
+        grants: &[(&str, bool)],
+    ) -> Config {
+        let data = root.join("data");
+        let artifacts = data.join("artifacts");
+        let sandbox_root = data.join("sandbox");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+
+        let mut allow_write = Vec::new();
+        let mut allow_path = Vec::new();
+        for (name, writable) in grants {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            if *writable {
+                allow_write.push(path);
+            } else {
+                allow_path.push(path);
+            }
+        }
+
+        Config {
+            data_dir: data.clone(),
+            events: data.join("events.sqlite"),
+            artifacts,
+            sandbox_root,
+            allow_tool: vec![PathBuf::from("/bin/sh")],
+            allow_path,
+            allow_write,
+            search_root: Vec::new(),
+            search_index: data.join("search"),
+            tool_env: Vec::new(),
+            confiner: PathBuf::from("/bin/sh"),
+            crash_after: None,
+            provider: crate::config::ProviderSettings::default(),
+        }
+    }
+
+    #[test]
+    fn a_path_under_a_write_root_is_allowed() {
+        let scratch = Scratch::new("write-root");
+        let config = config(&scratch.0, &[("write", true), ("read", false)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(&scratch.0.join("write").join("file.txt"), Moment::EPOCH,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_path_under_a_read_root_is_denied() {
+        let scratch = Scratch::new("read-root");
+        let config = config(&scratch.0, &[("write", true), ("read", false)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(&scratch.0.join("read").join("file.txt"), Moment::EPOCH,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_path_under_no_root_is_denied() {
+        let scratch = Scratch::new("no-root");
+        let config = config(&scratch.0, &[("write", true)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(
+                    &std::env::temp_dir().join("elsewhere").join("file.txt"),
+                    Moment::EPOCH,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_deepest_write_root_wins() {
+        let scratch = Scratch::new("deepest");
+        let config = config(&scratch.0, &[("outer", true), ("outer/inner", true)]);
+        let authority = Authority::new(&config, Moment::EPOCH).unwrap();
+
+        assert!(
+            authority
+                .may_write_at(
+                    &scratch.0.join("outer").join("inner").join("file.txt"),
+                    Moment::EPOCH,
+                )
+                .is_ok()
+        );
+    }
 }

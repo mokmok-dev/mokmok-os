@@ -137,6 +137,7 @@ fn render_resolution(resolution: Resolution) -> String {
         Resolution::TimedOut => "timed out".to_owned(),
         Resolution::Cancelled => "cancelled".to_owned(),
         Resolution::Refused => "refused".to_owned(),
+        Resolution::Applied => "applied".to_owned(),
         Resolution::Unknown => UNKNOWN_WARNING.to_owned(),
     }
 }

@@ -35,10 +35,12 @@ carries.[^crate]
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
 | `Relay`, `serve` | `src/serve.rs:52,138` | The outbox relay and the daemon loop |
-| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,464,483` | The vertical slice |
+| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,485,504` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:670,551,534,363` | The agent loop and its scripted model |
-| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:557` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
+| `editor::Editor` | `src/editor.rs:32` | The model's editor: it plans a patch against the checkout, asks the authority for the write, and commits the bytes through a resolved directory |
+| `Authority::may_write_at`, `access_at` | `src/authority.rs:127,163` | The one place the write answer is decided, from the grants the operator named |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:696,573,556,373` | The agent loop and its scripted model |
+| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:578` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
 `authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`, `serve`,
@@ -156,11 +158,26 @@ injection (`src/config.rs:953`), and the workspace's only wall-clock read
 
 # Tests
 
-184 cases: 133 in `#[cfg(test)]` modules, one of them ignored, and 51 across five integration files.
+221 cases: 166 in `#[cfg(test)]` modules, one of them ignored, and 55 across five integration files.
 
-`src/provider.rs` holds 30 cases for the measured model exchange, malformed output, the request
-body, endpoint parsing, and not following a redirect. `src/config.rs` holds 66 cases for resolution
+`src/provider.rs` holds 31 cases for the measured model exchange, malformed output, the request
+body, endpoint parsing, the tool list a session's grants decide, and not following a redirect. One of
+them is ignored: it reaches a live endpoint by hand. `src/config.rs` holds 66 cases for resolution
 and refusal, 33 of them driving a configuration file the test wrote.
+`src/editor.rs` holds 26 cases for planning an edit and committing one: the plan for one file, for a
+file that does not exist, at the size ceiling, and through a checkout the operator reached by a
+symlink; the commit that creates the file the plan read nothing for, writes the bytes with the mode
+preserved, answers `Stale` for a file that moved under it, refuses one that is gone, and refuses a
+target that appeared while a create was being written, taking the target's name only while it is
+absent; the ceiling itself, which is four mebibytes; the directory sync that fails after the write and
+the rename that fails before it, neither of which is a refusal; the placement a matched and an
+inserted hunk renders, and the two sentences a refusal's reason and a refused report render; and the
+refusals, a two-file patch, a deletion, a create over an existing file, an `expect` that does not
+match or is not a 64-character hexadecimal hash, a non-UTF-8 file, a hunk that matches nothing and is
+counted from one, a symlinked target, a directory on the way to the file that is a symlink, a read-only
+root, and a file over the ceiling. `src/authority.rs` holds 4 cases for the write answer a target
+gets: a path under a write root, one under a read root, one under no root, and the deepest write root
+winning a nested pair.
 `src/roster.rs` holds 5 cases for the listing: an empty log, the session written most recently coming
 first, a session that recorded a task carrying its goal and its checkout, the turn count, and a
 stream with no session fact. `tests/slice.rs` holds 12 cases including one confined tool, a replay, a
@@ -168,10 +185,10 @@ refused tool, an unknown outcome after a crash, the relay reaching a subscriber,
 readiness. `tests/supervisor.rs` holds 13 cases over the real daemon: readiness after the bus answers,
 a foreign socket never reporting ready, a stop draining and exiting zero, a `SIGKILL` restart over the
 stale socket, the keep-alive following the relay, and an uninstallable subscriber reported without
-failing the daemon. `tests/agent.rs` holds 24 cases for the whole loop, one of them driving a run
+failing the daemon. `tests/agent.rs` holds 28 cases for the whole loop, one of them driving a run
 whose provider group comes from a configuration file, one the credential the environment answered to a
-stub endpoint, a crash before dispatch, cancellation, a command no grant reaches, scripted prose, and
-the two ceilings.
+stub endpoint, a crash before dispatch, cancellation, a command no grant reaches, scripted prose, an
+edit that lands its bytes and one a refusal writes nothing for, and the two ceilings.
 
 ```
 cargo test -p mokmok-kernel

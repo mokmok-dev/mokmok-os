@@ -18,11 +18,10 @@ const fn session_id() -> SessionID {
 }
 
 /// The settlement a state records, re-derived from the public [`State`] rather than read back from
-/// the machine. An [`State::Applied`] execution settled as `Finished { code }`.
+/// the machine. An [`State::Applied`] execution still names the resolution it settled with.
 const fn settlement_of(state: State) -> Option<Resolution> {
     match state {
-        State::Settled(resolution) => Some(resolution),
-        State::Applied { code } => Some(Resolution::Finished { code }),
+        State::Settled(resolution) | State::Applied { resolution } => Some(resolution),
         State::InFlight => None,
     }
 }
@@ -120,9 +119,9 @@ impl Model {
                 },
                 Fact::ResultApplied { execution } => {
                     if let Some((_, state)) = table.get_mut(execution)
-                        && let State::Settled(Resolution::Finished { code }) = *state
+                        && let State::Settled(resolution) = *state
                     {
-                        *state = State::Applied { code };
+                        *state = State::Applied { resolution };
                     }
                 },
                 Fact::SessionOpened | Fact::CancelRequested | Fact::SessionClosed => {},
@@ -183,10 +182,10 @@ impl Model {
                             Verdict::Apply
                         }
                     },
-                    State::Settled(current) => settlement_verdict(current, resolution, execution),
-                    State::Applied { code } => {
-                        settlement_verdict(Resolution::Finished { code }, resolution, execution)
-                    },
+                    State::Settled(current)
+                    | State::Applied {
+                        resolution: current,
+                    } => settlement_verdict(current, resolution, execution),
                 },
             },
             Fact::CancelRequested => match phase {
@@ -200,7 +199,10 @@ impl Model {
                 Some((_, state)) => {
                     if matches!(state, State::Applied { .. }) {
                         Verdict::Duplicate
-                    } else if matches!(state, State::Settled(Resolution::Finished { .. })) {
+                    } else if matches!(
+                        state,
+                        State::Settled(Resolution::Finished { .. } | Resolution::Applied)
+                    ) {
                         match phase {
                             Phase::Closed(_) => Verdict::Refuse(Rejection::SessionOver),
                             Phase::Accepting | Phase::Draining => Verdict::Apply,
@@ -449,6 +451,10 @@ fn arbitrary_fact(ids: [ExecutionID; 4]) -> impl Strategy<Value = Fact> {
             8 => Fact::ExecutionSettled {
                 execution,
                 resolution: Resolution::Unknown,
+            },
+            9 => Fact::ExecutionSettled {
+                execution,
+                resolution: Resolution::Applied,
             },
             _ => Fact::ResultApplied { execution },
         }

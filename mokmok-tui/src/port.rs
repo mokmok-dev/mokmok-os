@@ -187,6 +187,8 @@ pub enum Line {
     /// A find is its own line kind rather than a [`Line::Work`]: nothing ran, and a `command` field
     /// would tell the human a program had.
     Find { query: String, observation: String },
+    /// An edit the agent asked for, and what came of it.
+    Edit { observation: String },
     /// A turn the agent could not finish, and why.
     Trouble(String),
 }
@@ -203,6 +205,8 @@ const CONTINUATION_PREFIX: &str = "       ";
 const COMMAND_PREFIX: &str = "  $ ";
 
 const QUERY_PREFIX: &str = "  ? ";
+
+const EDIT_PREFIX: &str = "  ✎ ";
 
 const OBSERVATION_PREFIX: &str = "    ";
 
@@ -226,6 +230,11 @@ impl std::fmt::Display for Line {
             Self::Find { query, observation } => {
                 let mut rows = vec![query_row(query)];
                 rows.extend(observation.lines().map(observation_row));
+                rows
+            },
+            Self::Edit { observation } => {
+                let mut rows = vec![edit_row(observation)];
+                rows.extend(observation.lines().skip(1).map(observation_row));
                 rows
             },
             other => rows_of(other),
@@ -263,6 +272,22 @@ fn rows_of(line: &Line) -> Vec<String> {
 
             rows
         },
+        Line::Edit { observation } => {
+            let mut rows = Vec::new();
+
+            if let Some(first) = observation.lines().next().filter(|first| !first.is_empty()) {
+                rows.push(edit_row(first));
+            }
+            if let Some(outcome) = observation
+                .lines()
+                .nth(1)
+                .filter(|second| !second.is_empty())
+            {
+                rows.push(observation_row(outcome));
+            }
+
+            rows
+        },
     }
 }
 
@@ -272,6 +297,10 @@ fn command_row(command: &str) -> String {
 
 fn query_row(query: &str) -> String {
     format!("{QUERY_PREFIX}{}", escaped(query))
+}
+
+fn edit_row(observation: &str) -> String {
+    format!("{EDIT_PREFIX}{}", escaped(observation))
 }
 
 fn observation_row(line: &str) -> String {
@@ -470,7 +499,7 @@ mod tests {
     use proptest::prelude::*;
     use uuid::Uuid;
 
-    use super::{Line, Row, Sheet, View};
+    use super::{Line, Row, Sheet, View, edit_row};
     use mokmok_protocol::SessionID;
 
     fn view(
@@ -676,6 +705,37 @@ mod tests {
                 "agent  found it".to_owned(),
             ],
             "a find must not draw the command's gutter",
+        );
+    }
+
+    #[test]
+    fn an_edit_draws_its_first_two_lines_with_the_edit_gutter() {
+        let line = Line::Edit {
+            observation: "edit applied to src/x.rs\n1 bytes became 1 bytes\n".to_owned(),
+        };
+
+        assert_eq!(
+            view(vec![line.clone()], 0).visible(2),
+            vec![
+                "  ✎ edit applied to src/x.rs".to_owned(),
+                "    1 bytes became 1 bytes".to_owned(),
+            ],
+            "an edit's first two non-empty lines appear in the frame",
+        );
+
+        let replayed = format!("{line}");
+        assert!(
+            replayed.contains("edit applied to src/x.rs")
+                && replayed.contains("1 bytes became 1 bytes"),
+            "the replay carries every line of the edit: {replayed:?}"
+        );
+    }
+
+    #[test]
+    fn edit_row_renders_the_exact_gutter() {
+        assert_eq!(
+            edit_row("applied to src/x.rs"),
+            "  ✎ applied to src/x.rs".to_owned(),
         );
     }
 

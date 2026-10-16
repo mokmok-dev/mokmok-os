@@ -28,6 +28,19 @@ exclude_re = [
   # `libc`'s `O_PATH` and `O_CLOEXEC` are distinct single bits, so `O_PATH | O_CLOEXEC`,
   # `O_PATH ^ O_CLOEXEC`, and the pair's sum are one value: `openat2` is handed identical flags.
   '^mokmok-sandbox/src/plan\.rs:\d+:\d+: replace \| with \^ in open_resolved$',
+  # `O_RDONLY` is 0 and `O_DIRECTORY` and `O_CLOEXEC` occupy disjoint bit positions, so `|`, `^`,
+  # and the pair's sum are one value for the three flags `open_resolved_dir` hands to `openat2`.
+  '^mokmok-sandbox/src/plan\.rs:\d+:\d+: replace \| with \^ in open_resolved_dir$',
+  # `Authority::may_write_at` asks the policy for `Action::Write` on the deepest write root, and
+  # `Decision::Allow` is built only from the grant `Authority::authorize` found to cover that
+  # request, so the grant it names already covers `ActionSet::WRITE`: the guard re-reads the fact
+  # the decision was made from, and no input can separate the two arms.
+  '^mokmok-kernel/src/authority\.rs:\d+:\d+: replace match guard grant\.permission\(\)\.actions\(\)\.covers\(ActionSet::WRITE\) with true in Authority::may_write_at$',
+  # `O_RDONLY` is 0, so `O_RDONLY | O_NOFOLLOW` and `O_RDONLY ^ O_NOFOLLOW` are both `O_NOFOLLOW`.
+  '^mokmok-kernel/src/editor\.rs:\d+:\d+: replace \| with \^ in read_target$',
+  # `O_WRONLY`, `O_CREAT`, `O_EXCL`, and `O_NOFOLLOW` occupy disjoint bit positions, so any
+  # combination of `|` and `^` among them produces the same flags value for `openat2`.
+  '^mokmok-kernel/src/editor\.rs:\d+:\d+: replace \| with \^ in write_atomic$',
   # `CompatLevel::HardRequirement` (plan.rs) makes a ruleset that cannot be fully applied an
   # error: landlock 0.4.7's `try_compat_binary` returns `Err` for an unsupported feature at that
   # level, and a state of `Full` is what `RulesetStatus::FullyEnforced` reports. So the

@@ -2,16 +2,18 @@
 
 use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
 use mokmok_state_machine::{
-    Attempt, Deadline, Ending, Fact, Phase, Turn, TurnFact, TurnNumber, TurnOutcome,
+    Attempt, Deadline, Ending, Fact, Phase, Resolution, Turn, TurnFact, TurnNumber, TurnOutcome,
 };
 
 use crate::context::{Context, context};
 use crate::dialogue::{Transcript, number_of};
+use crate::edit::{EditCall, EditOutcome, EditReport, Editor, Plan, Ready};
 use crate::error::Error;
 use crate::find::{FindReport, Finder};
 use crate::model::{Journal, Provider};
 use crate::record::{
-    AnswerRecord, CallRecord, FindRecord, PromptRecord, Receipt, Record, Step, StepId, StepKey,
+    AnswerRecord, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord, PromptRecord,
+    Receipt, Record, Step, StepId, StepKey,
 };
 use crate::task::Task;
 use crate::tool::{DEFAULT_DEADLINE, ToolCall, ToolReport, Tools};
@@ -42,6 +44,10 @@ pub enum Move {
     Find {
         turn: TurnID,
         query: String,
+    },
+    Edit {
+        turn: TurnID,
+        call: EditCall,
     },
     /// Settle a turn, and close the session when `ending` is set.
     Close {
@@ -126,6 +132,7 @@ pub async fn advance(
     provider: &impl Provider,
     tools: &impl Tools,
     finder: &impl Finder,
+    editor: &impl Editor,
     session: SessionID,
     at: Moment,
 ) -> Result<Progress, Error> {
@@ -198,6 +205,13 @@ pub async fn advance(
                 return Ok(Progress::Yielded);
             }
         },
+        Move::Edit { turn, call } => {
+            if let Some(progress) =
+                advance_edit(journal, editor, session, &transcript, *turn, call)?
+            {
+                return Ok(progress);
+            }
+        },
         Move::Close {
             turn,
             outcome,
@@ -212,6 +226,40 @@ pub async fn advance(
     }
 
     Ok(Progress::Advanced(decision))
+}
+
+fn advance_edit(
+    journal: &mut impl Journal,
+    editor: &impl Editor,
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    call: &EditCall,
+) -> Result<Option<Progress>, Error> {
+    match editor.plan(call)? {
+        Plan::Refused(reason) => {
+            let step = edit_refused_step(session, transcript, turn, call.execution, &reason);
+            if journal.append(step)? == Receipt::Replayed {
+                return Ok(Some(Progress::Yielded));
+            }
+        },
+        Plan::Ready(ready) => {
+            let intent = edit_intent_step(session, transcript, turn, call, &ready);
+            if journal.append(intent)? == Receipt::Replayed {
+                return Ok(Some(Progress::Yielded));
+            }
+            let report = editor.commit(&ready)?;
+            journal.append(edit_outcome_step(
+                session,
+                transcript,
+                turn,
+                call.execution,
+                report,
+            ))?;
+        },
+    }
+
+    Ok(None)
 }
 
 impl Halt {
@@ -275,7 +323,9 @@ fn accepting(transcript: &Transcript) -> Move {
             && !transcript.newest_answer(turn).is_some_and(|answer| {
                 matches!(
                     &answer.action,
-                    crate::model::Action::Command { .. } | crate::model::Action::Find { .. }
+                    crate::model::Action::Command { .. }
+                        | crate::model::Action::Find { .. }
+                        | crate::model::Action::Edit { .. }
                 )
             });
         if awaiting_human {
@@ -349,6 +399,20 @@ fn open_turn(
                         .find_of(turn)
                         .map_or_else(|| query.clone(), |find| find.query.clone());
                     Move::Find { turn, query }
+                },
+                crate::model::Action::Edit { patch, expect } => {
+                    let (patch, expect) = transcript.edit_of(turn).map_or_else(
+                        || (patch.clone(), expect.clone()),
+                        |intent| (intent.patch.clone(), intent.expect.clone()),
+                    );
+                    Move::Edit {
+                        turn,
+                        call: EditCall {
+                            execution: execution_id(turn),
+                            patch,
+                            expect,
+                        },
+                    }
                 },
                 crate::model::Action::Malformed { .. } => reask(turn, number, state, transcript),
             },
@@ -574,6 +638,154 @@ fn act_outcome(
     )
 }
 
+fn edit_intent_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    call: &EditCall,
+    ready: &Ready,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let records = vec![
+        Record::Session {
+            fact: Fact::ExecutionLaunched {
+                execution: call.execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::Turn {
+            turn,
+            fact: TurnFact::ToolRequested {
+                execution: call.execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::EditIntent(EditIntentRecord {
+            turn,
+            execution: call.execution,
+            patch: call.patch.clone(),
+            expect: call.expect.clone(),
+            relative: ready.relative.clone(),
+            before: ready.before.clone(),
+            after: ready.after.clone(),
+            placement: ready.placement.clone(),
+        }),
+    ];
+
+    Step::new(
+        StepId::derive(session, StepKey::EditIntent { turn: number }),
+        session,
+        records,
+    )
+}
+
+fn edit_outcome_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    execution: ExecutionID,
+    report: EditReport,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let resolution = report.outcome.resolution();
+    let outcome = report.outcome.outcome();
+
+    let mut records = vec![Record::Session {
+        fact: Fact::ExecutionSettled {
+            execution,
+            resolution,
+        },
+    }];
+    if matches!(report.outcome, EditOutcome::Applied) {
+        records.push(Record::Session {
+            fact: Fact::ResultApplied { execution },
+        });
+    }
+    records.push(Record::EditOutcome(EditOutcomeRecord {
+        turn,
+        execution,
+        report,
+    }));
+    records.push(Record::Turn {
+        turn,
+        fact: TurnFact::ToolResolved {
+            execution,
+            resolution,
+        },
+    });
+    records.push(Record::Turn {
+        turn,
+        fact: TurnFact::TurnSettled { outcome },
+    });
+
+    Step::new(
+        StepId::derive(session, StepKey::EditOutcome { turn: number }),
+        session,
+        records,
+    )
+}
+
+fn edit_refused_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    execution: ExecutionID,
+    reason: &str,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let resolution = Resolution::Refused;
+    let outcome = TurnOutcome::Failed;
+    let report = EditReport {
+        outcome: EditOutcome::Refused {
+            reason: reason.to_owned(),
+        },
+        observation: crate::edit::refused(reason),
+    };
+    let records = vec![
+        Record::Session {
+            fact: Fact::ExecutionLaunched {
+                execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::Turn {
+            turn,
+            fact: TurnFact::ToolRequested {
+                execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::Session {
+            fact: Fact::ExecutionSettled {
+                execution,
+                resolution,
+            },
+        },
+        Record::EditOutcome(EditOutcomeRecord {
+            turn,
+            execution,
+            report,
+        }),
+        Record::Turn {
+            turn,
+            fact: TurnFact::ToolResolved {
+                execution,
+                resolution,
+            },
+        },
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled { outcome },
+        },
+    ];
+
+    Step::new(
+        StepId::derive(session, StepKey::EditOutcome { turn: number }),
+        session,
+        records,
+    )
+}
+
 /// The one step a find takes.
 ///
 /// The turn settles [`TurnOutcome::Completed`] whatever the finder answered: a find cannot fail the
@@ -714,6 +926,7 @@ mod tests {
     use super::{Halt, Move, Progress, advance, next};
     use crate::context::Context;
     use crate::dialogue::Transcript;
+    use crate::edit::{EditCall, EditOutcome, EditReport, Plan, Ready};
     use crate::error::Error;
     use crate::find::{FindReport, NO_SEARCH_ROOT};
     use crate::model::{Action, Answer, Journal, Provider, Usage};
@@ -721,12 +934,12 @@ mod tests {
     use crate::speech::speak;
     use crate::task::Task;
     use crate::test_support::{
-        FakeFinder, TestJournal, act_intent_records, act_outcome_records, answer_records,
-        apply_all, artifact, begin_records, execution_id, find_records, open_records, report,
-        session, speech_records, task, turn_id,
+        FakeEditor, FakeFinder, TestJournal, act_intent_records, act_outcome_records,
+        answer_records, apply_all, artifact, begin_records, execution_id, find_records,
+        open_records, report, session, speech_records, task, turn_id,
     };
     use crate::tool::{Exit, ToolCall, ToolReport, Tools};
-    use mokmok_protocol::Moment;
+    use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Attempt, Ending, Fact, Phase, TurnNumber, TurnOutcome};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -900,6 +1113,21 @@ mod tests {
         FakeFinder::of(NO_SEARCH_ROOT)
     }
 
+    fn unedited() -> FakeEditor {
+        FakeEditor::of([], [])
+    }
+
+    fn ready(relative: &str) -> Ready {
+        Ready {
+            relative: relative.to_owned(),
+            before: artifact(0x01),
+            after: artifact(0x02),
+            bytes: b"after".to_vec(),
+            placement: "hunk 1 matched at line 1 (offset 0)".to_owned(),
+            creates: false,
+        }
+    }
+
     fn answer(action: Action) -> Answer {
         Answer {
             action,
@@ -911,6 +1139,26 @@ mod tests {
                 output: 1,
             },
         }
+    }
+
+    async fn drive(
+        journal: &mut TestJournal,
+        provider: &ScriptedProvider,
+        tools: &FakeTools,
+        editor: &FakeEditor,
+        session: SessionID,
+    ) -> Progress {
+        advance(
+            journal,
+            provider,
+            tools,
+            &unasked(),
+            editor,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -925,100 +1173,40 @@ mod tests {
             answer(Action::Final),
         ]);
         let tools = FakeTools::of([report(Exit::Finished { code: 0 })]);
+        let editor = unedited();
 
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(progress, Progress::Advanced(Move::Begin { .. })));
-
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(progress, Progress::Advanced(Move::Ask { .. })));
-
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(progress, Progress::Advanced(Move::Act { .. })));
-
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(progress, Progress::Advanced(Move::Ask { .. })));
-
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
         assert!(matches!(
-            progress,
+            drive(&mut journal, &provider, &tools, &editor, session).await,
+            Progress::Advanced(Move::Begin { .. })
+        ));
+        assert!(matches!(
+            drive(&mut journal, &provider, &tools, &editor, session).await,
+            Progress::Advanced(Move::Ask { .. })
+        ));
+        assert!(matches!(
+            drive(&mut journal, &provider, &tools, &editor, session).await,
+            Progress::Advanced(Move::Act { .. })
+        ));
+        assert!(matches!(
+            drive(&mut journal, &provider, &tools, &editor, session).await,
+            Progress::Advanced(Move::Ask { .. })
+        ));
+        assert!(matches!(
+            drive(&mut journal, &provider, &tools, &editor, session).await,
             Progress::Advanced(Move::Close { ending: None, .. })
         ));
-
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
         assert_eq!(
-            progress,
+            drive(&mut journal, &provider, &tools, &editor, session).await,
             Progress::Advanced(Move::Close {
                 turn: turn_id(2),
                 outcome: TurnOutcome::Completed,
                 ending: Some(Ending::Completed),
             }),
         );
-
-        let progress = advance(
-            &mut journal,
-            &provider,
-            &tools,
-            &unasked(),
-            session,
-            Moment::EPOCH,
-        )
-        .await
-        .unwrap();
-        assert_eq!(progress, Progress::Terminal(Ending::Completed));
+        assert_eq!(
+            drive(&mut journal, &provider, &tools, &editor, session).await,
+            Progress::Terminal(Ending::Completed)
+        );
 
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(tools.calls.load(Ordering::SeqCst), 1);
@@ -1051,6 +1239,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1059,6 +1248,237 @@ mod tests {
         assert_eq!(progress, Progress::Yielded);
         assert_eq!(tools.calls.load(Ordering::SeqCst), 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_edit_answer_derives_an_edit_move() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task.clone());
+        let turn = turn_id(1);
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(
+            turn,
+            1,
+            Action::Edit {
+                patch: "p".to_owned(),
+                expect: None,
+            },
+        ));
+
+        let progress = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &FakeEditor::of([Err(Error::Editor("planned".into()))], []),
+            session,
+            Moment::EPOCH,
+        )
+        .await;
+
+        assert!(
+            matches!(progress, Err(Error::Editor(_))),
+            "the derived move reaches the editor: {progress:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_settles_in_one_step() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task.clone());
+        let turn = turn_id(1);
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(
+            turn,
+            1,
+            Action::Edit {
+                patch: "p".to_owned(),
+                expect: None,
+            },
+        ));
+
+        let progress = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &FakeEditor::of([Ok(Plan::Refused("no file".to_owned()))], []),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            progress,
+            Progress::Advanced(Move::Edit {
+                turn: moved,
+                ..
+            }) if moved == turn,
+        ));
+        let transcript = journal.transcript(session).unwrap();
+        let (_, state) = transcript.newest_turn().unwrap();
+        assert_eq!(state.outcome(), Some(TurnOutcome::Failed));
+        assert!(transcript.edit_outcome_of(execution_id(turn)).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_ready_edit_writes_the_intent_then_commits() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task.clone());
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(
+            turn,
+            1,
+            Action::Edit {
+                patch: "p".to_owned(),
+                expect: None,
+            },
+        ));
+
+        let editor = FakeEditor::of(
+            [Ok(Plan::Ready(ready("src/x.rs")))],
+            [Ok(EditReport {
+                outcome: EditOutcome::Applied,
+                observation: "edit applied".to_owned(),
+            })],
+        );
+        let progress = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &editor,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            progress,
+            Progress::Advanced(Move::Edit {
+                turn: moved,
+                ..
+            }) if moved == turn,
+        ));
+        assert_eq!(editor.calls(), 1);
+        let transcript = journal.transcript(session).unwrap();
+        let (_, state) = transcript.newest_turn().unwrap();
+        assert_eq!(state.outcome(), Some(TurnOutcome::Completed));
+        assert_eq!(
+            transcript
+                .edit_of(turn)
+                .map(|intent| intent.relative.as_str()),
+            Some("src/x.rs"),
+        );
+        assert_eq!(
+            transcript
+                .edit_outcome_of(execution)
+                .map(|report| report.outcome.clone()),
+            Some(EditOutcome::Applied),
+        );
+        let transcript = journal.transcript(session).unwrap();
+        let (_, state) = transcript.newest_turn().unwrap();
+        assert_eq!(state.outcome(), Some(TurnOutcome::Completed));
+        assert_eq!(
+            transcript
+                .edit_of(turn)
+                .map(|intent| intent.relative.as_str()),
+            Some("src/x.rs"),
+        );
+        assert_eq!(
+            transcript
+                .edit_outcome_of(execution)
+                .map(|report| report.outcome.clone()),
+            Some(EditOutcome::Applied),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_edit_intent_performs_no_second_commit() {
+        let session = session();
+        let task = task(4);
+        let mut journal = TestJournal::new(session, task.clone());
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(
+            turn,
+            1,
+            Action::Edit {
+                patch: "p".to_owned(),
+                expect: None,
+            },
+        ));
+        journal.seed(&crate::test_support::edit_intent_records(
+            turn,
+            execution,
+            "p",
+            "src/x.rs",
+            &artifact(0x01),
+            &artifact(0x02),
+            "hunk 1 matched at line 1 (offset 0)",
+        ));
+        journal.mark(StepId::derive(session, StepKey::EditIntent { turn: 1 }));
+
+        let editor = FakeEditor::of([Ok(Plan::Ready(ready("src/x.rs")))], []);
+        let progress = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &editor,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(progress, Progress::Yielded);
+        assert_eq!(editor.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_edit_keeps_the_agent_working_in_a_conversation() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session);
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Edit {
+                    patch: "p".to_owned(),
+                    expect: None,
+                },
+            ),
+        );
+
+        assert!(
+            matches!(
+                next(&transcript),
+                Move::Edit {
+                    turn: moved,
+                    call: EditCall { execution, patch, .. },
+                } if moved == turn && execution == execution_id(turn) && patch == "p",
+            ),
+            "an edit answer keeps the agent working",
+        );
     }
 
     fn command_transcript(
@@ -1273,6 +1693,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1310,6 +1731,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1340,6 +1762,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1371,6 +1794,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1394,6 +1818,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1597,6 +2022,7 @@ mod tests {
             &provider,
             &tools,
             &finder,
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1629,6 +2055,7 @@ mod tests {
             &provider,
             &tools,
             &finder,
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1669,6 +2096,7 @@ mod tests {
             &provider,
             &tools,
             &finder,
+            &unedited(),
             session,
             Moment::EPOCH,
         )
@@ -1711,6 +2139,7 @@ mod tests {
             &provider,
             &tools,
             &unasked(),
+            &unedited(),
             session,
             Moment::EPOCH,
         )

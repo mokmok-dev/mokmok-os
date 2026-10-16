@@ -15,11 +15,13 @@ mokmok-egress = { workspace = true }
 mokmok-event-bus = { workspace = true }
 mokmok-event-store = { workspace = true }
 mokmok-observability = { workspace = true }
+mokmok-patch = { workspace = true }
 mokmok-protocol = { workspace = true }
 mokmok-sandbox = { workspace = true }
 mokmok-scheduler = { workspace = true }
 mokmok-search = { workspace = true }
 mokmok-state-machine = { workspace = true }
+nix = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }

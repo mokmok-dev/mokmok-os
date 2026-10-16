@@ -34,7 +34,7 @@ a cleanup step bound the run.[^crate]
 | `Request`, `Environment` | `src/request.rs:31,16` | The command, its arguments, its workspace, and its environment |
 | `Run`, `Outcome`, `Failure`, `Signal`, `Completed`, `Started` | `src/run.rs:89,52,399,24,308,66` | The handle, its outcome, and its two phases |
 | `Limits`, `Captured` | `src/limits.rs:9`, `src/output.rs:9` | Address space, cpu, file size, open files, output; and the captured bytes |
-| `Config`, `Reached` | `src/config.rs:8`, `src/plan.rs:228` | The root directory, the confiner path, the grace period; and the plan's verdict |
+| `Config`, `Reached` | `src/config.rs:8`, `src/plan.rs:257` | The root directory, the confiner path, the grace period; and the plan's verdict |
 | `Artifact` | `src/artifact.rs:8` | A plain relative path the workload may publish |
 
 The crate also ships the `mokmok-sandbox-confine` binary, which applies the plan and then executes

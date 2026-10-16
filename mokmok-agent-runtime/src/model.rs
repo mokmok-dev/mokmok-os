@@ -19,6 +19,11 @@ pub enum Action {
     Find {
         query: String,
     },
+    /// The model sent one unified diff to rewrite one file.
+    Edit {
+        patch: String,
+        expect: Option<String>,
+    },
     /// The model's tool arguments could not be decoded; it is recorded, never silently retried.
     Malformed {
         reason: String,

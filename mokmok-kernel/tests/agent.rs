@@ -16,7 +16,7 @@ mod tests {
 
     use clap::Parser as _;
     use mokmok_agent_runtime::{
-        Action, NO_SEARCH_ROOT, Progress, Record, UNKNOWN_WARNING, speak, turn_id,
+        Action, EditOutcome, NO_SEARCH_ROOT, Progress, Record, UNKNOWN_WARNING, speak, turn_id,
     };
     use mokmok_artifact::{BlobStore, ContentHash};
     use mokmok_kernel::agent::{Driver, Ledger};
@@ -318,6 +318,17 @@ mod tests {
         (port, seen)
     }
 
+    fn reconcile(scratch: &Scratch) -> Ran {
+        let mut args = base(scratch);
+        args.extend([
+            "reconcile".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+        ]);
+
+        run(scratch, &args)
+    }
+
     /// One `submit` of `body` through the operator's shell, which is the path the kernel takes
     /// before the agent's own loop is ever opened.
     fn submit_args(
@@ -386,6 +397,26 @@ mod tests {
                 _ => None,
             })
             .expect("the session holds one find record")
+    }
+
+    fn edit_intent_of(log: &mokmok_kernel::Log) -> &mokmok_agent_runtime::EditIntentRecord {
+        log.ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::EditIntent(edit) => Some(edit),
+                _ => None,
+            })
+            .expect("the session holds one edit intent record")
+    }
+
+    fn edit_outcome_of(log: &mokmok_kernel::Log) -> &mokmok_agent_runtime::EditOutcomeRecord {
+        log.ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::EditOutcome(edit) => Some(edit),
+                _ => None,
+            })
+            .expect("the session holds one edit outcome record")
     }
 
     #[test]
@@ -1318,6 +1349,241 @@ mod tests {
                 .speech(turn_id(session, 2)),
             Some("from elsewhere"),
             "and re-opening is what reads it",
+        );
+    }
+
+    const EDIT_PATCH: &str =
+        "--- a/out.txt\n+++ b/out.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+moon\n";
+
+    #[test]
+    fn a_scripted_edit_lands_the_bytes_and_records_the_path_and_observation() {
+        let scratch = Scratch::new("edit");
+        let target = scratch.checkout().join("out.txt");
+        std::fs::write(&target, "hello\nworld\n").expect("the seed file is written");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "edit", "patch": EDIT_PATCH}),
+                json!({"action": "final", "say": "done"}),
+            ],
+        );
+
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "hello\nmoon\n",
+        );
+        assert!(
+            ran.out.contains("move=edit turn=1"),
+            "the step line names the edit:\n{}",
+            ran.out,
+        );
+
+        let report = status(&scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        assert!(
+            report
+                .out
+                .lines()
+                .any(|line| line.starts_with("edit ") && line.contains("relative=\"out.txt\"")),
+            "the transcript's intent record carries the relative path:\n{}",
+            report.out,
+        );
+        assert!(
+            report
+                .out
+                .lines()
+                .any(|line| line.starts_with("edit ") && line.contains("outcome=Applied")),
+            "the transcript's outcome record says the edit applied:\n{}",
+            report.out,
+        );
+
+        let (log, _) = log_of(&scratch);
+        let intent = edit_intent_of(&log);
+        assert_eq!(intent.relative, "out.txt");
+        let outcome = edit_outcome_of(&log);
+        assert!(matches!(outcome.report.outcome, EditOutcome::Applied));
+        assert!(
+            outcome
+                .report
+                .observation
+                .contains("edit applied to out.txt"),
+            "{}",
+            outcome.report.observation,
+        );
+        assert!(
+            outcome.report.observation.contains("sha256"),
+            "the observation names both hashes:\n{}",
+            outcome.report.observation,
+        );
+    }
+
+    #[test]
+    fn a_refused_hunk_leaves_the_file_unchanged_and_records_the_refusal() {
+        let scratch = Scratch::new("edit-refused");
+        let target = scratch.checkout().join("out.txt");
+        std::fs::write(&target, "one\ntwo\n").expect("the seed file is written");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "edit", "patch": "--- a/out.txt\n+++ b/out.txt\n@@ -1,2 +1,2 @@\n three\n-two\n+four\n"}),
+                json!({"action": "final", "say": "done"}),
+            ],
+        );
+
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "one\ntwo\n",
+            "a refused edit must not have written anything",
+        );
+
+        let report = status(&scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        assert!(
+            report
+                .out
+                .lines()
+                .any(|line| line.starts_with("edit ") && line.contains("outcome=Refused")),
+            "the transcript records the refusal:\n{}",
+            report.out,
+        );
+
+        let (log, session) = log_of(&scratch);
+        assert_eq!(
+            log.turn(turn_id(session, 1))
+                .expect("turn 1 is in the log")
+                .outcome(),
+            Some(TurnOutcome::Failed),
+            "a refused hunk fails the turn",
+        );
+    }
+
+    #[test]
+    fn a_replayed_edit_intent_performs_no_second_write() {
+        let scratch = Scratch::new("edit-replay");
+        let target = scratch.checkout().join("out.txt");
+        std::fs::write(&target, "hello\nworld\n").expect("the seed file is written");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
+
+        // Three steps reach the edit's commit.
+        let crashed = run(
+            &scratch,
+            &agent_args(
+                &scratch,
+                &path,
+                &["--crash-after", "before-dispatch", "--steps", "3"],
+            ),
+        );
+        assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "hello\nworld\n",
+            "the crash stopped before the write:\n{}",
+            crashed.out,
+        );
+
+        let (log, _) = log_of(&scratch);
+        edit_intent_of(&log);
+        assert!(
+            !log.ordered
+                .iter()
+                .any(|record| matches!(record, Record::EditOutcome(_))),
+            "the log holds the intent but no outcome",
+        );
+
+        let reconciled = reconcile(&scratch);
+        assert!(reconciled.ok, "{}\n{}", reconciled.out, reconciled.err);
+        assert!(
+            reconciled.out.contains("resolution=Unknown"),
+            "reconcile settles the execution unknown:\n{}",
+            reconciled.out,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "hello\nworld\n",
+            "reconcile did not re-apply the patch",
+        );
+
+        script(&path, &[json!({"action": "final", "say": "done"})]);
+        let resumed = run(&scratch, &agent_args(&scratch, &path, &[]));
+        assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
+
+        let context = prompt_context(&scratch, 2);
+        assert!(
+            context.contains("interrupted"),
+            "the next prompt carries the unproven warning:\n{context}",
+        );
+        assert!(
+            context.contains("sha256"),
+            "and names both hashes:\n{context}",
+        );
+    }
+
+    #[test]
+    fn a_crash_after_dispatch_in_an_edit_keeps_the_post_image_and_settles_unknown() {
+        let scratch = Scratch::new("edit-crash-late");
+        let target = scratch.checkout().join("out.txt");
+        std::fs::write(&target, "hello\nworld\n").expect("the seed file is written");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "edit", "patch": EDIT_PATCH})]);
+
+        // Three steps reach the edit's commit.
+        let crashed = run(
+            &scratch,
+            &agent_args(
+                &scratch,
+                &path,
+                &["--crash-after", "after-dispatch", "--steps", "3"],
+            ),
+        );
+        assert_eq!(crashed.code, Some(97), "{}\n{}", crashed.out, crashed.err);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "hello\nmoon\n",
+            "the file holds the post-image after the crash:\n{}",
+            crashed.out,
+        );
+
+        let (log, _) = log_of(&scratch);
+        edit_intent_of(&log);
+        assert!(
+            !log.ordered
+                .iter()
+                .any(|record| matches!(record, Record::EditOutcome(_))),
+            "the log holds the intent but no outcome",
+        );
+
+        let reconciled = reconcile(&scratch);
+        assert!(reconciled.ok, "{}\n{}", reconciled.out, reconciled.err);
+        assert!(
+            reconciled.out.contains("resolution=Unknown"),
+            "reconcile settles the execution unknown:\n{}",
+            reconciled.out,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "hello\nmoon\n",
+            "reconcile did not re-apply the patch",
+        );
+
+        script(&path, &[json!({"action": "final", "say": "done"})]);
+        let resumed = run(&scratch, &agent_args(&scratch, &path, &[]));
+        assert!(resumed.ok, "{}\n{}", resumed.out, resumed.err);
+
+        let context = prompt_context(&scratch, 2);
+        assert!(
+            context.contains("interrupted"),
+            "the next prompt carries the unproven warning:\n{context}",
+        );
+        assert!(
+            context.contains("sha256"),
+            "and names both hashes:\n{context}",
         );
     }
 }

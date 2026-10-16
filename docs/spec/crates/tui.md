@@ -34,7 +34,7 @@ session the human is not looking at still moves, between his keystrokes.[^crate]
 | `Roster` | `src/port.rs:71` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:107` | `poll`, `event`, `draw` |
 | `Listing`, `Key`, `Event`, `Line` | `src/port.rs:59,135,160,173` | What the log holds of one session, the keys, and the five line kinds |
-| `View`, `Sheet`, `Row` | `src/port.rs:329,353,370` | The frame, the pane over the transcript, and one row of the listing |
+| `View`, `Sheet`, `Row` | `src/port.rs:358,382,399` | The frame, the pane over the transcript, and one row of the listing |
 | `Session` | `src/session.rs:15` | The kernel-backed engine |
 | `Sessions` | `src/session.rs:76` | The kernel-backed roster |
 | `Terminal` | `src/terminal.rs:28` | The terminal mode, its restoration, and the key reader |
@@ -130,7 +130,7 @@ another process.
 
 # Tests
 
-88 cases: 9 in `tests/` and 79 across four `#[cfg(test)]` modules, two of them property cases.
+90 cases: 9 in `tests/` and 81 across four `#[cfg(test)]` modules, two of them property cases.
 
 Six of the nine cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -138,9 +138,9 @@ One asserts that a provider holding no answer settles turn 1 failed and leaves t
 One asserts that a line is refused while the turn is in flight.
 One asserts that a find reaches the screen as its own line kind.
 One asserts that a session the human left keeps moving while he is in another, and that a frame in
-the new session reports the one working in the background (`tests/conversation.rs:531`).
+the new session reports the one working in the background (`tests/conversation.rs:530`).
 One asserts that the listing shows a session only the log holds and that choosing it opens it
-(`tests/conversation.rs:611`).
+(`tests/conversation.rs:608`).
 Three are binary cases: one asserts that a pipe on each standard stream refuses the run and says why,
 one drives a conversation on a pseudo-terminal through a frame and back to the shell, and one asserts
 that a frame drawn while a turn is in flight, the listing, and the prompt that names a goal all reach
@@ -150,10 +150,10 @@ Four modules hold the rest.
 One holds 39 cases and one property case for the trouble row, the work row, a dispatched command with
 no call record, the empty-line guard, the byte ceiling of the typed line and of a named goal, the
 status phrase of each mode, the rotation and its order, the listing's rows and cursor, adopting and
-creating a session, each pane's keys, and the frame the manager builds (`src/core.rs:676`).
-One holds 17 cases and one property case for gutters, multi-row replies, row-wise windowing, the
-trouble row, a find row, escaped control characters, the replay, and the rows of the listing
-(`src/port.rs:468`).
+creating a session, each pane's keys, and the frame the manager builds (`src/core.rs:681`).
+One holds 19 cases and one property case for gutters, multi-row replies, row-wise windowing, the
+trouble row, a find row, an edit row, escaped control characters, the replay, and the rows of the
+listing (`src/port.rs:497`).
 One holds 7 cases for a step another writer committed becoming visible after the engine reopens the
 ledger, the goal and the checkout the log holds being the ones a resumed session runs under, a
 session with no task being refused, a created session running under the goal the human typed, and the

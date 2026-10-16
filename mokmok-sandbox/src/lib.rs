@@ -93,12 +93,12 @@ mod sandbox;
 mod workspace;
 
 pub use artifact::Artifact;
-pub use capability::{Access, Capability, Exposure, uncovered};
+pub use capability::{Access, Capability, Exposure, resolve, uncovered};
 pub use config::Config;
 pub use confine::run;
 pub use limits::Limits;
 pub use output::Captured;
-pub use plan::Reached;
+pub use plan::{Reached, open_resolved, open_resolved_dir};
 pub use request::{Environment, Request};
 pub use run::{Completed, Error, Failure, Outcome, Run, Signal, Started};
 pub use sandbox::{Confined, LimitsOnly, Refusal, Sandbox};

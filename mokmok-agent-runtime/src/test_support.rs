@@ -1,7 +1,8 @@
 //! Builders the unit tests share, so a hand-written history is written once.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
@@ -9,12 +10,13 @@ use mokmok_state_machine::{Attempt, Deadline, Ending, Fact, TurnFact, TurnNumber
 use uuid::Uuid;
 
 use crate::dialogue::Transcript;
+use crate::edit::{EditCall, EditOutcome, EditReport, Editor, Plan, Ready};
 use crate::error::Error;
 use crate::find::{FindReport, Finder};
 use crate::model::{Action, Usage};
 use crate::record::{
-    AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, Receipt, Record, SpeechRecord,
-    Step, StepId, TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
+    PromptRecord, Receipt, Record, SpeechRecord, Step, StepId, TaskRecord,
 };
 use crate::task::{Budget, Setting, Task};
 use crate::tool::{Exit, ToolReport, observation};
@@ -231,6 +233,122 @@ pub fn act_outcome_records(
     records
 }
 
+/// The records an `Edit` intent carries: launch, request, and the intent.
+#[must_use]
+pub fn edit_intent_records(
+    turn: TurnID,
+    execution: ExecutionID,
+    patch: &str,
+    relative: &str,
+    before: &ArtifactRef,
+    after: &ArtifactRef,
+    placement: &str,
+) -> Vec<Record> {
+    let mut records = edit_requested_records(turn, execution);
+    records.push(Record::EditIntent(EditIntentRecord {
+        turn,
+        execution,
+        patch: patch.to_owned(),
+        expect: None,
+        relative: relative.to_owned(),
+        before: before.clone(),
+        after: after.clone(),
+        placement: placement.to_owned(),
+    }));
+
+    records
+}
+
+/// The launch and the turn's request for one edit, without the intent record.
+#[must_use]
+pub fn edit_requested_records(
+    turn: TurnID,
+    execution: ExecutionID,
+) -> Vec<Record> {
+    vec![
+        Record::Session {
+            fact: Fact::ExecutionLaunched {
+                execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::Turn {
+            turn,
+            fact: TurnFact::ToolRequested {
+                execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+    ]
+}
+
+/// The records a refusal decided before anything was written carries: the launch, the request, and
+/// the outcome, all in the one step a refusal takes.
+#[must_use]
+pub fn edit_refusal_records(
+    turn: TurnID,
+    execution: ExecutionID,
+    reason: &str,
+    observation: &str,
+) -> Vec<Record> {
+    let mut records = edit_requested_records(turn, execution);
+    records.extend(edit_outcome_records(
+        turn,
+        execution,
+        EditOutcome::Refused {
+            reason: reason.to_owned(),
+        },
+        observation,
+    ));
+
+    records
+}
+
+/// The records an `Edit` outcome carries: settlement and report.
+#[must_use]
+pub fn edit_outcome_records(
+    turn: TurnID,
+    execution: ExecutionID,
+    outcome: EditOutcome,
+    observation: &str,
+) -> Vec<Record> {
+    let resolution = outcome.resolution();
+    let turn_outcome = outcome.outcome();
+    let mut records = vec![Record::Session {
+        fact: Fact::ExecutionSettled {
+            execution,
+            resolution,
+        },
+    }];
+    if matches!(outcome, EditOutcome::Applied) {
+        records.push(Record::Session {
+            fact: Fact::ResultApplied { execution },
+        });
+    }
+    records.push(Record::EditOutcome(EditOutcomeRecord {
+        turn,
+        execution,
+        report: EditReport {
+            outcome,
+            observation: observation.to_owned(),
+        },
+    }));
+    records.push(Record::Turn {
+        turn,
+        fact: TurnFact::ToolResolved {
+            execution,
+            resolution,
+        },
+    });
+    records.push(Record::Turn {
+        turn,
+        fact: TurnFact::TurnSettled {
+            outcome: turn_outcome,
+        },
+    });
+    records
+}
+
 #[must_use]
 pub fn find_records(
     turn: TurnID,
@@ -336,6 +454,58 @@ impl Finder for FakeFinder {
         Ok(FindReport {
             observation: self.observation.clone(),
         })
+    }
+}
+
+/// One queued answer per `plan` and per `commit`, and a count of the plans, so a test can tell a
+/// replayed intent from one that planned again.
+pub struct FakeEditor {
+    plans: Mutex<VecDeque<Result<Plan, Error>>>,
+    commits: Mutex<VecDeque<Result<EditReport, Error>>>,
+    calls: AtomicUsize,
+}
+
+impl FakeEditor {
+    #[must_use]
+    pub fn of(
+        plans: impl IntoIterator<Item = Result<Plan, Error>>,
+        commits: impl IntoIterator<Item = Result<EditReport, Error>>,
+    ) -> Self {
+        Self {
+            plans: Mutex::new(plans.into_iter().collect()),
+            commits: Mutex::new(commits.into_iter().collect()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Editor for FakeEditor {
+    fn plan(
+        &self,
+        _call: &EditCall,
+    ) -> Result<Plan, Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.plans
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the fake editor holds a plan")
+    }
+
+    fn commit(
+        &self,
+        _ready: &Ready,
+    ) -> Result<EditReport, Error> {
+        self.commits
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the fake editor holds a commit")
     }
 }
 
