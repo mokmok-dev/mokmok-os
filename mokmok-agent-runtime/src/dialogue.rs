@@ -1229,6 +1229,7 @@ mod tests {
             before: artifact(0x01),
             after: artifact(0x02),
             placement: "hunk 1 matched at line 1 (offset 0)".to_owned(),
+            create: false,
         })
     }
 

@@ -254,6 +254,7 @@ pub fn edit_intent_records(
         before: before.clone(),
         after: after.clone(),
         placement: placement.to_owned(),
+        create: false,
     }));
 
     records

@@ -36,6 +36,8 @@ pub struct Ready {
     pub bytes: Vec<u8>,
     /// Where each hunk landed.
     pub placement: String,
+    /// Whether the patch creates the target from an absent source.
+    pub create: bool,
 }
 
 /// How one edit ended.
@@ -268,6 +270,7 @@ mod tests {
             before: artifact(1),
             after: artifact(2),
             placement: String::new(),
+            create: false,
         };
         let text = unproven(&intent);
 

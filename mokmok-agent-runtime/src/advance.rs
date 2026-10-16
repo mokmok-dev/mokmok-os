@@ -674,6 +674,7 @@ fn edit_intent_step(
             before: ready.before.clone(),
             after: ready.after.clone(),
             placement: ready.placement.clone(),
+            create: ready.create,
         }),
     ];
 
@@ -1124,6 +1125,7 @@ mod tests {
             after: artifact(0x02),
             bytes: b"after".to_vec(),
             placement: "hunk 1 matched at line 1 (offset 0)".to_owned(),
+            create: false,
         }
     }
 

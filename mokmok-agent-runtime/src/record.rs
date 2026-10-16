@@ -161,6 +161,9 @@ pub struct EditIntentRecord {
     pub after: ArtifactRef,
     /// Where each hunk landed.
     pub placement: String,
+    /// Whether the patch creates the target from an absent source.
+    #[serde(default)]
+    pub create: bool,
 }
 
 /// One edit's outcome.
