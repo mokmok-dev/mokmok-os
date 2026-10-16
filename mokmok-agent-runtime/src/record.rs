@@ -3,6 +3,7 @@
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
 use mokmok_state_machine::{Attempt, Fact, Rejection, TurnFact};
 
+use crate::edit::EditReport;
 use crate::find::FindReport;
 use crate::model::{Action, Usage};
 use crate::task::Task;
@@ -21,6 +22,11 @@ pub const MAX_SPEECH_BYTES: usize = 4 * 1024;
 /// refused: it is a phrase the model repeats, and the words it opened with are the words it meant.
 pub const MAX_QUERY_BYTES: usize = 512;
 
+/// How many bytes of one patch the log may hold.
+///
+/// A clipped diff is a different diff, so an over-long patch is refused rather than clipped.
+pub const MAX_PATCH_BYTES: usize = 32 * 1024;
+
 /// The head of `text`, clipped to [`MAX_QUERY_BYTES`] without splitting a character.
 ///
 /// The clip happens where the tool arguments are decoded, so the answer, the record, and the search
@@ -28,6 +34,20 @@ pub const MAX_QUERY_BYTES: usize = 512;
 #[must_use]
 pub fn clip_query(text: &str) -> String {
     clipped(text, MAX_QUERY_BYTES)
+}
+
+/// Why a patch may not be recorded, or `None` when it may.
+#[must_use]
+pub fn patch_refusal(patch: &str) -> Option<String> {
+    if patch.len() > MAX_PATCH_BYTES {
+        return Some(format!(
+            "the patch is {} bytes, and the log holds {}",
+            patch.len(),
+            MAX_PATCH_BYTES,
+        ));
+    }
+
+    None
 }
 
 /// The head of `text`, clipped to [`MAX_PROSE_BYTES`] without splitting a character.
@@ -123,6 +143,34 @@ pub struct FindRecord {
     pub report: FindReport,
 }
 
+/// One edit about to be written, and the bytes it will write.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct EditIntentRecord {
+    pub turn: TurnID,
+    pub execution: ExecutionID,
+    /// The patch, exactly as the answer named it.
+    pub patch: String,
+    /// The sha256 the model believed the file held, when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
+    /// The file, as the patch's own labels name it.
+    pub relative: String,
+    /// The bytes the file holds. Always a blob in the store.
+    pub before: ArtifactRef,
+    /// The bytes the patch produces. Always a blob in the store.
+    pub after: ArtifactRef,
+    /// Where each hunk landed.
+    pub placement: String,
+}
+
+/// One edit's outcome.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct EditOutcomeRecord {
+    pub turn: TurnID,
+    pub execution: ExecutionID,
+    pub report: EditReport,
+}
+
 /// One durable record.
 ///
 /// The machine facts and the result ride the same vocabulary as the runtime's own content records,
@@ -155,6 +203,10 @@ pub enum Record {
     /// The command about to be dispatched.
     Call(CallRecord),
     Find(FindRecord),
+    /// An edit about to be written, with the bytes it will write.
+    EditIntent(EditIntentRecord),
+    /// An edit's outcome.
+    EditOutcome(EditOutcomeRecord),
     /// A human's line, which opened this turn.
     Speech(SpeechRecord),
 }
@@ -182,6 +234,10 @@ pub enum StepKey {
     ActIntent { turn: u64 },
     /// One turn's outcome, written after the tool ran.
     ActOutcome { turn: u64 },
+    /// One turn's edit intent, written before the effect it describes.
+    EditIntent { turn: u64 },
+    /// One turn's edit outcome, written after the effect.
+    EditOutcome { turn: u64 },
     /// One turn's find, written with its settlement in the one step a find takes.
     Find { turn: u64 },
     /// A turn's settlement, and the session's close when it carries an ending.
@@ -221,6 +277,8 @@ impl StepKey {
             Self::AskOutcome { turn, attempt } => format!("ask-outcome:{turn}:{attempt}"),
             Self::ActIntent { turn } => format!("act-intent:{turn}"),
             Self::ActOutcome { turn } => format!("act-outcome:{turn}"),
+            Self::EditIntent { turn } => format!("edit-intent:{turn}"),
+            Self::EditOutcome { turn } => format!("edit-outcome:{turn}"),
             Self::Find { turn } => format!("find:{turn}"),
             Self::Close {
                 turn,
@@ -276,6 +334,8 @@ pub enum RecordKey {
     Call(ExecutionID),
     Result(ExecutionID),
     Find(TurnID),
+    EditIntent(ExecutionID),
+    EditOutcome(ExecutionID),
     Speech { turn: TurnID },
 }
 
@@ -310,6 +370,16 @@ pub enum Refusal {
         answer: String,
         find: String,
     },
+    /// An edit whose patch the answer recorded for the same turn did not name.
+    ///
+    /// `answer` is the patch that answer named, and empty when it named no patch at all.
+    EditMismatch {
+        turn: TurnID,
+        answer: String,
+        edit: String,
+    },
+    /// An edit outcome whose intent the fold does not hold.
+    Unprepared(ExecutionID),
 }
 
 impl std::fmt::Display for Refusal {
@@ -335,6 +405,16 @@ impl std::fmt::Display for Refusal {
                 formatter,
                 "the find for turn {} asks {find:?} but its answer named {answer:?}",
                 turn.as_uuid(),
+            ),
+            Self::EditMismatch { turn, answer, edit } => write!(
+                formatter,
+                "the edit for turn {} names {edit:?} but its answer named {answer:?}",
+                turn.as_uuid(),
+            ),
+            Self::Unprepared(execution) => write!(
+                formatter,
+                "the edit for execution {} has no intent",
+                execution.as_uuid(),
             ),
         }
     }
@@ -368,6 +448,16 @@ impl std::fmt::Display for RecordKey {
                 write!(formatter, "the result of execution {}", execution.as_uuid())
             },
             Self::Find(turn) => write!(formatter, "the find for turn {}", turn.as_uuid()),
+            Self::EditIntent(execution) => write!(
+                formatter,
+                "the edit intent for execution {}",
+                execution.as_uuid(),
+            ),
+            Self::EditOutcome(execution) => write!(
+                formatter,
+                "the edit outcome for execution {}",
+                execution.as_uuid(),
+            ),
             Self::Speech { turn } => {
                 write!(formatter, "the speech for turn {}", turn.as_uuid())
             },
@@ -377,7 +467,10 @@ impl std::fmt::Display for RecordKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PROSE_BYTES, MAX_QUERY_BYTES, MAX_SPEECH_BYTES, clip_prose, clip_query};
+    use super::{
+        MAX_PATCH_BYTES, MAX_PROSE_BYTES, MAX_QUERY_BYTES, MAX_SPEECH_BYTES, clip_prose,
+        clip_query, patch_refusal,
+    };
 
     // The values are the durable log's byte bounds, and the kernel's provider clips prose to the
     // second one. Every other consumer reads them by name, so this suite is the only place a drift
@@ -413,6 +506,22 @@ mod tests {
         let at_the_ceiling = "a".repeat(8_192);
 
         assert_eq!(clip_prose(&at_the_ceiling), at_the_ceiling);
+    }
+
+    #[test]
+    fn a_patch_at_the_ceiling_is_allowed_and_one_byte_more_is_refused() {
+        let at = "a".repeat(MAX_PATCH_BYTES);
+        assert!(patch_refusal(&at).is_none());
+
+        let over = "a".repeat(MAX_PATCH_BYTES + 1);
+        assert_eq!(
+            patch_refusal(&over),
+            Some(format!(
+                "the patch is {} bytes, and the log holds {}",
+                over.len(),
+                MAX_PATCH_BYTES,
+            )),
+        );
     }
 
     #[test]
