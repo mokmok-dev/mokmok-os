@@ -490,6 +490,11 @@ mod tests {
     use mokmok_agent_runtime::EditOutcome;
 
     #[test]
+    fn the_edit_size_ceiling_is_four_mebibytes() {
+        assert_eq!(MAX_EDIT_FILE_BYTES, 4_194_304);
+    }
+
+    #[test]
     fn placement_renders_matched_and_inserted_hunks() {
         let text = render_placement(&[
             Placed::Matched {
@@ -615,6 +620,7 @@ mod tests {
     fn plan_refuses_a_two_file_patch() {
         let scratch = Scratch::new("two-files");
         let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "x\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
         let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
 
@@ -624,7 +630,13 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(matches!(plan, Plan::Refused(_)));
+        let Plan::Refused(reason) = plan else {
+            panic!("expected a refusal");
+        };
+        assert!(
+            reason.contains("exactly one file") || reason.contains("more than one"),
+            "refusal must name the two-file rule: {reason}"
+        );
     }
 
     #[test]
@@ -644,6 +656,26 @@ mod tests {
             panic!("expected Refused");
         };
         assert!(reason.contains("delete"), "{reason}");
+    }
+
+    #[test]
+    fn plan_creates_a_file_that_does_not_exist() {
+        let scratch = Scratch::new("create");
+        let checkout = checkout(&scratch);
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- /dev/null\n+++ b/x.rs\n@@ -0,0 +1,1 @@\n+new\n",
+            ))
+            .unwrap();
+
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+        assert_eq!(ready.relative, "x.rs");
+        assert_eq!(std::str::from_utf8(&ready.bytes).unwrap(), "new\n");
     }
 
     #[test]
@@ -766,6 +798,60 @@ mod tests {
             panic!("expected Refused");
         };
         assert!(reason.contains("bytes"), "{reason}");
+    }
+
+    #[test]
+    fn plan_allows_a_file_at_the_size_ceiling() {
+        let scratch = Scratch::new("at-ceiling");
+        let checkout = checkout(&scratch);
+        // One line per byte-pair keeps the hunk matching at the exact ceiling.
+        std::fs::write(checkout.join("x.rs"), "x\n".repeat(MAX_EDIT_FILE_BYTES / 2)).unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n x\n+y\n",
+            ))
+            .unwrap();
+
+        assert!(
+            matches!(plan, Plan::Ready(_)),
+            "a file exactly at the ceiling must plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn open_reason_renders_exact_sentences() {
+        let not_found = open_reason(
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            std::path::Path::new("/tmp/missing"),
+            "the parent directory could not be opened",
+        );
+        assert_eq!(
+            not_found,
+            "/tmp/missing does not exist; create the parent directory with a command".to_owned(),
+        );
+
+        let symlink = open_reason(
+            &std::io::Error::from_raw_os_error(nix::errno::Errno::ELOOP as i32),
+            std::path::Path::new("/tmp/link"),
+            "the parent directory could not be opened",
+        );
+        assert_eq!(
+            symlink,
+            "the target is a symbolic link, and this tool never follows one".to_owned(),
+        );
+
+        let other = open_reason(
+            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            std::path::Path::new("/tmp/dir"),
+            "/tmp/dir could not be opened",
+        );
+        assert!(
+            other.contains("/tmp/dir could not be opened") && other.contains("denied"),
+            "{other}"
+        );
     }
 
     #[test]

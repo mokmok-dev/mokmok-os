@@ -357,6 +357,7 @@ mod tests {
     use crate::find::FindReport;
     use crate::model::{Action, Usage};
     use crate::record::{AnswerRecord, CallRecord, PromptRecord, Record, SpeechRecord};
+    use crate::task::Task;
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
         begin_records, edit_intent_records, edit_outcome_records, edit_refusal_records,
@@ -512,6 +513,31 @@ mod tests {
             built.bytes(),
             3 + 6 + ("command-1".len() + "observation-1".len() + 8)
         );
+    }
+
+    #[test]
+    fn context_flags_match_whether_search_and_write_roots_were_granted() {
+        let writable = task(4);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&writable));
+        let built = context(&transcript);
+        assert!(built.search, "search root granted");
+        assert!(built.writable, "write root granted");
+
+        let setting = crate::task::Setting {
+            writable: Vec::new(),
+            search: Vec::new(),
+            ..writable.setting.clone()
+        };
+        let read_only = Task {
+            setting,
+            ..writable
+        };
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&read_only));
+        let built = context(&transcript);
+        assert!(!built.search, "no search root");
+        assert!(!built.writable, "no write root");
     }
 
     #[test]

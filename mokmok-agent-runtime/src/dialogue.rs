@@ -1299,6 +1299,21 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_intent_redelivered_is_a_duplicate() {
+        let (mut transcript, turn, execution) =
+            an_edit_answered_turn("--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+y\n");
+        let record = edit_intent(
+            turn,
+            execution,
+            "--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+y\n",
+            "a",
+        );
+
+        assert_eq!(transcript.apply(&record), Ok(Ack::Applied));
+        assert_eq!(transcript.apply(&record), Ok(Ack::Duplicate));
+    }
+
+    #[test]
     fn an_edit_intent_refuses_a_different_patch() {
         let (mut transcript, turn, execution) =
             an_edit_answered_turn("--- a\n+++ b\n@@ -1,1 +1,1 @@\n-x\n+y\n");

@@ -479,6 +479,7 @@ mod tests {
     fn the_log_bounds_hold_the_declared_byte_counts() {
         assert_eq!(MAX_SPEECH_BYTES, 4096);
         assert_eq!(MAX_PROSE_BYTES, 8192);
+        assert_eq!(MAX_PATCH_BYTES, 32_768);
     }
 
     #[test]
