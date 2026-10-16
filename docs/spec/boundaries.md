@@ -30,13 +30,14 @@ the implementation that ships is named beside it.
 | --- | --- | --- |
 | `Sandbox` | `mokmok-sandbox/src/sandbox.rs:19` | `Confined` and `LimitsOnly` in the same crate, driven by `mokmok-kernel/src/execution.rs` |
 | `Tools` | `mokmok-agent-runtime/src/tool.rs:90` | `Shell` in `mokmok-kernel/src/agent.rs` |
-| `Provider` | `mokmok-agent-runtime/src/model.rs:55` | `Ollama` in `mokmok-kernel/src/provider.rs`, and `Model` and `Scripted` in `mokmok-kernel/src/agent.rs` |
-| `Journal` | `mokmok-agent-runtime/src/model.rs:70` | `Ledger` in `mokmok-kernel/src/agent.rs` |
+| `Provider` | `mokmok-agent-runtime/src/model.rs:60` | `Ollama` in `mokmok-kernel/src/provider.rs`, and `Model` and `Scripted` in `mokmok-kernel/src/agent.rs` |
+| `Journal` | `mokmok-agent-runtime/src/model.rs:75` | `Ledger` in `mokmok-kernel/src/agent.rs` |
 | `Finder`, `Index` | `mokmok-agent-runtime/src/find.rs:18` | `Index` in `mokmok-kernel/src/index.rs:19`, one BM25 corpus per granted root |
+| `Editor`, `EditReport` | `mokmok-agent-runtime/src/edit.rs:80,74` | `Editor` in `mokmok-kernel/src/editor.rs:32`, the daemon's own writer into the checkout |
 | `Clock` | `mokmok-scheduler/src/clock.rs:10` | The scheduler's own tests. The scheduler is composed nowhere |
-| `Resolver` | `mokmok-egress/src/dns.rs:10` | `SystemResolver` in `mokmok-kernel/src/provider.rs:295` |
+| `Resolver` | `mokmok-egress/src/dns.rs:10` | `SystemResolver` in `mokmok-kernel/src/provider.rs:357` |
 | `PolicyClient` | `mokmok-egress/src/policy_client.rs:34` | `Permit` in `mokmok-kernel/src/provider.rs` |
-| `AuditSink` | `mokmok-egress/src/audit.rs:45` | `AuditToLog` in `mokmok-kernel/src/provider.rs:342` |
+| `AuditSink` | `mokmok-egress/src/audit.rs:45` | `AuditToLog` in `mokmok-kernel/src/provider.rs:406` |
 | `Authorizer` | `mokmok-artifact/src/metadata.rs:94` | Test fixtures only |
 | `ReferenceStore` | `mokmok-artifact/src/metadata.rs:13` | Test fixtures only |
 | `Exporter` | `mokmok-observability/src/exporter.rs:12` | A test fixture in the same crate |

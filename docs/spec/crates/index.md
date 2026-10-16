@@ -21,6 +21,7 @@
 * [mokmok-artifact](artifact.md) - content-addressed blob storage with references, retention, and collection
 * [mokmok-observability](observability.md) - traces, metrics, logs, and the durable audit journal
 * [mokmok-search](search.md) - a BM25 index over a directory tree, answering the model's find
+* [mokmok-patch](patch.md) - a unified diff read into recomputed counts, applied to bytes with no file opened
 * [mokmok-kernel](kernel.md) - the composition root, recovery, the vertical slice, and the daemon
 
 # Applications

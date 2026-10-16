@@ -18,10 +18,10 @@ sources:
     last_modified: 2026-10-15T08:39:00Z
 ---
 
-# The fourteen members
+# The fifteen members
 
-`Cargo.toml` lists fourteen members.[^manifest] Each one carries a target logical boundary from the
-design's crate map, and the last two have no section in the design at all.
+`Cargo.toml` lists fifteen members.[^manifest] Each one carries a target logical boundary from the
+design's crate map, and the last three have no section in the design at all.
 
 | Member | Design section | Dependents | How it is composed |
 | --- | --- | --- | --- |
@@ -37,6 +37,7 @@ design's crate map, and the last two have no section in the design at all.
 | `mokmok-artifact` | 5.10 | `mokmok-kernel` | `BlobStore` and `ContentHash` only |
 | `mokmok-observability` | 5.11 | `mokmok-kernel` | The tracing subscriber, and the audit journal |
 | `mokmok-search` | None | `mokmok-kernel` | One corpus per granted root, read by the kernel's finder |
+| `mokmok-patch` | None | `mokmok-kernel` | One unified diff read into recomputed counts, applied in memory by the kernel's editor |
 | `mokmok-kernel` | 5.12 | `mokmok-tui` | The daemon binary and the TUI |
 | `mokmok-tui` | None | Nobody | An application above the kernel |
 
