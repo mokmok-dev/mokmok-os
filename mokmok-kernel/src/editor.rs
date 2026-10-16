@@ -178,7 +178,14 @@ impl EditorPort for Editor {
         }
 
         let (before_bytes, _mode) = match read_target(&parent_fd, name, &relative) {
-            Ok(Some(value)) => value,
+            Ok(Some(value)) => {
+                if matches!(section.source, Label::Absent) {
+                    return Ok(Plan::Refused(format!(
+                        "{relative} already exists; patch it instead of creating it"
+                    )));
+                }
+                value
+            },
             Ok(None) => {
                 if !matches!(section.source, Label::Absent) {
                     return Ok(Plan::Refused(format!(
@@ -511,5 +518,327 @@ mod tests {
             report.observation
         );
         assert!(matches!(report.outcome, EditOutcome::Refused { .. }));
+    }
+
+    use std::path::{Path, PathBuf};
+
+    use super::Config;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mokmok-editor-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn config(
+        root: &Path,
+        writable: &[PathBuf],
+        readable: &[PathBuf],
+    ) -> crate::config::Config {
+        let data = root.join("data");
+        let artifacts = data.join("artifacts");
+        let sandbox_root = data.join("sandbox");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::create_dir_all(&sandbox_root).unwrap();
+
+        Config {
+            data_dir: data.clone(),
+            events: data.join("events.sqlite"),
+            artifacts,
+            sandbox_root,
+            allow_tool: vec![PathBuf::from("/bin/sh")],
+            allow_path: readable.to_vec(),
+            allow_write: writable.to_vec(),
+            search_root: Vec::new(),
+            search_index: data.join("search"),
+            tool_env: Vec::new(),
+            confiner: PathBuf::from("/bin/sh"),
+            crash_after: None,
+            provider: crate::config::ProviderKind::Scripted,
+            script: None,
+            model: None,
+            endpoint: "https://ollama.com/v1".to_owned(),
+            provider_credential_file: None,
+            max_answer_tokens: 4096,
+        }
+    }
+
+    fn edit_call(patch: &str) -> EditCall {
+        EditCall {
+            execution: mokmok_protocol::ExecutionID::from_uuid(uuid::Uuid::nil()),
+            patch: patch.to_owned(),
+            expect: None,
+        }
+    }
+
+    fn checkout(scratch: &Scratch) -> PathBuf {
+        let path = scratch.0.join("checkout");
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn plan_applies_a_patch_to_one_file() {
+        let scratch = Scratch::new("apply");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\ntwo\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n",
+            ))
+            .unwrap();
+
+        let ready = match plan {
+            Plan::Ready(ready) => ready,
+            Plan::Refused(reason) => panic!("expected Ready, got Refused: {reason}"),
+        };
+        assert_eq!(ready.relative, "x.rs");
+        assert!(std::str::from_utf8(&ready.bytes).unwrap().contains("three"));
+    }
+
+    #[test]
+    fn plan_refuses_a_two_file_patch() {
+        let scratch = Scratch::new("two-files");
+        let checkout = checkout(&scratch);
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n x\n-y\n--- a/y.rs\n+++ b/y.rs\n@@ -1,1 +1,1 @@\n a\n-b\n",
+            ))
+            .unwrap();
+
+        assert!(matches!(plan, Plan::Refused(_)));
+    }
+
+    #[test]
+    fn plan_refuses_a_deletion() {
+        let scratch = Scratch::new("delete");
+        let checkout = checkout(&scratch);
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n x\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("delete"), "{reason}");
+    }
+
+    #[test]
+    fn plan_refuses_creating_over_an_existing_file() {
+        let scratch = Scratch::new("create-over");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "exists\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- /dev/null\n+++ b/x.rs\n@@ -0,0 +1,1 @@\n+new\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(
+            reason.contains("exists") || reason.contains("create"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn plan_refuses_an_expect_mismatch() {
+        let scratch = Scratch::new("expect");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
+        call.expect = Some("0".repeat(64));
+
+        let plan = editor.plan(&call).unwrap();
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("expected"), "{reason}");
+    }
+
+    #[test]
+    fn plan_refuses_a_non_utf8_file() {
+        let scratch = Scratch::new("binary");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), [0xff, 0xfe]).unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n x\n+y\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("UTF-8"), "{reason}");
+    }
+
+    #[test]
+    fn plan_refuses_a_non_matching_hunk() {
+        let scratch = Scratch::new("mismatch");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n two\n-three\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("hunk"), "{reason}");
+    }
+
+    #[test]
+    fn plan_refuses_a_symlinked_target() {
+        let scratch = Scratch::new("symlink");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("real.rs"), "one\n").unwrap();
+        std::os::unix::fs::symlink(checkout.join("real.rs"), checkout.join("x.rs")).unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("symbolic link"), "{reason}");
+    }
+
+    #[test]
+    fn plan_refuses_an_over_size_file() {
+        let scratch = Scratch::new("oversize");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "x".repeat(MAX_EDIT_FILE_BYTES + 1)).unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n x\n+y\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("bytes"), "{reason}");
+    }
+
+    #[test]
+    fn plan_refuses_a_read_only_root() {
+        let scratch = Scratch::new("read-only");
+        let checkout = checkout(&scratch);
+        std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
+        let config = config(&scratch.0, &[], std::slice::from_ref(&checkout));
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+
+        let Plan::Refused(reason) = plan else {
+            panic!("expected Refused");
+        };
+        assert!(reason.contains("granted"), "{reason}");
+    }
+
+    #[test]
+    fn commit_writes_the_bytes_and_preserves_the_mode() {
+        let scratch = Scratch::new("commit");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        std::fs::write(&target, "one\ntwo\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n one\n-two\n+three\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+
+        let report = editor.commit(&ready).unwrap();
+        assert!(
+            matches!(report.outcome, EditOutcome::Applied),
+            "report was not Applied: {}",
+            report.observation
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "one\nthree\n");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+    }
+
+    #[test]
+    fn commit_returns_stale_when_the_file_changes() {
+        let scratch = Scratch::new("stale");
+        let checkout = checkout(&scratch);
+        let target = checkout.join("x.rs");
+        std::fs::write(&target, "one\n").unwrap();
+        let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
+        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+
+        let plan = editor
+            .plan(&edit_call(
+                "--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n one\n+two\n",
+            ))
+            .unwrap();
+        let Plan::Ready(ready) = plan else {
+            panic!("expected Ready");
+        };
+
+        std::fs::write(&target, "changed\n").unwrap();
+        let report = editor.commit(&ready).unwrap();
+        assert!(matches!(report.outcome, EditOutcome::Stale { .. }));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed\n");
     }
 }
