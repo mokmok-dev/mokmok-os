@@ -1332,6 +1332,60 @@ mod tests {
     }
 
     #[test]
+    fn a_scripted_create_from_dev_null_writes_the_file_and_records_the_hashes() {
+        let scratch = Scratch::new("edit-create");
+        let target = scratch.checkout().join("new.rs");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "edit", "patch": "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,1 @@\n+hello\n"}),
+                json!({"action": "final", "say": "done"}),
+            ],
+        );
+
+        let ran = run(&agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file reads"),
+            "hello\n",
+        );
+
+        let report = status(&scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        assert!(
+            report
+                .out
+                .lines()
+                .any(|line| line.starts_with("edit ") && line.contains("relative=\"new.rs\"")),
+            "the transcript's intent record carries the relative path:\n{}",
+            report.out,
+        );
+        assert!(
+            report
+                .out
+                .lines()
+                .any(|line| line.starts_with("edit ") && line.contains("outcome=Applied")),
+            "the transcript's outcome record says the edit applied:\n{}",
+            report.out,
+        );
+
+        let (log, _) = log_of(&scratch);
+        let intent = edit_intent_of(&log);
+        assert!(intent.create, "the intent carries the create flag");
+        let outcome = edit_outcome_of(&log);
+        assert!(matches!(outcome.report.outcome, EditOutcome::Applied));
+        assert!(
+            outcome
+                .report
+                .observation
+                .contains("edit applied to new.rs"),
+            "{}",
+            outcome.report.observation,
+        );
+    }
+
+    #[test]
     fn a_refused_hunk_leaves_the_file_unchanged_and_records_the_refusal() {
         let scratch = Scratch::new("edit-refused");
         let target = scratch.checkout().join("out.txt");
