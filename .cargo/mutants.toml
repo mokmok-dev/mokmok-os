@@ -11,3 +11,47 @@ cap_lints = true
 # Not left at the default `test` profile: mutation testing only ever rebuilds,
 # so we prefer link speed over debug info (see [profile.mutants] in Cargo.toml).
 profile = "mutants"
+
+# Mutants that no test can distinguish from the original, one entry per proof. Matched against the
+# name `--list` prints, and keyed on the enclosing function rather than the line, so a move does
+# not invalidate an entry. Recorded here rather than worked around in the code: three of these are
+# one bit-packing idiom, and rewriting it as arithmetic would trade the idiom for this tool's
+# convenience.
+exclude_re = [
+  # `nibble` is `char::to_digit(16)` narrowed by `u8::try_from`, so it returns 0..=15. In
+  # `nibble(high)? << 4 | nibble(low)?` the left operand has bits 0..4 clear and the right operand
+  # only sets bits 0..4, so the operands are disjoint and `|` and `^` are the same byte.
+  'replace \| with \^ in <impl FromStr for ContentHash>::from_str',
+  # `hex_nibble` answers 0..=15 for the digits and `None` otherwise, so the operands of
+  # `(high << 4) | low` are disjoint in the same way.
+  'replace \| with \^ in parse_hex',
+  # `libc`'s `O_PATH` and `O_CLOEXEC` are distinct single bits, so `O_PATH | O_CLOEXEC`,
+  # `O_PATH ^ O_CLOEXEC`, and the pair's sum are one value: `openat2` is handed identical flags.
+  'replace \| with \^ in open_resolved',
+  # `CompatLevel::HardRequirement` (plan.rs) makes a ruleset that cannot be fully applied an
+  # error: landlock 0.4.7's `try_compat_binary` returns `Err` for an unsupported feature at that
+  # level, and a state of `Full` is what `RulesetStatus::FullyEnforced` reports. So the
+  # `Ok(enforced)` arm below the `FullyEnforced` guard is unreachable, and forcing the guard true
+  # takes the same branch. The arm stays because a match needs it and a future landlock may
+  # reach it, where refusing is the fail-closed answer.
+  'replace match guard enforced.ruleset == RulesetStatus::FullyEnforced with true in confine',
+  # `drain` reads into a `CHUNK`-sized buffer until end of file and keeps `min(total, cap)` bytes.
+  # Reading 16 + 1024 bytes per call rather than 16 * 1024 captures the same bytes in the same
+  # order; only the number of `read` calls differs, and nothing observes that. A module-level
+  # constant's mutant name carries no function, so this one is pinned to its file and line and
+  # stops applying, loudly, if that line moves.
+  'mokmok-sandbox/src/output\.rs:62:\d+: replace \* with \+',
+  # `steps` is a `u32` already clamped by `.min(capacity)`, so `steps >= 0` is always true and the
+  # guard cannot be told from `steps > 0`. At `steps == 0` the body is `tokens` `saturating_add(0)`
+  # then `min(capacity)`, and `tokens <= capacity` throughout, so it assigns the same values.
+  'replace > with >= in RateLimit::acquire',
+  # The expression is `max(through.seq(), held)`. With equal operands both arms yield that value.
+  'replace > with >= in advance',
+  # Not an equivalence but a scope limit, recorded so the count is honest. `model_audit_id` is
+  # read into `AuditRecord.execution`, and this crate's only `AuditSink`, `AuditToLog::record`,
+  # drops that field: `AuditEntry` has no execution field to carry it (mokmok-observability's
+  # audit.rs). So no durable byte differs. The value does cross a public trait, so a sink that
+  # kept it would make this mutant killable; that is a change to the audit entry's shape, and the
+  # gap it names is that a connection cannot be attributed to an execution after the fact.
+  'replace model_audit_id -> Uuid with Default::default\(\)',
+]
