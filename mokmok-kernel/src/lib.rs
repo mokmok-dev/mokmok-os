@@ -20,6 +20,7 @@ mod index;
 mod notify;
 mod provider;
 mod recovery;
+mod roster;
 mod serve;
 mod slice;
 
@@ -31,5 +32,6 @@ pub use config::{
 pub use db::{Db, Entry, Log, ResultRecord, TurnRecord};
 pub use error::Error;
 pub use execution::{Blob, ExecutionResult, Plan, Ran, Refused};
+pub use roster::{Summary, sessions};
 pub use serve::{Relay, serve};
-pub use slice::{Notice, Report, Submitted, outcome_of, reconcile, status, submit};
+pub use slice::{Notice, Report, Submitted, mint_session, outcome_of, reconcile, status, submit};

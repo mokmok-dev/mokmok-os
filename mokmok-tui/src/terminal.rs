@@ -1,6 +1,7 @@
 //! The ratatui adapter: crossterm events in, one frame out.
 
 use std::io::IsTerminal;
+use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -16,7 +17,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal as RtTerminal};
 
 use crate::Error;
-use crate::port::{Event, Key, Screen, View};
+use crate::port::{Event, Key, Screen, Sheet, View};
+
+/// What the input row starts with, so the line being typed and the goal being named are told apart.
+const INPUT_PREFIX: &str = "> ";
+
+const GOAL_PREFIX: &str = "goal> ";
 
 /// The real terminal: keys from crossterm, one frame to the alternate screen.
 pub struct Terminal {
@@ -65,6 +71,14 @@ impl Drop for Terminal {
 }
 
 impl Screen for Terminal {
+    fn poll(&mut self) -> Result<Option<Event>, Error> {
+        if !event::poll(Duration::ZERO).map_err(Error::Terminal)? {
+            return Ok(None);
+        }
+
+        self.event().map(Some)
+    }
+
     fn event(&mut self) -> Result<Event, Error> {
         loop {
             if let Some(event) = classified(&event::read().map_err(Error::Terminal)?) {
@@ -108,7 +122,7 @@ fn classified(event: &CtEvent) -> Option<Event> {
 
 /// The conversation's key for a reported key event, when it listens for it.
 ///
-/// A control or alt chord that is not the mapped `Ctrl-C` is dropped rather than typed as its
+/// A control or alt chord that is not one of the mapped ones is dropped rather than typed as its
 /// letter, so a human reaching for a key the program does not bind finds no stray character in the
 /// line; a shifted character still types itself. A release and a repeat are the same key already
 /// reported, so only a press is the stroke.
@@ -117,11 +131,16 @@ fn mapped(key: &KeyEvent) -> Option<Key> {
         return None;
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return Some(Key::Interrupt);
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') => Some(Key::Interrupt),
+            KeyCode::Char('n') => Some(Key::New),
+            KeyCode::Char('o') => Some(Key::List),
+            _ => None,
+        };
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+    if key.modifiers.contains(KeyModifiers::ALT) {
         return None;
     }
 
@@ -131,11 +150,16 @@ fn mapped(key: &KeyEvent) -> Option<Key> {
         KeyCode::Backspace => Some(Key::Backspace),
         KeyCode::Up => Some(Key::Up),
         KeyCode::Down => Some(Key::Down),
+        KeyCode::Tab => Some(Key::Next),
+        KeyCode::Esc => Some(Key::Escape),
         _ => None,
     }
 }
 
-/// Lays out one frame: the header, the transcript, the line being typed, and the status line.
+/// Lays out one frame: the header, the body, the line being typed, and the status line.
+///
+/// The body is the pane the human opened when he opened one, and the transcript otherwise, so the
+/// renderer asks [`View::body`] which rows to draw and decides nothing about them.
 fn render(
     frame: &mut Frame<'_>,
     view: &View,
@@ -148,17 +172,30 @@ fn render(
     ])
     .areas(frame.area());
 
-    let heading = format!("mokmok-tui  {}  {}", view.session.as_uuid(), view.status);
+    let heading = view.background.as_ref().map_or_else(
+        || format!("mokmok-tui  {}  {}", view.session.as_uuid(), view.status),
+        |background| {
+            format!(
+                "mokmok-tui  {}  {}  ({background})",
+                view.session.as_uuid(),
+                view.status,
+            )
+        },
+    );
     frame.render_widget(Paragraph::new(TextLine::raw(heading)), header);
 
     let lines: Vec<TextLine<'static>> = view
-        .visible(usize::from(body.height))
+        .body(usize::from(body.height))
         .into_iter()
         .map(TextLine::raw)
         .collect();
     frame.render_widget(Paragraph::new(lines), body);
 
-    let typed = format!("> {}", view.input);
+    let typed = match &view.sheet {
+        Some(Sheet::List { .. }) => String::new(),
+        Some(Sheet::New { goal }) => format!("{GOAL_PREFIX}{goal}"),
+        None => format!("{INPUT_PREFIX}{}", view.input),
+    };
     frame.render_widget(Paragraph::new(TextLine::raw(typed.as_str())), input);
     frame.render_widget(Paragraph::new(TextLine::raw(view.status.as_str())), status);
 
@@ -180,7 +217,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{both_are_terminals, classified, mapped, render};
-    use crate::port::{Event, Key, Line, View};
+    use crate::port::{Event, Key, Line, Row, Sheet, View};
     use mokmok_protocol::SessionID;
 
     #[test]
@@ -198,7 +235,15 @@ mod tests {
         assert_eq!(
             mapped(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Key::Interrupt),
-            "Ctrl-C is the one mapped control key",
+            "Ctrl-C is the mapped interrupt",
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(Key::New),
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(Key::List),
         );
         assert_eq!(
             mapped(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
@@ -214,6 +259,17 @@ mod tests {
             mapped(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(Key::Enter),
         );
+    }
+
+    #[test]
+    fn the_pane_keys_and_the_cursor_keys_map_to_themselves() {
+        for (code, key) in [(KeyCode::Tab, Key::Next), (KeyCode::Esc, Key::Escape)] {
+            assert_eq!(
+                mapped(&KeyEvent::new(code, KeyModifiers::NONE)),
+                Some(key),
+                "{code:?} is a key the conversation acts on",
+            );
+        }
     }
 
     #[test]
@@ -307,6 +363,8 @@ mod tests {
             input: "hi".to_owned(),
             status: "your turn".to_owned(),
             scroll,
+            background: None,
+            sheet: None,
         }
     }
 
@@ -528,5 +586,117 @@ mod tests {
             assert_eq!(row(buffer, 1, 40), "  $ ls");
             assert_eq!(row(buffer, 2, 40), "    out.txt");
         }
+    }
+
+    fn listing(
+        rows: Vec<Row>,
+        cursor: usize,
+    ) -> View {
+        View {
+            sheet: Some(Sheet::List { rows, cursor }),
+            ..view(Vec::new(), 0)
+        }
+    }
+
+    fn listed_row(
+        seed: u128,
+        goal: Option<&str>,
+        held: bool,
+    ) -> Row {
+        Row {
+            session: SessionID::from_uuid(Uuid::from_u128(seed)),
+            goal: goal.map(str::to_owned),
+            status: "your turn".to_owned(),
+            held,
+            focused: false,
+        }
+    }
+
+    #[test]
+    fn the_listing_draws_its_rows_and_takes_the_input_row() {
+        let view = listing(
+            vec![
+                listed_row(1, Some("hold a conversation"), true),
+                listed_row(2, None, false),
+            ],
+            1,
+        );
+        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            row(buffer, 1, 80),
+            "  * 00000000-0000-0000-0000-000000000001  your turn  hold a conversation",
+        );
+        assert_eq!(
+            row(buffer, 2, 80),
+            ">   00000000-0000-0000-0000-000000000002  your turn  (no goal recorded)",
+        );
+        assert_eq!(
+            row(buffer, 8, 80),
+            "",
+            "the listing takes the input row rather than sharing it with a line",
+        );
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(0, 8),
+            "the cursor sits at the start of the blank input row",
+        );
+    }
+
+    #[test]
+    fn naming_a_goal_draws_the_prompt_and_the_cursor_after_the_goal() {
+        let view = View {
+            sheet: Some(Sheet::New {
+                goal: "count".to_owned(),
+            }),
+            ..view(vec![Line::Human("hello".to_owned())], 0)
+        };
+        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(row(buffer, 1, 80), "you    hello");
+        assert_eq!(row(buffer, 8, 80), "goal> count");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(11, 8),
+            "the cursor sits one column past the goal",
+        );
+    }
+
+    #[test]
+    fn the_heading_reports_the_other_sessions_that_are_working() {
+        let quiet = view(vec![Line::Human("hello".to_owned())], 0);
+        let busy = View {
+            background: Some("1 other session working".to_owned()),
+            ..quiet.clone()
+        };
+        let mut terminal = RtTerminal::new(TestBackend::new(120, 10)).expect("the screen opens");
+
+        terminal
+            .draw(|frame| render(frame, &quiet))
+            .expect("the frame draws");
+        assert_eq!(
+            row(terminal.backend().buffer(), 0, 120),
+            format!("mokmok-tui  {}  your turn", quiet.session.as_uuid()),
+            "a frame with nothing moving elsewhere is the frame it was",
+        );
+
+        terminal
+            .draw(|frame| render(frame, &busy))
+            .expect("the frame draws");
+        assert_eq!(
+            row(terminal.backend().buffer(), 0, 120),
+            format!(
+                "mokmok-tui  {}  your turn  (1 other session working)",
+                busy.session.as_uuid(),
+            ),
+        );
     }
 }

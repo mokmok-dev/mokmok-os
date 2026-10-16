@@ -36,13 +36,33 @@ The check is the flake's `cargoTest`, which is crane's `cargoNextest` over the w
 workspace.[^flake] The command runs that derivation again so its output reaches a log, for the
 reason [the executor](/references/executors/run-nix-check.md) records.
 
-# The run on 2026-10-15
+# The run on 2026-10-16
 
 The receipt below is what the run returned, and
 [nextest-count.sh](/references/attesters/nextest-count.sh) returned `verdict=pass` against it.
 
 | Field | Value |
 | --- | --- |
+| `command` | `nix flake check --print-build-logs` |
+| `exit_code` | 0 |
+| `tests_run` | 858 |
+| `failed` | 0 |
+| nextest summary | `858 tests run: 858 passed, 1 skipped` |
+
+Every check attribute reported pass: `cargoClippy`, `cargoDocTest`, `pre-commit`, `cargoTest`,
+`treefmt`, `nixosModule`, `dependencyRules`, and `mokmokdUnit`.
+
+# What this proves
+
+858 test cases compile and pass in the nix build sandbox at the head of `feat/tui-sessions`. The
+sandbox has a real SQLite, a real Unix socket, and a real Landlock kernel, so the cases that need
+those are running against them.
+
+# The run before it, on 2026-10-15
+
+| Field | Value |
+| --- | --- |
+| `command` | `nix build .#checks.x86_64-linux.cargoTest --rebuild --print-build-logs` |
 | `exit_code` | 1 |
 | `tests_run` | 608 |
 | `failed` | 0 |
@@ -51,13 +71,7 @@ The receipt below is what the run returned, and
 The exit status of 1 comes from `--rebuild` comparing the rebuilt output with the stored one. The
 check installs a compressed copy of `target/`, so the two outputs differ and nix reports that. The
 attester keys on the nextest summary and on the absence of any failing line, and it reports the
-status alongside the verdict.
-
-# What this proves
-
-608 test cases compile and pass in the nix build sandbox at commit `bbe2ea2`. The sandbox has a
-real SQLite, a real Unix socket, and a real Landlock kernel, so the cases that need those are
-running against them.
+status alongside the verdict. That run measured the repository at commit `bbe2ea2`.
 
 # What this does not prove
 

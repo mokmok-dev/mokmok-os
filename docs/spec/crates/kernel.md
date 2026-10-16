@@ -38,10 +38,11 @@ carries.[^crate]
 | `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,464,483` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
 | `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:665,546,529,363` | The agent loop and its scripted model |
+| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:557` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
-`authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `serve`, and
-`slice` are private modules. `agent` is public. The daemon binary is
+`authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`, `serve`,
+and `slice` are private modules. `agent` is public. The daemon binary is
 `mokmok-kernel/src/bin/mokmokd.rs`.
 
 # Owned state
@@ -62,6 +63,11 @@ publisher per topic in `Relay` (`src/serve.rs:54`), the scripted model's answer 
   (`src/authority.rs:60-92`).
 - A search root must sit inside a read or write grant, or the run is refused before any index is
   opened (`src/config.rs:399`).
+- Every stream the commit log holds is one session's, so `Db::streams` is the whole list of them and
+  the position of a stream's newest commit is the order a chooser reads (`src/db.rs:388-414`).
+- A session that committed no task is listed with no goal and no checkout, and a stream that
+  committed no session fact at all folds to the phase an empty history reaches rather than being
+  skipped (`src/roster.rs:43-64`).
 - A credential file must be mode 0600 (`src/config.rs:624`) and must not sit inside a write grant
   (`src/config.rs:642`).
 - An artifact path must be plain and relative. A parent-directory component, a root component, and
@@ -108,8 +114,9 @@ holds no rusqlite dependency, so SQLite reaches it through `mokmok-event-store` 
 
 The design names the modules `config`, `bootstrap`, `services`, `lifecycle`, `recovery`, and
 `shutdown`.[^architecture] The crate names them `authority`, `config`, `db`, `error`, `execution`,
-`agent`, `notify`, `provider`, `recovery`, `serve`, and `slice`. There is no service registry and no
-lifecycle type; serving and shutdown both live in `serve_until_stopped` (`src/serve.rs:165-285`).
+`agent`, `notify`, `provider`, `recovery`, `roster`, `serve`, and `slice`. There is no service
+registry and no lifecycle type; serving and shutdown both live in `serve_until_stopped`
+(`src/serve.rs:165-285`).
 
 The design has the kernel initiate migrations. There is no migration module, no schema-version row,
 and no expected-version check. Schema creation is `CREATE TABLE IF NOT EXISTS` inside
@@ -137,19 +144,21 @@ injection (`src/config.rs:555`), and the workspace's only wall-clock read
 
 # Tests
 
-155 cases: 107 in `#[cfg(test)]` modules, one of them ignored, and 48 across five integration files.
+162 cases: 114 in `#[cfg(test)]` modules, one of them ignored, and 48 across five integration files.
 
 `src/provider.rs` holds 32 cases for the measured model exchange, malformed output, the request
 body, endpoint parsing, credential secrecy, and not following a redirect. `src/config.rs` holds 44
 cases for resolution and refusal, 23 of them for the configuration file under `XDG_CONFIG_HOME`.
-`tests/slice.rs` holds 12 cases including one confined tool, a replay, a refused tool, an unknown
-outcome after a crash, the relay reaching a subscriber, and recovery before readiness.
-`tests/supervisor.rs` holds 13 cases over the real daemon: readiness after the bus answers, a foreign
-socket never reporting ready, a stop draining and exiting zero, a `SIGKILL` restart over the stale
-socket, the keep-alive following the relay, and an uninstallable subscriber reported without failing
-the daemon. `tests/agent.rs` holds 21 cases for the whole loop, one of them driving a run whose
-provider group comes from a configuration file, a crash before dispatch, cancellation, a command no
-grant reaches, scripted prose, and the two ceilings.
+`src/roster.rs` holds 5 cases for the listing: an empty log, the session written most recently coming
+first, a session that recorded a task carrying its goal and its checkout, the turn count, and a
+stream with no session fact. `tests/slice.rs` holds 12 cases including one confined tool, a replay, a
+refused tool, an unknown outcome after a crash, the relay reaching a subscriber, and recovery before
+readiness. `tests/supervisor.rs` holds 13 cases over the real daemon: readiness after the bus answers,
+a foreign socket never reporting ready, a stop draining and exiting zero, a `SIGKILL` restart over the
+stale socket, the keep-alive following the relay, and an uninstallable subscriber reported without
+failing the daemon. `tests/agent.rs` holds 21 cases for the whole loop, one of them driving a run
+whose provider group comes from a configuration file, a crash before dispatch, cancellation, a command
+no grant reaches, scripted prose, and the two ceilings.
 
 ```
 cargo test -p mokmok-kernel

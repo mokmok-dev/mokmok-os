@@ -13,9 +13,11 @@ mod tests {
     use mokmok_agent_runtime::{Progress, turn_id};
     use mokmok_artifact::{BlobStore, ContentHash};
     use mokmok_kernel::{Agent, Args, Command, Config, Run};
-    use mokmok_protocol::Moment;
+    use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Phase, Turn, TurnOutcome};
-    use mokmok_tui::{Engine, Error, Event, Key, Line, Screen, Session, View, run};
+    use mokmok_tui::{
+        Engine, Error, Event, Key, Line, Screen, Session, Sessions, Sheet, View, run,
+    };
     use serde_json::json;
 
     const SESSION: &str = "018f2f1e-0000-7000-8000-000000000000";
@@ -49,24 +51,56 @@ mod tests {
         }
     }
 
-    /// A screen driven by a script of keys, remembering every frame it was handed.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        Key(Key),
+        /// The screen reports nothing for this many polls, which is what the human not typing looks
+        /// like while the agent works.
+        Think(usize),
+    }
+
     struct ScriptedScreen {
-        keys: VecDeque<Key>,
+        script: VecDeque<Step>,
         frames: Vec<View>,
     }
 
     impl Screen for ScriptedScreen {
-        fn event(&mut self) -> Result<Event, Error> {
-            // A screen with no keys left is a terminal nobody is typing at: `Error::Terminal` stops
-            // the driver rather than letting it spin.
-            self.keys.pop_front().map_or_else(
-                || {
-                    Err(Error::Terminal(std::io::Error::other(
-                        "the script is spent",
-                    )))
+        fn poll(&mut self) -> Result<Option<Event>, Error> {
+            match self.script.front_mut() {
+                Some(Step::Think(left)) => {
+                    *left -= 1;
+                    if *left == 0 {
+                        self.script.pop_front();
+                    }
+
+                    Ok(None)
                 },
-                |key| Ok(Event::Key(key)),
-            )
+                Some(Step::Key(key)) => {
+                    let key = *key;
+                    self.script.pop_front();
+
+                    Ok(Some(Event::Key(key)))
+                },
+                None => Err(Error::Terminal(std::io::Error::other(
+                    "the script is spent",
+                ))),
+            }
+        }
+
+        fn event(&mut self) -> Result<Event, Error> {
+            // A blocking wait skips the silences: they are what the human not typing looks like, and
+            // the driver only blocks when nothing can move.
+            loop {
+                match self.script.pop_front() {
+                    Some(Step::Think(_)) => {},
+                    Some(Step::Key(key)) => return Ok(Event::Key(key)),
+                    None => {
+                        return Err(Error::Terminal(std::io::Error::other(
+                            "the script is spent",
+                        )));
+                    },
+                }
+            }
         }
 
         fn draw(
@@ -79,19 +113,24 @@ mod tests {
         }
     }
 
-    /// The keys that type each line and submit it, then leave with `Ctrl-C`.
-    fn typed(lines: &[&str]) -> VecDeque<Key> {
-        let mut keys = VecDeque::new();
+    /// The keys that type each line and submit it, with a silence after it, and then the interrupt.
+    ///
+    /// The silence is what gives the session the loops it needs to answer, and a silence longer than
+    /// the answer needs costs nothing: the driver skips the ones left once nothing can move.
+    fn typed(lines: &[&str]) -> VecDeque<Step> {
+        let mut steps = VecDeque::new();
 
         for line in lines {
-            for character in line.chars() {
-                keys.push_back(Key::Char(character));
-            }
-            keys.push_back(Key::Enter);
+            steps.extend(
+                line.chars()
+                    .map(|character| Step::Key(Key::Char(character))),
+            );
+            steps.push_back(Step::Key(Key::Enter));
+            steps.push_back(Step::Think(32));
         }
-        keys.push_back(Key::Interrupt);
+        steps.push_back(Step::Key(Key::Interrupt));
 
-        keys
+        steps
     }
 
     /// A `cargo mutants` run names the confiner with `MOKMOK_CONFINER`.
@@ -211,6 +250,35 @@ mod tests {
         (config, run)
     }
 
+    /// The fold of the session the log holds, read the way another process would read it.
+    fn probe(
+        config: &Config,
+        run: &Run,
+        session: SessionID,
+    ) -> mokmok_agent_runtime::Transcript {
+        let spec = Run {
+            session: session.as_uuid().to_string(),
+            ..run.clone()
+        };
+
+        Session::open(config, &spec, Moment::from_millis(0))
+            .expect("the session re-opens")
+            .fold()
+            .expect("the fold reads")
+    }
+
+    /// Steps an engine until the model is done with it, so a case can leave a session behind.
+    async fn settle(session: &mut Session) {
+        for _ in 0..8 {
+            match session.step().await.expect("the step runs") {
+                Progress::Awaiting | Progress::Terminal(_) => return,
+                _ => {},
+            }
+        }
+
+        panic!("the session did not settle");
+    }
+
     #[tokio::test]
     async fn a_conversation_shows_the_line_it_answers_and_survives_two_exchanges() {
         let scratch = Scratch::new("conversation");
@@ -223,22 +291,22 @@ mod tests {
             ],
         );
         let (config, spec) = config_and_run(&scratch, &path, &[]);
-
-        let mut session =
-            Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
-        let session_id = session.session();
+        let at = Moment::from_millis(0);
+        let world = Sessions::new(config.clone(), spec.clone(), at);
+        let first = world.start().expect("the session opens");
         let mut screen = ScriptedScreen {
-            keys: typed(&["line 1", "line 2"]),
+            script: typed(&["line 1", "line 2"]),
             frames: Vec::new(),
         };
 
-        let outcome = run(&mut session, &mut screen)
+        let outcome = run(&world, first, &mut screen)
             .await
             .expect("the conversation ends when the human leaves");
+        assert_eq!(outcome.left.len(), 1, "the process held one session");
         assert!(
-            outcome.ending.is_none(),
+            outcome.left[0].ending.is_none(),
             "Ctrl-C leaves the session open: {:?}",
-            outcome.ending,
+            outcome.left[0].ending,
         );
 
         let shown: Vec<&Line> = screen
@@ -259,7 +327,12 @@ mod tests {
             "the model's own words are on screen",
         );
 
-        let fold = session.fold().expect("the fold reads");
+        let session_id = SessionID::from_uuid(
+            SESSION
+                .parse::<uuid::Uuid>()
+                .expect("the session is a uuid"),
+        );
+        let fold = probe(&config, &spec, session_id);
         assert_eq!(fold.speeches.len(), 2, "both human lines are durable");
         assert_eq!(
             fold.speeches
@@ -280,11 +353,11 @@ mod tests {
             "the conversation is still open for its human",
         );
 
-        let first = turn_id(session_id, 1);
+        let first_turn = turn_id(session_id, 1);
         let prompt = fold
             .prompts
             .iter()
-            .find(|((turn, _), _)| *turn == first)
+            .find(|((turn, _), _)| *turn == first_turn)
             .map(|(_, reference)| reference)
             .expect("turn 1's prompt is recorded");
         let bytes = BlobStore::open(config.artifacts.clone())
@@ -305,22 +378,21 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[]);
         let (config, spec) = config_and_run(&scratch, &path, &[]);
-
-        let mut session =
-            Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
-        let session_id = session.session();
+        let at = Moment::from_millis(0);
+        let world = Sessions::new(config.clone(), spec.clone(), at);
+        let first = world.start().expect("the session opens");
         let mut screen = ScriptedScreen {
-            keys: typed(&["line 1"]),
+            script: typed(&["line 1"]),
             frames: Vec::new(),
         };
 
-        let outcome = run(&mut session, &mut screen)
+        let outcome = run(&world, first, &mut screen)
             .await
             .expect("a provider failure does not end the conversation");
         assert!(
-            outcome.ending.is_none(),
+            outcome.left[0].ending.is_none(),
             "Ctrl-C leaves the session open: {:?}",
-            outcome.ending,
+            outcome.left[0].ending,
         );
 
         let shown: Vec<&Line> = screen
@@ -342,25 +414,30 @@ mod tests {
             "the spent attempts are on screen as trouble: {shown:?}",
         );
 
-        let fold = session.fold().expect("the fold reads");
+        let session_id = SessionID::from_uuid(
+            SESSION
+                .parse::<uuid::Uuid>()
+                .expect("the session is a uuid"),
+        );
+        let fold = probe(&config, &spec, session_id);
         assert_eq!(
             fold.session.phase(),
             Phase::Accepting,
             "a failed model call leaves the conversation open for its human",
         );
 
-        let first = turn_id(session_id, 1);
+        let first_turn = turn_id(session_id, 1);
         let prompts = fold
             .prompts
             .keys()
-            .filter(|(turn, _)| *turn == first)
+            .filter(|(turn, _)| *turn == first_turn)
             .count();
         assert_eq!(
             prompts, 3,
             "the model is re-asked until the turn's attempt ceiling is spent",
         );
         assert_eq!(
-            fold.turn(first).and_then(Turn::outcome),
+            fold.turn(first_turn).and_then(Turn::outcome),
             Some(TurnOutcome::Failed),
             "the turn settles failed rather than the session closing",
         );
@@ -412,15 +489,14 @@ mod tests {
         );
         let root = scratch.checkout().display().to_string();
         let (config, spec) = config_and_run(&scratch, &path, &["--search-root", root.as_str()]);
-
-        let mut session =
-            Session::open(&config, &spec, Moment::from_millis(0)).expect("the session opens");
+        let world = Sessions::new(config, spec, Moment::from_millis(0));
+        let first = world.start().expect("the session opens");
         let mut screen = ScriptedScreen {
-            keys: typed(&["where is the quokka"]),
+            script: typed(&["where is the quokka"]),
             frames: Vec::new(),
         };
 
-        run(&mut session, &mut screen)
+        run(&world, first, &mut screen)
             .await
             .expect("the conversation ends when the human leaves");
 
@@ -447,6 +523,172 @@ mod tests {
         assert!(
             !shown.iter().any(|line| matches!(line, Line::Work { .. })),
             "a find must not be drawn as a command the agent ran: {shown:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_the_human_left_keeps_moving_while_he_is_in_another() {
+        let scratch = Scratch::new("background");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "final", "say": "the first reply"}),
+                json!({"action": "final", "say": "the second reply"}),
+            ],
+        );
+        let (config, spec) = config_and_run(&scratch, &path, &[]);
+        let world = Sessions::new(config, spec, Moment::from_millis(0));
+        let first = world.start().expect("the session opens");
+
+        let mut script = VecDeque::new();
+        for character in "line 1".chars() {
+            script.push_back(Step::Key(Key::Char(character)));
+        }
+        script.push_back(Step::Key(Key::Enter));
+        script.push_back(Step::Key(Key::New));
+        for character in "second".chars() {
+            script.push_back(Step::Key(Key::Char(character)));
+        }
+        script.push_back(Step::Key(Key::Enter));
+        script.push_back(Step::Think(32));
+        script.push_back(Step::Key(Key::Interrupt));
+        let mut screen = ScriptedScreen {
+            script,
+            frames: Vec::new(),
+        };
+
+        let outcome = run(&world, first, &mut screen)
+            .await
+            .expect("the conversation ends when the human leaves");
+
+        assert_eq!(
+            outcome.left.len(),
+            2,
+            "the process held the session it started in and the one the human created",
+        );
+        let started = &outcome.left[0];
+        assert_eq!(started.session.as_uuid().to_string(), SESSION);
+        assert!(
+            started.lines.contains(&Line::Human("line 1".to_owned())),
+            "the human's line is in the session he left: {:?}",
+            started.lines,
+        );
+        assert!(
+            started
+                .lines
+                .contains(&Line::Agent("the first reply".to_owned())),
+            "the turn settled while the human was in the other session: {:?}",
+            started.lines,
+        );
+
+        let created = outcome.left[1].session;
+        let background = screen
+            .frames
+            .iter()
+            .find(|frame| frame.session == created && frame.background.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no frame in the new session reported the one in the background: {:?}",
+                    screen
+                        .frames
+                        .iter()
+                        .map(|frame| (frame.session, frame.background.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            });
+
+        assert_eq!(
+            background.background.as_deref(),
+            Some("1 other session working"),
+        );
+    }
+
+    #[tokio::test]
+    async fn the_listing_shows_the_logs_other_session_and_switching_to_it_opens_it() {
+        let scratch = Scratch::new("listing");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "final", "say": "the older reply"}),
+                json!({"action": "final", "say": "the newer reply"}),
+            ],
+        );
+        let (config, spec) = config_and_run(&scratch, &path, &[]);
+        let at = Moment::from_millis(0);
+        let elsewhere = SessionID::from_uuid(uuid::Uuid::from_u128(0x11));
+
+        // A session another run left behind, written through the same world the conversation uses.
+        {
+            let older = Run {
+                session: elsewhere.as_uuid().to_string(),
+                ..spec.clone()
+            };
+            let mut session = Session::open(&config, &older, at).expect("the older session opens");
+            session.speak("the older line").expect("it takes the line");
+            settle(&mut session).await;
+        }
+
+        let world = Sessions::new(config, spec, at);
+        let first = world.start().expect("the session opens");
+        let mut screen = ScriptedScreen {
+            script: VecDeque::from([
+                Step::Key(Key::List),
+                Step::Key(Key::Down),
+                Step::Key(Key::Enter),
+                Step::Think(8),
+                Step::Key(Key::Interrupt),
+            ]),
+            frames: Vec::new(),
+        };
+
+        let outcome = run(&world, first, &mut screen)
+            .await
+            .expect("the conversation ends when the human leaves");
+
+        let listed = screen
+            .frames
+            .iter()
+            .find_map(|frame| match &frame.sheet {
+                Some(Sheet::List { rows, .. }) => Some(rows.clone()),
+                _ => None,
+            })
+            .expect("the listing is drawn");
+        let row = listed
+            .iter()
+            .find(|row| row.session == elsewhere)
+            .expect("the log's other session is a row");
+        assert!(
+            !row.held && row.goal.is_some(),
+            "a session only the log holds says so, and carries the goal it recorded: {row:?}",
+        );
+        assert_eq!(
+            listed[0].session.as_uuid().to_string(),
+            SESSION,
+            "the session this process holds comes first",
+        );
+
+        assert_eq!(
+            outcome.left.len(),
+            2,
+            "the session the human switched to was opened by this process",
+        );
+        let adopted = outcome
+            .left
+            .iter()
+            .find(|left| left.session == elsewhere)
+            .expect("the adopted session is one of the two");
+        assert!(
+            adopted
+                .lines
+                .contains(&Line::Human("the older line".to_owned())),
+            "the adopted session's own conversation is on screen: {:?}",
+            adopted.lines,
+        );
+        assert_eq!(
+            adopted.ending, None,
+            "switching to a session does not end it",
         );
     }
 }

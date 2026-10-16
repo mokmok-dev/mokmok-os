@@ -1,11 +1,11 @@
-//! The conversation at a terminal: the kernel's own flags, one session, one screen.
+//! The conversation at a terminal: the kernel's own flags, and as many sessions as the human holds.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser as _;
 use mokmok_kernel::{Agent, Args, Command, Config, Run};
 use mokmok_protocol::Moment;
-use mokmok_tui::{Error, Session, Terminal, run};
+use mokmok_tui::{Error, Sessions, Terminal, run};
 
 /// The kernel's own flag declarations, flattened, so no TUI-only flag exists and every rule that
 /// refuses a run refuses a conversation the same way.
@@ -15,7 +15,15 @@ use mokmok_tui::{Error, Session, Terminal, run};
     version,
     about = "hold a conversation with the agent",
     after_help = "--steps is accepted so a 'mokmokd agent run' command line works unchanged, but this \
-                  conversation ignores it: it runs until the session closes or you leave with Ctrl-C."
+                  conversation ignores it: it runs until every session it holds has ended, or until \
+                  you leave.\n\n\
+                  --session names the session the conversation starts in. Its first line opens it.\n\n\
+                  Keys\n  \
+                  Tab       show the next session this process holds\n  \
+                  Ctrl-O    list the sessions the log holds, and open one of them\n  \
+                  Ctrl-N    start a session with a goal you type\n  \
+                  Esc       close the list or the prompt\n  \
+                  Ctrl-C    leave, with every session open and resumable"
 )]
 struct Cli {
     #[command(flatten)]
@@ -52,22 +60,28 @@ fn conversation(cli: Cli) -> Result<(), Error> {
         .map_err(Error::Terminal)?;
 
     runtime.block_on(async move {
-        let mut session = Session::open(&config, &cli.run, at)?;
-        let session_id = session.session();
+        let world = Sessions::new(config, cli.run, at);
+        let first = world.start()?;
         let mut terminal = Terminal::open()?;
-        let outcome = run(&mut session, &mut terminal).await;
+        let outcome = run(&world, first, &mut terminal).await;
 
         // The frame lived on the alternate screen, so the plain replay is printed after the terminal
         // is handed back.
         drop(terminal);
 
         let outcome = outcome?;
-        for line in &outcome.lines {
-            println!("{line}");
-        }
-        match outcome.ending {
-            Some(ending) => println!("the session ended: {ending:?}"),
-            None => println!("left open; resume with --session {}", session_id.as_uuid()),
+        for left in &outcome.left {
+            println!("--- session {}", left.session.as_uuid());
+            for line in &left.lines {
+                println!("{line}");
+            }
+            match left.ending {
+                Some(ending) => println!("the session ended: {ending:?}"),
+                None => println!(
+                    "left open; resume with --session {}",
+                    left.session.as_uuid(),
+                ),
+            }
         }
 
         Ok(())

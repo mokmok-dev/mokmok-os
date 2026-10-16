@@ -41,7 +41,7 @@ the implementation that ships is named beside it.
 | `ReferenceStore` | `mokmok-artifact/src/metadata.rs:13` | Test fixtures only |
 | `Exporter` | `mokmok-observability/src/exporter.rs:12` | A test fixture in the same crate |
 | `AuditLog` | `mokmok-observability/src/audit.rs:116` | `Journal` in the same crate, used directly by `mokmok-kernel/src/provider.rs` |
-| `Engine`, `Screen` | `mokmok-tui/src/port.rs:15,52` | `Session` and `Terminal` in the same crate, over the kernel's driver |
+| `Engine`, `Screen` | `mokmok-tui/src/port.rs:17,107` | `Session` and `Terminal` in the same crate, over the kernel's driver |
 
 Four of these rows have no implementation outside their own crate's tests: `Clock`, `Authorizer`,
 `ReferenceStore`, and `Exporter`. Each of them belongs to a crate whose port has no production
