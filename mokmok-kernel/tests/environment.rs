@@ -55,7 +55,15 @@ mod tests {
         PathBuf::from(env!("CARGO_BIN_EXE_mokmokd"))
     }
 
+    /// A `cargo mutants` run names the confiner with `MOKMOK_CONFINER`.
     fn confiner() -> PathBuf {
+        if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
+            let path = PathBuf::from(named);
+            assert!(path.is_file(), "{} is not a file", path.display());
+
+            return path;
+        }
+
         let path = binary()
             .parent()
             .expect("the binary has a directory")
@@ -63,7 +71,7 @@ mod tests {
         assert!(
             path.is_file(),
             "{} is missing: build the workspace (cargo build --workspace) before running this \
-             package's tests alone",
+             package's tests alone, or name the confiner with MOKMOK_CONFINER",
             path.display(),
         );
 

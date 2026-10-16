@@ -1,5 +1,6 @@
 //! Builders the unit tests share, so a hand-written history is written once.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
@@ -7,9 +8,12 @@ use mokmok_state_machine::{Attempt, Deadline, Ending, Fact, TurnFact, TurnNumber
 use uuid::Uuid;
 
 use crate::dialogue::Transcript;
+use crate::error::Error;
+use crate::find::{FindReport, Finder};
 use crate::model::{Action, Usage};
 use crate::record::{
-    AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Record, SpeechRecord, TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, Record, SpeechRecord,
+    TaskRecord,
 };
 use crate::task::{Budget, Setting, Task};
 use crate::tool::{Exit, ToolReport, observation};
@@ -53,6 +57,7 @@ pub fn task(turns: u32) -> Task {
             writable: vec!["/srv/checkout".into()],
             program: "/bin/sh".into(),
             deadline: Duration::from_secs(120),
+            search: vec!["/srv/checkout".into()],
         },
         budget: Budget {
             turns,
@@ -225,6 +230,27 @@ pub fn act_outcome_records(
     records
 }
 
+#[must_use]
+pub fn find_records(
+    turn: TurnID,
+    query: &str,
+    report: &FindReport,
+) -> Vec<Record> {
+    vec![
+        Record::Find(FindRecord {
+            turn,
+            query: query.to_owned(),
+            report: report.clone(),
+        }),
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled {
+                outcome: TurnOutcome::Completed,
+            },
+        },
+    ]
+}
+
 /// The records a `Close` step carries.
 #[must_use]
 pub fn close_records(
@@ -270,5 +296,44 @@ pub fn apply_all(
         transcript
             .apply(record)
             .expect("a builder produced a record the fold admits");
+    }
+}
+
+/// The count is what proves a search ran again, which is the whole of what an interrupted find
+/// leaves to check.
+pub struct FakeFinder {
+    observation: String,
+    queries: Mutex<Vec<String>>,
+}
+
+impl FakeFinder {
+    #[must_use]
+    pub fn of(observation: &str) -> Self {
+        Self {
+            observation: observation.to_owned(),
+            queries: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.queries.lock().unwrap().len()
+    }
+
+    #[must_use]
+    pub fn queries(&self) -> Vec<String> {
+        self.queries.lock().unwrap().clone()
+    }
+}
+
+impl Finder for FakeFinder {
+    fn find(
+        &self,
+        query: &str,
+    ) -> Result<FindReport, Error> {
+        self.queries.lock().unwrap().push(query.to_owned());
+        Ok(FindReport {
+            observation: self.observation.clone(),
+        })
     }
 }

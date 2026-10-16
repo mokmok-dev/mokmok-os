@@ -29,6 +29,7 @@ use crate::config::{Config, ConfigError, CrashPoint, ProviderKind, Run};
 use crate::db::{Db, Entry, Log};
 use crate::error::Error;
 use crate::execution::{self, Blob, Plan, Ran};
+use crate::index::Index;
 use crate::recovery;
 use crate::slice::Notice;
 
@@ -60,6 +61,7 @@ impl Run {
                 writable: config.allow_write.clone(),
                 program,
                 deadline: Duration::from_secs(self.tool_deadline_seconds),
+                search: config.search_root.clone(),
             },
             budget: Budget {
                 turns: self.max_turns,
@@ -155,6 +157,7 @@ impl Ledger {
                     resolution = Some(report.exit.resolution());
                 },
                 Record::Speech(speech) => turn = Some(speech.turn),
+                Record::Find(find) => turn = Some(find.turn),
                 Record::Task(_)
                 | Record::Prompt(_)
                 | Record::Answer(_)
@@ -380,7 +383,7 @@ impl Scripted {
         for answer in script {
             let prose = answer
                 .say()
-                .map_or_else(String::new, crate::provider::clip_prose);
+                .map_or_else(String::new, mokmok_agent_runtime::clip_prose);
             let text = serde_json::to_vec(&answer)?;
             let hash = store.put(&text)?;
             answers.push_back(Answer {
@@ -425,10 +428,13 @@ impl Provider for Scripted {
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Script {
-    /// The model asked for the one tool.
     Command {
         command: String,
-        /// The model's own words, when the script supplies them, so an offline run shows prose.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
+    Find {
+        query: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },
@@ -450,9 +456,10 @@ enum Script {
 impl Script {
     fn say(&self) -> Option<&str> {
         match self {
-            Self::Command { say, .. } | Self::Final { say } | Self::Malformed { say, .. } => {
-                say.as_deref()
-            },
+            Self::Command { say, .. }
+            | Self::Find { say, .. }
+            | Self::Final { say }
+            | Self::Malformed { say, .. } => say.as_deref(),
         }
     }
 }
@@ -461,6 +468,7 @@ impl From<Script> for Action {
     fn from(script: Script) -> Self {
         match script {
             Script::Command { command, .. } => Self::Command { command },
+            Script::Find { query, .. } => Self::Find { query },
             Script::Final { .. } => Self::Final,
             Script::Malformed { reason, .. } => Self::Malformed { reason },
         }
@@ -534,6 +542,7 @@ pub struct Report {
 pub struct Driver {
     ledger: Ledger,
     shell: Shell,
+    index: Index,
     provider: Model,
     config: Config,
     session: SessionID,
@@ -542,12 +551,13 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// Opens the session's world: its ledger, its tool, and the provider the configuration named.
+    /// Opens the session's world: its ledger, its tool, its finder, and the provider the
+    /// configuration named.
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Run::task`], the provider the configuration named, the tool, and the
-    /// ledger.
+    /// Returns the errors of [`Run::task`], the provider the configuration named, the tool, the
+    /// ledger, and the finder.
     pub fn open(
         config: &Config,
         run: &Run,
@@ -558,10 +568,25 @@ impl Driver {
         let provider = model(config, session)?;
         let shell = Shell::new(config, task.setting.program.clone(), at)?;
         let ledger = Ledger::open(config, session, Some(task.clone()), at)?;
+        // The task the fold holds, not the one this invocation built: the prompt the model was
+        // handed, the tools the provider was given, and the roots the finder opened must all come
+        // off the one recorded task, or a resumed session is offered a tool that will not answer
+        // and a finder over roots the model was never told about.
+        let task = ledger
+            .transcript(session)
+            .map_err(Error::Agent)?
+            .task
+            .unwrap_or(task);
+        let index = if task.setting.search.is_empty() {
+            Index::none()
+        } else {
+            Index::open(&task.setting.search, &config.search_index)?
+        };
 
         Ok(Self {
             ledger,
             shell,
+            index,
             provider,
             config: config.clone(),
             session,
@@ -608,6 +633,7 @@ impl Driver {
             &mut self.ledger,
             &self.provider,
             &self.shell,
+            &self.index,
             self.session,
             self.at,
         )
@@ -793,6 +819,12 @@ fn step_line(
             number_of(ledger, session, *turn),
             execution.as_uuid(),
         ),
+        Move::Find { turn, query } => {
+            format!(
+                "move=find turn={} query={query:?}",
+                number_of(ledger, session, *turn)
+            )
+        },
         Move::Close {
             turn,
             outcome,
@@ -824,6 +856,9 @@ fn ask_line(
                 )
             },
             Action::Final => format!("move=ask turn={number} attempt={attempt} answer=final"),
+            Action::Find { query } => {
+                format!("move=ask turn={number} attempt={attempt} answer=find query={query:?}")
+            },
             Action::Malformed { reason } => {
                 format!(
                     "move=ask turn={number} attempt={attempt} answer=malformed reason={reason:?}"
@@ -894,6 +929,8 @@ mod tests {
             allow_tool: Vec::new(),
             allow_path: Vec::new(),
             allow_write: Vec::new(),
+            search_root: Vec::new(),
+            search_index: data.join("search"),
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
@@ -915,6 +952,7 @@ mod tests {
                 writable: Vec::new(),
                 program: PathBuf::from("/bin/sh"),
                 deadline: Duration::from_secs(1),
+                search: Vec::new(),
             },
             budget: Budget::default(),
         }

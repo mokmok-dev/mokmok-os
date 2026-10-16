@@ -13,10 +13,16 @@ use crate::record::{ArtifactRef, Receipt, Step};
 pub enum Action {
     /// The model is done and named no command.
     Final,
-    /// The model asked for the one tool, with the command to run.
-    Command { command: String },
+    Command {
+        command: String,
+    },
+    Find {
+        query: String,
+    },
     /// The model's tool arguments could not be decoded; it is recorded, never silently retried.
-    Malformed { reason: String },
+    Malformed {
+        reason: String,
+    },
 }
 
 /// What the model answered, in the runtime's canonical vocabulary.

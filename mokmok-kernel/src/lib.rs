@@ -16,6 +16,7 @@ mod config;
 mod db;
 mod error;
 mod execution;
+mod index;
 mod notify;
 mod provider;
 mod recovery;

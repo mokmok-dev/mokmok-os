@@ -345,6 +345,29 @@ mod tests {
     }
 
     #[test]
+    fn a_find_row_shows_the_query_and_its_answer() {
+        let view = view(
+            vec![
+                Line::Find {
+                    query: "quokka".to_owned(),
+                    observation: "indexed=2 hits=1\n1.500  notes.txt\n".to_owned(),
+                },
+                Line::Agent("next".to_owned()),
+            ],
+            0,
+        );
+        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(row(buffer, 1, 80), "  ? quokka");
+        assert_eq!(row(buffer, 2, 80), "    indexed=2 hits=1");
+        assert_eq!(row(buffer, 3, 80), "agent  next");
+    }
+
+    #[test]
     fn the_newest_rows_survive_a_transcript_taller_than_the_pane() {
         let view = view(
             vec![

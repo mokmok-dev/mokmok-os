@@ -14,8 +14,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use mokmok_agent_runtime::{
-    Action, Answer, ArtifactRef, Context, ContextAct, ContextTurn, Error as AgentError,
-    MAX_PROSE_BYTES, Provider, Usage,
+    Action, Answer, ArtifactRef, Context, ContextAct, ContextTurn, Error as AgentError, Provider,
+    Usage, clip_prose, clip_query,
 };
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_egress::{
@@ -30,13 +30,16 @@ use uuid::Uuid;
 use crate::authority::AGENT;
 use crate::config::Config;
 
-/// The one tool the request offers, matching the runtime's tool surface.
-const TOOL_NAME: &str = "run_shell";
+const SHELL_TOOL: &str = "run_shell";
 
-/// The tool description the endpoint is handed.
-const TOOL_DESCRIPTION: &str = "Run one shell command with `sh -c` in a fresh, empty working \
+const FIND_TOOL: &str = "find_files";
+
+const SHELL_DESCRIPTION: &str = "Run one shell command with `sh -c` in a fresh, empty working \
      directory. The checkout is reached by absolute path, stdin is empty, and there is no TCP \
      network.";
+
+const FIND_DESCRIPTION: &str = "Find files under the granted search roots by the words in their \
+     name or their contents. Returns a ranked list of paths. Reads and changes nothing.";
 
 /// The chat-completions path appended to a configured endpoint.
 const COMPLETIONS: &str = "/chat/completions";
@@ -590,7 +593,7 @@ fn provider_error(error: Error) -> AgentError {
 
 /// The chat-completions body the endpoint was measured to accept.
 ///
-/// The one tool is the runtime's, and its `arguments` are the JSON-string envelope that
+/// The tool list is the runtime's, and each call's `arguments` are the JSON-string envelope that
 /// [`parse_answer`] decodes back. The message list always carries a user message: an endpoint
 /// measured here answers a body whose messages are the system prompt alone with
 /// `finish_reason: "load"`, no tokens, and no tool call, so the goal must ride the user message
@@ -607,20 +610,53 @@ pub fn request_body(
             {"role": "system", "content": context.system},
             {"role": "user", "content": user_text(context)},
         ],
-        "tools": [{
-            "type": "function",
-            "function": {
-                "name": TOOL_NAME,
-                "description": TOOL_DESCRIPTION,
-                "parameters": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                },
-            },
-        }],
+        "tools": tools(context),
         "max_tokens": max_tokens,
         "stream": false,
+    })
+}
+
+/// The tools the request offers, in the order the model reads them.
+///
+/// The finder is offered exactly when [`Context::search`] says the session holds a granted root,
+/// which is the same recorded flag the system prompt names it by: a body offering a tool the
+/// finder will not answer for would leave the model asking into a refusal.
+fn tools(context: &Context) -> Vec<serde_json::Value> {
+    let mut tools = vec![shell_tool()];
+    if context.search {
+        tools.push(find_tool());
+    }
+
+    tools
+}
+
+fn shell_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": SHELL_TOOL,
+            "description": SHELL_DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    })
+}
+
+fn find_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": FIND_TOOL,
+            "description": FIND_DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
     })
 }
 
@@ -664,6 +700,13 @@ fn turn_text(turn: &ContextTurn) -> String {
         Some(ContextAct::Said { reply }) => {
             text.push_str("\nreply: ");
             text.push_str(reply);
+        },
+        // A find is labelled as itself: `command` would tell the model a search ran a program.
+        Some(ContextAct::Found { query, observation }) => {
+            text.push_str("\nfind: ");
+            text.push_str(query);
+            text.push_str("\nobservation: ");
+            text.push_str(observation);
         },
         None => {},
     }
@@ -720,21 +763,6 @@ fn prose_of(message: &serde_json::Value) -> String {
         .map_or_else(String::new, clip_prose)
 }
 
-/// Clips prose to [`MAX_PROSE_BYTES`] on a character boundary.
-#[must_use]
-pub fn clip_prose(text: &str) -> String {
-    if text.len() <= MAX_PROSE_BYTES {
-        return text.to_owned();
-    }
-
-    let mut end = MAX_PROSE_BYTES;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    text[..end].to_owned()
-}
-
 /// The action a `finish_reason` and its message name.
 fn action_of(
     finish: &str,
@@ -749,17 +777,31 @@ fn action_of(
     }
 }
 
-/// The command a structured tool call names, or why it could not be read.
+/// The action the first structured tool call names, or why it could not be read.
+///
+/// The function name is what selects the decoder, so a call naming a tool this session was offered
+/// no way to reach is malformed rather than silently read as a command.
 fn tool_call(message: &serde_json::Value) -> Action {
-    let arguments = message
+    let Some(function) = message
         .get("tool_calls")
         .and_then(|calls| calls.get(0))
         .and_then(|call| call.get("function"))
-        .and_then(|function| function.get("arguments"))
-        .and_then(serde_json::Value::as_str);
-    let Some(arguments) = arguments else {
+    else {
         return Action::Malformed {
-            reason: "the answer named no tool call arguments".to_owned(),
+            reason: "the answer named no tool call".to_owned(),
+        };
+    };
+    let Some(name) = function.get("name").and_then(serde_json::Value::as_str) else {
+        return Action::Malformed {
+            reason: "the tool call names no function".to_owned(),
+        };
+    };
+    let Some(arguments) = function
+        .get("arguments")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Action::Malformed {
+            reason: format!("the {name} call named no tool call arguments"),
         };
     };
     let decoded: serde_json::Value = match serde_json::from_str(arguments) {
@@ -771,17 +813,35 @@ fn tool_call(message: &serde_json::Value) -> Action {
         },
     };
 
-    decoded
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || Action::Malformed {
-                reason: "the tool arguments name no command string".to_owned(),
-            },
-            |command| Action::Command {
-                command: command.to_owned(),
-            },
-        )
+    match name {
+        SHELL_TOOL => decoded
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || Action::Malformed {
+                    reason: "the tool arguments name no command string".to_owned(),
+                },
+                |command| Action::Command {
+                    command: command.to_owned(),
+                },
+            ),
+        FIND_TOOL => decoded
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || Action::Malformed {
+                    reason: "the tool arguments name no query string".to_owned(),
+                },
+                // The clip happens here, so the answer, the record, and the search all name one
+                // string rather than three lengths of it.
+                |query| Action::Find {
+                    query: clip_query(query),
+                },
+            ),
+        other => Action::Malformed {
+            reason: format!("the answer called {other:?}, which is not a tool of this session"),
+        },
+    }
 }
 
 /// The reference that names `bytes`, which are the whole answer text.
@@ -807,12 +867,14 @@ fn token(
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, Credential, Error, Ollama, Usage, clip_prose, parse_answer, parse_endpoint,
-        request_body,
+        Action, Credential, Error, Ollama, Usage, parse_answer, parse_endpoint, request_body,
     };
     use crate::config::{Config, ProviderKind};
     use clap::Parser as _;
-    use mokmok_agent_runtime::{Context, ContextAct, ContextTurn, MAX_PROSE_BYTES, Provider as _};
+    use mokmok_agent_runtime::{
+        Context, ContextAct, ContextTurn, MAX_PROSE_BYTES, MAX_QUERY_BYTES, Provider as _,
+        clip_prose,
+    };
     use mokmok_egress::{AddressClass, Rules, Scheme};
     use mokmok_protocol::SessionID;
     use mokmok_state_machine::TurnNumber;
@@ -846,6 +908,14 @@ mod tests {
             system: "the system prompt".to_owned(),
             goal: "the goal".to_owned(),
             turns: Vec::new(),
+            search: false,
+        }
+    }
+
+    fn searching() -> Context {
+        Context {
+            search: true,
+            ..context()
         }
     }
 
@@ -885,21 +955,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tool_arguments_that_are_not_json_are_malformed_rather_than_retried() {
-        let body = serde_json::json!({
+    fn call_body(
+        name: &str,
+        arguments: &str,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
             "choices": [{
                 "message": {
                     "content": "",
-                    "tool_calls": [{"function": {"name": "run_shell", "arguments": "{not json"}}],
+                    "tool_calls": [{"function": {"name": name, "arguments": arguments}}],
                 },
                 "finish_reason": "tool_calls",
             }],
             "usage": {"prompt_tokens": 1, "completion_tokens": 2},
-        });
+        }))
+        .unwrap()
+    }
 
+    #[test]
+    fn a_find_call_decodes_to_its_query_and_clips_it() {
+        let answer = parse_answer(&call_body("find_files", r#"{"query": "bm25 index"}"#), "m")
+            .expect("the body decodes");
+
+        assert_eq!(
+            answer.action,
+            Action::Find {
+                query: "bm25 index".to_owned(),
+            },
+        );
+
+        let long = "q".repeat(MAX_QUERY_BYTES + 8);
+        let clipped = parse_answer(
+            &call_body("find_files", &format!(r#"{{"query": "{long}"}}"#)),
+            "m",
+        )
+        .expect("the body decodes");
+
+        assert_eq!(
+            clipped.action,
+            Action::Find {
+                query: "q".repeat(MAX_QUERY_BYTES),
+            },
+        );
+    }
+
+    #[test]
+    fn a_find_call_without_a_query_string_is_malformed() {
         let answer =
-            parse_answer(&serde_json::to_vec(&body).unwrap(), "m").expect("the body decodes");
+            parse_answer(&call_body("find_files", r#"{"path": "notes.txt"}"#), "m").unwrap();
+
+        assert!(matches!(answer.action, Action::Malformed { .. }));
+    }
+
+    #[test]
+    fn a_call_naming_a_tool_this_session_offers_not_is_malformed_and_names_it() {
+        let answer =
+            parse_answer(&call_body("rm_rf", r#"{"query": "x"}"#), "m").expect("the body decodes");
+
+        let Action::Malformed { reason } = answer.action else {
+            panic!("a call to another tool is malformed");
+        };
+        assert!(reason.contains("rm_rf"), "{reason}");
+    }
+
+    #[test]
+    fn tool_arguments_that_are_not_json_are_malformed_rather_than_retried() {
+        let answer =
+            parse_answer(&call_body("run_shell", "{not json"), "m").expect("the body decodes");
 
         assert!(matches!(answer.action, Action::Malformed { .. }));
     }
@@ -970,6 +1092,7 @@ mod tests {
                     act: None,
                 },
             ],
+            search: false,
         };
 
         let body = request_body(&turns, "m", 1);
@@ -978,6 +1101,36 @@ mod tests {
         assert!(content.contains("human: hello"), "{content}");
         assert!(content.contains("reply: hi"), "{content}");
         assert!(content.contains("human: next"), "{content}");
+    }
+
+    #[test]
+    fn a_found_turn_renders_its_query_and_its_observation_under_their_own_labels() {
+        let turns = Context {
+            system: "s".to_owned(),
+            goal: "the goal".to_owned(),
+            turns: vec![ContextTurn {
+                number: TurnNumber::new(1),
+                speech: None,
+                act: Some(ContextAct::Found {
+                    query: "quokka".to_owned(),
+                    observation: "indexed=2 hits=1".to_owned(),
+                }),
+            }],
+            search: true,
+        };
+
+        let body = request_body(&turns, "m", 1);
+        let content = body["messages"][1]["content"].as_str().unwrap();
+
+        assert!(content.contains("find: quokka"), "{content}");
+        assert!(
+            content.contains("observation: indexed=2 hits=1"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("command:"),
+            "a find must not read as a command: {content}",
+        );
     }
 
     #[test]
@@ -1018,6 +1171,35 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["messages"][1]["content"], "the goal");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["tools"].as_array().unwrap().len(),
+            1,
+            "a session with no granted root is offered no finder",
+        );
+    }
+
+    #[test]
+    fn the_body_offers_the_finder_exactly_when_the_session_holds_a_root() {
+        let one_tool = request_body(&context(), "m", 1);
+        assert_eq!(one_tool["tools"].as_array().unwrap().len(), 1);
+
+        let two = request_body(&searching(), "m", 1);
+        let tools = two["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "run_shell");
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["function"]["name"], "find_files");
+        assert_eq!(
+            tools[1]["function"]["parameters"]["properties"]["query"]["type"],
+            "string",
+        );
+        assert_eq!(tools[1]["function"]["parameters"]["required"][0], "query",);
+        assert!(
+            tools[1]["function"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("contents")),
+            "the finder's description must say it reads a file's contents",
+        );
     }
 
     #[test]
@@ -1043,6 +1225,7 @@ mod tests {
                     observation: "exit code 0".to_owned(),
                 }),
             }],
+            search: false,
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1209,6 +1392,7 @@ mod tests {
                 .to_owned(),
             goal: "list the source files".to_owned(),
             turns: Vec::new(),
+            search: false,
         };
 
         let answer = provider.complete(&prompt).await.unwrap();
@@ -1247,6 +1431,8 @@ mod tests {
             allow_tool: Vec::new(),
             allow_path: Vec::new(),
             allow_write: Vec::new(),
+            search_root: Vec::new(),
+            search_index: data.join("search"),
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,

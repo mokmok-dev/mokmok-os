@@ -3,6 +3,7 @@
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
 use mokmok_state_machine::{Attempt, Fact, Rejection, TurnFact};
 
+use crate::find::FindReport;
 use crate::model::{Action, Usage};
 use crate::task::Task;
 use crate::tool::ToolReport;
@@ -13,6 +14,43 @@ use crate::tool::ToolReport;
 /// The runtime refuses a longer line rather than truncating it, because a truncated sentence is a
 /// different sentence.
 pub const MAX_SPEECH_BYTES: usize = 4 * 1024;
+
+/// How many bytes of the model's query one find record may hold.
+///
+/// The log is folded whole on every step, so a record stays bounded. A query is clipped rather than
+/// refused: it is a phrase the model repeats, and the words it opened with are the words it meant.
+pub const MAX_QUERY_BYTES: usize = 512;
+
+/// The head of `text`, clipped to [`MAX_QUERY_BYTES`] without splitting a character.
+///
+/// The clip happens where the tool arguments are decoded, so the answer, the record, and the search
+/// all name one string rather than three lengths of it.
+#[must_use]
+pub fn clip_query(text: &str) -> String {
+    clipped(text, MAX_QUERY_BYTES)
+}
+
+/// The head of `text`, clipped to [`MAX_PROSE_BYTES`] without splitting a character.
+///
+/// The provider clips what the model said, and so does the scripted model, because the cap is this
+/// crate's to keep: a record holds what a prompt and a screen need, and the whole body stays in the
+/// artifact store under the reference `AnswerRecord::text` names.
+#[must_use]
+pub fn clip_prose(text: &str) -> String {
+    clipped(text, MAX_PROSE_BYTES)
+}
+
+#[must_use]
+fn clipped(
+    text: &str,
+    limit: usize,
+) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+
+    text[..text.floor_char_boundary(limit)].to_owned()
+}
 
 /// How many bytes of the model's own words one answer record may hold.
 ///
@@ -78,6 +116,13 @@ pub struct CallRecord {
     pub command: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct FindRecord {
+    pub turn: TurnID,
+    pub query: String,
+    pub report: FindReport,
+}
+
 /// One durable record.
 ///
 /// The machine facts and the result ride the same vocabulary as the runtime's own content records,
@@ -88,9 +133,14 @@ pub struct CallRecord {
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum Record {
     /// A fact of the session machine.
-    Session { fact: Fact },
+    Session {
+        fact: Fact,
+    },
     /// A fact of one turn's machine, with the turn it belongs to.
-    Turn { turn: TurnID, fact: TurnFact },
+    Turn {
+        turn: TurnID,
+        fact: TurnFact,
+    },
     /// What one execution produced, with the bounded rendering of its outcome.
     Result {
         execution: ExecutionID,
@@ -104,6 +154,7 @@ pub enum Record {
     Answer(AnswerRecord),
     /// The command about to be dispatched.
     Call(CallRecord),
+    Find(FindRecord),
     /// A human's line, which opened this turn.
     Speech(SpeechRecord),
 }
@@ -131,6 +182,8 @@ pub enum StepKey {
     ActIntent { turn: u64 },
     /// One turn's outcome, written after the tool ran.
     ActOutcome { turn: u64 },
+    /// One turn's find, written with its settlement in the one step a find takes.
+    Find { turn: u64 },
     /// A turn's settlement, and the session's close when it carries an ending.
     ///
     /// [`Move::Close`](crate::Move) runs twice on one turn — once to settle it and once to close
@@ -168,6 +221,7 @@ impl StepKey {
             Self::AskOutcome { turn, attempt } => format!("ask-outcome:{turn}:{attempt}"),
             Self::ActIntent { turn } => format!("act-intent:{turn}"),
             Self::ActOutcome { turn } => format!("act-outcome:{turn}"),
+            Self::Find { turn } => format!("find:{turn}"),
             Self::Close {
                 turn,
                 session: false,
@@ -221,6 +275,7 @@ pub enum RecordKey {
     Answer { turn: TurnID, attempt: Attempt },
     Call(ExecutionID),
     Result(ExecutionID),
+    Find(TurnID),
     Speech { turn: TurnID },
 }
 
@@ -228,7 +283,8 @@ pub enum RecordKey {
 ///
 /// A call carries the command in two records, its own and the answer's, so the fold checks the two
 /// agree: [`Refusal::CommandMismatch`] is that disagreement, and it names both commands because
-/// [`Refusal::Conflict`] means one key recorded twice, not two records that must agree.
+/// [`Refusal::Conflict`] means one key recorded twice, not two records that must agree. A find
+/// carries its query the same way, and [`Refusal::QueryMismatch`] is its twin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Refusal {
     /// A second record under one key carried different content.
@@ -244,6 +300,15 @@ pub enum Refusal {
         turn: TurnID,
         answer: String,
         call: String,
+    },
+    /// A find whose query the answer recorded for the same turn did not name.
+    ///
+    /// `answer` is the query that answer named, and empty when it named no query at all: an answer
+    /// that asked for another tool asked for no search.
+    QueryMismatch {
+        turn: TurnID,
+        answer: String,
+        find: String,
     },
 }
 
@@ -264,6 +329,11 @@ impl std::fmt::Display for Refusal {
             Self::CommandMismatch { turn, answer, call } => write!(
                 formatter,
                 "the call for turn {} names {call:?} but its answer named {answer:?}",
+                turn.as_uuid(),
+            ),
+            Self::QueryMismatch { turn, answer, find } => write!(
+                formatter,
+                "the find for turn {} asks {find:?} but its answer named {answer:?}",
                 turn.as_uuid(),
             ),
         }
@@ -297,9 +367,60 @@ impl std::fmt::Display for RecordKey {
             Self::Result(execution) => {
                 write!(formatter, "the result of execution {}", execution.as_uuid())
             },
+            Self::Find(turn) => write!(formatter, "the find for turn {}", turn.as_uuid()),
             Self::Speech { turn } => {
                 write!(formatter, "the speech for turn {}", turn.as_uuid())
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_QUERY_BYTES, clip_prose, clip_query};
+
+    #[test]
+    fn a_query_at_the_ceiling_is_kept_whole_and_a_longer_one_is_clipped_to_its_head() {
+        let at_the_ceiling = "a".repeat(MAX_QUERY_BYTES);
+        assert_eq!(clip_query(&at_the_ceiling), at_the_ceiling);
+
+        let mut over_the_ceiling = "b".repeat(MAX_QUERY_BYTES);
+        over_the_ceiling.push_str("clipped away");
+        assert_eq!(clip_query(&over_the_ceiling), "b".repeat(MAX_QUERY_BYTES),);
+    }
+
+    #[test]
+    fn a_query_past_its_ceiling_keeps_its_first_five_hundred_and_twelve_bytes() {
+        assert_eq!(clip_query(&"a".repeat(600)), "a".repeat(512));
+    }
+
+    #[test]
+    fn a_prose_past_its_ceiling_keeps_its_first_eight_thousand_one_hundred_and_ninety_two_bytes() {
+        assert_eq!(clip_prose(&"a".repeat(9_000)), "a".repeat(8_192));
+    }
+
+    #[test]
+    fn a_prose_at_its_ceiling_is_kept_whole() {
+        let at_the_ceiling = "a".repeat(8_192);
+
+        assert_eq!(clip_prose(&at_the_ceiling), at_the_ceiling);
+    }
+
+    #[test]
+    fn a_clipped_query_stops_on_a_character_boundary() {
+        let mut text = "a".repeat(MAX_QUERY_BYTES - 1);
+        text.push('é');
+        text.push_str("and more");
+
+        assert_eq!(clip_query(&text), "a".repeat(MAX_QUERY_BYTES - 1));
+    }
+
+    #[test]
+    fn a_clipped_prose_stops_on_a_character_boundary() {
+        let mut text = "a".repeat(8_191);
+        text.push('é');
+        text.push_str("and more");
+
+        assert_eq!(clip_prose(&text), "a".repeat(8_191));
     }
 }

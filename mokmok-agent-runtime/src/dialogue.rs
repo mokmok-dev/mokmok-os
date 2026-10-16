@@ -9,8 +9,8 @@ use mokmok_state_machine::{
 
 use crate::model::Action;
 use crate::record::{
-    AnswerRecord, ArtifactRef, CallRecord, PromptRecord, Record, RecordKey, Refusal, SpeechRecord,
-    TaskRecord,
+    AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, Record, RecordKey, Refusal,
+    SpeechRecord, TaskRecord,
 };
 use crate::task::Task;
 use crate::tool::{self, ToolReport};
@@ -36,6 +36,10 @@ pub struct Transcript {
     pub answers: BTreeMap<(TurnID, Attempt), AnswerRecord>,
     /// The command one execution is about to dispatch.
     pub calls: BTreeMap<ExecutionID, CallRecord>,
+    /// The find one turn asked for, when its answer asked for one.
+    ///
+    /// One turn carries one action, so a turn holds at most one find, and the turn is the key.
+    pub finds: BTreeMap<TurnID, FindRecord>,
     /// The report each result record carried, so a redelivery is compared as the whole record and
     /// the observation it holds is what the model was shown.
     pub runs: BTreeMap<ExecutionID, ToolReport>,
@@ -53,6 +57,7 @@ impl Transcript {
             prompts: BTreeMap::new(),
             answers: BTreeMap::new(),
             calls: BTreeMap::new(),
+            finds: BTreeMap::new(),
             runs: BTreeMap::new(),
         }
     }
@@ -142,6 +147,14 @@ impl Transcript {
         self.calls.values().find(|call| call.turn == turn)
     }
 
+    #[must_use]
+    pub fn find_of(
+        &self,
+        turn: TurnID,
+    ) -> Option<&FindRecord> {
+        self.finds.get(&turn)
+    }
+
     /// The newest attempt's answer for one turn, if the fold holds one.
     #[must_use]
     pub fn newest_answer(
@@ -187,8 +200,8 @@ impl Record {
     /// # Errors
     ///
     /// Returns [`Refusal::Floating`], [`Refusal::Late`], [`Refusal::Conflict`],
-    /// [`Refusal::CommandMismatch`], or the [`Refusal::Rejected`] of the state machine that owns
-    /// the fact.
+    /// [`Refusal::CommandMismatch`], [`Refusal::QueryMismatch`], or the [`Refusal::Rejected`] of the
+    /// state machine that owns the fact.
     pub fn apply(
         &self,
         into: &mut Transcript,
@@ -201,6 +214,7 @@ impl Record {
             Self::Prompt(record) => apply_prompt(into, record),
             Self::Answer(record) => apply_answer(into, record),
             Self::Call(record) => apply_call(into, record),
+            Self::Find(record) => apply_find(into, record),
             Self::Speech(record) => apply_speech(into, record),
         }
     }
@@ -373,18 +387,59 @@ fn apply_call(
         return Err(Refusal::Floating(RecordKey::Call(record.execution)));
     }
 
-    if let Some(Action::Command { command }) =
-        into.newest_answer(record.turn).map(|answer| &answer.action)
-        && command != &record.command
-    {
-        return Err(Refusal::CommandMismatch {
-            turn: record.turn,
-            answer: command.clone(),
-            call: record.command.clone(),
-        });
+    match into.newest_answer(record.turn).map(|answer| &answer.action) {
+        Some(Action::Command { command }) if command != &record.command => {
+            return Err(Refusal::CommandMismatch {
+                turn: record.turn,
+                answer: command.clone(),
+                call: record.command.clone(),
+            });
+        },
+        // A find's query stands where a call's command would, so an answer that asked the finder
+        // admits no call.
+        Some(Action::Find { query }) => {
+            return Err(Refusal::CommandMismatch {
+                turn: record.turn,
+                answer: query.clone(),
+                call: record.command.clone(),
+            });
+        },
+        None | Some(Action::Command { .. } | Action::Final | Action::Malformed { .. }) => {},
     }
 
     into.calls.insert(record.execution, record.clone());
+    Ok(Ack::Applied)
+}
+
+fn apply_find(
+    into: &mut Transcript,
+    record: &FindRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::Find(record.turn);
+    if let Some(recorded) = into.finds.get(&record.turn) {
+        return if recorded == record {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let Some(named) = into.newest_answer(record.turn).map(|answer| &answer.action) else {
+        return Err(Refusal::Floating(key));
+    };
+    let named = match named {
+        Action::Find { query } => query,
+        Action::Command { .. } | Action::Final | Action::Malformed { .. } => "",
+    };
+    if named != record.query {
+        return Err(Refusal::QueryMismatch {
+            turn: record.turn,
+            answer: named.to_owned(),
+            find: record.query.clone(),
+        });
+    }
+
+    into.finds.insert(record.turn, record.clone());
     Ok(Ack::Applied)
 }
 
@@ -403,10 +458,11 @@ pub fn number_of(
 #[cfg(test)]
 mod tests {
     use super::{Record, Transcript, number_of};
+    use crate::find::FindReport;
     use crate::model::{Action, Usage};
     use crate::record::{
-        AnswerRecord, ArtifactRef, CallRecord, PromptRecord, RecordKey, Refusal, SpeechRecord,
-        TaskRecord,
+        AnswerRecord, ArtifactRef, CallRecord, FindRecord, PromptRecord, RecordKey, Refusal,
+        SpeechRecord, TaskRecord,
     };
     use crate::task::{Budget, Setting, Task};
     use crate::test_support::{artifact, execution_id, session, task, turn_id};
@@ -485,6 +541,41 @@ mod tests {
             turn,
             text: text.to_owned(),
         })
+    }
+
+    fn find(
+        turn: TurnID,
+        query: &str,
+    ) -> Record {
+        Record::Find(FindRecord {
+            turn,
+            query: query.to_owned(),
+            report: FindReport {
+                observation: "indexed=831 hits=1".to_owned(),
+            },
+        })
+    }
+
+    fn a_find_answered_turn(query: &str) -> (Transcript, TurnID) {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        transcript
+            .apply(&Record::Session {
+                fact: Fact::SessionOpened,
+            })
+            .unwrap();
+        open(&mut transcript, turn, 1);
+        request(&mut transcript, turn, 1);
+        answered(&mut transcript, turn);
+        transcript
+            .apply(&answer(
+                turn,
+                Action::Find {
+                    query: query.to_owned(),
+                },
+            ))
+            .unwrap();
+        (transcript, turn)
     }
 
     fn call(
@@ -773,6 +864,66 @@ mod tests {
     }
 
     #[test]
+    fn a_call_after_an_answer_that_asked_the_finder_is_refused() {
+        let (mut transcript, turn) = a_find_answered_turn("bm25");
+        let execution = execution_id(turn);
+        requested(&mut transcript, turn, execution);
+
+        assert_eq!(
+            transcript.apply(&call(turn, execution)),
+            Err(Refusal::CommandMismatch {
+                turn,
+                answer: "bm25".to_owned(),
+                call: "ls".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_find_whose_query_the_answer_never_named_is_refused() {
+        let (mut transcript, turn) = a_find_answered_turn("bm25");
+
+        assert_eq!(
+            transcript.apply(&find(turn, "tantivy")),
+            Err(Refusal::QueryMismatch {
+                turn,
+                answer: "bm25".to_owned(),
+                find: "tantivy".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_find_before_the_answer_that_asked_for_it_is_refused() {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        open(&mut transcript, turn, 1);
+        request(&mut transcript, turn, 1);
+
+        assert_eq!(
+            transcript.apply(&find(turn, "bm25")),
+            Err(Refusal::Floating(RecordKey::Find(turn))),
+        );
+    }
+
+    #[test]
+    fn a_find_redelivered_is_a_duplicate_and_a_different_query_is_a_conflict() {
+        let (mut transcript, turn) = a_find_answered_turn("bm25");
+
+        let record = find(turn, "bm25");
+        assert_eq!(transcript.apply(&record), Ok(Ack::Applied));
+        assert_eq!(
+            transcript.find_of(turn).map(|find| find.query.as_str()),
+            Some("bm25"),
+        );
+        assert_eq!(transcript.apply(&record), Ok(Ack::Duplicate));
+        assert_eq!(
+            transcript.apply(&find(turn, "tantivy")),
+            Err(Refusal::Conflict(RecordKey::Find(turn))),
+        );
+    }
+
+    #[test]
     fn a_result_without_its_settlement_is_refused() {
         let execution = execution_id(turn_id(1));
         let mut transcript = a_requested_turn(execution);
@@ -861,6 +1012,10 @@ mod tests {
     fn a_refusal_and_a_key_render_what_they_name() {
         assert_eq!(RecordKey::Task.to_string(), "the task");
         assert_eq!(
+            RecordKey::Find(turn_id(1)).to_string(),
+            format!("the find for turn {}", turn_id(1).as_uuid()),
+        );
+        assert_eq!(
             Refusal::Conflict(RecordKey::Task).to_string(),
             "the task already recorded with different content",
         );
@@ -873,6 +1028,18 @@ mod tests {
             .to_string(),
             format!(
                 "the call for turn {} names \"rm\" but its answer named \"ls\"",
+                turn_id(1).as_uuid(),
+            ),
+        );
+        assert_eq!(
+            Refusal::QueryMismatch {
+                turn: turn_id(1),
+                answer: "bm25".to_owned(),
+                find: "tantivy".to_owned(),
+            }
+            .to_string(),
+            format!(
+                "the find for turn {} asks \"tantivy\" but its answer named \"bm25\"",
                 turn_id(1).as_uuid(),
             ),
         );
@@ -967,6 +1134,7 @@ mod tests {
         prop_oneof![
             Just(Action::Final),
             "[a-z ]{0,8}".prop_map(|command| Action::Command { command }),
+            "[a-z ]{0,8}".prop_map(|query| Action::Find { query }),
             "[a-z ]{0,8}".prop_map(|reason| Action::Malformed { reason }),
         ]
     }
@@ -1009,6 +1177,7 @@ mod tests {
                 writable: Vec::new(),
                 program: "/bin/sh".into(),
                 deadline: Duration::from_secs(120),
+                search: Vec::new(),
             },
             budget: Budget {
                 turns,
@@ -1065,6 +1234,13 @@ mod tests {
                     turn: TurnID::from_uuid(turn),
                     execution: ExecutionID::from_uuid(execution),
                     command,
+                })
+            }),
+            (arb_uuid(), "[a-z ]{0,8}", "[a-z ]{0,16}").prop_map(|(turn, query, observation)| {
+                Record::Find(FindRecord {
+                    turn: TurnID::from_uuid(turn),
+                    query,
+                    report: FindReport { observation },
                 })
             }),
         ]
