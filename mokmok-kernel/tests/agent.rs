@@ -191,17 +191,24 @@ mod tests {
         }
     }
 
+    /// The child every run here spawns: the crash knob unlocked and this test's configuration root,
+    /// both set the way the crash harness sets them. A case that pins a variable of its own, or
+    /// removes one, starts from here.
+    fn child(scratch: &Scratch) -> Command {
+        let mut command = Command::new(binary());
+        command
+            .env("MOKMOKD_CRASH", "1")
+            .env("XDG_CONFIG_HOME", scratch.0.join("config"));
+
+        command
+    }
+
     /// Runs the binary with the crash knob unlocked, as the crash harness does.
     fn run(
         scratch: &Scratch,
         args: &[String],
     ) -> Ran {
-        ran(&Command::new(binary())
-            .env("MOKMOKD_CRASH", "1")
-            .env("XDG_CONFIG_HOME", scratch.0.join("config"))
-            .args(args)
-            .output()
-            .expect("the binary runs"))
+        ran(&child(scratch).args(args).output().expect("the binary runs"))
     }
 
     /// Writes the scripted provider's answers to `path`.
@@ -409,6 +416,89 @@ mod tests {
             std::fs::read_to_string(scratch.checkout().join("out.txt")).expect("the command wrote"),
             "hello",
         );
+    }
+
+    #[test]
+    fn a_run_reads_the_script_the_environment_names() {
+        let scratch = Scratch::new("config-variable");
+        let directory = scratch.0.join("config/mokmok");
+        std::fs::create_dir_all(&directory).expect("the config directory is made");
+        script(
+            &directory.join("answers.json"),
+            &[
+                json!({
+                    "action": "command",
+                    "command": format!("cd {} && printf hello > out.txt", scratch.checkout().display()),
+                }),
+                json!({"action": "final"}),
+            ],
+        );
+        std::fs::write(
+            directory.join("config.toml"),
+            "provider = \"scripted\"\nscript = \"${MOKMOK_SCRIPT}\"\n",
+        )
+        .expect("the config file is written");
+
+        let mut args = base(&scratch);
+        args.extend([
+            "agent".to_owned(),
+            "run".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+            "--goal".to_owned(),
+            "write hello into out.txt".to_owned(),
+            "--checkout".to_owned(),
+            scratch.checkout().display().to_string(),
+            "--max-turns".to_owned(),
+            "6".to_owned(),
+        ]);
+
+        let ran = ran(&child(&scratch)
+            .env("MOKMOK_SCRIPT", "answers.json")
+            .args(&args)
+            .output()
+            .expect("the binary runs"));
+
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(
+            std::fs::read_to_string(scratch.checkout().join("out.txt")).expect("the command wrote"),
+            "hello",
+        );
+    }
+
+    #[test]
+    fn a_run_refuses_a_reference_the_environment_does_not_answer() {
+        let scratch = Scratch::new("config-variable-unset");
+        let directory = scratch.0.join("config/mokmok");
+        std::fs::create_dir_all(&directory).expect("the config directory is made");
+        let file = directory.join("config.toml");
+        std::fs::write(
+            &file,
+            "provider = \"scripted\"\nscript = \"${MOKMOK_SCRIPT}\"\n",
+        )
+        .expect("the config file is written");
+
+        let mut args = base(&scratch);
+        args.extend([
+            "status".to_owned(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+        ]);
+
+        let ran = ran(&child(&scratch)
+            .env_remove("MOKMOK_SCRIPT")
+            .args(&args)
+            .output()
+            .expect("the binary runs"));
+
+        assert!(!ran.ok, "{}\n{}", ran.out, ran.err);
+        for expected in [
+            file.display().to_string(),
+            "script".to_owned(),
+            "MOKMOK_SCRIPT".to_owned(),
+        ] {
+            assert!(ran.err.contains(&expected), "{}", ran.err);
+        }
     }
 
     #[test]
