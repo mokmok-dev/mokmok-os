@@ -39,10 +39,10 @@ crate root. `frontmatter` reads the file's shape and gathers a raw value that `p
 | Item | Where | What it is |
 | --- | --- | --- |
 | `SkillName` | `src/name.rs:16` | A validated name: 1..=64 characters, `[a-z0-9-]`, no leading or trailing hyphen, no `--` |
-| `SkillSummary` | `src/lib.rs:33` | The name and description the prompt advertises |
-| `Skill` | `src/lib.rs:42` | One `SKILL.md`: the summary, three optional fields, a `metadata` map, and the body |
+| `SkillSummary` | `src/lib.rs:63` | The name and description the prompt advertises |
+| `Skill` | `src/lib.rs:72` | One `SKILL.md`: the summary, three optional fields, a `metadata` map, and the body |
 | `Refusal` | `src/refusal.rs:13` | Why a file is not a skill, one variant per rule, one sentence on `Display` |
-| `parse`, `MAX_FRONTMATTER_BYTES`, `MAX_INSTRUCTIONS_BYTES` | `src/lib.rs:70,18,23` | Read one file against its directory name, and the two caps |
+| `parse`, `MAX_FRONTMATTER_BYTES`, `MAX_INSTRUCTIONS_BYTES` | `src/lib.rs:100,48,53` | Read one file against its directory name, and the two caps |
 
 `frontmatter::read` (`src/frontmatter.rs:92`) checks the fences, the value subset, and one level of
 `metadata` nesting, and returns a shape-checked value. `parse` applies the field rules on top of it.
@@ -56,7 +56,7 @@ the caller keeps the string it passed in.
 
 - The name is the directory. A file whose `name` is absent, malformed, or different from the
   directory it was read from is refused, and a name entering a decode is re-validated by the same
-  rule (`src/name.rs:25`, `src/lib.rs:78`).[^crate]
+  rule (`src/name.rs:25`, `src/lib.rs:108`).[^crate]
 - A key the format does not name is skipped with its value, and its indented lines are swallowed
   rather than read as the next key (`src/frontmatter.rs:217`). A duplicate key naming a known field
   is refused, while a duplicate unknown key is tolerated (`src/frontmatter.rs:222`).
@@ -67,9 +67,7 @@ the caller keeps the string it passed in.
   region between the fences is capped before the body is measured (`src/frontmatter.rs:104`,
   `src/frontmatter.rs:119`).
 - An oversized body is refused, never clipped, because a clipped instruction is a different
-  instruction (`src/lib.rs:125`).
-- Text only. A file that is not an opening fence followed by a closing one is refused, and no shape
-  other than the accepted subset reaches the field rules.
+  instruction (`src/lib.rs:156`).
 
 # Dependencies
 

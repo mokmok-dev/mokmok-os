@@ -148,14 +148,11 @@ pub struct FindRecord {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum SkillOutcome {
-    /// The body was read and recorded.
     Loaded {
         /// Exactly the Markdown after the frontmatter.
         instructions: String,
     },
-    /// Nothing was loaded, and this is the reason the model reads.
     Refused {
-        /// Why the skill could not be loaded.
         reason: String,
     },
 }
@@ -171,8 +168,6 @@ impl SkillOutcome {
     }
 }
 
-/// One activation: the skill the model named and what reading it produced.
-///
 /// The body is inline rather than an [`ArtifactRef`], because [`context`](crate::context) is pure
 /// over the fold and cannot resolve a hash. `MAX_INSTRUCTIONS_BYTES` is what keeps the record
 /// bounded, and the runtime enforces it whatever a [`Skills`](crate::Skills) implementation returns.
@@ -243,7 +238,6 @@ pub enum Record {
     /// The command about to be dispatched.
     Call(CallRecord),
     Find(FindRecord),
-    /// One activation: the skill the model named and what reading it produced.
     Skill(SkillRecord),
     /// An edit about to be written, with the bytes it will write.
     EditIntent(EditIntentRecord),

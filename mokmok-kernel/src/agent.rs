@@ -461,7 +461,6 @@ enum Script {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },
-    /// The model asked to load one advertised skill by name.
     UseSkill {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

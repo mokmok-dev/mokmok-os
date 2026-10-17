@@ -41,10 +41,10 @@ Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `s
 | `EditReport`, `EditOutcome` | `src/edit.rs:77,46` | What one edit produced: applied, stale, or refused |
 | `Action`, `Answer`, `Usage` | `src/model.rs:14,43,59` | A final answer, a command, a find, an edit, a skill to load, or malformed output |
 | `Tools`, `ToolCall`, `ToolReport`, `Exit` | `src/tool.rs:90,22,76,31` | The execution port and its vocabulary |
-| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:222,343,264,375,366,405` | The durable record, the step key, and the two answers to an append |
+| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:217,337,258,369,360,399` | The durable record, the step key, and the two answers to an append |
 | `FindRecord`, `MAX_QUERY_BYTES`, `clip_query`, `clip_prose` | `src/record.rs:141,24,36,60` | One find's durable record, and the caps on the query it holds and the prose the model said |
-| `EditIntentRecord`, `EditOutcomeRecord`, `MAX_PATCH_BYTES`, `patch_refusal` | `src/record.rs:188,208,29,42` | One edit's two durable records, and the cap on the patch it carries |
-| `SkillRecord`, `SkillOutcome` | `src/record.rs:180,150` | One activation's durable record, and whether it loaded or refused |
+| `EditIntentRecord`, `EditOutcomeRecord`, `MAX_PATCH_BYTES`, `patch_refusal` | `src/record.rs:183,203,29,42` | One edit's two durable records, and the cap on the patch it carries |
+| `SkillRecord`, `SkillOutcome` | `src/record.rs:175,150` | One activation's durable record, and whether it loaded or refused |
 | `Task`, `Setting`, `Budget` | `src/task.rs:30,41,67` | The goal, its limits, and the ceilings |
 | `Advert` | `src/task.rs:14` | The metadata of one discovered skill, frozen into the task |
 | `Context`, `ContextAct`, `ContextSkill` | `src/context.rs:16,70,42` | The bytes the model is handed, what one settled turn reads as, and one loaded body |

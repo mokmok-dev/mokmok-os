@@ -574,11 +574,9 @@ pub fn request_body(
     })
 }
 
-/// The system message: the base prompt, then each loaded skill's own heading and body.
-///
-/// The loaded bodies ride the system message rather than the user text so that progressive
-/// disclosure adds them once, after the prompt the session was opened with, and a later turn's user
-/// message stays the goal and the turns it always was.
+/// The loaded bodies ride the system message rather than the user text, so progressive disclosure
+/// adds them once, after the prompt the session was opened with, and a later turn's user message
+/// stays the goal and the turns it always was.
 fn system_text(context: &Context) -> String {
     let mut text = context.system.clone();
     for skill in &context.loaded {

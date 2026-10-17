@@ -386,7 +386,6 @@ pub fn find_records(
     ]
 }
 
-/// The records one activation takes: the skill record and the turn's settlement.
 #[must_use]
 pub fn skill_records(
     turn: TurnID,

@@ -25,7 +25,6 @@ pub enum Action {
         patch: String,
         expect: Option<String>,
     },
-    /// The model asked to load one advertised skill by name.
     UseSkill {
         name: SkillName,
     },

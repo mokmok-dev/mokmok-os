@@ -17,7 +17,6 @@ use mokmok_skill::{MAX_FRONTMATTER_BYTES, MAX_INSTRUCTIONS_BYTES, parse};
 
 use crate::config::ConfigError;
 
-/// The file every skill directory holds.
 const SKILL_FILE: &str = "SKILL.md";
 
 /// Reads every valid skill under `roots` into one advert, in `roots` order and by directory name.
@@ -138,7 +137,6 @@ pub struct Library {
 }
 
 impl Library {
-    /// The library over `adverts`, the ones the recorded task holds.
     #[must_use]
     pub fn open(adverts: &[Advert]) -> Self {
         Self {

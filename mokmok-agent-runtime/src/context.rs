@@ -179,8 +179,7 @@ pub fn system_prompt(task: &Task) -> String {
         format!("You have these tools: {}.\n", tools.join("; "))
     };
     // The advertisement is built from the recorded task alone, so a resumed session shows exactly
-    // the skills it was opened with and a re-ask is byte-identical. One line per skill, in the
-    // order the task holds them; no skills advertised means no block at all.
+    // the skills it was opened with and a re-ask is byte-identical.
     let advertised = if task.setting.skills.is_empty() {
         String::new()
     } else {

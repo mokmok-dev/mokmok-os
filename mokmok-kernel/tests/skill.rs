@@ -411,7 +411,6 @@ mod tests {
         );
         let path = scratch.0.join("script.json");
 
-        // One step opens the session and freezes the advertisement.
         script(&path, &[]);
         let opened = run(
             &scratch,

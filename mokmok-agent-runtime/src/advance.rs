@@ -284,8 +284,6 @@ fn advance_edit(
     Ok(None)
 }
 
-/// Performs one activation: resolve the advert, read once, and commit the load or the refusal.
-///
 /// A name no advert names is refused here without calling the port, because the port reads a file
 /// and a name the task never advertised names no file to read. A [`Receipt::Replayed`] append yields
 /// rather than reporting a second time.
@@ -882,12 +880,12 @@ fn find_step(
     )
 }
 
-/// The one step an activation takes.
+/// A load and a refusal settle the turn in the same append, because there is no execution and no
+/// intent to reconcile.
 ///
-/// A load and a refusal settle the turn in the same append: there is no execution and no intent to
-/// reconcile, so a crash leaves either nothing — the turn retries the read — or the whole record,
-/// and then the turn is settled and the body never re-reads. A load settles the turn
-/// [`TurnOutcome::Completed`]; a refusal settles it [`TurnOutcome::Failed`].
+/// A crash leaves either nothing, and the turn retries the read, or the whole record, and then the
+/// turn is settled and the body never re-reads. A load settles the turn [`TurnOutcome::Completed`];
+/// a refusal settles it [`TurnOutcome::Failed`].
 fn use_skill_step(
     session: SessionID,
     transcript: &Transcript,
@@ -938,7 +936,6 @@ fn bound(read: Read) -> SkillOutcome {
     }
 }
 
-/// The refusal a load reads as when its name matches no advert the task froze.
 fn unadvertised(
     transcript: &Transcript,
     name: &SkillName,
