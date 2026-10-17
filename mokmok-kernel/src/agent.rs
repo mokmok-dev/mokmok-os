@@ -889,8 +889,9 @@ fn step_line(
         },
         Move::UseSkill { turn, name } => {
             format!(
-                "move=use-skill turn={} skill={name:?}",
-                number_of(ledger, session, *turn)
+                "move=use-skill turn={} skill={:?}",
+                number_of(ledger, session, *turn),
+                name.as_str()
             )
         },
         Move::Edit { turn, .. } => {
@@ -931,7 +932,10 @@ fn ask_line(
                 format!("move=ask turn={number} attempt={attempt} answer=find query={query:?}")
             },
             Action::UseSkill { name } => {
-                format!("move=ask turn={number} attempt={attempt} answer=use_skill skill={name:?}")
+                format!(
+                    "move=ask turn={number} attempt={attempt} answer=use_skill skill={:?}",
+                    name.as_str(),
+                )
             },
             Action::Edit { patch, .. } => {
                 format!("move=ask turn={number} attempt={attempt} answer=edit patch={patch:?}")
