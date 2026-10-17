@@ -1,7 +1,7 @@
 //! Reads one `SKILL.md` into a validated skill, with no file opened.
 //!
 //! The crate owns one answer: what a `SKILL.md` may contain, and which files are not one. Two
-//! stages divide that answer. [`frontmatter::read`] checks the file's shape — the `---` fences, the
+//! stages divide that answer. `frontmatter::read` checks the file's shape — the `---` fences, the
 //! value subset, and one level of `metadata` nesting. [`parse`] applies the field rules section 2
 //! names, so a key the spec does not name is parsed for shape and then dropped rather than refused.
 
@@ -56,7 +56,7 @@ pub struct Skill {
 
 /// Parses one `SKILL.md`, read from a directory whose name its `name` must equal.
 ///
-/// Only the file's shape is checked by [`frontmatter::read`]; this function applies the field rules,
+/// Only the file's shape is checked by `frontmatter::read`; this function applies the field rules,
 /// so a key the spec does not name is dropped, and a duplicate key naming a known field was already
 /// refused while reading.
 ///
@@ -65,7 +65,7 @@ pub struct Skill {
 /// Returns a [`Refusal`] naming the field and the offending text or size when `name` is absent,
 /// malformed, or differs from `directory`; when `description` is absent, empty, or over 1024
 /// characters; when `compatibility` is over 500 characters; when `license` is empty; when the body
-/// is over [`MAX_INSTRUCTIONS_BYTES`]; or, from [`frontmatter::read`], when the file's shape is not
+/// is over [`MAX_INSTRUCTIONS_BYTES`]; or, from `frontmatter::read`, when the file's shape is not
 /// a skill.
 pub fn parse(
     directory: &str,
