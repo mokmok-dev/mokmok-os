@@ -1,6 +1,6 @@
 {
   "harness": "6226ed3075df0ef21d41f32532f843d740c70b587dea0c5da1d3e57b7e9688d6",
-  "generated": "2026-10-17T13:29:30Z",
+  "generated": "2026-10-17T15:17:45Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
@@ -94,12 +94,12 @@
       "name": "mokmok-patch",
       "score": 100.0,
       "target": 100.0,
-      "tested": 84,
-      "caught": 84,
+      "tested": 82,
+      "caught": 82,
       "missed": [],
       "timeout": 0,
-      "digest": "172214b26819c77c2dc0a25e9b25b55cfe905315a328cc9c42c7d89162a18f7c",
-      "timed_out": []
+      "timed_out": [],
+      "digest": "e7619aa24a3b8af6a6c1e09e9bdc547067836f85bc06ef9d3833b55fd269982c"
     },
     {
       "name": "mokmok-protocol",
@@ -149,12 +149,12 @@
       "name": "mokmok-skill",
       "score": 100.0,
       "target": 100.0,
-      "tested": 123,
-      "caught": 123,
+      "tested": 111,
+      "caught": 111,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "1a41eb9df02b768fe7e68da2aba4514ca4ccda87bf28b4b4444a207b34b433bb"
+      "digest": "3f9bab22ceab471450c5d027e91f2321e05bc9a166befda722a6b301ffe91d0b"
     },
     {
       "name": "mokmok-state-machine",
