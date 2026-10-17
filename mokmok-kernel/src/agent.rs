@@ -32,6 +32,7 @@ use crate::error::Error;
 use crate::execution::{self, Blob, Plan, Ran};
 use crate::index::Index;
 use crate::recovery;
+use crate::skill::Library;
 use crate::slice::Notice;
 
 /// The model name a scripted answer records, so a transcript says where it came from.
@@ -40,10 +41,13 @@ const SCRIPTED_MODEL: &str = "scripted";
 impl Run {
     /// The task this invocation seeds the session with.
     ///
+    /// Discovery runs here, once per invocation: the recorded task freezes what it found, so a
+    /// resumed session is offered exactly the skills it was opened with.
+    ///
     /// # Errors
     ///
     /// Returns [`ConfigError::NoTool`] when no `--allow-tool` names the one program the model's
-    /// commands run as.
+    /// commands run as, and [`ConfigError::DuplicateSkill`] when two skill roots hold one name.
     pub fn task(
         &self,
         config: &Config,
@@ -63,6 +67,7 @@ impl Run {
                 program,
                 deadline: Duration::from_secs(self.tool_deadline_seconds),
                 search: config.search_root.clone(),
+                skills: crate::skill::discover(&config.skill_root)?,
             },
             budget: Budget {
                 turns: self.max_turns,
@@ -159,6 +164,7 @@ impl Ledger {
                 },
                 Record::Speech(speech) => turn = Some(speech.turn),
                 Record::Find(find) => turn = Some(find.turn),
+                Record::Skill(skill) => turn = Some(skill.turn),
                 Record::EditIntent(edit) => {
                     turn = Some(edit.turn);
                     execution = Some(edit.execution);
@@ -455,6 +461,11 @@ enum Script {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },
+    UseSkill {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
     /// The model is done.
     Final {
         /// The model's own words, when the script supplies them, so an offline run shows prose.
@@ -476,6 +487,7 @@ impl Script {
             Self::Command { say, .. }
             | Self::Find { say, .. }
             | Self::Edit { say, .. }
+            | Self::UseSkill { say, .. }
             | Self::Final { say }
             | Self::Malformed { say, .. } => say.as_deref(),
         }
@@ -491,6 +503,13 @@ impl From<Script> for Action {
                 .map_or(Self::Edit { patch, expect }, |reason| Self::Malformed {
                     reason,
                 }),
+            Script::UseSkill { name, .. } => mokmok_agent_runtime::SkillName::new(&name)
+                .map_or_else(
+                    |refusal| Self::Malformed {
+                        reason: format!("the skill name is not valid: {refusal}"),
+                    },
+                    |name| Self::UseSkill { name },
+                ),
             Script::Final { .. } => Self::Final,
             Script::Malformed { reason, .. } => Self::Malformed { reason },
         }
@@ -574,6 +593,7 @@ pub struct Driver {
     ledger: Ledger,
     shell: Shell,
     index: Index,
+    skills: Library,
     editor: Editor,
     provider: Model,
     config: Config,
@@ -615,11 +635,13 @@ impl Driver {
         } else {
             Index::open(&task.setting.search, &config.search_index)?
         };
+        let skills = Library::open(&task.setting.skills);
 
         Ok(Self {
             ledger,
             shell,
             index,
+            skills,
             editor,
             provider,
             config: config.clone(),
@@ -669,6 +691,7 @@ impl Driver {
             &self.shell,
             &self.index,
             &self.editor,
+            &self.skills,
             self.session,
             self.at,
         )
@@ -863,6 +886,13 @@ fn step_line(
                 number_of(ledger, session, *turn)
             )
         },
+        Move::UseSkill { turn, name } => {
+            format!(
+                "move=use-skill turn={} skill={:?}",
+                number_of(ledger, session, *turn),
+                name.as_str()
+            )
+        },
         Move::Edit { turn, .. } => {
             format!("move=edit turn={}", number_of(ledger, session, *turn))
         },
@@ -899,6 +929,12 @@ fn ask_line(
             Action::Final => format!("move=ask turn={number} attempt={attempt} answer=final"),
             Action::Find { query } => {
                 format!("move=ask turn={number} attempt={attempt} answer=find query={query:?}")
+            },
+            Action::UseSkill { name } => {
+                format!(
+                    "move=ask turn={number} attempt={attempt} answer=use_skill skill={:?}",
+                    name.as_str(),
+                )
             },
             Action::Edit { patch, .. } => {
                 format!("move=ask turn={number} attempt={attempt} answer=edit patch={patch:?}")
@@ -975,6 +1011,7 @@ mod tests {
             allow_write: Vec::new(),
             search_root: Vec::new(),
             search_index: data.join("search"),
+            skill_root: Vec::new(),
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
@@ -992,6 +1029,7 @@ mod tests {
                 program: PathBuf::from("/bin/sh"),
                 deadline: Duration::from_secs(1),
                 search: Vec::new(),
+                skills: Vec::new(),
             },
             budget: Budget::default(),
         }

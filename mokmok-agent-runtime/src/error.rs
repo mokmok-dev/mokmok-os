@@ -29,6 +29,8 @@ pub enum Error {
     Finder(#[source] Source),
     #[error("the editor failed: {0}")]
     Editor(#[source] Source),
+    #[error("the skills failed: {0}")]
+    Skills(#[source] Source),
     /// The fold refused a record.
     #[error("{0}")]
     Refused(#[from] Refusal),

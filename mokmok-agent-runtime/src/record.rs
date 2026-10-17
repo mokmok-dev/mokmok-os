@@ -1,7 +1,8 @@
 //! The runtime's durable vocabulary: one record per decision or outcome the loop commits.
 
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
-use mokmok_state_machine::{Attempt, Fact, Rejection, TurnFact};
+use mokmok_skill::SkillName;
+use mokmok_state_machine::{Attempt, Fact, Rejection, TurnFact, TurnOutcome};
 
 use crate::edit::EditReport;
 use crate::find::FindReport;
@@ -143,6 +144,40 @@ pub struct FindRecord {
     pub report: FindReport,
 }
 
+/// How one activation ended.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SkillOutcome {
+    Loaded {
+        /// Exactly the Markdown after the frontmatter.
+        instructions: String,
+    },
+    Refused {
+        reason: String,
+    },
+}
+
+impl SkillOutcome {
+    /// How this outcome settles the turn it belongs to.
+    #[must_use]
+    pub const fn outcome(&self) -> TurnOutcome {
+        match self {
+            Self::Loaded { .. } => TurnOutcome::Completed,
+            Self::Refused { .. } => TurnOutcome::Failed,
+        }
+    }
+}
+
+/// The body is inline rather than an [`ArtifactRef`], because [`context`](crate::context) is pure
+/// over the fold and cannot resolve a hash. `MAX_INSTRUCTIONS_BYTES` is what keeps the record
+/// bounded, and the runtime enforces it whatever a [`Skills`](crate::Skills) implementation returns.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SkillRecord {
+    pub turn: TurnID,
+    pub name: SkillName,
+    pub outcome: SkillOutcome,
+}
+
 /// One edit about to be written, and the bytes it will write.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct EditIntentRecord {
@@ -203,6 +238,7 @@ pub enum Record {
     /// The command about to be dispatched.
     Call(CallRecord),
     Find(FindRecord),
+    Skill(SkillRecord),
     /// An edit about to be written, with the bytes it will write.
     EditIntent(EditIntentRecord),
     /// An edit's outcome.
@@ -240,6 +276,8 @@ pub enum StepKey {
     EditOutcome { turn: u64 },
     /// One turn's find, written with its settlement in the one step a find takes.
     Find { turn: u64 },
+    /// One turn's activation, written with its settlement in the one step a load takes.
+    UseSkill { turn: u64 },
     /// A turn's settlement, and the session's close when it carries an ending.
     ///
     /// [`Move::Close`](crate::Move) runs twice on one turn — once to settle it and once to close
@@ -280,6 +318,7 @@ impl StepKey {
             Self::EditIntent { turn } => format!("edit-intent:{turn}"),
             Self::EditOutcome { turn } => format!("edit-outcome:{turn}"),
             Self::Find { turn } => format!("find:{turn}"),
+            Self::UseSkill { turn } => format!("use-skill:{turn}"),
             Self::Close {
                 turn,
                 session: false,
@@ -329,14 +368,24 @@ pub enum Receipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecordKey {
     Task,
-    Prompt { turn: TurnID, attempt: Attempt },
-    Answer { turn: TurnID, attempt: Attempt },
+    Prompt {
+        turn: TurnID,
+        attempt: Attempt,
+    },
+    Answer {
+        turn: TurnID,
+        attempt: Attempt,
+    },
     Call(ExecutionID),
     Result(ExecutionID),
     Find(TurnID),
+    /// One activation, keyed by the turn it belongs to; a turn carries one action.
+    UseSkill(TurnID),
     EditIntent(ExecutionID),
     EditOutcome(ExecutionID),
-    Speech { turn: TurnID },
+    Speech {
+        turn: TurnID,
+    },
 }
 
 /// Why the fold refused a record.
@@ -344,7 +393,8 @@ pub enum RecordKey {
 /// A call carries the command in two records, its own and the answer's, so the fold checks the two
 /// agree: [`Refusal::CommandMismatch`] is that disagreement, and it names both commands because
 /// [`Refusal::Conflict`] means one key recorded twice, not two records that must agree. A find
-/// carries its query the same way, and [`Refusal::QueryMismatch`] is its twin.
+/// carries its query the same way, and [`Refusal::QueryMismatch`] is its twin; a load carries its
+/// skill name the same way, and [`Refusal::SkillMismatch`] is that twin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Refusal {
     /// A second record under one key carried different content.
@@ -369,6 +419,15 @@ pub enum Refusal {
         turn: TurnID,
         answer: String,
         find: String,
+    },
+    /// An activation whose skill name the answer recorded for the same turn did not name.
+    ///
+    /// A load carries its name the way a find carries its query, and this is the twin of
+    /// [`Refusal::QueryMismatch`]: `answer` is whatever that answer named instead.
+    SkillMismatch {
+        turn: TurnID,
+        answer: String,
+        skill: String,
     },
     /// An edit whose patch the answer recorded for the same turn did not name.
     ///
@@ -404,6 +463,15 @@ impl std::fmt::Display for Refusal {
             Self::QueryMismatch { turn, answer, find } => write!(
                 formatter,
                 "the find for turn {} asks {find:?} but its answer named {answer:?}",
+                turn.as_uuid(),
+            ),
+            Self::SkillMismatch {
+                turn,
+                answer,
+                skill,
+            } => write!(
+                formatter,
+                "the skill for turn {} loads {skill:?} but its answer named {answer:?}",
                 turn.as_uuid(),
             ),
             Self::EditMismatch { turn, answer, edit } => write!(
@@ -448,6 +516,7 @@ impl std::fmt::Display for RecordKey {
                 write!(formatter, "the result of execution {}", execution.as_uuid())
             },
             Self::Find(turn) => write!(formatter, "the find for turn {}", turn.as_uuid()),
+            Self::UseSkill(turn) => write!(formatter, "the skill for turn {}", turn.as_uuid()),
             Self::EditIntent(execution) => write!(
                 formatter,
                 "the edit intent for execution {}",

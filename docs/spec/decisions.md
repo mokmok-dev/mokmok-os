@@ -43,7 +43,7 @@ enforcement.
 
 # Decisions the tree made
 
-Five choices shape the tree and appear in no design section.
+Six choices shape the tree and appear in no design section.
 
 The event bus keeps its own log. The design has the bus read committed events from the event
 store.[^architecture] The bus opens a second SQLite file with its own schema, and the two logs share
@@ -75,6 +75,19 @@ container, or wrapper starts the daemon with picks the host that receives the go
 exception that is read literally and names the variable a credential comes from. The design names no
 configuration file at all, and its default-deny authority section assumes every rule arrives as a
 named flag.
+
+Skills are advertised and loaded, and the design names neither. `--skill-root` names each root whose
+immediate subdirectories are candidates, and the kernel reads them the way it reads its own
+configuration file, so a root needs no `--allow-path` grant: a skill adds instructions the operator
+chose to hand over, not reach the sandbox can use (`mokmok-kernel/src/config.rs:383`). Discovery
+freezes the validated name, description, source, and content hash into the recorded task, so the
+advertisement is durable and a resumed session keeps the skills it was opened with. Activation is
+read-only, so it writes no intent and no resolution and commits the instructions and the turn's
+settlement in one transaction, and a skill whose file changed after discovery is refused rather than
+read. A frontmatter key the spec does not name is skipped, value and all, because nothing reads it,
+and a file the parser refuses is left out of the catalogue with its reason rather than aborting the
+run. The cost is that a misspelt known key arrives as a missing required field, which refuses the
+whole skill, and that until the model asks, the advertisement is all it has of the instructions.
 
 # The credential moved into the environment
 

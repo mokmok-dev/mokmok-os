@@ -1,6 +1,7 @@
 //! The total decision over the fold, and the one bounded step that performs it.
 
 use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+use mokmok_skill::{MAX_INSTRUCTIONS_BYTES, SkillName};
 use mokmok_state_machine::{
     Attempt, Deadline, Ending, Fact, Phase, Resolution, Turn, TurnFact, TurnNumber, TurnOutcome,
 };
@@ -13,8 +14,9 @@ use crate::find::{FindReport, Finder};
 use crate::model::{Journal, Provider};
 use crate::record::{
     AnswerRecord, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord, PromptRecord,
-    Receipt, Record, Step, StepId, StepKey,
+    Receipt, Record, SkillOutcome, SkillRecord, Step, StepId, StepKey,
 };
+use crate::skill::{NO_SKILLS, Read, Skills};
 use crate::task::Task;
 use crate::tool::{DEFAULT_DEADLINE, ToolCall, ToolReport, Tools};
 
@@ -44,6 +46,11 @@ pub enum Move {
     Find {
         turn: TurnID,
         query: String,
+    },
+    /// Load one advertised skill's body by name.
+    UseSkill {
+        turn: TurnID,
+        name: SkillName,
     },
     Edit {
         turn: TurnID,
@@ -80,6 +87,9 @@ pub enum Halt {
 }
 
 /// What one step did.
+// The one large variant is the move the step performed; boxing it would put an allocation on every
+// step's return for a value the caller reads once and drops.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Progress {
     /// The step performed this move.
@@ -118,21 +128,26 @@ pub fn next(transcript: &Transcript) -> Move {
 /// runs only on [`Receipt::Written`]. A [`Receipt::Replayed`] intent yields instead, so a second
 /// resume cannot execute a tool twice.
 ///
-/// A find spends one transaction rather than two: it writes its record and its turn's settlement
-/// together, because a search that changes nothing has no outcome to prove and no intent to
-/// reconcile.
+/// A find and an activation each spend one transaction rather than two: each writes its record and
+/// its turn's settlement together, because neither changes the world in a way an outcome could
+/// prove. A find re-runs harmlessly if a crash interrupts it; an activation is read-only too, so a
+/// crash before its append leaves the turn unsettled and the read is simply retried.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Journal`] for a journal failure, [`Error::Provider`] for a provider failure,
-/// [`Error::Tool`] for a tool failure, the finder's own failure, and
+/// [`Error::Tool`] for a tool failure, the finder's or the skills' own failure, and
 /// [`Error::Refused`]/[`Error::Rejected`] when the fold refuses the step the move would write.
+// One argument per port plus the session and the instant. Grouping the ports would hide which
+// adapter answers which question, and every caller already holds them as separate fields.
+#[allow(clippy::too_many_arguments)]
 pub async fn advance(
     journal: &mut impl Journal,
     provider: &impl Provider,
     tools: &impl Tools,
     finder: &impl Finder,
     editor: &impl Editor,
+    skills: &impl Skills,
     session: SessionID,
     at: Moment,
 ) -> Result<Progress, Error> {
@@ -205,6 +220,13 @@ pub async fn advance(
                 return Ok(Progress::Yielded);
             }
         },
+        Move::UseSkill { turn, name } => {
+            if let Some(progress) =
+                advance_use_skill(journal, skills, session, &transcript, *turn, name)?
+            {
+                return Ok(progress);
+            }
+        },
         Move::Edit { turn, call } => {
             if let Some(progress) =
                 advance_edit(journal, editor, session, &transcript, *turn, call)?
@@ -257,6 +279,37 @@ fn advance_edit(
                 report,
             ))?;
         },
+    }
+
+    Ok(None)
+}
+
+/// A name no advert names is refused here without calling the port, because the port reads a file
+/// and a name the task never advertised names no file to read. A [`Receipt::Replayed`] append yields
+/// rather than reporting a second time.
+fn advance_use_skill(
+    journal: &mut impl Journal,
+    skills: &impl Skills,
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    name: &SkillName,
+) -> Result<Option<Progress>, Error> {
+    let advert = transcript.task.as_ref().and_then(|task| {
+        task.setting
+            .skills
+            .iter()
+            .find(|advert| advert.name == *name)
+    });
+    let outcome = match advert {
+        Some(advert) => bound(skills.read(advert)?),
+        None => SkillOutcome::Refused {
+            reason: unadvertised(transcript, name),
+        },
+    };
+    let step = use_skill_step(session, transcript, turn, name, outcome);
+    if journal.append(step)? == Receipt::Replayed {
+        return Ok(Some(Progress::Yielded));
     }
 
     Ok(None)
@@ -326,6 +379,7 @@ fn accepting(transcript: &Transcript) -> Move {
                     crate::model::Action::Command { .. }
                         | crate::model::Action::Find { .. }
                         | crate::model::Action::Edit { .. }
+                        | crate::model::Action::UseSkill { .. }
                 )
             });
         if awaiting_human {
@@ -399,6 +453,12 @@ fn open_turn(
                         .find_of(turn)
                         .map_or_else(|| query.clone(), |find| find.query.clone());
                     Move::Find { turn, query }
+                },
+                crate::model::Action::UseSkill { name } => {
+                    let name = transcript
+                        .skill_of(turn)
+                        .map_or_else(|| name.clone(), |record| record.name.clone());
+                    Move::UseSkill { turn, name }
                 },
                 crate::model::Action::Edit { patch, expect } => {
                     let (patch, expect) = transcript.edit_of(turn).map_or_else(
@@ -820,6 +880,77 @@ fn find_step(
     )
 }
 
+/// A load and a refusal settle the turn in the same append, because there is no execution and no
+/// intent to reconcile.
+///
+/// A crash leaves either nothing, and the turn retries the read, or the whole record, and then the
+/// turn is settled and the body never re-reads. A load settles the turn [`TurnOutcome::Completed`];
+/// a refusal settles it [`TurnOutcome::Failed`].
+fn use_skill_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    name: &SkillName,
+    outcome: SkillOutcome,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let settled = outcome.outcome();
+    let records = vec![
+        Record::Skill(SkillRecord {
+            turn,
+            name: name.clone(),
+            outcome,
+        }),
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled { outcome: settled },
+        },
+    ];
+
+    Step::new(
+        StepId::derive(session, StepKey::UseSkill { turn: number }),
+        session,
+        records,
+    )
+}
+
+/// Bounds a port's answer to what one record may hold.
+///
+/// A [`Skills`] implementation is a port and may return any bytes. Unlike a prompt, whose whole body
+/// lives in the artifact store and is read only on demand, a skill record is folded whole on every
+/// step, so the runtime refuses an oversized body itself rather than trusting the adapter. The cap
+/// is [`MAX_INSTRUCTIONS_BYTES`], the same number the parser enforces, so a well-behaved adapter and
+/// this check agree and a broken one cannot bloat the record.
+fn bound(read: Read) -> SkillOutcome {
+    match read {
+        Read::Body(instructions) if instructions.len() <= MAX_INSTRUCTIONS_BYTES => {
+            SkillOutcome::Loaded { instructions }
+        },
+        Read::Body(instructions) => SkillOutcome::Refused {
+            reason: format!(
+                "the instructions are {} bytes, larger than the {MAX_INSTRUCTIONS_BYTES} the log holds",
+                instructions.len(),
+            ),
+        },
+        Read::Refused(reason) => SkillOutcome::Refused { reason },
+    }
+}
+
+fn unadvertised(
+    transcript: &Transcript,
+    name: &SkillName,
+) -> String {
+    let advertised = transcript
+        .task
+        .as_ref()
+        .is_some_and(|task| !task.setting.skills.is_empty());
+    if advertised {
+        format!("no advertised skill is named {name}")
+    } else {
+        NO_SKILLS.to_owned()
+    }
+}
+
 fn close_step(
     session: SessionID,
     transcript: &Transcript,
@@ -924,22 +1055,24 @@ fn halt_settle(
 #[cfg(test)]
 mod tests {
     use super::{Halt, Move, Progress, advance, next};
-    use crate::context::Context;
+    use crate::context::{Context, ContextAct};
     use crate::dialogue::Transcript;
     use crate::edit::{EditCall, EditOutcome, EditReport, Plan, Ready};
     use crate::error::Error;
     use crate::find::{FindReport, NO_SEARCH_ROOT};
     use crate::model::{Action, Answer, Journal, Provider, Usage};
-    use crate::record::{MAX_SPEECH_BYTES, Receipt, Record, StepId, StepKey};
+    use crate::record::{MAX_SPEECH_BYTES, Receipt, Record, SkillOutcome, StepId, StepKey};
+    use crate::skill::Read;
     use crate::speech::speak;
-    use crate::task::Task;
+    use crate::task::{Advert, Task};
     use crate::test_support::{
-        FakeEditor, FakeFinder, TestJournal, act_intent_records, act_outcome_records,
+        FakeEditor, FakeFinder, FakeSkills, TestJournal, act_intent_records, act_outcome_records,
         answer_records, apply_all, artifact, begin_records, execution_id, find_records,
-        open_records, report, session, speech_records, task, turn_id,
+        open_records, report, session, skill_advert, skill_records, speech_records, task, turn_id,
     };
     use crate::tool::{Exit, ToolCall, ToolReport, Tools};
-    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_protocol::{Moment, SessionID, TurnID};
+    use mokmok_skill::{MAX_INSTRUCTIONS_BYTES, SkillName};
     use mokmok_state_machine::{Attempt, Ending, Fact, Phase, TurnNumber, TurnOutcome};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1117,6 +1250,10 @@ mod tests {
         FakeEditor::of([], [])
     }
 
+    fn no_skills() -> FakeSkills {
+        FakeSkills::of([])
+    }
+
     fn ready(relative: &str) -> Ready {
         Ready {
             relative: relative.to_owned(),
@@ -1154,6 +1291,7 @@ mod tests {
             tools,
             &unasked(),
             editor,
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1240,6 +1378,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1273,6 +1412,7 @@ mod tests {
             &FakeTools::of([]),
             &unasked(),
             &FakeEditor::of([Err(Error::Editor("planned".into()))], []),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1307,6 +1447,7 @@ mod tests {
             &FakeTools::of([]),
             &unasked(),
             &FakeEditor::of([Ok(Plan::Refused("no file".to_owned()))], []),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1357,6 +1498,7 @@ mod tests {
             &FakeTools::of([]),
             &unasked(),
             &editor,
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1438,6 +1580,7 @@ mod tests {
             &FakeTools::of([]),
             &unasked(),
             &editor,
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1694,6 +1837,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1732,6 +1876,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1763,6 +1908,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1795,6 +1941,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -1819,6 +1966,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -2023,6 +2171,7 @@ mod tests {
             &tools,
             &finder,
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -2056,6 +2205,7 @@ mod tests {
             &tools,
             &finder,
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -2097,6 +2247,7 @@ mod tests {
             &tools,
             &finder,
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -2140,6 +2291,7 @@ mod tests {
             &tools,
             &unasked(),
             &unedited(),
+            &no_skills(),
             session,
             Moment::EPOCH,
         )
@@ -2289,6 +2441,273 @@ mod tests {
             speak(&mut journal, session, &"x".repeat(4096)).unwrap(),
             Receipt::Written,
             "the ceiling is inclusive: 4096 bytes is a line the log holds, 4097 is not",
+        );
+    }
+
+    /// A task advertising `adverts`, over the shared ceilings.
+    fn task_with_skills(adverts: Vec<Advert>) -> Task {
+        let mut task = task(4);
+        task.setting.skills = adverts;
+
+        task
+    }
+
+    fn named(name: &str) -> Action {
+        Action::UseSkill {
+            name: SkillName::new(name).expect("the test names a valid skill"),
+        }
+    }
+
+    /// A journal seeded through the answer that asked to load `name`.
+    fn skill_asked_task(name: &str) -> (SessionID, Task, TurnID, TestJournal) {
+        let session = session();
+        let task = task_with_skills(vec![skill_advert(name)]);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(turn, 1, named(name)));
+
+        (session, task, turn, journal)
+    }
+
+    #[test]
+    fn an_answer_naming_a_skill_derives_the_move() {
+        let task = task_with_skills(vec![skill_advert("pdf-processing")]);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(turn, 1, named("pdf-processing")),
+        );
+
+        assert_eq!(
+            next(&transcript),
+            Move::UseSkill {
+                turn,
+                name: SkillName::new("pdf-processing").unwrap(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_settles_in_one_step_and_a_later_step_reads_no_body_again() {
+        let (session, _task, turn, mut journal) = skill_asked_task("pdf-processing");
+        let skills = FakeSkills::of([Ok(Read::Body("do the thing\n".to_owned()))]);
+
+        let progress = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &skills,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            progress,
+            Progress::Advanced(Move::UseSkill { turn: moved, .. }) if moved == turn,
+        ));
+        assert_eq!(skills.calls(), 1);
+        assert_eq!(skills.asked(), vec!["pdf-processing".to_owned()]);
+        assert_eq!(
+            *journal.written.last().expect("the load wrote one step"),
+            StepId::derive(session, StepKey::UseSkill { turn: 1 }),
+        );
+
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(
+            transcript.skill_of(turn).map(|record| &record.outcome),
+            Some(&SkillOutcome::Loaded {
+                instructions: "do the thing\n".to_owned(),
+            }),
+        );
+        assert_eq!(
+            transcript.newest_turn().unwrap().1.outcome(),
+            Some(TurnOutcome::Completed),
+        );
+        // The next decision opens the following turn, so a resume derives no second activation and
+        // the body the record now holds is never read again.
+        assert!(
+            matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2))
+        );
+        assert_eq!(skills.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_settles_failed_and_its_reason_reaches_the_next_context() {
+        let (session, _task, _turn, mut journal) = skill_asked_task("pdf-processing");
+        let skills = FakeSkills::of([Ok(Read::Refused("the file vanished".to_owned()))]);
+
+        advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &skills,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(
+            transcript.newest_turn().unwrap().1.outcome(),
+            Some(TurnOutcome::Failed),
+        );
+        let built = crate::context::context(&transcript);
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Refused {
+                name: SkillName::new("pdf-processing").unwrap(),
+                reason: "the file vanished".to_owned(),
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_no_advert_names_is_refused_without_reading() {
+        let session = session();
+        let task = task_with_skills(vec![skill_advert("pdf-processing")]);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(turn, 1, named("other-skill")));
+        // An empty queue would panic on a read, so reaching the port is itself the failure.
+        let skills = FakeSkills::of([]);
+
+        advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &skills,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(skills.calls(), 0);
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(
+            transcript.skill_of(turn).map(|record| &record.outcome),
+            Some(&SkillOutcome::Refused {
+                reason: "no advertised skill is named other-skill".to_owned(),
+            }),
+            "a session holding adverts says the name was not among them",
+        );
+        assert_eq!(
+            transcript.newest_turn().unwrap().1.outcome(),
+            Some(TurnOutcome::Failed),
+        );
+        assert!(
+            matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_asked_of_a_session_that_advertised_nothing_reads_the_no_skills_sentence() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(turn, 1, named("pdf-processing")));
+        let skills = FakeSkills::of([]);
+
+        advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &skills,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(
+            transcript.skill_of(turn).map(|record| &record.outcome),
+            Some(&SkillOutcome::Refused {
+                reason: "no skill was advertised, so none can be loaded".to_owned(),
+            }),
+            "a session holding no adverts at all says so instead of naming a missing one",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_from_a_port_is_refused_rather_than_recorded() {
+        let (session, _task, turn, mut journal) = skill_asked_task("pdf-processing");
+        let oversized = "x".repeat(MAX_INSTRUCTIONS_BYTES + 1);
+        let skills = FakeSkills::of([Ok(Read::Body(oversized))]);
+
+        advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &skills,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        let transcript = journal.transcript(session).unwrap();
+        match transcript.skill_of(turn).map(|record| &record.outcome) {
+            Some(SkillOutcome::Refused { reason }) => {
+                assert!(reason.contains("larger than"), "{reason}");
+            },
+            other => panic!("an oversized body is refused, not recorded: {other:?}"),
+        }
+        assert_eq!(
+            transcript.newest_turn().unwrap().1.outcome(),
+            Some(TurnOutcome::Failed),
+        );
+    }
+
+    #[test]
+    fn a_use_skill_keeps_the_agent_working_in_a_conversation() {
+        let task = task_with_skills(vec![skill_advert("pdf-processing")]);
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &speech_records(turn, 1, "hello"));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(turn, 1, named("pdf-processing")),
+        );
+        apply_all(
+            &mut transcript,
+            &skill_records(
+                turn,
+                "pdf-processing",
+                SkillOutcome::Loaded {
+                    instructions: "do the thing\n".to_owned(),
+                },
+            ),
+        );
+
+        assert!(
+            matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2)),
+            "a load keeps the agent working rather than handing the turn to the human",
         );
     }
 }

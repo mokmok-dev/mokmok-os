@@ -65,7 +65,7 @@ one's score and target to `mutation.json`, and exports the confiner the kernel's
 integration tests need; `--check-baseline` reads that ledger back and reports which rows moved.
 Eight mutants across six members are excluded as equivalent, each with its proof beside the
 exclusion in `.cargo/mutants.toml`, and one of those eight is a scope limit rather than an
-equivalence. All fifteen members score 100% over the mutants that remain.[^mutants]
+equivalence. All sixteen members score 100% over the mutants that remain.[^mutants]
 
 # The four attested computations
 

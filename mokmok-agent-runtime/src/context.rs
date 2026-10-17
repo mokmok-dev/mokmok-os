@@ -1,9 +1,11 @@
 //! The bytes the model is handed: a system prompt, the goal, and the turns it may see.
 
 use crate::dialogue::Transcript;
+use crate::record::SkillOutcome;
 use crate::task::Task;
 use crate::tool::clip;
 use mokmok_protocol::TurnID;
+use mokmok_skill::SkillName;
 use mokmok_state_machine::{Turn, TurnNumber};
 
 /// The canonical prompt content for one model call.
@@ -23,6 +25,25 @@ pub struct Context {
     /// this flag is true, because both are built from the same recorded task.
     #[serde(default)]
     pub writable: bool,
+    /// Whether the session advertised any skill. The body offers `use_skill` exactly when this flag
+    /// is true, because both are built from the same recorded task.
+    #[serde(default)]
+    pub skills: bool,
+    /// The bodies activation has loaded, in turn order, deduped by name.
+    ///
+    /// They ride every prompt from the turn that loaded them on, so this is a floor the turn-level
+    /// trim cannot remove: the operator's `--context-bytes` stays the real ceiling.
+    #[serde(default)]
+    pub loaded: Vec<ContextSkill>,
+}
+
+/// One skill body the prompt carries because the model loaded it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ContextSkill {
+    /// The name the model loaded the skill by.
+    pub name: SkillName,
+    /// The Markdown after the frontmatter, exactly as the record holds it.
+    pub instructions: String,
 }
 
 /// One turn the model may see: what opened it and what the agent did with it.
@@ -64,6 +85,15 @@ pub enum ContextAct {
     Edited {
         observation: String,
     },
+    /// The agent loaded a skill. The body is in [`Context::loaded`], so the act carries the name.
+    Loaded {
+        name: SkillName,
+    },
+    /// The agent's load was refused, and this is the reason it reads.
+    Refused {
+        name: SkillName,
+        reason: String,
+    },
 }
 
 impl Context {
@@ -74,6 +104,11 @@ impl Context {
     pub fn bytes(&self) -> usize {
         self.system.len()
             + self.goal.len()
+            + self
+                .loaded
+                .iter()
+                .map(|skill| skill.instructions.len())
+                .sum::<usize>()
             + self
                 .turns
                 .iter()
@@ -92,6 +127,10 @@ impl Context {
                             ) => command.len() + observation.len(),
                             Some(ContextAct::Edited { observation }) => observation.len(),
                             Some(ContextAct::Said { reply }) => reply.len(),
+                            Some(ContextAct::Loaded { name }) => name.as_str().len(),
+                            Some(ContextAct::Refused { name, reason }) => {
+                                name.as_str().len() + reason.len()
+                            },
                             None => 0,
                         }
                         + 8
@@ -139,10 +178,25 @@ pub fn system_prompt(task: &Task) -> String {
     } else {
         format!("You have these tools: {}.\n", tools.join("; "))
     };
+    // The advertisement is built from the recorded task alone, so a resumed session shows exactly
+    // the skills it was opened with and a re-ask is byte-identical.
+    let advertised = if task.setting.skills.is_empty() {
+        String::new()
+    } else {
+        std::iter::once("Skills you may load by name with use_skill:\n".to_owned())
+            .chain(
+                task.setting
+                    .skills
+                    .iter()
+                    .map(|advert| format!("- {}: {}\n", advert.name, advert.description)),
+            )
+            .collect()
+    };
 
     format!(
         "You are a coding agent working in a scratch checkout.\n\
          {tooling}\
+         {advertised}\
          The working directory is a fresh, empty, ephemeral directory, and stdin is empty.\n\
          There is no TCP network. Reach the checkout by absolute path, for example \
          `cd {checkout} && ...`.\n\
@@ -242,6 +296,20 @@ impl Transcript {
             });
         }
 
+        // A skill turn requested no tool, so the fallback below would read it as a turn the model
+        // never finished. The record is what the turn is shown by, whether it loaded or refused.
+        if let Some(record) = self.skill_of(turn) {
+            return Some(match &record.outcome {
+                SkillOutcome::Loaded { .. } => ContextAct::Loaded {
+                    name: record.name.clone(),
+                },
+                SkillOutcome::Refused { reason } => ContextAct::Refused {
+                    name: record.name.clone(),
+                    reason: reason.clone(),
+                },
+            });
+        }
+
         if let Some(answer) = self.newest_answer(turn)
             && answer.action == crate::model::Action::Final
         {
@@ -295,6 +363,8 @@ pub fn context(transcript: &Transcript) -> Context {
             turns: Vec::new(),
             search: false,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         };
     };
 
@@ -307,6 +377,8 @@ pub fn context(transcript: &Transcript) -> Context {
         turns,
         search: !task.setting.search.is_empty(),
         writable: !task.setting.writable.is_empty(),
+        skills: !task.setting.skills.is_empty(),
+        loaded: transcript.loaded(),
     };
     while context.bytes() > bytes_of(task.budget.context_bytes) && !context.turns.is_empty() {
         context.turns.remove(0);
@@ -351,22 +423,26 @@ fn paths(granted: &[std::path::PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Context, ContextAct, ContextTurn, MISSING_COMMAND, bytes_of, context, keep_newest, paths,
-        system_prompt,
+        Context, ContextAct, ContextSkill, ContextTurn, MISSING_COMMAND, bytes_of, context,
+        keep_newest, paths, system_prompt,
     };
     use crate::dialogue::Transcript;
     use crate::edit::EditOutcome;
     use crate::find::FindReport;
     use crate::model::{Action, Usage};
-    use crate::record::{AnswerRecord, CallRecord, PromptRecord, Record, SpeechRecord};
-    use crate::task::Task;
+    use crate::record::{
+        AnswerRecord, CallRecord, PromptRecord, Record, SkillOutcome, SpeechRecord,
+    };
+    use crate::task::{Advert, Task};
     use crate::test_support::{
         act_intent_records, act_outcome_records, answer_records, apply_all, artifact,
         begin_records, edit_intent_records, edit_outcome_records, edit_refusal_records,
-        execution_id, find_records, open_records, session, speech_records, task, turn_id,
+        execution_id, find_records, open_records, session, skill_records, speech_records, task,
+        turn_id,
     };
     use crate::tool::{Exit, ToolReport, UNKNOWN_WARNING, observation};
     use mokmok_protocol::{ExecutionID, TurnID};
+    use mokmok_skill::SkillName;
     use mokmok_state_machine::{
         Attempt, Deadline, Fact, Resolution, Turn, TurnFact, TurnNumber, TurnOutcome,
     };
@@ -509,6 +585,8 @@ mod tests {
             turns: vec![turn_of(1)],
             search: false,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         };
 
         assert_eq!(
@@ -1176,6 +1254,8 @@ mod tests {
                 turns: Vec::new(),
                 search: false,
                 writable: false,
+                skills: false,
+                loaded: Vec::new(),
             },
         );
     }
@@ -1347,6 +1427,226 @@ mod tests {
             Some(ContextAct::Edited {
                 observation: "the edit was refused: the patch names two files".to_owned(),
             }),
+        );
+    }
+
+    fn pdf_name() -> SkillName {
+        SkillName::new("pdf-processing").expect("a valid name")
+    }
+
+    fn advertised() -> Advert {
+        Advert {
+            name: pdf_name(),
+            description: "Extract PDF text, fill forms, merge files. Use when handling PDFs."
+                .to_owned(),
+            source: "/skills/pdf-processing/SKILL.md".into(),
+            digest: "digest".to_owned(),
+        }
+    }
+
+    fn advertising_task() -> Task {
+        let mut task = task(4);
+        task.setting.skills = vec![advertised()];
+
+        task
+    }
+
+    /// A transcript whose one turn loaded `instructions`, with the body the task advertised.
+    fn loaded_turn(instructions: &str) -> (Task, TurnID, Transcript) {
+        let task = advertising_task();
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(turn, 1, Action::UseSkill { name: pdf_name() }),
+        );
+        apply_all(
+            &mut transcript,
+            &skill_records(
+                turn,
+                "pdf-processing",
+                SkillOutcome::Loaded {
+                    instructions: instructions.to_owned(),
+                },
+            ),
+        );
+
+        (task, turn, transcript)
+    }
+
+    #[test]
+    fn the_advertisement_block_is_the_fixed_text_in_task_order() {
+        let mut task = advertising_task();
+        let second = Advert {
+            name: SkillName::new("quokka").expect("a valid name"),
+            description: "Describe quokkas.".to_owned(),
+            source: "/skills/quokka/SKILL.md".into(),
+            digest: "digest".to_owned(),
+        };
+        task.setting.skills.push(second);
+
+        let prompt = system_prompt(&task);
+
+        assert!(
+            prompt.contains(
+                "Skills you may load by name with use_skill:\n\
+                 - pdf-processing: Extract PDF text, fill forms, merge files. Use when handling PDFs.\n\
+                 - quokka: Describe quokkas.\n"
+            ),
+            "the block is the fixed text, one line per skill, in task order:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn a_task_with_no_skills_advertises_no_block() {
+        let prompt = system_prompt(&task(4));
+
+        assert!(!prompt.contains("use_skill"), "{prompt}");
+        assert!(!prompt.contains("Skills you may load"), "{prompt}");
+    }
+
+    #[test]
+    fn the_advertisement_is_byte_identical_across_a_re_ask() {
+        let task = advertising_task();
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+
+        let first = serde_json::to_vec(&context(&transcript)).unwrap();
+        apply_all(&mut transcript, &open_records(turn, 1, 2));
+        let second = serde_json::to_vec(&context(&transcript)).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_settled_skill_turn_renders_loaded_and_carries_the_body() {
+        let (_, _, transcript) = loaded_turn("do the thing\n");
+
+        let built = context(&transcript);
+
+        assert!(built.skills, "a task with a skill offers the tool");
+        assert_eq!(
+            built.turns[0].act,
+            Some(ContextAct::Loaded { name: pdf_name() }),
+        );
+        assert_eq!(
+            built.loaded,
+            vec![ContextSkill {
+                name: pdf_name(),
+                instructions: "do the thing\n".to_owned(),
+            }],
+        );
+    }
+
+    #[test]
+    fn context_bytes_counts_the_loaded_instructions() {
+        let (_, _, transcript) = loaded_turn(&"x".repeat(40));
+
+        let built = context(&transcript);
+        let mut without = built.clone();
+        without.loaded.clear();
+
+        assert_eq!(built.loaded[0].instructions.len(), 40);
+        assert_eq!(
+            built.bytes() - without.bytes(),
+            40,
+            "the loaded instructions are charged to the context",
+        );
+    }
+
+    #[test]
+    fn context_bytes_charges_a_refused_skill_its_name_and_its_reason() {
+        let built = Context {
+            system: String::new(),
+            goal: String::new(),
+            turns: vec![ContextTurn {
+                number: TurnNumber::new(1),
+                speech: None,
+                act: Some(ContextAct::Refused {
+                    name: pdf_name(),
+                    reason: "the file vanished".to_owned(),
+                }),
+            }],
+            search: false,
+            writable: false,
+            skills: true,
+            loaded: Vec::new(),
+        };
+
+        assert_eq!(
+            built.bytes(),
+            "pdf-processing".len() + "the file vanished".len() + 8,
+            "a refusal spends the name plus the reason, not the two multiplied",
+        );
+    }
+
+    #[test]
+    fn the_trim_drops_older_turns_before_it_can_touch_a_loaded_body() {
+        let (_, _, mut transcript) = loaded_turn("the body");
+        transcript.task.as_mut().unwrap().budget.context_bytes = 1;
+
+        let built = context(&transcript);
+
+        assert_eq!(built.turns, Vec::new(), "every turn is dropped");
+        assert_eq!(
+            built.loaded,
+            vec![ContextSkill {
+                name: pdf_name(),
+                instructions: "the body".to_owned(),
+            }],
+            "the loaded body is a floor the turn trim cannot remove",
+        );
+    }
+
+    #[test]
+    fn loaded_bodies_come_in_turn_order_deduped_by_name() {
+        let task = advertising_task();
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        let first = turn_id(1);
+        apply_all(&mut transcript, &open_records(first, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(first, 1, Action::UseSkill { name: pdf_name() }),
+        );
+        apply_all(
+            &mut transcript,
+            &skill_records(
+                first,
+                "pdf-processing",
+                SkillOutcome::Loaded {
+                    instructions: "the first body".to_owned(),
+                },
+            ),
+        );
+        let second = turn_id(2);
+        apply_all(&mut transcript, &open_records(second, 2, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(second, 1, Action::UseSkill { name: pdf_name() }),
+        );
+        apply_all(
+            &mut transcript,
+            &skill_records(
+                second,
+                "pdf-processing",
+                SkillOutcome::Loaded {
+                    instructions: "the second body".to_owned(),
+                },
+            ),
+        );
+
+        assert_eq!(
+            transcript.loaded(),
+            vec![ContextSkill {
+                name: pdf_name(),
+                instructions: "the first body".to_owned(),
+            }],
+            "the first body a name loads wins, and the name appears once",
         );
     }
 }

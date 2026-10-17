@@ -1,6 +1,7 @@
 //! The ports: everything the pure loop needs from the world, in the runtime's own types.
 
 use mokmok_protocol::SessionID;
+use mokmok_skill::SkillName;
 
 use crate::context::Context;
 use crate::dialogue::Transcript;
@@ -23,6 +24,9 @@ pub enum Action {
     Edit {
         patch: String,
         expect: Option<String>,
+    },
+    UseSkill {
+        name: SkillName,
     },
     /// The model's tool arguments could not be decoded; it is recorded, never silently retried.
     Malformed {

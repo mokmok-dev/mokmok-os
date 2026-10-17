@@ -471,6 +471,19 @@ fn transcript_line(
             edit.report.outcome,
             edit.report.observation,
         )),
+        mokmok_agent_runtime::Record::Skill(skill) => Some(format!(
+            "skill turn={} number={} name={:?} {}",
+            skill.turn.as_uuid(),
+            number(skill.turn),
+            skill.name.as_str(),
+            match &skill.outcome {
+                mokmok_agent_runtime::SkillOutcome::Loaded { instructions } =>
+                    format!("loaded {} bytes", instructions.len()),
+                mokmok_agent_runtime::SkillOutcome::Refused { reason } => {
+                    format!("refused {reason:?}")
+                },
+            },
+        )),
         mokmok_agent_runtime::Record::Session { .. }
         | mokmok_agent_runtime::Record::Turn { .. } => None,
     }

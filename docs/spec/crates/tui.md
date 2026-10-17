@@ -29,7 +29,7 @@ session the human is not looking at still moves, between his keystrokes.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:618` | The driver loop over every session the process holds |
+| `run` | `src/core.rs:657` | The driver loop over every session the process holds |
 | `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `reopen` |
 | `Roster` | `src/port.rs:71` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:107` | `poll`, `event`, `draw` |

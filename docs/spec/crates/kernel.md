@@ -30,21 +30,23 @@ carries.[^crate]
 | Item | Where | What it is |
 | --- | --- | --- |
 | `Config`, `Args`, `Command` | `src/config.rs:365,249,259` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
-| `ProviderLayer`, `ProviderSettings`, `config_path`, `ProcessEnvironment` | `src/config.rs:61,89,521,555` | The provider group as the flags and the configuration file's keys at once, the same group once every layer has spoken, which owns the credential the environment answered, the path discovery looks in, and the process environment a value may name and a credential arrives in, read once by a binary and handed in |
+| `ProviderLayer`, `ProviderSettings`, `config_path`, `ProcessEnvironment` | `src/config.rs:61,89,536,570` | The provider group as the flags and the configuration file's keys at once, the same group once every layer has spoken, which owns the credential the environment answered, the path discovery looks in, and the process environment a value may name and a credential arrives in, read once by a binary and handed in |
+| `Global`, `Config` | `src/config.rs:201,368` | The flags every invocation shares, including `--skill-root`, and the resolved configuration that carries `skill_root` |
 | `Db`, `Log`, `Entry`, `TurnRecord`, `ResultRecord` | `src/db.rs:276,103,45,89,96` | The appender over the event log and the folded view of one session |
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
 | `Relay`, `serve` | `src/serve.rs:52,138` | The outbox relay and the daemon loop |
-| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,485,504` | The vertical slice |
+| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,498,517` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
+| `skill::discover`, `Library` | `src/skill.rs:30,136` | Discovery of a root's immediate subdirectories into adverts, and the recorded-task library activation reads |
 | `editor::Editor` | `src/editor.rs:32` | The model's editor: it plans a patch against the checkout, asks the authority for the write, and commits the bytes through a resolved directory |
 | `Authority::may_write_at`, `access_at` | `src/authority.rs:127,163` | The one place the write answer is decided, from the grants the operator named |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:696,573,556,373` | The agent loop and its scripted model |
-| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:578` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:720,593,576,379` | The agent loop and its scripted model |
+| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:591` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
-`authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`, `serve`,
-and `slice` are private modules. `agent` is public. The daemon binary is
+`authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`,
+`serve`, `skill`, and `slice` are private modules. `agent` is public. The daemon binary is
 `mokmok-kernel/src/bin/mokmokd.rs`.
 
 # Owned state
@@ -66,6 +68,19 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   (`src/authority.rs:60-92`).
 - A search root must sit inside a read or write grant, or the run is refused before any index is
   opened (`src/config.rs:467`).
+- A `skill_root` is not an authority grant. It must be an absolute existing directory, and it is
+  resolved the way the configuration file is, so a root no grant covers is a root the sandbox is
+  never asked about (`src/config.rs:451`).
+- One name held by two skill roots is refused with both files, because one name must name one skill
+  (`src/skill.rs:50`).
+- Discovery skips an invalid or oversized skill and continues, reporting each with its path and the
+  reason, because a skills root is a directory the operator shares with other tools
+  (`src/skill.rs:64`).
+- Activation re-reads the advertised file and refuses a body whose digest no longer matches the one
+  discovery recorded, so the body the model receives is the body the session was told about
+  (`src/skill.rs:189`).
+- The advertisement is built from the recorded task, so a resumed session keeps exactly the skills it
+  was opened with (`src/agent.rs:639`).
 - Every stream the commit log holds is one session's, so `Db::streams` is the whole list of them and
   the position of a stream's newest commit is the order a chooser reads (`src/db.rs:388-414`).
 - A session that committed no task is listed with no goal and no checkout, and a stream that
@@ -86,7 +101,7 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   the one place a dollar means anything: `$$` writes one literal dollar, and any other dollar is
   refused rather than passed through (`src/config.rs:685`).
 - The environment a reference names is read once by the two binaries and handed to resolution as
-  data, which `ProcessEnvironment` carries (`src/config.rs:555`).
+  data, which `ProcessEnvironment` carries (`src/config.rs:570`).
 - `config_path` decides the file from the environment, and `--config` names it outright; the two
   binaries also read the environment a value may name, and a file the operator named and that is not
   there is refused, while a file discovery looked for and did not find is silence
@@ -119,10 +134,10 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
 
 # Dependencies
 
-All twelve other crates of the workspace except `mokmok-tui`, plus `clap`, `reqwest`, `serde`,
-`serde_json`, `thiserror`, `tokio`, `toml`, `tracing`, `tracing-subscriber`, and `uuid`. The crate
-holds no rusqlite dependency, so SQLite reaches it through `mokmok-event-store` and
-`mokmok-event-bus`. It declares no axum dependency.
+Every other member except `mokmok-tui`, plus `clap`, `reqwest`, `serde`, `serde_json`, `thiserror`,
+`tokio`, `toml`, `tracing`, `tracing-subscriber`, and `uuid`. The crate holds no rusqlite dependency,
+so SQLite reaches it through `mokmok-event-store` and `mokmok-event-bus`. It declares no axum
+dependency.
 
 # Reconciliation
 
@@ -151,19 +166,20 @@ policy content from flags (`src/authority.rs:56-107`) and owns the provider's eg
 `mokmok-scheduler` is a declared dependency of this crate, and no symbol from it appears under
 `src/` or `tests/`. The scheduler is composed nowhere.
 
-The kernel owns more than the design's list: the agent loop (`src/agent.rs:670`), the systemd
+The kernel owns more than the design's list: the agent loop (`src/agent.rs:720`), the systemd
 notification protocol (`src/notify.rs`), the egress-backed model provider (`src/provider.rs`), crash
-injection (`src/config.rs:953`), and the workspace's only wall-clock read
-(`src/bin/mokmokd.rs:80-88`).
+injection (`src/config.rs:953`), discovery of the operator's skill roots (`src/skill.rs`), and the
+workspace's only wall-clock read (`src/bin/mokmokd.rs:80-88`).
 
 # Tests
 
-221 cases: 166 in `#[cfg(test)]` modules, one of them ignored, and 55 across five integration files.
+243 cases: 182 in `#[cfg(test)]` modules, one of them ignored, and 61 across six integration files.
 
-`src/provider.rs` holds 31 cases for the measured model exchange, malformed output, the request
-body, endpoint parsing, the tool list a session's grants decide, and not following a redirect. One of
-them is ignored: it reaches a live endpoint by hand. `src/config.rs` holds 66 cases for resolution
-and refusal, 33 of them driving a configuration file the test wrote.
+`src/provider.rs` holds 36 cases for the measured model exchange, malformed output, the request
+body, endpoint parsing, the tool list a session's grants and skills decide, not following a redirect,
+the `use_skill` call's decode and its two malformed shapes, and the loaded bodies in the system
+message. One of them is ignored: it reaches a live endpoint by hand. `src/config.rs` holds 66 cases
+for resolution and refusal, 33 of them driving a configuration file the test wrote.
 `src/editor.rs` holds 26 cases for planning an edit and committing one: the plan for one file, for a
 file that does not exist, at the size ceiling, and through a checkout the operator reached by a
 symlink; the commit that creates the file the plan read nothing for, writes the bytes with the mode
@@ -180,7 +196,11 @@ gets: a path under a write root, one under a read root, one under no root, and t
 winning a nested pair.
 `src/roster.rs` holds 5 cases for the listing: an empty log, the session written most recently coming
 first, a session that recorded a task carrying its goal and its checkout, the turn count, and a
-stream with no session fact. `tests/slice.rs` holds 12 cases including one confined tool, a replay, a
+stream with no session fact. `src/skill.rs` holds 11 cases for discovery and activation: a valid skill
+advertised with its digest and source, an invalid one skipped and reported with its path and reason,
+an oversized file skipped without being read, the entries sorted by directory name, one name held by
+two roots refused naming both paths, and the library refusing a changed, vanished, or unheld file.
+`tests/slice.rs` holds 12 cases including one confined tool, a replay, a
 refused tool, an unknown outcome after a crash, the relay reaching a subscriber, and recovery before
 readiness. `tests/supervisor.rs` holds 13 cases over the real daemon: readiness after the bus answers,
 a foreign socket never reporting ready, a stop draining and exiting zero, a `SIGKILL` restart over the
@@ -188,7 +208,11 @@ stale socket, the keep-alive following the relay, and an uninstallable subscribe
 failing the daemon. `tests/agent.rs` holds 28 cases for the whole loop, one of them driving a run
 whose provider group comes from a configuration file, one the credential the environment answered to a
 stub endpoint, a crash before dispatch, cancellation, a command no grant reaches, scripted prose, an
-edit that lands its bytes and one a refusal writes nothing for, and the two ceilings.
+edit that lands its bytes and one a refusal writes nothing for, and the two ceilings. `tests/skill.rs`
+holds 6 cases over the real daemon: a valid skill advertised and an invalid one skipped, a folded
+description advertised folded, a scripted run loading a skill whose instructions ride the next prompt,
+a skill changed after discovery refused at activation, a file named as a root refused at resolve, and
+two roots holding one name refused.
 
 ```
 cargo test -p mokmok-kernel
@@ -196,4 +220,4 @@ MOKMOKD=target/debug/mokmokd bash scripts/daemon.sh
 ```
 
 [^architecture]: Section 5.12 of `mokmok-os-architecture.md`.
-[^crate]: The module list is `mokmok-kernel/src/lib.rs:11-23`.
+[^crate]: The module list is `mokmok-kernel/src/lib.rs:13-27`.

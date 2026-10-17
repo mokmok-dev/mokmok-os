@@ -20,6 +20,7 @@ mokmok-protocol = { workspace = true }
 mokmok-sandbox = { workspace = true }
 mokmok-scheduler = { workspace = true }
 mokmok-search = { workspace = true }
+mokmok-skill = { workspace = true }
 mokmok-state-machine = { workspace = true }
 nix = { workspace = true }
 reqwest = { workspace = true }

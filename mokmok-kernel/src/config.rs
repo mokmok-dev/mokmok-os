@@ -213,6 +213,9 @@ pub struct Global {
     pub allow_write: Vec<PathBuf>,
     #[arg(long = "search-root", global = true, value_name = "DIR")]
     pub search_root: Vec<PathBuf>,
+    /// A directory whose immediate subdirectories are candidate skills. Repeatable.
+    #[arg(long = "skill-root", global = true, value_name = "DIR")]
+    pub skill_root: Vec<PathBuf>,
     /// A `NAME=VALUE` pair the confined workload is given. Repeatable, in order.
     ///
     /// The workload's environment is exactly these pairs plus `PATH`, taken from this process, and
@@ -377,6 +380,12 @@ pub struct Config {
     pub allow_write: Vec<PathBuf>,
     pub search_root: Vec<PathBuf>,
     pub search_index: PathBuf,
+    /// Directories whose immediate subdirectories are candidate skills.
+    ///
+    /// Not a grant: nothing the sandbox reaches is read from here, and the kernel reads a root the
+    /// way it reads its own configuration file. A skill only adds instructions the operator chose to
+    /// hand over, so there is no `SkillUngranted` twin of [`ConfigError::SearchUngranted`].
+    pub skill_root: Vec<PathBuf>,
     /// The exact environment a confined tool is started with: `PATH` from this process, then each
     /// `--tool-env` entry in order. It replaces the daemon's environment rather than adding to it.
     pub tool_env: Vec<(OsString, OsString)>,
@@ -439,6 +448,11 @@ impl Config {
             .iter()
             .map(|path| reachable_directory(path))
             .collect::<Result<Vec<_>, _>>()?;
+        let skill_root = global
+            .skill_root
+            .iter()
+            .map(|path| reachable_directory(path))
+            .collect::<Result<Vec<_>, _>>()?;
         // The checkout is reached only through a write grant, so a run whose checkout no grant
         // covers would be refused by the sandbox halfway through; refusing it here names the path.
         if let Command::Agent(Agent::Run(run)) = &args.command {
@@ -498,6 +512,7 @@ impl Config {
             allow_write,
             search_root,
             search_index: global.data_dir.join("search"),
+            skill_root,
             tool_env: tool_environment(&global.tool_env)?,
             confiner: runnable(&confiner)?,
             crash_after: global.crash_after,
@@ -1085,6 +1100,14 @@ pub enum ConfigError {
          finder would read what the operator never opened"
     )]
     SearchUngranted { path: PathBuf },
+    #[error(
+        "the skill `{name}` is held by both {first} and {second}, and one name must name one skill"
+    )]
+    DuplicateSkill {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
     #[error("no --allow-tool program is named, so the agent has nothing to run")]
     NoTool,
     #[error("no --script file is named, and the scripted provider has nothing to answer with")]
@@ -1221,6 +1244,7 @@ mod tests {
                 allow_path: vec![PathBuf::from("/bin")],
                 allow_write: Vec::new(),
                 search_root: Vec::new(),
+                skill_root: Vec::new(),
                 tool_env: Vec::new(),
                 confiner: Some(PathBuf::from("/bin/sh")),
                 crash_after: None,

@@ -99,6 +99,16 @@ fn lines(fold: &Transcript) -> Vec<Line> {
             Some(ContextAct::Edited { observation }) => {
                 lines.push(Line::Edit { observation });
             },
+            // A loaded skill is not one of the agent's own words, so it draws as its own line; a
+            // refused load made the turn fail, so it is the reason the turn could not finish.
+            Some(ContextAct::Loaded { name }) => {
+                lines.push(Line::Agent(format!("loaded skill {name}")));
+            },
+            Some(ContextAct::Refused { name, reason }) => {
+                lines.push(Line::Trouble(format!(
+                    "the skill {name} could not be loaded: {reason}"
+                )));
+            },
             // A settled turn with no act is one the model never finished: the agent opened it, so
             // the human still needs to know it could not.
             None if fold
@@ -126,9 +136,11 @@ fn reason(
         .and_then(|attempt| fold.answers.get(&(turn, attempt)))
         .and_then(|answer| match &answer.action {
             Action::Malformed { reason } => Some(reason.as_str()),
-            Action::Final | Action::Command { .. } | Action::Find { .. } | Action::Edit { .. } => {
-                None
-            },
+            Action::Final
+            | Action::Command { .. }
+            | Action::Find { .. }
+            | Action::Edit { .. }
+            | Action::UseSkill { .. } => None,
         });
 
     malformed.map_or_else(
@@ -773,6 +785,7 @@ mod tests {
                     program: "/bin/sh".into(),
                     deadline: std::time::Duration::from_secs(120),
                     search: Vec::new(),
+                    skills: Vec::new(),
                 },
                 budget: Budget::default(),
             },

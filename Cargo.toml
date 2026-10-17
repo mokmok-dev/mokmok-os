@@ -13,6 +13,7 @@ members = [
   "mokmok-sandbox",
   "mokmok-scheduler",
   "mokmok-search",
+  "mokmok-skill",
   "mokmok-state-machine",
   "mokmok-tui",
 ]
@@ -36,6 +37,7 @@ mokmok-protocol = { path = "mokmok-protocol" }
 mokmok-sandbox = { path = "mokmok-sandbox" }
 mokmok-scheduler = { path = "mokmok-scheduler" }
 mokmok-search = { path = "mokmok-search" }
+mokmok-skill = { path = "mokmok-skill" }
 mokmok-state-machine = { path = "mokmok-state-machine" }
 nix = { version = "0.31", default-features = false, features = [
   "fs",
