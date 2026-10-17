@@ -333,10 +333,12 @@ mod tests {
     #[test]
     fn a_folded_description_advertises_folded() {
         let scratch = Scratch::new("folded");
+        // A folded description between other keys, which is the shape a real skill uses and the one
+        // discovery must not spin on.
         let root = scratch.skill(
             "skills",
             "folded",
-            "---\nname: folded\ndescription: >-\n  Extract PDF text,\n  fill forms, merge files.\n---\nbody\n",
+            "---\nname: folded\ndescription: >-\n  Extract PDF text,\n  fill forms, merge files.\nlicense: MIT\ncompatibility: >-\n  Requires uv.\n---\nbody\n",
         );
         let path = scratch.0.join("script.json");
         script(&path, &[serde_json::json!({"action": "final"})]);

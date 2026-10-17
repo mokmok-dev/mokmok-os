@@ -20,7 +20,7 @@ pub enum Value {
 /// The shape of one file's frontmatter, before any field rule is applied.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Raw {
-    /// Every top-level field, in file order, unknown keys included.
+    /// Every field the spec names, in file order. A key the spec does not name is skipped.
     pub fields: Vec<(String, Value)>,
     /// The entries gathered from the one nested `metadata` block, in file order.
     pub metadata: Vec<(String, String)>,
@@ -54,6 +54,8 @@ enum State {
     MetadataEntry,
     /// The line that must decide an empty `metadata` value: nothing, or one level too deep.
     MetadataValue,
+    /// The lines under a key the spec does not name, consumed without being read.
+    SkipValue,
 }
 
 /// How a block scalar treats its trailing newline.
@@ -173,6 +175,7 @@ impl Scanner {
             State::BlockScalar => self.block_scalar(line, number),
             State::MetadataEntry => self.metadata_entry(line, number),
             State::MetadataValue => self.metadata_value(line, number),
+            State::SkipValue => Ok(self.skip_value(line)),
             State::Outside | State::Body => Ok(true),
         }
     }
@@ -208,9 +211,17 @@ impl Scanner {
         }
         let value = line[colon + 1..].trim();
 
+        // A key the spec does not name is skipped, value and all: nothing reads it, so its shape is
+        // the vendor's business, and refusing a skill over a field no reader consults would drop the
+        // operator's skill for a reason the skill cannot fix.
+        if !is_known(key) {
+            self.state = State::SkipValue;
+            return Ok(true);
+        }
+
         let duplicate = self.fields.iter().any(|(seen, _)| seen == key)
             || (key == "metadata" && self.metadata_seen);
-        if is_known(key) && duplicate {
+        if duplicate {
             return Err(Refusal::DuplicateKey {
                 key: key.to_string(),
                 line: number,
@@ -282,10 +293,29 @@ impl Scanner {
         }
 
         if let Some(active) = self.block.as_mut() {
-            let base = active.indent.unwrap_or(indent);
+            // The first continuation line fixes the block's indentation, so a later line indented
+            // less than it ends the block instead of being read as part of the value.
+            let base = *active.indent.get_or_insert(indent);
             active.lines.push(line[base..].to_string());
         }
         Ok(true)
+    }
+
+    /// The lines under a key the spec does not name: consumed, and read by nothing.
+    ///
+    /// An indented line continues the skipped value, whatever shape the vendor wrote. The first line
+    /// at the top level begins the next key, so it is left for [`State::TopLevelKey`] to read rather
+    /// than consumed here.
+    fn skip_value(
+        &mut self,
+        line: &str,
+    ) -> bool {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return true;
+        }
+
+        self.state = State::TopLevelKey;
+        false
     }
 
     /// One `key: value` line inside the `metadata` block, or the line that ends the block.
@@ -379,7 +409,13 @@ impl Scanner {
         Err(Refusal::EmptyMetadataValue { field, line })
     }
 
-    /// Puts the open block scalar's value where its key belongs.
+    /// Puts the open block scalar's value where its key belongs, and returns to the state its key
+    /// was written in.
+    ///
+    /// The caller that ends a block on a line it did not consume re-reads that line in this state.
+    /// Leaving the state as `BlockScalar` would dispatch that line to `block_scalar` again with no
+    /// block open, which neither consumes the line nor leaves the state, so the scan would never
+    /// finish.
     fn finish_block(&mut self) {
         if let Some(block) = self.block.take() {
             let rendered = render_block(&block);
@@ -388,6 +424,7 @@ impl Scanner {
             } else {
                 self.fields.push((block.key, Value::Block(rendered)));
             }
+            self.state = block.after;
         }
     }
 }
@@ -551,14 +588,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_key_is_shape_checked() {
+    fn an_unknown_key_is_skipped_with_its_value() {
+        let raw = read("---\nvendor: [a]\nname: x\n---\nbody\n").unwrap();
+
         assert_eq!(
-            read("---\nvendor: [a]\n---\nbody\n"),
-            Err(Refusal::InvalidValue {
-                field: "vendor".to_string(),
-                line: 2,
-                text: "[a]".to_string(),
-            })
+            raw.fields,
+            vec![("name".to_string(), Value::Scalar("x".to_string()))],
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_s_value_swallows_its_indented_lines() {
+        let raw = read("---\nvendor:\n  a: 1\n  b: [2, 3]\nname: x\n---\nbody\n").unwrap();
+
+        assert_eq!(
+            raw.fields,
+            vec![("name".to_string(), Value::Scalar("x".to_string()))],
         );
     }
 
@@ -627,5 +672,37 @@ mod tests {
     fn the_body_is_everything_after_the_closing_fence() {
         let raw = read("---\nname: x\n---\n\nsecond line\n").unwrap();
         assert_eq!(raw.body, "\nsecond line\n");
+    }
+
+    #[test]
+    fn a_block_scalar_ends_at_the_next_top_level_key() {
+        let raw =
+            read("---\nname: s\ndescription: >-\n  one\n  two\nlicense: MIT\n---\nbody\n").unwrap();
+
+        assert_eq!(
+            raw.fields,
+            vec![
+                ("name".to_string(), Value::Scalar("s".to_string())),
+                (
+                    "description".to_string(),
+                    Value::Block("one two".to_string())
+                ),
+                ("license".to_string(), Value::Scalar("MIT".to_string())),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_block_scalar_ends_at_the_next_metadata_entry() {
+        let raw = read("---\nmetadata:\n  note: >-\n    one\n    two\n  author: org\n---\nbody\n")
+            .unwrap();
+
+        assert_eq!(
+            raw.metadata,
+            vec![
+                ("note".to_string(), "one two".to_string()),
+                ("author".to_string(), "org".to_string()),
+            ],
+        );
     }
 }

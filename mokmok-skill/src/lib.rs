@@ -3,7 +3,7 @@
 //! The crate owns one answer: what a `SKILL.md` may contain, and which files are not one. Two
 //! stages divide that answer. `frontmatter::read` checks the file's shape — the `---` fences, the
 //! value subset, and one level of `metadata` nesting. [`parse`] applies the field rules section 2
-//! names, so a key the spec does not name is parsed for shape and then dropped rather than refused.
+//! names. A key the spec does not name is skipped, value and all: nothing reads it.
 
 mod frontmatter;
 mod name;
@@ -56,9 +56,9 @@ pub struct Skill {
 
 /// Parses one `SKILL.md`, read from a directory whose name its `name` must equal.
 ///
-/// Only the file's shape is checked by `frontmatter::read`; this function applies the field rules,
-/// so a key the spec does not name is dropped, and a duplicate key naming a known field was already
-/// refused while reading.
+/// Only the file's shape is checked by `frontmatter::read`; this function applies the field rules.
+/// A key the spec does not name never reaches here — the reader skipped it, value and all — and a
+/// duplicate key naming a known field was refused while reading.
 ///
 /// # Errors
 ///
@@ -334,6 +334,21 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_description_between_other_keys_still_parses() {
+        // The shape real skills use: a folded description, then a scalar, then a folded
+        // compatibility. A scanner that does not leave the block state when its last continuation
+        // ends reads the key after it forever.
+        let text = "---\nname: s\ndescription: >-\n  Extract PDF text,\n  fill forms, merge files.\nlicense: MIT\ncompatibility: >-\n  Requires uv.\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(
+            skill.summary.description,
+            "Extract PDF text, fill forms, merge files."
+        );
+        assert_eq!(skill.license.as_deref(), Some("MIT"));
+        assert_eq!(skill.compatibility.as_deref(), Some("Requires uv."));
+    }
+
+    #[test]
     fn a_folded_compatibility_is_joined_with_a_space() {
         let text = "---\nname: s\ndescription: d\ncompatibility: >-\n  Requires uv\n  and Python.\n---\nbody\n";
         let skill = parse("s", text).unwrap();
@@ -391,18 +406,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_key_with_an_unsupported_value_is_refused() {
-        assert_eq!(
-            parse(
-                "s",
-                "---\nname: s\ndescription: d\nvendor: [a]\n---\nbody\n"
-            ),
-            Err(Refusal::InvalidValue {
-                field: "vendor".to_string(),
-                line: 4,
-                text: "[a]".to_string(),
-            })
-        );
+    fn an_unknown_key_is_skipped_with_its_value() {
+        let skill = parse(
+            "s",
+            "---\nname: s\ndescription: d\npaths: [\"**/*.ts\", \"**/*.tsx\"]\n---\nbody\n",
+        )
+        .unwrap();
+
+        assert_eq!(skill.summary.description, "d");
+        assert_eq!(skill.instructions, "body\n");
     }
 
     #[test]
