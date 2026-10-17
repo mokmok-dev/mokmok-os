@@ -1,5 +1,7 @@
 //! Why a file is not a skill: one variant per rule section 2 names.
 
+use alloc::string::String;
+
 use thiserror::Error;
 
 /// Why a file is not a skill.

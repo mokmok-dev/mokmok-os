@@ -38,14 +38,14 @@ One module, `src/lib.rs`, with no `mod` inside it.
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `Patch`, `FilePatch` | `src/lib.rs:9,16` | One diff, and one file's section of it |
-| `Label` | `src/lib.rs:27` | Which file a side names, with `/dev/null` as `Absent` |
-| `Hunk`, `Header` | `src/lib.rs:36,45` | One hunk and the four numbers its `@@` line stated |
-| `Line`, `Kind`, `FileLine` | `src/lib.rs:58,69,672` | One body line, what it does, and the equality its matching uses |
-| `Applied`, `Placed` | `src/lib.rs:80,89` | A patched file and where each hunk went |
-| `ParseError`, `ApplyError` | `src/lib.rs:108,123` | Why a diff could not be read, and why a section could not be applied |
-| `Patch::parse`, `recounted`, `to_unified` | `src/lib.rs:156,211,232` | Read a diff, recompute its counts, and render it again |
-| `FilePatch::apply` | `src/lib.rs:253` | Apply one section to the bytes the caller holds |
+| `Patch`, `FilePatch` | `src/lib.rs:19,26` | One diff, and one file's section of it |
+| `Label` | `src/lib.rs:37` | Which file a side names, with `/dev/null` as `Absent` |
+| `Hunk`, `Header` | `src/lib.rs:46,56` | One hunk and the four numbers its `@@` line stated |
+| `Line`, `Kind`, `FileLine` | `src/lib.rs:87,98,678` | One body line, what it does, and the equality its matching uses |
+| `Applied`, `Placed` | `src/lib.rs:121,130` | A patched file and where each hunk went |
+| `ParseError`, `ApplyError` | `src/lib.rs:149,164` | Why a diff could not be read, and why a section could not be applied |
+| `Patch::parse`, `recounted`, `to_unified` | `src/lib.rs:197,252,265` | Read a diff, recompute its counts, and render it again |
+| `FilePatch::apply` | `src/lib.rs:286` | Apply one section to the bytes the caller holds |
 
 # Owned state
 
@@ -77,7 +77,8 @@ from: the caller keeps the bytes it passed in.
 # Dependencies
 
 `thiserror` alone. Development adds `proptest`, which the property cases in `src/lib.rs` are the
-only consumer of. The crate declares `purity = "adapter"` in its manifest.[^manifest]
+only consumer of. The crate is `#![no_std]` with `extern crate alloc` (`src/lib.rs:6-8`), and it
+declares `purity = "pure"` in its manifest.[^manifest]
 
 # Reconciliation
 
@@ -90,7 +91,7 @@ the model's edit tool keeps it behind the kernel, which is what keeps the diff f
 
 # Tests
 
-One `#[cfg(test)] mod tests` in `src/lib.rs` holds 34 cases, two of them property cases inside a
+One `#[cfg(test)] mod tests` in `src/lib.rs` holds 35 cases, two of them property cases inside a
 single `proptest!` block. The property strategy generates removed lines as well as added ones, which
 is what lets a body's reading be falsified rather than assumed.
 
@@ -99,7 +100,7 @@ cargo test -p mokmok-patch
 MUTANTS_PACKAGE=mokmok-patch ./scripts/mutants.sh --jobs 8
 ```
 
-The mutation gate records 100% over 84 tested mutants for this member.
+The mutation gate records 100% over 82 tested mutants for this member.
 
 [^crate]: The crate doc and the module are `mokmok-patch/src/lib.rs:1`.
 [^manifest]: The manifest is `mokmok-patch/Cargo.toml:7`.
