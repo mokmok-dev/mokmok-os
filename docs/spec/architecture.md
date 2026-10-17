@@ -77,9 +77,9 @@ the eight layers and none of the formal one, which
 | Applications | Rust agents and external Effect-TS applications | A Rust agent runtime, a kernel loop over it, and a terminal front end |
 | User interfaces | CLI and React, with desktop integration later | A CLI, and a terminal user interface |
 
-Pure contract and transition crates avoid runtime dependencies. Four crates are `#![no_std]`:
-protocol, state machine, scheduler, and capability. Each one declares `extern crate alloc`, and each
-one passes a check that it holds no I/O dependency.
+Pure contract and transition crates avoid runtime dependencies. Six crates are `#![no_std]`:
+protocol, state machine, scheduler, capability, patch, and skill. Each one declares
+`extern crate alloc`, and each one passes a check that it holds no I/O dependency.
 
 The design's cross-language claim has no counterpart yet. There is no TypeScript in the workspace,
 so the shared-contract argument rests on Rust alone.

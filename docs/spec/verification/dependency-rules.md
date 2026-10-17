@@ -9,6 +9,7 @@ generated: { by: grok-build/grok-4.7, at: 2026-10-15T02:00:00Z }
 verified:
   - { by: process:dependency-rules, at: 2026-10-15T02:04:00Z }
   - { by: process:dependency-rules, at: 2026-10-16T02:00:00Z }
+  - { by: process:dependency-rules, at: 2026-10-18T00:30:00Z }
 stale_after: 2026-11-15T00:00:00Z
 parameters:
   - { name: repo, type: string, required: true }
@@ -145,6 +146,28 @@ manifest can name a package under a key that is not the package name, with
 A text scan sees none of the three, so the rule reported a pass over a crate that named the
 forbidden package. An independent verifier found this on the first version of this page and the
 three faults hold the fix.
+
+# The run on 2026-10-18
+
+Nine rules. All nine returned `status=pass` at the head of `refactor/pure-patch-skill`, where
+`mokmok-patch` and `mokmok-skill` moved from the `adapter` role to `pure` and to `#![no_std]` with
+`extern crate alloc`.
+
+```
+rule=protocol-has-no-domain-dependency status=pass
+rule=every-member-declares-its-role status=pass
+rule=pure-crates-are-no_std status=pass
+rule=pure-crates-depend-only-on-pure-crates status=pass
+rule=the-role-census-is-not-empty status=pass detail=pure=6 adapter=8 shell=2
+rule=event-store-has-no-transport-dependency status=pass
+rule=scheduler-has-no-model-dependency status=pass
+rule=capability-performs-no-enforcement-io status=pass
+rule=kernel-dependents-are-applications status=pass
+```
+
+`pure=6 adapter=8 shell=2` is all sixteen members. Two members moved role together with their
+sources: `pure-crates-are-no_std` holds a declaration and a `#![no_std]` line to each other, so a
+member cannot take one without the other.
 
 # What this proves
 

@@ -44,7 +44,7 @@ The table below is that strategy with a third column for what exists in this tre
 | Layer | Purpose | In this tree |
 | --- | --- | --- |
 | Unit | Local behaviour | `#[test]` and `#[tokio::test]` cases in every crate |
-| Property and model-based | Invariants across generated sequences | `proptest` in ten crates, and `proptest-state-machine` in `mokmok-state-machine` |
+| Property and model-based | Invariants across generated sequences | `proptest` in twelve crates, and `proptest-state-machine` in `mokmok-state-machine` |
 | Mutation | Weak assertions | `scripts/mutants.sh`: one package per run at a 95% floor, `--all` scores every member into `mutation.json` |
 | Fuzzing | Unexpected input | Absent |
 | Concurrency | Controlled interleavings | Real concurrent tests using two stores, two writers, and a churning publisher; no Loom |
@@ -63,8 +63,8 @@ The mutation gate is a script the operator runs, not a check. One package per in
 by `MUTANTS_PACKAGE`, enforces a floor of 95% by default. `--all` sweeps every member, writes each
 one's score and target to `mutation.json`, and exports the confiner the kernel's and the tui's
 integration tests need; `--check-baseline` reads that ledger back and reports which rows moved.
-Eight mutants across six members are excluded as equivalent, each with its proof beside the
-exclusion in `.cargo/mutants.toml`, and one of those eight is a scope limit rather than an
+Twelve mutants across six members are excluded as equivalent, each with its proof beside the
+exclusion in `.cargo/mutants.toml`, and one of those twelve is a scope limit rather than an
 equivalence. All sixteen members score 100% over the mutants that remain.[^mutants]
 
 # The four attested computations
