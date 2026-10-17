@@ -619,7 +619,7 @@ mod tests {
     #[test]
     fn an_empty_frontmatter_is_shaped_not_refused() {
         let raw = read("---\n---\nbody\n").unwrap();
-        assert!(raw.fields.is_empty());
+        assert_eq!(raw.fields.len(), 0);
         assert_eq!(raw.body, "body\n");
     }
 
