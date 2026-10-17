@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: The workspace as it stands
-description: The fourteen workspace members, who composes each one, and how they map onto the design's crate set.
+description: The sixteen workspace members, who composes each one, and how they map onto the design's crate set.
 resource: ../../Cargo.toml
 tags: [mokmok-os, architecture, workspace]
 status: draft
@@ -18,10 +18,10 @@ sources:
     last_modified: 2026-10-15T08:39:00Z
 ---
 
-# The fifteen members
+# The sixteen members
 
-`Cargo.toml` lists fifteen members.[^manifest] Each one carries a target logical boundary from the
-design's crate map, and the last three have no section in the design at all.
+`Cargo.toml` lists sixteen members.[^manifest] Each one carries a target logical boundary from the
+design's crate map, and four of them have no section in the design at all.
 
 | Member | Design section | Dependents | How it is composed |
 | --- | --- | --- | --- |
@@ -38,13 +38,14 @@ design's crate map, and the last three have no section in the design at all.
 | `mokmok-observability` | 5.11 | `mokmok-kernel` | The tracing subscriber, and the audit journal |
 | `mokmok-search` | None | `mokmok-kernel` | One corpus per granted root, read by the kernel's finder |
 | `mokmok-patch` | None | `mokmok-kernel` | One unified diff read into recomputed counts, applied in memory by the kernel's editor |
+| `mokmok-skill` | None | `mokmok-agent-runtime`, `mokmok-kernel` | One `SKILL.md` frozen into an advert by the kernel's discovery, activated through the kernel's library |
 | `mokmok-kernel` | 5.12 | `mokmok-tui` | The daemon binary and the TUI |
 | `mokmok-tui` | None | Nobody | An application above the kernel |
 
 # The physical split differs from the plan
 
 The design proposes seven physical crates with the target boundaries grouped inside them, and an
-extraction step later.[^architecture] The tree holds fourteen, one per target boundary, and never
+extraction step later.[^architecture] The tree holds sixteen, one per target boundary, and never
 created the grouped crates `mokmok-agent`, `mokmok-security`, or `mokmok-execution`.
 
 | Design's initial crate | What it grouped | What exists instead |
