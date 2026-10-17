@@ -40,6 +40,25 @@ pub struct Hunk {
     pub lines: Vec<Line>,
 }
 
+impl Hunk {
+    /// The header this hunk's body implies, with the starts left as stated.
+    fn counted(&self) -> Header {
+        Header {
+            old_len: self
+                .lines
+                .iter()
+                .filter(|line| line.kind.on_old_side())
+                .count() as u64,
+            new_len: self
+                .lines
+                .iter()
+                .filter(|line| line.kind.on_new_side())
+                .count() as u64,
+            ..self.stated
+        }
+    }
+}
+
 /// The numbers one `@@` header states, as bytes in the diff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Header {
@@ -73,6 +92,18 @@ pub enum Kind {
     Removed,
     /// A line present only on the new side.
     Added,
+}
+
+impl Kind {
+    /// Whether a line of this kind occupies a line of the old side.
+    const fn on_old_side(self) -> bool {
+        matches!(self, Self::Context | Self::Removed)
+    }
+
+    /// Whether a line of this kind occupies a line of the new side.
+    const fn on_new_side(self) -> bool {
+        matches!(self, Self::Context | Self::Added)
+    }
 }
 
 /// A file with every hunk applied.
@@ -212,16 +243,8 @@ impl Patch {
         let mut files = self.files.clone();
         for file in &mut files {
             for hunk in &mut file.hunks {
-                hunk.stated.old_len = hunk
-                    .lines
-                    .iter()
-                    .filter(|line| matches!(line.kind, Kind::Context | Kind::Removed))
-                    .count() as u64;
-                hunk.stated.new_len = hunk
-                    .lines
-                    .iter()
-                    .filter(|line| matches!(line.kind, Kind::Context | Kind::Added))
-                    .count() as u64;
+                let counted = hunk.counted();
+                hunk.stated = counted;
             }
         }
         Self { files }
@@ -266,19 +289,15 @@ impl FilePatch {
         let mut delta: i64 = 0;
 
         for (hunk_index, hunk) in self.hunks.iter().enumerate() {
-            let old_side: Vec<usize> = hunk
+            let old_side: Vec<&Line> = hunk
                 .lines
                 .iter()
-                .enumerate()
-                .filter(|(_, line)| matches!(line.kind, Kind::Context | Kind::Removed))
-                .map(|(index, _)| index)
+                .filter(|line| line.kind.on_old_side())
                 .collect();
-            let new_side: Vec<usize> = hunk
+            let new_side: Vec<&Line> = hunk
                 .lines
                 .iter()
-                .enumerate()
-                .filter(|(_, line)| matches!(line.kind, Kind::Context | Kind::Added))
-                .map(|(index, _)| index)
+                .filter(|line| line.kind.on_new_side())
                 .collect();
 
             let n = file_lines.len();
@@ -320,13 +339,9 @@ impl FilePatch {
                 let idx = shifted.saturating_sub(1);
                 let found_idx = (idx..=max_idx)
                     .find(|&candidate| {
-                        old_side
-                            .iter()
-                            .enumerate()
-                            .all(|(offset_in_side, &line_index)| {
-                                file_lines[candidate + offset_in_side]
-                                    .matches(&hunk.lines[line_index])
-                            })
+                        old_side.iter().enumerate().all(|(offset_in_side, line)| {
+                            file_lines[candidate + offset_in_side].matches(line)
+                        })
                     })
                     .ok_or(ApplyError::NotFound { hunk: hunk_index })?;
                 let line = u64::try_from(found_idx + 1).unwrap_or(u64::MAX);
@@ -338,7 +353,7 @@ impl FilePatch {
 
             let replacements: Vec<FileLine> = new_side
                 .iter()
-                .map(|&line_index| FileLine::from_hunk_line(&hunk.lines[line_index]))
+                .map(|line| FileLine::from_hunk_line(line))
                 .collect();
             file_lines.splice(insert_index..insert_index + old_side.len(), replacements);
             delta += i64::try_from(new_side.len()).unwrap_or(i64::MAX)
@@ -405,6 +420,70 @@ fn parse_hunk<'a>(
     body_by_prefix_scan(stated, tail)
 }
 
+/// One step through a hunk body.
+enum Step {
+    /// A body line, read from the diff but not yet placed.
+    Line(Line),
+    /// The `\ No newline at end of file` marker, which clears the newline of the line before it.
+    Marker,
+}
+
+/// Reads one body line, or answers `None` when the line cannot be one.
+///
+/// Both readers of a body take their line grammar from here, so a line a body may hold is decided
+/// once and the two readings differ only in where they stop.
+fn body_step(line: &str) -> Option<Step> {
+    if line == "\\ No newline at end of file" {
+        return Some(Step::Marker);
+    }
+
+    if line.is_empty() {
+        return Some(Step::Line(Line {
+            kind: Kind::Context,
+            text: String::new(),
+            newline: true,
+        }));
+    }
+
+    let kind = match line.as_bytes()[0] {
+        b' ' => Kind::Context,
+        b'-' => Kind::Removed,
+        b'+' => Kind::Added,
+        _ => return None,
+    };
+
+    Some(Step::Line(Line {
+        kind,
+        text: line[1..].to_string(),
+        newline: true,
+    }))
+}
+
+impl Step {
+    /// Places the step on the body and answers the old-side and new-side lines it accounts for.
+    fn place(
+        self,
+        body: &mut Vec<Line>,
+    ) -> (u64, u64) {
+        match self {
+            Self::Line(line) => {
+                let counted = (
+                    u64::from(line.kind.on_old_side()),
+                    u64::from(line.kind.on_new_side()),
+                );
+                body.push(line);
+                counted
+            },
+            Self::Marker => {
+                if let Some(last) = body.last_mut() {
+                    last.newline = false;
+                }
+                (0, 0)
+            },
+        }
+    }
+}
+
 fn body_by_counts<'a>(
     stated: Header,
     tail: &'a [&'a str],
@@ -416,67 +495,28 @@ fn body_by_counts<'a>(
 
     while let Some((line, after)) = rest.split_first() {
         if old_seen >= stated.old_len && new_seen >= stated.new_len {
-            return if is_body_boundary(line, after.first()) {
-                Some((
-                    Hunk {
-                        stated,
-                        lines: body,
-                    },
-                    rest,
-                ))
-            } else {
-                None
-            };
+            return is_body_boundary(line, after.first()).then_some((
+                Hunk {
+                    stated,
+                    lines: body,
+                },
+                rest,
+            ));
         }
 
-        if *line == "\\ No newline at end of file" {
-            if let Some(last) = body.last_mut() {
-                last.newline = false;
-            }
-            rest = after;
-            continue;
-        }
-
-        if line.is_empty() {
-            body.push(Line {
-                kind: Kind::Context,
-                text: String::new(),
-                newline: true,
-            });
-            old_seen = old_seen.saturating_add(1);
-            new_seen = new_seen.saturating_add(1);
-            rest = after;
-            continue;
-        }
-
-        let (kind, old_delta, new_delta) = match line.as_bytes()[0] {
-            b' ' => (Kind::Context, 1, 1),
-            b'-' => (Kind::Removed, 1, 0),
-            b'+' => (Kind::Added, 0, 1),
-            _ => return None,
-        };
-
-        body.push(Line {
-            kind,
-            text: line[1..].to_string(),
-            newline: true,
-        });
-        old_seen = old_seen.saturating_add(old_delta);
-        new_seen = new_seen.saturating_add(new_delta);
+        let (old, new) = body_step(line)?.place(&mut body);
+        old_seen = old_seen.saturating_add(old);
+        new_seen = new_seen.saturating_add(new);
         rest = after;
     }
 
-    if old_seen >= stated.old_len && new_seen >= stated.new_len {
-        Some((
-            Hunk {
-                stated,
-                lines: body,
-            },
-            rest,
-        ))
-    } else {
-        None
-    }
+    (old_seen >= stated.old_len && new_seen >= stated.new_len).then_some((
+        Hunk {
+            stated,
+            lines: body,
+        },
+        rest,
+    ))
 }
 
 /// Whether `line` ends a hunk body.
@@ -507,36 +547,10 @@ fn body_by_prefix_scan<'a>(
             break;
         }
 
-        if *line == "\\ No newline at end of file" {
-            if let Some(last) = body.last_mut() {
-                last.newline = false;
-            }
-            rest = after;
-            continue;
-        }
-
-        if line.is_empty() {
-            body.push(Line {
-                kind: Kind::Context,
-                text: String::new(),
-                newline: true,
-            });
-            rest = after;
-            continue;
-        }
-
-        let kind = match line.as_bytes()[0] {
-            b' ' => Kind::Context,
-            b'-' => Kind::Removed,
-            b'+' => Kind::Added,
-            _ => return Err(ParseError::InvalidHunkLine(line.to_string())),
+        let Some(step) = body_step(line) else {
+            return Err(ParseError::InvalidHunkLine(line.to_string()));
         };
-
-        body.push(Line {
-            kind,
-            text: line[1..].to_string(),
-            newline: true,
-        });
+        step.place(&mut body);
         rest = after;
     }
 
@@ -550,11 +564,10 @@ fn body_by_prefix_scan<'a>(
 }
 
 fn parse_header(line: &str) -> Result<Header, ParseError> {
-    if !line.starts_with("@@") {
-        return Err(ParseError::InvalidHeader(line.to_string()));
-    }
+    let rest = line
+        .strip_prefix("@@")
+        .ok_or_else(|| ParseError::InvalidHeader(line.to_string()))?;
 
-    let rest = &line[2..];
     let marker = rest
         .find("@@")
         .ok_or_else(|| ParseError::InvalidHeader(line.to_string()))?;
@@ -627,21 +640,12 @@ fn write_hunk(
     out: &mut String,
     hunk: &Hunk,
 ) {
-    let old_len = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line.kind, Kind::Context | Kind::Removed))
-        .count() as u64;
-    let new_len = hunk
-        .lines
-        .iter()
-        .filter(|line| matches!(line.kind, Kind::Context | Kind::Added))
-        .count() as u64;
+    let counted = hunk.counted();
 
     let _ = writeln!(
         out,
         "@@ -{},{} +{},{} @@",
-        hunk.stated.old_start, old_len, hunk.stated.new_start, new_len
+        counted.old_start, counted.old_len, counted.new_start, counted.new_len
     );
 
     for line in &hunk.lines {
@@ -671,9 +675,7 @@ impl FileLine {
         &self,
         hunk_line: &Line,
     ) -> bool {
-        matches!(hunk_line.kind, Kind::Context | Kind::Removed)
-            && self.text == hunk_line.text
-            && self.newline == hunk_line.newline
+        self.text == hunk_line.text && self.newline == hunk_line.newline
     }
 
     fn from_hunk_line(line: &Line) -> Self {
@@ -685,10 +687,6 @@ impl FileLine {
 }
 
 fn split_text(text: &str) -> Vec<FileLine> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-
     let mut lines = Vec::new();
     let mut start = 0;
     for (index, character) in text.char_indices() {
