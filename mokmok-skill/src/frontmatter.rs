@@ -350,11 +350,10 @@ impl Scanner {
             });
         }
 
-        let repeated = self.metadata.iter().any(|(seen, _)| seen == key)
-            || self
-                .pending_empty
-                .as_ref()
-                .is_some_and(|(seen, _)| seen == key);
+        // Only a pushed entry can repeat here: an entry written with no value moves to
+        // `MetadataValue`, which refuses the next indented line rather than reading another entry,
+        // so `pending_empty` is always `None` by the time a second entry is read.
+        let repeated = self.metadata.iter().any(|(seen, _)| seen == key);
         if repeated {
             return Err(Refusal::DuplicateKey {
                 key: key.to_string(),
