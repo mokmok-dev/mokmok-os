@@ -5,6 +5,9 @@
 //! naming a known field. It does not decide what a valid `name` or `description` is; [`read`]
 //! returns a [`Raw`] and `crate::parse` applies the field rules.
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use crate::MAX_FRONTMATTER_BYTES;
 use crate::refusal::Refusal;
 
@@ -527,6 +530,9 @@ fn split_lines(text: &str) -> Vec<(&str, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+    use alloc::vec;
+
     use super::*;
 
     /// [`read`], bounded, so a scanner that stops advancing its cursor fails a case here instead
