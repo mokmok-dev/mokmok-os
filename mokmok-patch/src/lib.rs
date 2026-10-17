@@ -577,12 +577,9 @@ fn parse_header(line: &str) -> Result<Header, ParseError> {
 }
 
 fn parse_range(token: &str) -> Result<(u64, u64), ParseError> {
-    let bytes = token.as_bytes();
-    if bytes.len() < 2 {
-        return Err(ParseError::InvalidHeader(token.to_string()));
-    }
-
-    let rest = &token[1..];
+    let rest = token
+        .get(1..)
+        .ok_or_else(|| ParseError::InvalidHeader(token.to_string()))?;
     let (start_s, len_s) = rest
         .find(',')
         .map_or((rest, "1"), |index| (&rest[..index], &rest[index + 1..]));
@@ -912,6 +909,16 @@ mod tests {
         let recounted = patch.recounted();
         assert_eq!(recounted.files[0].hunks[0].stated.old_len, 2);
         assert_eq!(recounted.files[0].hunks[0].stated.new_len, 2);
+    }
+
+    #[test]
+    fn a_header_whose_range_starts_with_a_wide_character_is_refused() {
+        let diff = "--- a/f\n+++ b/f\n@@ →1,2 +3,4 @@\n a\n";
+
+        assert!(matches!(
+            Patch::parse(diff),
+            Err(ParseError::InvalidHeader(_))
+        ));
     }
 
     #[test]
