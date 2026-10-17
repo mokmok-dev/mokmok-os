@@ -7,7 +7,7 @@ version.workspace = true
 purity = "adapter"
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["alloc", "derive"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
