@@ -138,7 +138,8 @@ pub fn parse(
     })
 }
 
-/// The last field named `key`, if any. A known key cannot repeat; an unknown one may.
+/// The field named `key`, if any. A known key cannot repeat, so a caller asking for one is handed
+/// the only one; only an unknown key may appear more than once, and no caller asks for those.
 fn field<'a>(
     raw: &'a frontmatter::Raw,
     key: &str,
@@ -252,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn the_measured_poteto_mode_name_is_refused() {
+    fn a_display_name_with_uppercase_and_a_space_is_refused() {
         assert!(parse("poteto-mode", &skill("Poteto Mode", "d")).is_err());
     }
 
@@ -390,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_parsed_for_shape_and_dropped() {
+    fn an_unknown_key_with_an_unsupported_value_is_refused() {
         assert_eq!(
             parse(
                 "s",
