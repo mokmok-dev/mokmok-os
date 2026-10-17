@@ -2600,16 +2600,53 @@ mod tests {
 
         assert_eq!(skills.calls(), 0);
         let transcript = journal.transcript(session).unwrap();
-        assert!(matches!(
+        assert_eq!(
             transcript.skill_of(turn).map(|record| &record.outcome),
-            Some(SkillOutcome::Refused { .. }),
-        ));
+            Some(&SkillOutcome::Refused {
+                reason: "no advertised skill is named other-skill".to_owned(),
+            }),
+            "a session holding adverts says the name was not among them",
+        );
         assert_eq!(
             transcript.newest_turn().unwrap().1.outcome(),
             Some(TurnOutcome::Failed),
         );
         assert!(
             matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_asked_of_a_session_that_advertised_nothing_reads_the_no_skills_sentence() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(turn, 1, named("pdf-processing")));
+        let skills = FakeSkills::of([]);
+
+        advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &skills,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        let transcript = journal.transcript(session).unwrap();
+        assert_eq!(
+            transcript.skill_of(turn).map(|record| &record.outcome),
+            Some(&SkillOutcome::Refused {
+                reason: "no skill was advertised, so none can be loaded".to_owned(),
+            }),
+            "a session holding no adverts at all says so instead of naming a missing one",
         );
     }
 

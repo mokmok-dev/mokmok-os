@@ -1559,6 +1559,32 @@ mod tests {
     }
 
     #[test]
+    fn context_bytes_charges_a_refused_skill_its_name_and_its_reason() {
+        let built = Context {
+            system: String::new(),
+            goal: String::new(),
+            turns: vec![ContextTurn {
+                number: TurnNumber::new(1),
+                speech: None,
+                act: Some(ContextAct::Refused {
+                    name: pdf_name(),
+                    reason: "the file vanished".to_owned(),
+                }),
+            }],
+            search: false,
+            writable: false,
+            skills: true,
+            loaded: Vec::new(),
+        };
+
+        assert_eq!(
+            built.bytes(),
+            "pdf-processing".len() + "the file vanished".len() + 8,
+            "a refusal spends the name plus the reason, not the two multiplied",
+        );
+    }
+
+    #[test]
     fn the_trim_drops_older_turns_before_it_can_touch_a_loaded_body() {
         let (_, _, mut transcript) = loaded_turn("the body");
         transcript.task.as_mut().unwrap().budget.context_bytes = 1;
