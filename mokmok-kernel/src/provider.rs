@@ -36,6 +36,8 @@ const FIND_TOOL: &str = "find_files";
 
 const EDIT_TOOL: &str = "apply_patch";
 
+const USE_SKILL_TOOL: &str = "use_skill";
+
 const SHELL_DESCRIPTION: &str = "Run one shell command with `sh -c` in a fresh, empty working \
      directory. The checkout is reached by absolute path, stdin is empty, and there is no TCP \
      network.";
@@ -48,6 +50,10 @@ const EDIT_DESCRIPTION: &str = "Apply a unified diff to one file under the check
      the tool never follows a symlink. One file per call, and the patch applies cleanly or \
      nothing is written. An optional expect carries the sha256 the model believes the file \
      holds; the edit is refused if the file does not match.";
+
+const USE_SKILL_DESCRIPTION: &str = "Load one advertised skill's instructions by name. The name \
+     must be one the system prompt lists under \"Skills you may load by name with use_skill\"; the \
+     instructions then ride every later prompt for the session.";
 
 /// The chat-completions path appended to a configured endpoint.
 const COMPLETIONS: &str = "/chat/completions";
@@ -559,13 +565,30 @@ pub fn request_body(
     serde_json::json!({
         "model": model,
         "messages": [
-            {"role": "system", "content": context.system},
+            {"role": "system", "content": system_text(context)},
             {"role": "user", "content": user_text(context)},
         ],
         "tools": tools(context),
         "max_tokens": max_tokens,
         "stream": false,
     })
+}
+
+/// The system message: the base prompt, then each loaded skill's own heading and body.
+///
+/// The loaded bodies ride the system message rather than the user text so that progressive
+/// disclosure adds them once, after the prompt the session was opened with, and a later turn's user
+/// message stays the goal and the turns it always was.
+fn system_text(context: &Context) -> String {
+    let mut text = context.system.clone();
+    for skill in &context.loaded {
+        text.push_str("\n\nSkill `");
+        text.push_str(skill.name.as_str());
+        text.push_str("`:\n");
+        text.push_str(&skill.instructions);
+    }
+
+    text
 }
 
 /// The tools the request offers, in the order the model reads them.
@@ -580,6 +603,9 @@ fn tools(context: &Context) -> Vec<serde_json::Value> {
     }
     if context.writable {
         tools.push(edit_tool());
+    }
+    if context.skills {
+        tools.push(use_skill_tool());
     }
 
     tools
@@ -639,6 +665,21 @@ fn edit_tool() -> serde_json::Value {
     })
 }
 
+fn use_skill_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": USE_SKILL_TOOL,
+            "description": USE_SKILL_DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    })
+}
+
 /// The goal the model was asked to reach, with the settled turns appended once there are any.
 fn user_text(context: &Context) -> String {
     let turns = turns_text(context);
@@ -691,6 +732,18 @@ fn turn_text(turn: &ContextTurn) -> String {
         Some(ContextAct::Edited { observation }) => {
             text.push_str("\nedit: ");
             text.push_str(observation);
+        },
+        // A load names the skill whose body now rides the system message; a refusal names the reason
+        // it did not, so the model can tell the two without re-reading the instructions block.
+        Some(ContextAct::Loaded { name }) => {
+            text.push_str("\nskill loaded: ");
+            text.push_str(name.as_str());
+        },
+        Some(ContextAct::Refused { name, reason }) => {
+            text.push_str("\nskill refused: ");
+            text.push_str(name.as_str());
+            text.push_str("\nreason: ");
+            text.push_str(reason);
         },
         None => {},
     }
@@ -842,6 +895,20 @@ fn tool_call(message: &serde_json::Value) -> Action {
             },
             |reason| Action::Malformed { reason },
         ),
+        USE_SKILL_TOOL => decoded
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || Action::Malformed {
+                    reason: "the tool arguments name no skill name string".to_owned(),
+                },
+                |name| match mokmok_agent_runtime::SkillName::new(name) {
+                    Ok(name) => Action::UseSkill { name },
+                    Err(refusal) => Action::Malformed {
+                        reason: format!("the skill name is not valid: {refusal}"),
+                    },
+                },
+            ),
         other => Action::Malformed {
             reason: format!("the answer called {other:?}, which is not a tool of this session"),
         },
@@ -877,8 +944,8 @@ mod tests {
     use crate::config::{Config, ProviderKind, ProviderSettings};
     use clap::Parser as _;
     use mokmok_agent_runtime::{
-        Context, ContextAct, ContextTurn, MAX_PROSE_BYTES, MAX_QUERY_BYTES, Provider as _,
-        clip_prose,
+        Context, ContextAct, ContextSkill, ContextTurn, MAX_PROSE_BYTES, MAX_QUERY_BYTES,
+        Provider as _, SkillName, clip_prose,
     };
     use mokmok_egress::{
         AddressClass, CallContext, Destination, Host, Port, Refusal, Rules, Scheme,
@@ -917,6 +984,8 @@ mod tests {
             turns: Vec::new(),
             search: false,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         }
     }
 
@@ -1110,6 +1179,8 @@ mod tests {
             ],
             search: false,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1135,6 +1206,8 @@ mod tests {
             }],
             search: true,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1236,6 +1309,80 @@ mod tests {
         );
     }
 
+    fn skilled() -> Context {
+        Context {
+            skills: true,
+            ..context()
+        }
+    }
+
+    #[test]
+    fn the_body_offers_use_skill_exactly_when_the_session_advertises_a_skill() {
+        let bare = request_body(&context(), "m", 1);
+        assert_eq!(bare["tools"].as_array().unwrap().len(), 1);
+
+        let offered = request_body(&skilled(), "m", 1);
+        let tools = offered["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["function"]["name"], "use_skill");
+        assert_eq!(
+            tools[1]["function"]["parameters"]["properties"]["name"]["type"],
+            "string",
+        );
+        assert_eq!(tools[1]["function"]["parameters"]["required"][0], "name");
+    }
+
+    #[test]
+    fn a_use_skill_call_decodes_to_the_named_action() {
+        let answer = parse_answer(
+            &call_body("use_skill", r#"{"name": "pdf-processing"}"#),
+            "m",
+        )
+        .unwrap();
+
+        assert_eq!(
+            answer.action,
+            Action::UseSkill {
+                name: SkillName::new("pdf-processing").unwrap(),
+            },
+        );
+    }
+
+    #[test]
+    fn a_use_skill_call_naming_an_invalid_skill_is_malformed() {
+        let answer = parse_answer(&call_body("use_skill", r#"{"name": "Bad Name"}"#), "m").unwrap();
+
+        assert!(matches!(answer.action, Action::Malformed { .. }));
+    }
+
+    #[test]
+    fn a_use_skill_call_naming_no_skill_is_malformed() {
+        let answer = parse_answer(&call_body("use_skill", "{}"), "m").unwrap();
+
+        assert!(matches!(answer.action, Action::Malformed { .. }));
+    }
+
+    #[test]
+    fn the_system_message_carries_every_loaded_skill_after_the_base_prompt() {
+        let loaded = Context {
+            skills: true,
+            loaded: vec![ContextSkill {
+                name: SkillName::new("pdf-processing").unwrap(),
+                instructions: "do the thing".to_owned(),
+            }],
+            ..context()
+        };
+
+        let body = request_body(&loaded, "m", 1);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+
+        assert!(system.starts_with("the system prompt"), "{system}");
+        assert!(
+            system.contains("Skill `pdf-processing`:\ndo the thing"),
+            "the loaded body rides the system message after the base prompt: {system}",
+        );
+    }
+
     #[test]
     fn the_first_call_carries_the_goal_as_a_user_message() {
         let body = request_body(&context(), "m", 1);
@@ -1261,6 +1408,8 @@ mod tests {
             }],
             search: false,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         };
 
         let body = request_body(&turns, "m", 1);
@@ -1410,6 +1559,8 @@ mod tests {
             turns: Vec::new(),
             search: false,
             writable: false,
+            skills: false,
+            loaded: Vec::new(),
         };
 
         let answer = provider.complete(&prompt).await.unwrap();
@@ -1441,6 +1592,7 @@ mod tests {
             allow_write: Vec::new(),
             search_root: Vec::new(),
             search_index: data.join("search"),
+            skill_root: Vec::new(),
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,

@@ -152,6 +152,7 @@ mod tests {
                 program: PathBuf::from("/bin/sh"),
                 deadline: Duration::from_secs(1),
                 search: Vec::new(),
+                skills: Vec::new(),
             },
             budget: Budget::default(),
         }

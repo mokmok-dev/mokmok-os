@@ -309,6 +309,7 @@ mod tests {
             allow_write,
             search_root: Vec::new(),
             search_index: data.join("search"),
+            skill_root: Vec::new(),
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,

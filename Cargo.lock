@@ -1550,6 +1550,7 @@ name = "mokmok-agent-runtime"
 version = "0.0.0"
 dependencies = [
  "mokmok-protocol",
+ "mokmok-skill",
  "mokmok-state-machine",
  "proptest",
  "serde",
@@ -1644,6 +1645,7 @@ dependencies = [
  "mokmok-sandbox",
  "mokmok-scheduler",
  "mokmok-search",
+ "mokmok-skill",
  "mokmok-state-machine",
  "nix 0.31.3",
  "proptest",

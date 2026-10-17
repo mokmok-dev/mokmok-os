@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
 use mokmok_state_machine::{Ack, Attempt, Rejection, Session, State, Turn, TurnFact, TurnNumber};
 
+use crate::context::ContextSkill;
 use crate::edit::{EditOutcome, EditReport};
 use crate::model::Action;
 use crate::record::{
     AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
-    PromptRecord, Record, RecordKey, Refusal, SpeechRecord, TaskRecord,
+    PromptRecord, Record, RecordKey, Refusal, SkillOutcome, SkillRecord, SpeechRecord, TaskRecord,
 };
 use crate::task::Task;
 use crate::tool::{self, ToolReport};
@@ -39,6 +40,10 @@ pub struct Transcript {
     ///
     /// One turn carries one action, so a turn holds at most one find, and the turn is the key.
     pub finds: BTreeMap<TurnID, FindRecord>,
+    /// The activation one turn asked for, when its answer asked for one.
+    ///
+    /// One turn carries one action, so a turn holds at most one activation, and the turn is the key.
+    pub skills: BTreeMap<TurnID, SkillRecord>,
     /// The report each result record carried, so a redelivery is compared as the whole record and
     /// the observation it holds is what the model was shown.
     pub runs: BTreeMap<ExecutionID, ToolReport>,
@@ -61,6 +66,7 @@ impl Transcript {
             answers: BTreeMap::new(),
             calls: BTreeMap::new(),
             finds: BTreeMap::new(),
+            skills: BTreeMap::new(),
             runs: BTreeMap::new(),
             edit_intents: BTreeMap::new(),
             edit_outcomes: BTreeMap::new(),
@@ -160,6 +166,41 @@ impl Transcript {
         self.finds.get(&turn)
     }
 
+    #[must_use]
+    pub fn skill_of(
+        &self,
+        turn: TurnID,
+    ) -> Option<&SkillRecord> {
+        self.skills.get(&turn)
+    }
+
+    /// The bodies activation has loaded, in turn order, deduped by name, the first body winning.
+    ///
+    /// A name loaded twice keeps the body the first load recorded: the turn order is what the model
+    /// saw, so a later load of the same name must not rewrite the instructions already in the
+    /// prompt. The rendering is the floor `Context::loaded` holds, so it survives the turn trim.
+    #[must_use]
+    pub fn loaded(&self) -> Vec<ContextSkill> {
+        let mut seen = std::collections::HashSet::new();
+        let mut loaded = Vec::new();
+
+        for (turn, _) in self.turns_in_order() {
+            let Some(record) = self.skills.get(&turn) else {
+                continue;
+            };
+            if let SkillOutcome::Loaded { instructions } = &record.outcome
+                && seen.insert(record.name.clone())
+            {
+                loaded.push(ContextSkill {
+                    name: record.name.clone(),
+                    instructions: instructions.clone(),
+                });
+            }
+        }
+
+        loaded
+    }
+
     /// The edit intent one turn recorded, if any.
     #[must_use]
     pub fn edit_of(
@@ -240,6 +281,7 @@ impl Record {
             Self::Answer(record) => apply_answer(into, record),
             Self::Call(record) => apply_call(into, record),
             Self::Find(record) => apply_find(into, record),
+            Self::Skill(record) => apply_skill(into, record),
             Self::EditIntent(record) => apply_edit_intent(into, record),
             Self::EditOutcome(record) => apply_edit_outcome(into, record),
             Self::Speech(record) => apply_speech(into, record),
@@ -441,6 +483,13 @@ fn apply_call(
                 call: record.command.clone(),
             });
         },
+        Some(Action::UseSkill { name }) => {
+            return Err(Refusal::CommandMismatch {
+                turn: record.turn,
+                answer: name.to_string(),
+                call: record.command.clone(),
+            });
+        },
         None | Some(Action::Command { .. } | Action::Final | Action::Malformed { .. }) => {},
     }
 
@@ -467,6 +516,7 @@ fn apply_find(
     let named = match named {
         Action::Find { query } => query,
         Action::Edit { patch, .. } => patch,
+        Action::UseSkill { name } => name.as_str(),
         Action::Command { .. } | Action::Final | Action::Malformed { .. } => "",
     };
     if named != record.query {
@@ -478,6 +528,40 @@ fn apply_find(
     }
 
     into.finds.insert(record.turn, record.clone());
+    Ok(Ack::Applied)
+}
+
+fn apply_skill(
+    into: &mut Transcript,
+    record: &SkillRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::UseSkill(record.turn);
+    if let Some(recorded) = into.skills.get(&record.turn) {
+        return if recorded == record {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let Some(named) = into.newest_answer(record.turn).map(|answer| &answer.action) else {
+        return Err(Refusal::Floating(key));
+    };
+    let named = match named {
+        Action::UseSkill { name } => name.as_str(),
+        Action::Find { query } => query,
+        Action::Edit { patch, .. } => patch,
+        Action::Command { .. } | Action::Final | Action::Malformed { .. } => "",
+    };
+    if named != record.name.as_str() {
+        return Err(Refusal::SkillMismatch {
+            turn: record.turn,
+            answer: named.to_owned(),
+            skill: record.name.to_string(),
+        });
+    }
+
+    into.skills.insert(record.turn, record.clone());
     Ok(Ack::Applied)
 }
 
@@ -520,6 +604,13 @@ fn apply_edit_intent(
             return Err(Refusal::EditMismatch {
                 turn: record.turn,
                 answer: query.clone(),
+                edit: record.patch.clone(),
+            });
+        },
+        Some(Action::UseSkill { name }) => {
+            return Err(Refusal::EditMismatch {
+                turn: record.turn,
+                answer: name.to_string(),
                 edit: record.patch.clone(),
             });
         },
@@ -610,12 +701,13 @@ mod tests {
     use crate::model::{Action, Usage};
     use crate::record::{
         AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
-        PromptRecord, RecordKey, Refusal, SpeechRecord, TaskRecord,
+        PromptRecord, RecordKey, Refusal, SkillOutcome, SkillRecord, SpeechRecord, TaskRecord,
     };
     use crate::task::{Budget, Setting, Task};
     use crate::test_support::{artifact, execution_id, session, task, turn_id};
     use crate::tool::{Exit, ToolReport};
     use mokmok_protocol::{ExecutionID, TurnID};
+    use mokmok_skill::SkillName;
     use mokmok_state_machine::{
         Ack, Attempt, Deadline, Fact, Resolution, TurnFact, TurnNumber, TurnOutcome,
     };
@@ -720,6 +812,41 @@ mod tests {
                 turn,
                 Action::Find {
                     query: query.to_owned(),
+                },
+            ))
+            .unwrap();
+        (transcript, turn)
+    }
+
+    fn skill(
+        turn: TurnID,
+        name: &str,
+    ) -> Record {
+        Record::Skill(SkillRecord {
+            turn,
+            name: SkillName::new(name).expect("the test names a valid skill"),
+            outcome: SkillOutcome::Loaded {
+                instructions: "body".to_owned(),
+            },
+        })
+    }
+
+    fn a_skill_answered_turn(name: &str) -> (Transcript, TurnID) {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        transcript
+            .apply(&Record::Session {
+                fact: Fact::SessionOpened,
+            })
+            .unwrap();
+        open(&mut transcript, turn, 1);
+        request(&mut transcript, turn, 1);
+        answered(&mut transcript, turn);
+        transcript
+            .apply(&answer(
+                turn,
+                Action::UseSkill {
+                    name: SkillName::new(name).expect("the test names a valid skill"),
                 },
             ))
             .unwrap();
@@ -1068,6 +1195,68 @@ mod tests {
         assert_eq!(
             transcript.apply(&find(turn, "tantivy")),
             Err(Refusal::Conflict(RecordKey::Find(turn))),
+        );
+    }
+
+    #[test]
+    fn a_skill_before_the_answer_that_asked_for_it_is_refused() {
+        let turn = turn_id(1);
+        let mut transcript = Transcript::new(session());
+        open(&mut transcript, turn, 1);
+        request(&mut transcript, turn, 1);
+
+        assert_eq!(
+            transcript.apply(&skill(turn, "pdf-processing")),
+            Err(Refusal::Floating(RecordKey::UseSkill(turn))),
+        );
+    }
+
+    #[test]
+    fn a_skill_whose_name_the_answer_never_named_is_refused() {
+        let (mut transcript, turn) = a_skill_answered_turn("pdf-processing");
+
+        assert_eq!(
+            transcript.apply(&skill(turn, "other-skill")),
+            Err(Refusal::SkillMismatch {
+                turn,
+                answer: "pdf-processing".to_owned(),
+                skill: "other-skill".to_owned(),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_skill_redelivered_is_a_duplicate_and_a_different_name_is_a_conflict() {
+        let (mut transcript, turn) = a_skill_answered_turn("pdf-processing");
+
+        let record = skill(turn, "pdf-processing");
+        assert_eq!(transcript.apply(&record), Ok(Ack::Applied));
+        assert_eq!(
+            transcript
+                .skill_of(turn)
+                .map(|skill| skill.name.as_str().to_owned()),
+            Some("pdf-processing".to_owned()),
+        );
+        assert_eq!(transcript.apply(&record), Ok(Ack::Duplicate));
+        assert_eq!(
+            transcript.apply(&skill(turn, "other-skill")),
+            Err(Refusal::Conflict(RecordKey::UseSkill(turn))),
+        );
+    }
+
+    #[test]
+    fn a_call_after_an_answer_that_asked_for_a_skill_is_refused() {
+        let (mut transcript, turn) = a_skill_answered_turn("pdf-processing");
+        let execution = execution_id(turn);
+        requested(&mut transcript, turn, execution);
+
+        assert_eq!(
+            transcript.apply(&call(turn, execution)),
+            Err(Refusal::CommandMismatch {
+                turn,
+                answer: "pdf-processing".to_owned(),
+                call: "ls".to_owned(),
+            }),
         );
     }
 
@@ -1589,6 +1778,9 @@ mod tests {
             Just(Action::Final),
             "[a-z ]{0,8}".prop_map(|command| Action::Command { command }),
             "[a-z ]{0,8}".prop_map(|query| Action::Find { query }),
+            Just(Action::UseSkill {
+                name: SkillName::new("skill").unwrap()
+            }),
             "[a-z ]{0,8}".prop_map(|reason| Action::Malformed { reason }),
         ]
     }
@@ -1632,6 +1824,7 @@ mod tests {
                 program: "/bin/sh".into(),
                 deadline: Duration::from_secs(120),
                 search: Vec::new(),
+                skills: Vec::new(),
             },
             budget: Budget {
                 turns,

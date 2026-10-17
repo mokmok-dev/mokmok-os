@@ -1,11 +1,13 @@
 //! Builders the unit tests share, so a hand-written history is written once.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
+use mokmok_skill::SkillName;
 use mokmok_state_machine::{Attempt, Deadline, Ending, Fact, TurnFact, TurnNumber, TurnOutcome};
 use uuid::Uuid;
 
@@ -16,9 +18,11 @@ use crate::find::{FindReport, Finder};
 use crate::model::{Action, Usage};
 use crate::record::{
     AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
-    PromptRecord, Receipt, Record, SpeechRecord, Step, StepId, TaskRecord,
+    PromptRecord, Receipt, Record, SkillOutcome, SkillRecord, SpeechRecord, Step, StepId,
+    TaskRecord,
 };
-use crate::task::{Budget, Setting, Task};
+use crate::skill::{Read, Skills};
+use crate::task::{Advert, Budget, Setting, Task};
 use crate::tool::{Exit, ToolReport, observation};
 
 /// The session every builder in this module names.
@@ -61,6 +65,7 @@ pub fn task(turns: u32) -> Task {
             program: "/bin/sh".into(),
             deadline: Duration::from_secs(120),
             search: vec!["/srv/checkout".into()],
+            skills: Vec::new(),
         },
         budget: Budget {
             turns,
@@ -70,6 +75,17 @@ pub fn task(turns: u32) -> Task {
             context_turns: 8,
             context_bytes: 65_536,
         },
+    }
+}
+
+/// One advertised skill, as discovery would freeze it.
+#[must_use]
+pub fn skill_advert(name: &str) -> Advert {
+    Advert {
+        name: SkillName::new(name).expect("the test names a valid skill"),
+        description: format!("{name} description"),
+        source: PathBuf::from(format!("/skills/{name}/SKILL.md")),
+        digest: format!("{name} digest"),
     }
 }
 
@@ -370,6 +386,27 @@ pub fn find_records(
     ]
 }
 
+/// The records one activation takes: the skill record and the turn's settlement.
+#[must_use]
+pub fn skill_records(
+    turn: TurnID,
+    name: &str,
+    outcome: SkillOutcome,
+) -> Vec<Record> {
+    let settled = outcome.outcome();
+    vec![
+        Record::Skill(SkillRecord {
+            turn,
+            name: SkillName::new(name).expect("the test names a valid skill"),
+            outcome,
+        }),
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled { outcome: settled },
+        },
+    ]
+}
+
 /// The records a `Close` step carries.
 #[must_use]
 pub fn close_records(
@@ -454,6 +491,47 @@ impl Finder for FakeFinder {
         Ok(FindReport {
             observation: self.observation.clone(),
         })
+    }
+}
+
+/// One queued answer per read, and the names asked, so a test can tell a load from a refusal that
+/// never reached the port.
+pub struct FakeSkills {
+    reads: Mutex<VecDeque<Result<Read, Error>>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeSkills {
+    #[must_use]
+    pub fn of(reads: impl IntoIterator<Item = Result<Read, Error>>) -> Self {
+        Self {
+            reads: Mutex::new(reads.into_iter().collect()),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+
+    #[must_use]
+    pub fn asked(&self) -> Vec<String> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+impl Skills for FakeSkills {
+    fn read(
+        &self,
+        advert: &Advert,
+    ) -> Result<Read, Error> {
+        self.asked.lock().unwrap().push(advert.name.to_string());
+        self.reads
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the fake skills holds a read")
     }
 }
 

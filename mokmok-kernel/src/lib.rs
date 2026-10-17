@@ -23,6 +23,7 @@ mod provider;
 mod recovery;
 mod roster;
 mod serve;
+mod skill;
 mod slice;
 
 pub use authority::{AGENT, Authority};

@@ -1,7 +1,29 @@
 //! What the operator asked a session to do, and the limits it runs under.
 
+use mokmok_skill::SkillName;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// The metadata of one discovered skill, frozen into the task the session records.
+///
+/// The body is deliberately absent: progressive disclosure reads it only when the model asks for it
+/// by name, and the read is a separate port. The digest binds the record to the bytes activation
+/// will hand the model, so a file that changed after discovery is refused rather than silently
+/// substituted.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct Advert {
+    /// The validated name the model loads the skill by.
+    pub name: SkillName,
+    /// The one-line description the prompt advertises the name with.
+    pub description: String,
+    /// The `SKILL.md` activation re-reads. Never advertised; it is the read source, not metadata.
+    pub source: PathBuf,
+    /// The sha256 of that file at discovery.
+    ///
+    /// Activation refuses if the file no longer hashes to this, so the body the model receives is the
+    /// body the session was told about.
+    pub digest: String,
+}
 
 /// The goal, the world it runs in, and the budget it may spend.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -33,6 +55,11 @@ pub struct Setting {
     /// no root rather than refusing to decode.
     #[serde(default)]
     pub search: Vec<PathBuf>,
+    /// Skills the operator advertised to this session, frozen at discovery.
+    ///
+    /// `default` keeps a task record written before the field readable, the same rule as `search`.
+    #[serde(default)]
+    pub skills: Vec<Advert>,
 }
 
 /// The ceilings one session runs under.
@@ -96,7 +123,28 @@ mod tests {
                 program: "/bin/sh".into(),
                 deadline: Duration::from_secs(120),
                 search: Vec::new(),
+                skills: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn a_setting_written_before_the_skills_field_still_decodes() {
+        let json = r#"{
+            "checkout": "/srv/checkout",
+            "readable": ["/nix/store"],
+            "writable": ["/srv/checkout"],
+            "program": "/bin/sh",
+            "deadline": {"secs": 120, "nanos": 0},
+            "search": ["/srv/checkout"]
+        }"#;
+
+        let setting: Setting = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            setting.search,
+            vec![std::path::PathBuf::from("/srv/checkout")]
+        );
+        assert_eq!(setting.skills, Vec::new());
     }
 }

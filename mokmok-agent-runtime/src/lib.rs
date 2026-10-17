@@ -1,8 +1,9 @@
 //! Orchestrates model invocations, tools, sessions, and durable continuation.
 //!
 //! The crate is pure: it reads no clock, no file, and no socket, and no sandbox, store, or HTTP
-//! type appears in it. Everything from the world enters through one of five ports — [`Journal`],
-//! [`Provider`], [`Tools`], [`Finder`], and [`Editor`] — and [`advance`] performs at most one bounded step.
+//! type appears in it. Everything from the world enters through one of six ports — [`Journal`],
+//! [`Provider`], [`Tools`], [`Finder`], [`Editor`], and [`Skills`] — and [`advance`] performs at
+//! most one bounded step.
 //!
 //! The loop is a total decision, [`next`], over the fold of a session's records, [`Transcript`].
 //! Every effectful move spends two transactions: an intent is committed before the effect it
@@ -20,6 +21,7 @@ mod error;
 mod find;
 mod model;
 mod record;
+mod skill;
 mod speech;
 mod task;
 mod tool;
@@ -28,7 +30,7 @@ mod tool;
 mod test_support;
 
 pub use advance::{Halt, Move, Progress, advance, execution_id, next, turn_id};
-pub use context::{Context, ContextAct, ContextTurn, context, system_prompt};
+pub use context::{Context, ContextAct, ContextSkill, ContextTurn, context, system_prompt};
 pub use dialogue::Transcript;
 pub use edit::{EditCall, EditOutcome, EditReport, Editor, Plan, Ready, unproven};
 pub use error::{Error, Source};
@@ -37,11 +39,15 @@ pub use model::{Action, Answer, Journal, Provider, Usage};
 pub use record::{
     AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
     MAX_PATCH_BYTES, MAX_PROSE_BYTES, MAX_QUERY_BYTES, MAX_SPEECH_BYTES, PromptRecord, Receipt,
-    Record, RecordKey, Refusal, SpeechRecord, Step, StepId, StepKey, TaskRecord, clip_prose,
-    clip_query, patch_refusal,
+    Record, RecordKey, Refusal, SkillOutcome, SkillRecord, SpeechRecord, Step, StepId, StepKey,
+    TaskRecord, clip_prose, clip_query, patch_refusal,
 };
+pub use skill::{NO_SKILLS, Read, Skills};
 pub use speech::speak;
-pub use task::{Budget, Setting, Task};
+pub use task::{Advert, Budget, Setting, Task};
 pub use tool::{
     DEFAULT_DEADLINE, Exit, ToolCall, ToolReport, Tools, UNKNOWN_WARNING, clip, observation,
 };
+
+/// The validated skill name a [`Action::UseSkill`] and a [`SkillRecord`] both carry.
+pub use mokmok_skill::SkillName;
