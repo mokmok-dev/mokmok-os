@@ -205,6 +205,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use mokmok_agent_runtime::{Read, Skills};
+    use mokmok_skill::{MAX_FRONTMATTER_BYTES, MAX_INSTRUCTIONS_BYTES};
 
     use super::{Library, discover};
 
@@ -371,17 +372,51 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_skill_file_is_skipped_without_being_read() {
+    fn an_oversized_skill_file_is_skipped_by_the_size_warning() {
         let scratch = Scratch::new("oversize");
         let root = scratch.root("skills");
         let body = "x".repeat(64 * 1024);
-        skill(
+        let directory = skill(
             &root,
             "huge",
             &format!("---\nname: huge\ndescription: d\n---\n{body}"),
         );
+        capture_logs();
 
         assert_eq!(discover(std::slice::from_ref(&root)).unwrap().len(), 0);
+        let logged = logged();
+        assert!(
+            logged.contains("larger than the parser reads"),
+            "the size gate is what skips it, not the parser's later refusal: {logged}",
+        );
+        assert!(
+            logged.contains(&directory.join("SKILL.md").display().to_string()),
+            "the size warning names the path: {logged}",
+        );
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_size_limit_is_advertised() {
+        let scratch = Scratch::new("at-limit");
+        let root = scratch.root("skills");
+        let name = "exact";
+        let fence = "---\n";
+        let prefix = format!("{fence}name: {name}\ndescription: d\n");
+        let vendor = "vendor: \n";
+        let padding = MAX_FRONTMATTER_BYTES - prefix.len() - fence.len() - vendor.len();
+        let body = "x".repeat(MAX_INSTRUCTIONS_BYTES);
+        let text = format!("{prefix}vendor: {}\n{fence}{body}", "v".repeat(padding));
+        assert_eq!(text.len(), MAX_FRONTMATTER_BYTES + MAX_INSTRUCTIONS_BYTES);
+        skill(&root, name, &text);
+
+        let adverts = discover(std::slice::from_ref(&root)).unwrap();
+
+        assert_eq!(
+            adverts.len(),
+            1,
+            "a file exactly at the gate is read, and both parser caps are inclusive",
+        );
+        assert_eq!(adverts[0].name.as_str(), name);
     }
 
     #[test]
