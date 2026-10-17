@@ -12,6 +12,36 @@ mod refusal;
 pub use name::SkillName;
 pub use refusal::Refusal;
 
+/// Runs `work` on another thread and hands back its answer, failing when no answer arrives.
+///
+/// The scanner advances its line cursor only when a state consumes the line, so a state that
+/// declines every line spins without ever returning and no assertion in a case that calls `parse`
+/// would run. A deadline is what turns that failure to terminate into a failure. The flag makes
+/// every later call fail at once, so a proptest shrinking search costs one deadline, not one per
+/// attempt.
+#[cfg(test)]
+pub(crate) fn answered<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    static STUCK: AtomicBool = AtomicBool::new(false);
+
+    assert!(
+        !STUCK.load(Ordering::Relaxed),
+        "an earlier call never answered"
+    );
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    let Ok(answer) = receiver.recv_timeout(Duration::from_secs(2)) else {
+        STUCK.store(true, Ordering::Relaxed);
+        panic!("no answer within two seconds: the parse does not terminate");
+    };
+    answer
+}
+
 use std::collections::BTreeMap;
 
 /// The largest frontmatter region accepted, in bytes, between the two `---` fences.
@@ -161,11 +191,39 @@ fn text_of(value: &frontmatter::Value) -> String {
 mod tests {
     use super::*;
 
+    /// [`crate::parse`], bounded. The shadowed name keeps every case below on the invariant the
+    /// wrapper pins: a parse always answers.
+    fn parse(
+        directory: &str,
+        text: &str,
+    ) -> Result<Skill, Refusal> {
+        let directory = directory.to_string();
+        let text = text.to_string();
+        crate::answered(move || crate::parse(&directory, &text))
+    }
+
     fn skill(
         name: &str,
         description: &str,
     ) -> String {
         format!("---\nname: {name}\ndescription: {description}\n---\nbody\n")
+    }
+
+    #[test]
+    fn a_parse_answers_for_every_shape_a_scan_can_enter() {
+        // Each text drives the scanner into one of the states whose answer about consuming the
+        // line decides the cursor's next step: a blank line, a skipped vendor value, a block
+        // scalar ending on the key after it, and a metadata block ending on a top-level key. A
+        // scanner that stopped advancing would never return from one of them, and the bounded
+        // `parse` above is what turns that from a hanging run into this failure.
+        for text in [
+            "---\n\nname: s\ndescription: d\n---\nbody\n",
+            "---\nname: s\ndescription: d\nvendor: [a]\n---\nbody\n",
+            "---\nname: s\ndescription: >-\n  one\n  two\nlicense: MIT\n---\nbody\n",
+            "---\nmetadata:\n  author: org\nname: s\ndescription: d\n---\nbody\n",
+        ] {
+            assert!(parse("s", text).is_ok(), "{text}");
+        }
     }
 
     #[test]
@@ -424,6 +482,79 @@ mod tests {
 
         let refused = serde_json::from_str::<SkillName>("\"Bad Name\"");
         assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_name_displays_as_itself() {
+        let name = SkillName::new("pdf-processing").unwrap();
+        assert_eq!(name.to_string(), "pdf-processing");
+    }
+
+    #[test]
+    fn a_compatibility_of_exactly_500_characters_is_accepted() {
+        let compatibility = "x".repeat(500);
+        let text =
+            format!("---\nname: s\ndescription: d\ncompatibility: {compatibility}\n---\nbody\n");
+        let skill = parse("s", &text).unwrap();
+        assert_eq!(skill.compatibility.as_deref(), Some(compatibility.as_str()));
+    }
+
+    #[test]
+    fn a_body_of_exactly_the_cap_is_accepted() {
+        let body = "x".repeat(32 * 1024);
+        let text = format!("---\nname: s\ndescription: d\n---\n{body}");
+        let skill = parse("s", &text).unwrap();
+        assert_eq!(skill.instructions.len(), 32 * 1024);
+    }
+
+    #[test]
+    fn a_literal_block_keeps_every_trailing_newline() {
+        // The `+` chomp keeps the trailing blank line, where `|` would strip it.
+        let text = "---\nname: s\ndescription: |+\n  one\n\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "one\n\n");
+    }
+
+    #[test]
+    fn a_clip_chomp_strips_trailing_blank_lines() {
+        let text = "---\nname: s\ndescription: |\n  one\n\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "one\n");
+    }
+
+    #[test]
+    fn an_all_blank_block_is_empty_plus_the_clip_newline() {
+        let text = "---\nname: s\ndescription: |\n\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "\n");
+    }
+
+    #[test]
+    fn a_folded_block_joins_its_lines_with_a_space() {
+        let text = "---\nname: s\ndescription: >\n  one\n  two\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "one two\n");
+    }
+
+    #[test]
+    fn a_folded_block_that_keeps_newlines_still_folds() {
+        let text = "---\nname: s\ndescription: >+\n  one\n  two\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "one two\n");
+    }
+
+    #[test]
+    fn a_quoted_scalar_unescapes_a_backslash() {
+        let text = "---\nname: s\ndescription: \"back\\\\slash\"\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "back\\slash");
+    }
+
+    #[test]
+    fn a_quoted_scalar_unescapes_a_newline() {
+        let text = "---\nname: s\ndescription: \"two\\nlines\"\n---\nbody\n";
+        let skill = parse("s", text).unwrap();
+        assert_eq!(skill.summary.description, "two\nlines");
     }
 
     use proptest::prelude::*;

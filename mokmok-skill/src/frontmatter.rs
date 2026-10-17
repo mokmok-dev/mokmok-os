@@ -525,6 +525,13 @@ fn split_lines(text: &str) -> Vec<(&str, usize)> {
 mod tests {
     use super::*;
 
+    /// [`read`], bounded, so a scanner that stops advancing its cursor fails a case here instead
+    /// of hanging the run.
+    fn read(text: &str) -> Result<Raw, Refusal> {
+        let text = text.to_string();
+        crate::answered(move || super::read(&text))
+    }
+
     #[test]
     fn a_file_that_does_not_open_with_a_fence_is_refused() {
         assert_eq!(read("name: x\n"), Err(Refusal::NoFrontmatter { line: 1 }));
@@ -703,6 +710,66 @@ mod tests {
                 ("note".to_string(), "one two".to_string()),
                 ("author".to_string(), "org".to_string()),
             ],
+        );
+    }
+
+    #[test]
+    fn a_frontmatter_of_exactly_the_cap_is_accepted() {
+        let filled = "x".repeat(MAX_FRONTMATTER_BYTES - "big: \n".len());
+        let text = format!("---\nbig: {filled}\n---\nbody\n");
+        let raw = read(&text).unwrap();
+
+        assert_eq!(raw.body, "body\n");
+    }
+
+    #[test]
+    fn the_frontmatter_refusal_names_the_region_size() {
+        let filled = "x".repeat(MAX_FRONTMATTER_BYTES);
+        let text = format!("---\nbig: {filled}\n---\nbody\n");
+
+        assert_eq!(
+            read(&text),
+            Err(Refusal::FrontmatterTooLarge {
+                bytes: MAX_FRONTMATTER_BYTES + "big: \n".len(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_file_has_no_fence() {
+        assert_eq!(read(""), Err(Refusal::NoFrontmatter { line: 1 }));
+    }
+
+    #[test]
+    fn a_top_level_key_with_no_name_is_refused() {
+        assert_eq!(
+            read("---\n: value\n---\nbody\n"),
+            Err(Refusal::NotAKey {
+                line: 2,
+                text: ": value".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_metadata_entry_with_no_name_is_refused() {
+        assert_eq!(
+            read("---\nmetadata:\n  : v\n---\nbody\n"),
+            Err(Refusal::InvalidMetadata {
+                line: 3,
+                text: "  : v".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_metadata_key_is_refused() {
+        assert_eq!(
+            read("---\nmetadata:\n  author: a\n  author: b\n---\nbody\n"),
+            Err(Refusal::DuplicateKey {
+                key: "author".to_string(),
+                line: 4,
+            })
         );
     }
 }
