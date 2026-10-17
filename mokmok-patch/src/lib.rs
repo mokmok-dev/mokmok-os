@@ -1,7 +1,17 @@
 //! Reads a unified diff and applies it, with no repository behind it.
+//!
+//! The crate is `no_std` with `alloc`: it opens no file, reads no clock, and reaches no socket, so a
+//! caller owns every effect and a rule over a diff is reproducible in a test.
 
-use std::fmt::Write as _;
-use std::str;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt::Write as _;
+use core::str;
 use thiserror::Error;
 
 /// One patch: the file sections a diff names, in order.
@@ -723,6 +733,7 @@ fn encode_lines(lines: &[FileLine]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use proptest::prelude::*;
 
     #[test]

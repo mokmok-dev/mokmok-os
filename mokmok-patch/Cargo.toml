@@ -4,10 +4,10 @@ name = "mokmok-patch"
 version.workspace = true
 
 [package.metadata.mokmok]
-purity = "adapter"
+purity = "pure"
 
 [dependencies]
-thiserror = { workspace = true }
+thiserror = { workspace = true, default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }
