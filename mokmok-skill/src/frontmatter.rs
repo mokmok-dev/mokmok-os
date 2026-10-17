@@ -38,8 +38,8 @@ const KNOWN_KEYS: [&str; 6] = [
     "allowed-tools",
 ];
 
-/// Which line of the file the scanner is reading.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Which line of the file the scanner is reading, and what that line is read for.
+#[derive(Debug, Default, Eq, PartialEq)]
 enum State {
     /// Before the opening `---`.
     #[default]
@@ -48,14 +48,32 @@ enum State {
     Body,
     /// A top-level field, or a blank line between fields.
     TopLevelKey,
-    /// The continuation lines of a `|` or `>` block scalar.
-    BlockScalar,
+    /// The continuation lines of a `|` or `>` block scalar, and the block being gathered.
+    Block(Block),
     /// A `key: value` entry inside the `metadata` block.
     MetadataEntry,
     /// The line that must decide an empty `metadata` value: nothing, or one level too deep.
-    MetadataValue,
+    MetadataValue {
+        /// The key the empty entry named.
+        field: String,
+        /// The line the empty entry was written on.
+        line: usize,
+    },
     /// The lines under a key the spec does not name, consumed without being read.
     SkipValue,
+}
+
+/// Where a finished block scalar's value belongs.
+///
+/// Not the state to return to: a [`State`] that reads a block would send the line that ended this
+/// block back to a reader with no block to read, which consumes nothing and leaves the state, so
+/// the scan would never finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Home {
+    /// A top-level field.
+    Fields,
+    /// An entry of the `metadata` block.
+    Metadata,
 }
 
 /// How a block scalar treats its trailing newline.
@@ -77,7 +95,7 @@ struct Block {
     chomp: Chomp,
     indent: Option<usize>,
     lines: Vec<String>,
-    after: State,
+    home: Home,
 }
 
 /// Reads one file's frontmatter and body into a shape-checked [`Raw`].
@@ -112,12 +130,15 @@ pub fn read(text: &str) -> Result<Raw, Refusal> {
                 index += 1;
                 continue;
             }
-            if scanner.state == State::BlockScalar {
+            if matches!(scanner.state, State::Block(_)) {
                 scanner.finish_block();
             }
             let bytes = offset.saturating_sub(frontmatter_start);
             if bytes > MAX_FRONTMATTER_BYTES {
                 return Err(Refusal::FrontmatterTooLarge { bytes });
+            }
+            if let State::MetadataValue { field, line } = core::mem::take(&mut scanner.state) {
+                return Err(Refusal::EmptyMetadataValue { field, line });
             }
             scanner.state = State::Body;
             index += 1;
@@ -141,10 +162,6 @@ pub fn read(text: &str) -> Result<Raw, Refusal> {
         _ => return Err(Refusal::UnterminatedFrontmatter),
     }
 
-    if let Some((field, line)) = scanner.pending_empty.take() {
-        return Err(Refusal::EmptyMetadataValue { field, line });
-    }
-
     Ok(Raw {
         fields: scanner.fields,
         metadata: scanner.metadata,
@@ -158,25 +175,46 @@ struct Scanner {
     state: State,
     fields: Vec<(String, Value)>,
     metadata: Vec<(String, String)>,
-    block: Option<Block>,
-    pending_empty: Option<(String, usize)>,
     metadata_seen: bool,
 }
 
 impl Scanner {
     /// Reads one line in the current state. Returns whether the line was consumed.
+    ///
+    /// The state is taken for the step, so a state that carries a block or a pending key hands it to
+    /// its reader rather than leaving a copy behind, and every reader writes the state the line
+    /// after it is read in.
     fn step(
         &mut self,
         line: &str,
         number: usize,
     ) -> Result<bool, Refusal> {
-        match self.state {
+        match core::mem::take(&mut self.state) {
             State::TopLevelKey => self.top_level(line, number),
-            State::BlockScalar => self.block_scalar(line, number),
             State::MetadataEntry => self.metadata_entry(line, number),
-            State::MetadataValue => self.metadata_value(line, number),
-            State::SkipValue => Ok(self.skip_value(line)),
-            State::Outside | State::Body => Ok(true),
+            State::Block(block) => self.block_scalar(block, line, number),
+            State::MetadataValue { field, line: at } => {
+                if line.trim().is_empty() {
+                    self.state = State::MetadataValue { field, line: at };
+                    return Ok(true);
+                }
+                if line.starts_with(' ') {
+                    return Err(Refusal::NestedMetadata { line: number });
+                }
+                Err(Refusal::EmptyMetadataValue { field, line: at })
+            },
+            State::SkipValue => {
+                if line.starts_with(' ') || line.starts_with('\t') {
+                    self.state = State::SkipValue;
+                    return Ok(true);
+                }
+                self.state = State::TopLevelKey;
+                Ok(false)
+            },
+            state @ (State::Outside | State::Body) => {
+                self.state = state;
+                Ok(true)
+            },
         }
     }
 
@@ -187,6 +225,7 @@ impl Scanner {
         number: usize,
     ) -> Result<bool, Refusal> {
         if line.trim().is_empty() {
+            self.state = State::TopLevelKey;
             return Ok(true);
         }
         if line.starts_with('\t') {
@@ -214,7 +253,7 @@ impl Scanner {
         // A key the spec does not name is skipped, value and all: nothing reads it, so its shape is
         // the vendor's business, and refusing a skill over a field no reader consults would drop the
         // operator's skill for a reason the skill cannot fix.
-        if !is_known(key) {
+        if !KNOWN_KEYS.contains(&key) {
             self.state = State::SkipValue;
             return Ok(true);
         }
@@ -242,15 +281,14 @@ impl Scanner {
         }
 
         if let Some((folded, chomp)) = block_indicator(value) {
-            self.block = Some(Block {
+            self.state = State::Block(Block {
                 key: key.to_string(),
                 folded,
                 chomp,
                 indent: None,
                 lines: Vec::new(),
-                after: State::TopLevelKey,
+                home: Home::Fields,
             });
-            self.state = State::BlockScalar;
             return Ok(true);
         }
 
@@ -260,19 +298,20 @@ impl Scanner {
             text: value.to_string(),
         })?;
         self.fields.push((key.to_string(), Value::Scalar(scalar)));
+        self.state = State::TopLevelKey;
         Ok(true)
     }
 
     /// One continuation line of a block scalar, or the line that ends it.
     fn block_scalar(
         &mut self,
+        mut block: Block,
         line: &str,
         number: usize,
     ) -> Result<bool, Refusal> {
         if line.is_empty() {
-            if let Some(active) = self.block.as_mut() {
-                active.lines.push(String::new());
-            }
+            block.lines.push(String::new());
+            self.state = State::Block(block);
             return Ok(true);
         }
         if line.starts_with('\t') {
@@ -281,41 +320,18 @@ impl Scanner {
 
         let indent = line.len() - line.trim_start_matches(' ').len();
         let indented = line.starts_with(' ');
-        let ends = !indented
-            || self
-                .block
-                .as_ref()
-                .and_then(|block| block.indent)
-                .is_some_and(|base| indent < base);
+        let ends = !indented || block.indent.is_some_and(|base| indent < base);
         if ends {
-            self.finish_block();
+            self.place_block(block);
             return Ok(false);
         }
 
-        if let Some(active) = self.block.as_mut() {
-            // The first continuation line fixes the block's indentation, so a later line indented
-            // less than it ends the block instead of being read as part of the value.
-            let base = *active.indent.get_or_insert(indent);
-            active.lines.push(line[base..].to_string());
-        }
+        // The first continuation line fixes the block's indentation, so a later line indented
+        // less than it ends the block instead of being read as part of the value.
+        let base = *block.indent.get_or_insert(indent);
+        block.lines.push(line[base..].to_string());
+        self.state = State::Block(block);
         Ok(true)
-    }
-
-    /// The lines under a key the spec does not name: consumed, and read by nothing.
-    ///
-    /// An indented line continues the skipped value, whatever shape the vendor wrote. The first line
-    /// at the top level begins the next key, so it is left for [`State::TopLevelKey`] to read rather
-    /// than consumed here.
-    fn skip_value(
-        &mut self,
-        line: &str,
-    ) -> bool {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            return true;
-        }
-
-        self.state = State::TopLevelKey;
-        false
     }
 
     /// One `key: value` line inside the `metadata` block, or the line that ends the block.
@@ -325,6 +341,7 @@ impl Scanner {
         number: usize,
     ) -> Result<bool, Refusal> {
         if line.trim().is_empty() {
+            self.state = State::MetadataEntry;
             return Ok(true);
         }
         if line.starts_with('\t') {
@@ -363,21 +380,22 @@ impl Scanner {
 
         let value = entry[colon + 1..].trim();
         if value.is_empty() {
-            self.pending_empty = Some((key.to_string(), number));
-            self.state = State::MetadataValue;
+            self.state = State::MetadataValue {
+                field: key.to_string(),
+                line: number,
+            };
             return Ok(true);
         }
 
         if let Some((folded, chomp)) = block_indicator(value) {
-            self.block = Some(Block {
+            self.state = State::Block(Block {
                 key: key.to_string(),
                 folded,
                 chomp,
                 indent: None,
                 lines: Vec::new(),
-                after: State::MetadataEntry,
+                home: Home::Metadata,
             });
-            self.state = State::BlockScalar;
             return Ok(true);
         }
 
@@ -386,51 +404,38 @@ impl Scanner {
             text: line.to_string(),
         })?;
         self.metadata.push((key.to_string(), scalar));
+        self.state = State::MetadataEntry;
         Ok(true)
     }
 
-    /// The line after an empty `metadata` value: deeper means a nested map, flatter means no value.
-    fn metadata_value(
+    /// Puts a finished block scalar's value where its key belongs.
+    fn place_block(
         &mut self,
-        line: &str,
-        number: usize,
-    ) -> Result<bool, Refusal> {
-        if line.trim().is_empty() {
-            return Ok(true);
-        }
-        if line.starts_with(' ') {
-            return Err(Refusal::NestedMetadata { line: number });
-        }
-        let (field, line) = self
-            .pending_empty
-            .take()
-            .unwrap_or_else(|| (String::new(), number));
-        Err(Refusal::EmptyMetadataValue { field, line })
-    }
-
-    /// Puts the open block scalar's value where its key belongs, and returns to the state its key
-    /// was written in.
-    ///
-    /// The caller that ends a block on a line it did not consume re-reads that line in this state.
-    /// Leaving the state as `BlockScalar` would dispatch that line to `block_scalar` again with no
-    /// block open, which neither consumes the line nor leaves the state, so the scan would never
-    /// finish.
-    fn finish_block(&mut self) {
-        if let Some(block) = self.block.take() {
-            let rendered = render_block(&block);
-            if block.after == State::MetadataEntry {
-                self.metadata.push((block.key, rendered));
-            } else {
+        block: Block,
+    ) {
+        let rendered = render_block(&block);
+        match block.home {
+            Home::Fields => {
                 self.fields.push((block.key, Value::Block(rendered)));
-            }
-            self.state = block.after;
+                self.state = State::TopLevelKey;
+            },
+            Home::Metadata => {
+                self.metadata.push((block.key, rendered));
+                self.state = State::MetadataEntry;
+            },
         }
     }
-}
 
-/// The keys section 2 names.
-fn is_known(key: &str) -> bool {
-    KNOWN_KEYS.contains(&key)
+    /// Puts the open block scalar's value where its key belongs, and leaves no block open.
+    ///
+    /// The caller that ends a block on a line it did not consume re-reads that line in the state
+    /// this answers. Leaving a block open would dispatch that line to `block_scalar` again with
+    /// nothing to read, so the scan would never finish.
+    fn finish_block(&mut self) {
+        if let State::Block(block) = core::mem::take(&mut self.state) {
+            self.place_block(block);
+        }
+    }
 }
 
 /// The `|`/`>` indicator, if `value` is one: folded or literal, and how it chomps.
@@ -653,6 +658,17 @@ mod tests {
     fn an_empty_metadata_value_is_refused() {
         assert_eq!(
             read("---\nmetadata:\n  author:\nname: x\n---\nbody\n"),
+            Err(Refusal::EmptyMetadataValue {
+                field: "author".to_string(),
+                line: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_metadata_value_at_the_closing_fence_is_refused() {
+        assert_eq!(
+            read("---\nmetadata:\n  author:\n---\nbody\n"),
             Err(Refusal::EmptyMetadataValue {
                 field: "author".to_string(),
                 line: 3,
