@@ -1729,6 +1729,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mokmok-skill"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mokmok-state-machine"
 version = "0.0.0"
 dependencies = [
