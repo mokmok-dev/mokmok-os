@@ -151,6 +151,39 @@ pub async fn advance(
     session: SessionID,
     at: Moment,
 ) -> Result<Progress, Error> {
+    advance_watched(
+        journal,
+        provider,
+        tools,
+        finder,
+        editor,
+        skills,
+        session,
+        at,
+        &mut |_| {},
+    )
+    .await
+}
+
+/// Like [`advance`], but forwards every prose fragment the model emits while streaming to `watch`.
+///
+/// The journal still records one whole answer per attempt; the stream is display-only.
+///
+/// # Errors
+///
+/// Returns the same errors as [`advance`].
+#[allow(clippy::too_many_arguments)]
+pub async fn advance_watched(
+    journal: &mut impl Journal,
+    provider: &impl Provider,
+    tools: &impl Tools,
+    finder: &impl Finder,
+    editor: &impl Editor,
+    skills: &impl Skills,
+    session: SessionID,
+    at: Moment,
+    watch: &mut dyn FnMut(&str),
+) -> Result<Progress, Error> {
     tracing::debug!(
         session = %session.as_uuid(),
         at = at.as_millis(),
@@ -198,7 +231,7 @@ pub async fn advance(
             if journal.append(intent)? == Receipt::Replayed {
                 return Ok(Progress::Yielded);
             }
-            let answer = provider.complete(context).await?;
+            let answer = provider.complete_watched(context, watch).await?;
             journal.append(ask_outcome(session, *turn, *number, *attempt, answer))?;
         },
         Move::Act {
@@ -1054,7 +1087,7 @@ fn halt_settle(
 
 #[cfg(test)]
 mod tests {
-    use super::{Halt, Move, Progress, advance, next};
+    use super::{Halt, Move, Progress, advance, advance_watched, next};
     use crate::context::{Context, ContextAct};
     use crate::dialogue::Transcript;
     use crate::edit::{EditCall, EditOutcome, EditReport, Plan, Ready};
@@ -1276,6 +1309,91 @@ mod tests {
                 output: 1,
             },
         }
+    }
+
+    fn answer_with_prose(
+        action: Action,
+        prose: String,
+    ) -> Answer {
+        Answer {
+            action,
+            prose,
+            text: artifact(0xbb),
+            model: "test".to_owned(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+            },
+        }
+    }
+
+    struct WatchedProvider {
+        fragments: Vec<String>,
+    }
+
+    impl WatchedProvider {
+        fn of(fragments: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                fragments: fragments.into_iter().map(str::to_owned).collect(),
+            }
+        }
+    }
+
+    impl Provider for WatchedProvider {
+        fn complete(
+            &self,
+            _context: &Context,
+        ) -> impl Future<Output = Result<Answer, Error>> + Send {
+            std::future::ready(Ok(answer_with_prose(Action::Final, String::new())))
+        }
+
+        fn complete_watched<'a>(
+            &'a self,
+            _context: &'a Context,
+            watch: &'a mut dyn FnMut(&str),
+        ) -> impl Future<Output = Result<Answer, Error>> + 'a {
+            let mut prose = String::new();
+            for fragment in &self.fragments {
+                watch(fragment);
+                prose.push_str(fragment);
+            }
+            std::future::ready(Ok(answer_with_prose(Action::Final, prose)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watched_provider_forwards_fragments_and_records_the_whole_answer() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+
+        let provider = WatchedProvider::of(["hello ", "world"]);
+        let mut seen = Vec::new();
+        let progress = advance_watched(
+            &mut journal,
+            &provider,
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &no_skills(),
+            session,
+            Moment::EPOCH,
+            &mut |fragment| seen.push(fragment.to_owned()),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(progress, Progress::Advanced(Move::Ask { .. })));
+        assert_eq!(seen, vec!["hello ".to_owned(), "world".to_owned()]);
+        let transcript = journal.transcript(session).unwrap();
+        let answer = transcript
+            .newest_answer(turn)
+            .expect("the answer is recorded");
+        assert_eq!(answer.prose, "hello world");
+        assert_eq!(answer.action, Action::Final);
     }
 
     async fn drive(

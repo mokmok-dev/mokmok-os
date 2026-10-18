@@ -62,6 +62,13 @@ impl Engine for Session {
         self.driver.step().await.map_err(Error::from)
     }
 
+    async fn step_watched<'a>(
+        &'a mut self,
+        watch: &'a mut dyn FnMut(&str),
+    ) -> Result<Progress, Error> {
+        self.driver.step_watched(watch).await.map_err(Error::from)
+    }
+
     fn reopen(&mut self) -> Result<(), Error> {
         self.driver.reopen().map_err(Error::from)
     }

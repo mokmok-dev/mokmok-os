@@ -7,12 +7,14 @@
 //! resolution answered for `env_key` arrives as the [`Config`]'s own field, in a value whose
 //! [`Debug`] prints `REDACTED`.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use mokmok_agent_runtime::{
     Action, Answer, ArtifactRef, Context, ContextAct, ContextTurn, Error as AgentError, Provider,
     Usage, clip_prose, clip_query,
@@ -131,6 +133,12 @@ pub enum Error {
     /// The answer text could not be stored.
     #[error("the provider could not store the answer text")]
     Artifact(#[source] mokmok_artifact::Error),
+    /// The stream reported an error event.
+    #[error("the endpoint reported a streaming error: {message}")]
+    StreamEvent { message: String },
+    /// The stream ended without any content or tool call.
+    #[error("the stream ended without an answer")]
+    EmptyStream,
 }
 
 /// An endpoint parsed by hand from the `--endpoint` value.
@@ -542,11 +550,282 @@ impl Provider for Ollama {
 
         Ok(answer)
     }
+
+    async fn complete_watched<'a>(
+        &'a self,
+        context: &'a Context,
+        watch: &'a mut dyn FnMut(&str),
+    ) -> Result<Answer, AgentError> {
+        let mut body_value = request_body(context, &self.model, self.max_tokens);
+        if let Some(obj) = body_value.as_object_mut() {
+            obj.insert("stream".to_owned(), serde_json::Value::Bool(true));
+        }
+        let body = serde_json::to_vec(&body_value)
+            .map_err(|error| provider_error(Error::Encode(error)))?;
+        let response = self
+            .client
+            .post(&self.url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", self.credential.expose()),
+            )
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| provider_error(Error::Transport(error)))?;
+        let status = response.status();
+
+        if !status.is_success() {
+            return Err(provider_error(Error::Status {
+                status: status.as_u16(),
+            }));
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type.contains("text/event-stream") {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| provider_error(Error::Transport(error)))?;
+            let answer = parse_answer(&bytes, &self.model).map_err(provider_error)?;
+            self.store
+                .put(&bytes)
+                .map_err(|error| provider_error(Error::Artifact(error)))?;
+            watch(&answer.prose);
+            return Ok(answer);
+        }
+
+        let (answer, bytes) = stream_answer(response, watch, &self.model).await?;
+        self.store
+            .put(&bytes)
+            .map_err(|error| provider_error(Error::Artifact(error)))?;
+
+        Ok(answer)
+    }
 }
 
 /// Erases the adapter's failure behind the runtime's provider port.
 fn provider_error(error: Error) -> AgentError {
     AgentError::Provider(Box::new(error))
+}
+
+/// Reads one streamed answer, forwarding content fragments to `watch` and returning the canonical
+/// non-streaming body so one decoder serves both paths.
+async fn stream_answer(
+    response: reqwest::Response,
+    watch: &mut dyn FnMut(&str),
+    model: &str,
+) -> Result<(Answer, Vec<u8>), AgentError> {
+    let mut content = String::new();
+    let mut tool_calls: BTreeMap<u32, serde_json::Value> = BTreeMap::new();
+    let mut finish_reason = String::new();
+    let mut usage: Option<serde_json::Value> = None;
+    let mut buffer = Vec::new();
+
+    let mut stream = response.bytes_stream();
+    'stream: while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| provider_error(Error::Transport(error)))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
+            let line: Vec<u8> = buffer.drain(..pos).collect();
+            if let Some(event) = parse_event_line(&line) {
+                if event == b"[DONE]" {
+                    break 'stream;
+                }
+                apply_event(
+                    &event,
+                    &mut content,
+                    &mut tool_calls,
+                    &mut finish_reason,
+                    &mut usage,
+                    watch,
+                )?;
+            }
+            let _ = buffer.drain(..1_usize);
+        }
+    }
+
+    if content.is_empty() && tool_calls.is_empty() {
+        return Err(provider_error(Error::EmptyStream));
+    }
+
+    build_answer(&content, tool_calls, &finish_reason, usage, model)
+}
+
+/// Strips SSE framing from one non-empty line, returning `None` for comments or malformed prefixes.
+fn parse_event_line(line: &[u8]) -> Option<Vec<u8>> {
+    let line = trim_carriage_return(line);
+    line.strip_prefix(b"data:")
+        .map(trim_leading_space)
+        .map(<[u8]>::to_vec)
+}
+
+/// Drops a trailing carriage return from a line that ended with `\r\n`.
+fn trim_carriage_return(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+/// Drops the single leading space the SSE `data:` prefix is followed by.
+fn trim_leading_space(event: &[u8]) -> &[u8] {
+    event.strip_prefix(b" ").unwrap_or(event)
+}
+
+/// Applies one streamed JSON event to the accumulating answer state.
+fn apply_event(
+    event: &[u8],
+    content: &mut String,
+    tool_calls: &mut BTreeMap<u32, serde_json::Value>,
+    finish_reason: &mut String,
+    usage: &mut Option<serde_json::Value>,
+    watch: &mut dyn FnMut(&str),
+) -> Result<(), AgentError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(event).map_err(|error| provider_error(Error::Json(error)))?;
+    if let Some(message) = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Err(provider_error(Error::StreamEvent {
+            message: message.to_owned(),
+        }));
+    }
+
+    if let Some(delta) = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+    {
+        if let Some(fragment) = delta
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|fragment| !fragment.is_empty())
+        {
+            watch(fragment);
+            content.push_str(fragment);
+        }
+        if let Some(deltas) = delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for delta_call in deltas {
+                if let Some(index) = delta_call.get("index").and_then(serde_json::Value::as_u64) {
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    let entry = tool_calls
+                        .entry(index)
+                        .or_insert_with(|| serde_json::json!({}));
+                    merge_tool_call(entry, delta_call);
+                }
+            }
+        }
+    }
+
+    if let Some(finish) = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(serde_json::Value::as_str)
+    {
+        finish.clone_into(finish_reason);
+    }
+    if let Some(usage_value) = value.get("usage").filter(|value| !value.is_null()) {
+        *usage = Some(usage_value.clone());
+    }
+
+    Ok(())
+}
+
+/// Builds the canonical non-streaming body from accumulated stream state and decodes it.
+fn build_answer(
+    content: &str,
+    tool_calls: BTreeMap<u32, serde_json::Value>,
+    finish_reason: &str,
+    usage: Option<serde_json::Value>,
+    model: &str,
+) -> Result<(Answer, Vec<u8>), AgentError> {
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !tool_calls.is_empty() {
+        let calls: Vec<serde_json::Value> = tool_calls.into_values().collect();
+        if let Some(object) = message.as_object_mut() {
+            let _ = object.insert("tool_calls".to_owned(), serde_json::Value::Array(calls));
+        }
+    }
+    let mut body = serde_json::json!({
+        "choices": [{"message": message, "finish_reason": finish_reason}],
+    });
+    if let Some(usage_value) = usage
+        && let Some(object) = body.as_object_mut()
+    {
+        let _ = object.insert("usage".to_owned(), usage_value);
+    }
+    let bytes = serde_json::to_vec(&body).map_err(|error| provider_error(Error::Encode(error)))?;
+    let answer = parse_answer(&bytes, model).map_err(provider_error)?;
+
+    Ok((answer, bytes))
+}
+
+/// Merges one `tool_calls` delta into the accumulated call for its index, concatenating function
+/// argument fragments as strings.
+fn merge_tool_call(
+    base: &mut serde_json::Value,
+    delta: &serde_json::Value,
+) {
+    let Some(delta_object) = delta.as_object() else {
+        return;
+    };
+    let Some(base_object) = base.as_object_mut() else {
+        return;
+    };
+
+    for (key, value) in delta_object {
+        match key.as_str() {
+            "function" => {
+                let entry = base_object
+                    .entry("function")
+                    .or_insert_with(|| serde_json::json!({}));
+                merge_function(entry, value);
+            },
+            _ => {
+                let _ = base_object.insert(key.clone(), value.clone());
+            },
+        }
+    }
+}
+
+/// Merges the `function` object of a tool-call delta, concatenating `arguments` strings.
+fn merge_function(
+    base: &mut serde_json::Value,
+    delta: &serde_json::Value,
+) {
+    let Some(delta_object) = delta.as_object() else {
+        return;
+    };
+    let Some(base_object) = base.as_object_mut() else {
+        return;
+    };
+
+    for (key, value) in delta_object {
+        if key == "arguments" {
+            let mut joined = base_object
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(String::new, String::from);
+            if let Some(appended) = value.as_str() {
+                joined.push_str(appended);
+            }
+            let _ = base_object.insert(key.clone(), serde_json::Value::String(joined));
+        } else {
+            let _ = base_object.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 /// The chat-completions body the endpoint was measured to accept.
@@ -955,7 +1234,7 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -1728,6 +2007,231 @@ mod tests {
         let detail = format!("model provider 127.0.0.1:{port}");
         assert_eq!(entries[0].detail(), Some(detail.as_str()));
 
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Serves one raw HTTP response over a local socket, returning the provider that points at it.
+    ///
+    /// The spawned handler reads the whole request, and when `assert_stream` is true it checks the
+    /// body carried `stream: true`.
+    fn serve(
+        response_body: &[u8],
+        content_type: &str,
+        assert_stream: bool,
+    ) -> (Ollama, PathBuf) {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let count = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let directory = scratch(&format!("stream-{count}"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = response_body.to_vec();
+        let content_type = content_type.to_owned();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        request.extend_from_slice(&buffer[..n]);
+                    },
+                }
+            }
+            if assert_stream {
+                let headers_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map_or(request.len(), |position| position + 4);
+                let request_body = &request[headers_end..];
+                let parsed: serde_json::Value = serde_json::from_slice(request_body).unwrap();
+                assert_eq!(parsed["stream"], serde_json::Value::Bool(true));
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                content_type,
+                body.len(),
+                String::from_utf8_lossy(&body),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+        let config = provider_config(&directory, &endpoint);
+        let credential = config.provider.credential.clone().unwrap();
+        let provider =
+            Ollama::open(&config, credential, SessionID::from_uuid(Uuid::nil())).unwrap();
+
+        (provider, directory)
+    }
+
+    /// Encodes one SSE event per JSON value, terminated by `[DONE]`.
+    fn sse(events: impl IntoIterator<Item = serde_json::Value>) -> Vec<u8> {
+        let mut body = Vec::new();
+        for event in events {
+            body.extend_from_slice(b"data: ");
+            body.extend_from_slice(serde_json::to_vec(&event).unwrap().as_slice());
+            body.extend_from_slice(b"\n\n");
+        }
+        body.extend_from_slice(b"data: [DONE]\n\n");
+
+        body
+    }
+
+    #[tokio::test]
+    async fn streamed_fragments_arrive_in_order_and_match_the_whole_body() {
+        let body = sse([
+            serde_json::json!({"choices": [{"delta": {"content": "hello "}, "finish_reason": null}]}),
+            serde_json::json!({"choices": [{"delta": {"content": "world"}, "finish_reason": null}]}),
+            serde_json::json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            }),
+        ]);
+        let (provider, directory) = serve(&body, "text/event-stream", true);
+        let mut seen = Vec::new();
+
+        let answer = provider
+            .complete_watched(&context(), &mut |fragment| seen.push(fragment.to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec!["hello ".to_owned(), "world".to_owned()]);
+        assert_eq!(answer.prose, "hello world");
+        assert_eq!(answer.action, Action::Final);
+        assert_eq!(
+            answer.usage,
+            Usage {
+                input: 3,
+                output: 2,
+            },
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_split_across_stream_fragments_decodes_to_command() {
+        let body = sse([
+            serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "run_shell", "arguments": ""}}]}, "finish_reason": null}]}),
+            serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"command\":\""}}]}, "finish_reason": null}]}),
+            serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "ls\"}"}}]}, "finish_reason": null}]}),
+            serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        ]);
+        let (provider, directory) = serve(&body, "text/event-stream", true);
+
+        let answer = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answer.action,
+            Action::Command {
+                command: "ls".to_owned(),
+            },
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_non_streaming_json_response_still_parses_and_watches_once() {
+        let body = br#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let (provider, directory) = serve(body, "application/json", true);
+        let mut seen = Vec::new();
+
+        let answer = provider
+            .complete_watched(&context(), &mut |fragment| seen.push(fragment.to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec!["done".to_owned()]);
+        assert_eq!(answer.prose, "done");
+        assert_eq!(answer.action, Action::Final);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_event_is_a_provider_error() {
+        let body = sse([serde_json::json!({"error": {"message": "model overloaded"}})]);
+        let (provider, directory) = serve(&body, "text/event-stream", true);
+
+        let refused = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(
+            refused.to_string().contains("model overloaded"),
+            "{refused}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_content_or_tool_call_is_a_provider_error() {
+        let body = sse([serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]})]);
+        let (provider, directory) = serve(&body, "text/event-stream", true);
+
+        let refused = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(
+            refused
+                .to_string()
+                .contains("stream ended without an answer"),
+            "{refused}",
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_streaming_request_body_sets_stream_true_while_request_body_keeps_false() {
+        let non_streaming = request_body(&context(), "m", 1);
+        assert_eq!(non_streaming["stream"], serde_json::Value::Bool(false));
+        // The watched call builds the same body but overrides stream; the mock server asserts it.
+    }
+
+    #[tokio::test]
+    async fn a_done_event_ends_the_call_before_the_connection_does() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buffer = [0_u8; 4096];
+            while stream.read(&mut buffer).is_ok_and(|read| read > 0) {}
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+            );
+            let _ = stream.write_all(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            );
+            let _ = stream.write_all(b"data: [DONE]\n\n");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let directory = scratch("done-holds");
+        let config = provider_config(&directory, &format!("http://127.0.0.1:{port}/v1"));
+        let credential = config.provider.credential.clone().unwrap();
+        let provider =
+            Ollama::open(&config, credential, SessionID::from_uuid(Uuid::nil())).unwrap();
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1),
+            provider.complete_watched(&context(), &mut |_| {}),
+        )
+        .await
+        .expect("the call ends on [DONE] rather than on the connection")
+        .unwrap();
+
+        assert_eq!(answer.prose, "done");
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

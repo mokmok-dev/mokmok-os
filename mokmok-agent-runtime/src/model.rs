@@ -70,6 +70,23 @@ pub trait Provider: Sync {
         &self,
         context: &Context,
     ) -> impl Future<Output = Result<Answer, Error>> + Send;
+
+    /// The same call, with a callback for each prose fragment the provider emits while streaming.
+    ///
+    /// The default implementation delegates to [`complete`] and forwards the whole prose once. The
+    /// observer is not `Send` because a terminal-bound watcher cannot cross await points safely,
+    /// and the future is not `Send` for the same reason; callers that need `Send` use `complete`.
+    fn complete_watched<'a>(
+        &'a self,
+        context: &'a Context,
+        watch: &'a mut dyn FnMut(&str),
+    ) -> impl Future<Output = Result<Answer, Error>> + 'a {
+        async move {
+            let answer = self.complete(context).await?;
+            watch(&answer.prose);
+            Ok(answer)
+        }
+    }
 }
 
 /// The session's durable past and the one way to extend it.

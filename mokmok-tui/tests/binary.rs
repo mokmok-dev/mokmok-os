@@ -4,7 +4,9 @@
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::io::Read as _;
     use std::io::Write as _;
+    use std::net::TcpListener;
     use std::os::fd::AsFd;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
@@ -256,7 +258,7 @@ mod tests {
     /// closed the tty hangs up, and the settings read back at the end would be a fresh terminal's.
     fn on_a_pty(
         scratch: &Path,
-        script: &Path,
+        arguments: Vec<String>,
     ) -> (Reaped, File, File) {
         // The 80x10 screen the asserted moves belong to.
         let size = Winsize {
@@ -282,7 +284,8 @@ mod tests {
         let child = Reaped::new(
             Command::new(env!("CARGO_BIN_EXE_mokmok-tui"))
                 .env("XDG_CONFIG_HOME", scratch.join("config"))
-                .args(args(scratch, script))
+                .env("MOKMOK_TEST_KEY", "test-key")
+                .args(arguments)
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::from(pty.slave))
                 .stderr(Stdio::piped())
@@ -299,7 +302,7 @@ mod tests {
         let script = scratch.0.join("script.json");
         std::fs::write(&script, b"[]").expect("the script is written");
 
-        let (mut child, mut master, kept) = on_a_pty(&scratch.0, &script);
+        let (mut child, mut master, kept) = on_a_pty(&scratch.0, args(&scratch.0, &script));
 
         let deadline = Instant::now() + PATIENCE;
         let mut transcript = Vec::new();
@@ -377,7 +380,7 @@ mod tests {
         std::fs::write(&script, br#"[{"action": "final", "say": "done"}]"#)
             .expect("the script is written");
 
-        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, &script);
+        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, args(&scratch.0, &script));
         let deadline = Instant::now() + PATIENCE;
         let mut transcript = Vec::new();
 
@@ -462,6 +465,131 @@ mod tests {
         assert!(
             found(&transcript, b"--- session", 0).is_some(),
             "the plain replay names the session it hands back: {}",
+            transcript.escape_ascii(),
+        );
+    }
+
+    /// The flags an endpoint run resolves: the provider is a local socket, so no network is reached.
+    fn stream_args(
+        scratch: &Path,
+        port: u16,
+    ) -> Vec<String> {
+        let checkout = scratch.join("checkout");
+
+        vec![
+            "--data-dir".to_owned(),
+            scratch.join("data").display().to_string(),
+            "--confiner".to_owned(),
+            shell().display().to_string(),
+            "--allow-tool".to_owned(),
+            shell().display().to_string(),
+            "--allow-write".to_owned(),
+            checkout.display().to_string(),
+            "--session".to_owned(),
+            SESSION.to_owned(),
+            "--goal".to_owned(),
+            "hold a conversation".to_owned(),
+            "--checkout".to_owned(),
+            checkout.display().to_string(),
+            "--provider".to_owned(),
+            "ollama".to_owned(),
+            "--model".to_owned(),
+            "m".to_owned(),
+            "--endpoint".to_owned(),
+            format!("http://127.0.0.1:{port}/v1"),
+            "--env-key".to_owned(),
+            "MOKMOK_TEST_KEY".to_owned(),
+        ]
+    }
+
+    /// Serves one SSE answer on a local socket, holding its second fragment until `release` fires.
+    ///
+    /// The hold is what makes the assertion about the first fragment mean something: the second
+    /// fragment does not exist on the wire while the first is being drawn.
+    fn serve_stream(release: std::sync::mpsc::Receiver<()>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("the mock endpoint binds");
+        let port = listener.local_addr().expect("the port").port();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut buffer = [0_u8; 4096];
+            while stream.read(&mut buffer).is_ok_and(|read| read > 0) {}
+
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.write_all(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"stream-one\"},\"finish_reason\":null}]}\n\n",
+            );
+            let _ = stream.flush();
+
+            let _ = release.recv_timeout(Duration::from_secs(10));
+
+            let _ = stream.write_all(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"stream-two\"},\"finish_reason\":\"stop\"}]}\n\n",
+            );
+            let _ = stream.write_all(b"data: [DONE]\n\n");
+            let _ = stream.flush();
+        });
+
+        port
+    }
+
+    #[test]
+    fn a_streamed_answer_is_drawn_while_it_arrives_and_keys_still_echo() {
+        let scratch = Scratch::new("pty-stream");
+        let (release, hold) = std::sync::mpsc::channel();
+        let port = serve_stream(hold);
+        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, stream_args(&scratch.0, port));
+        let deadline = Instant::now() + PATIENCE;
+        let mut transcript = Vec::new();
+
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            "the conversation's own screen is up: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(b"hi\r").expect("a line is submitted");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"stream-one"], deadline),
+            "the first fragment is drawn before the second is sent: {}",
+            transcript.escape_ascii(),
+        );
+
+        master
+            .write_all(b"z")
+            .expect("a key is typed while the call runs");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"\x1b[9;3Hz"], deadline),
+            "a key typed during the stream is echoed: {}",
+            transcript.escape_ascii(),
+        );
+
+        release.send(()).expect("the stream is released");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"stream-two"], deadline),
+            "the rest of the answer is drawn: {}",
+            transcript.escape_ascii(),
+        );
+
+        let first = found(&transcript, b"stream-one", 0).expect("the first fragment is drawn");
+        let second = found(&transcript, b"stream-two", 0).expect("the second fragment is drawn");
+        assert!(
+            first < second,
+            "the screen follows the stream in order: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(CTRL_C).expect("the interrupt is typed");
+        let status = await_exit(&mut child, &master, &mut transcript, deadline);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the conversation leaves when the human does: {}",
             transcript.escape_ascii(),
         );
     }

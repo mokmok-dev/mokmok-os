@@ -29,7 +29,7 @@ mod tool;
 #[cfg(test)]
 mod test_support;
 
-pub use advance::{Halt, Move, Progress, advance, execution_id, next, turn_id};
+pub use advance::{Halt, Move, Progress, advance, advance_watched, execution_id, next, turn_id};
 pub use context::{Context, ContextAct, ContextSkill, ContextTurn, context, system_prompt};
 pub use dialogue::Transcript;
 pub use edit::{EditCall, EditOutcome, EditReport, Editor, Plan, Ready, unproven};

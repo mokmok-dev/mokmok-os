@@ -1,11 +1,12 @@
 //! A conversation with the constrained agent, drawn on a terminal, in as many sessions as the human
 //! holds.
 //!
-//! The screen is a pure function of the durable [`Transcript`]s of the sessions this process holds:
-//! the crate keeps only the lines being typed, how far back each transcript is scrolled, which
-//! session the human is in, and the pane he opened, and everything else the screen shows and the
-//! loop does next comes from the folds. [`run`] drives the same kernel loop `mokmokd agent run`
-//! drives, one bounded step at a time, for whichever session's turn it is.
+//! The screen is the durable [`Transcript`]s of the sessions this process holds, plus the one
+//! answer a focused step is still streaming: the crate keeps the lines being typed, how far back
+//! each transcript is scrolled, which session the human is in, the pane he opened, and the keys a
+//! step deferred, and everything else the screen shows and the loop does next comes from the folds.
+//! [`run`] drives the same kernel loop `mokmokd agent run` drives, one bounded step at a time, for
+//! whichever session's turn it is.
 //!
 //! [`Transcript`]: mokmok_agent_runtime::Transcript
 
