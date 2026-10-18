@@ -151,7 +151,7 @@ pub async fn advance(
     session: SessionID,
     at: Moment,
 ) -> Result<Progress, Error> {
-    advance_watched(
+    advance_inner(
         journal,
         provider,
         tools,
@@ -160,9 +160,15 @@ pub async fn advance(
         skills,
         session,
         at,
-        &mut |_| {},
+        Ask::Whole,
     )
     .await
+}
+
+/// Whether one step asks the provider for a whole body or for a stream it can watch.
+enum Ask<'a> {
+    Whole,
+    Watched(&'a mut dyn FnMut(&str)),
 }
 
 /// Like [`advance`], but forwards every prose fragment the model emits while streaming to `watch`.
@@ -183,6 +189,32 @@ pub async fn advance_watched(
     session: SessionID,
     at: Moment,
     watch: &mut dyn FnMut(&str),
+) -> Result<Progress, Error> {
+    advance_inner(
+        journal,
+        provider,
+        tools,
+        finder,
+        editor,
+        skills,
+        session,
+        at,
+        Ask::Watched(watch),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn advance_inner(
+    journal: &mut impl Journal,
+    provider: &impl Provider,
+    tools: &impl Tools,
+    finder: &impl Finder,
+    editor: &impl Editor,
+    skills: &impl Skills,
+    session: SessionID,
+    at: Moment,
+    ask: Ask<'_>,
 ) -> Result<Progress, Error> {
     tracing::debug!(
         session = %session.as_uuid(),
@@ -231,7 +263,10 @@ pub async fn advance_watched(
             if journal.append(intent)? == Receipt::Replayed {
                 return Ok(Progress::Yielded);
             }
-            let answer = provider.complete_watched(context, watch).await?;
+            let answer = match ask {
+                Ask::Whole => provider.complete(context).await?,
+                Ask::Watched(watch) => provider.complete_watched(context, watch).await?,
+            };
             journal.append(ask_outcome(session, *turn, *number, *attempt, answer))?;
         },
         Move::Act {
@@ -1330,7 +1365,6 @@ mod tests {
     struct WatchedProvider {
         fragments: Vec<String>,
     }
-
     impl WatchedProvider {
         fn of(fragments: impl IntoIterator<Item = &'static str>) -> Self {
             Self {
@@ -1394,6 +1428,66 @@ mod tests {
             .expect("the answer is recorded");
         assert_eq!(answer.prose, "hello world");
         assert_eq!(answer.action, Action::Final);
+    }
+
+    struct SplitProvider {
+        whole: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        watched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Provider for SplitProvider {
+        fn complete(
+            &self,
+            _context: &Context,
+        ) -> impl Future<Output = Result<Answer, Error>> + Send {
+            self.whole.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            std::future::ready(Ok(answer_with_prose(Action::Final, "whole".to_owned())))
+        }
+
+        fn complete_watched<'a>(
+            &'a self,
+            _context: &'a Context,
+            _watch: &'a mut dyn FnMut(&str),
+        ) -> impl Future<Output = Result<Answer, Error>> + 'a {
+            self.watched
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            std::future::ready(Ok(answer_with_prose(Action::Final, "watched".to_owned())))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_unwatched_step_asks_the_whole_body_path() {
+        let session = session();
+        let task = task(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        let whole = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let watched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SplitProvider {
+            whole: std::sync::Arc::clone(&whole),
+            watched: std::sync::Arc::clone(&watched),
+        };
+
+        let progress = advance(
+            &mut journal,
+            &provider,
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &no_skills(),
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(progress, Progress::Advanced(Move::Ask { .. })));
+        assert_eq!(whole.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(watched.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     async fn drive(

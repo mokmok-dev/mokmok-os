@@ -624,6 +624,7 @@ async fn stream_answer(
     let mut finish_reason = String::new();
     let mut usage: Option<serde_json::Value> = None;
     let mut buffer = Vec::new();
+    let mut event = Vec::new();
 
     let mut stream = response.bytes_stream();
     'stream: while let Some(chunk) = stream.next().await {
@@ -631,22 +632,48 @@ async fn stream_answer(
         buffer.extend_from_slice(&chunk);
         while let Some(pos) = buffer.iter().position(|&byte| byte == b'\n') {
             let line: Vec<u8> = buffer.drain(..pos).collect();
-            if let Some(event) = parse_event_line(&line) {
-                if event == b"[DONE]" {
-                    break 'stream;
-                }
-                apply_event(
+            let line = trim_carriage_return(&line);
+
+            if line.is_empty() {
+                if dispatch(
                     &event,
                     &mut content,
                     &mut tool_calls,
                     &mut finish_reason,
                     &mut usage,
                     watch,
-                )?;
+                )? == Dispatch::Done
+                {
+                    break 'stream;
+                }
+                event.clear();
+            } else if let Some(data) = data_line(line) {
+                if !event.is_empty() {
+                    event.push(b'\n');
+                }
+                event.extend_from_slice(data);
             }
+
             let _ = buffer.drain(..1_usize);
         }
     }
+
+    if !buffer.is_empty()
+        && let Some(data) = data_line(trim_carriage_return(&buffer))
+    {
+        if !event.is_empty() {
+            event.push(b'\n');
+        }
+        event.extend_from_slice(data);
+    }
+    let _ = dispatch(
+        &event,
+        &mut content,
+        &mut tool_calls,
+        &mut finish_reason,
+        &mut usage,
+        watch,
+    )?;
 
     if content.is_empty() && tool_calls.is_empty() {
         return Err(provider_error(Error::EmptyStream));
@@ -655,11 +682,34 @@ async fn stream_answer(
     build_answer(&content, tool_calls, &finish_reason, usage, model)
 }
 
-fn parse_event_line(line: &[u8]) -> Option<Vec<u8>> {
-    let line = trim_carriage_return(line);
-    line.strip_prefix(b"data:")
-        .map(trim_leading_space)
-        .map(<[u8]>::to_vec)
+/// Whether a dispatched event ended the stream or left more of it to read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dispatch {
+    More,
+    Done,
+}
+
+fn dispatch(
+    event: &[u8],
+    content: &mut String,
+    tool_calls: &mut BTreeMap<u32, serde_json::Value>,
+    finish_reason: &mut String,
+    usage: &mut Option<serde_json::Value>,
+    watch: &mut dyn FnMut(&str),
+) -> Result<Dispatch, AgentError> {
+    if event.is_empty() {
+        return Ok(Dispatch::More);
+    }
+    if event == b"[DONE]" {
+        return Ok(Dispatch::Done);
+    }
+    apply_event(event, content, tool_calls, finish_reason, usage, watch)?;
+
+    Ok(Dispatch::More)
+}
+
+fn data_line(line: &[u8]) -> Option<&[u8]> {
+    line.strip_prefix(b"data:").map(trim_leading_space)
 }
 
 fn trim_carriage_return(line: &[u8]) -> &[u8] {
@@ -741,6 +791,17 @@ fn build_answer(
     usage: Option<serde_json::Value>,
     model: &str,
 ) -> Result<(Answer, Vec<u8>), AgentError> {
+    // A stream may close without a finish event. The content it sent is complete, so name the
+    // finish the content itself implies rather than reporting every such answer as malformed.
+    let finish = if finish_reason.is_empty() {
+        if tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        }
+    } else {
+        finish_reason
+    };
     let mut message = serde_json::json!({
         "role": "assistant",
         "content": content,
@@ -752,7 +813,7 @@ fn build_answer(
         }
     }
     let mut body = serde_json::json!({
-        "choices": [{"message": message, "finish_reason": finish_reason}],
+        "choices": [{"message": message, "finish_reason": finish}],
     });
     if let Some(usage_value) = usage
         && let Some(object) = body.as_object_mut()
@@ -2216,6 +2277,64 @@ mod tests {
         .unwrap();
 
         assert_eq!(answer.prose, "done");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_a_finish_reason_is_a_final_answer() {
+        let body = sse([serde_json::json!({"choices": [{"delta": {"content": "done"}}]})]);
+        let (provider, directory) = serve(&body, "text/event-stream", true);
+
+        let answer = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(answer.action, Action::Final);
+        assert_eq!(answer.prose, "done");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_final_event_is_still_read() {
+        let body =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}";
+        let (provider, directory) = serve(body, "text/event-stream", true);
+
+        let answer = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(answer.prose, "tail");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_done_event_is_not_an_error() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]";
+        let (provider, directory) = serve(body, "text/event-stream", true);
+
+        let answer = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(answer.prose, "tail");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_event_is_joined_before_it_is_decoded() {
+        let body = b": keep-alive\ndata: {\"choices\":[{\"delta\":{\"content\":\"multi\"},\ndata: \"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        let (provider, directory) = serve(body, "text/event-stream", true);
+
+        let answer = provider
+            .complete_watched(&context(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(answer.prose, "multi");
         let _ = std::fs::remove_dir_all(&directory);
     }
 }
