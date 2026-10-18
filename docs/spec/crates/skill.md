@@ -38,13 +38,13 @@ crate root. `frontmatter` reads the file's shape and gathers a raw value that `p
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `SkillName` | `src/name.rs:16` | A validated name: 1..=64 characters, `[a-z0-9-]`, no leading or trailing hyphen, no `--` |
-| `SkillSummary` | `src/lib.rs:63` | The name and description the prompt advertises |
-| `Skill` | `src/lib.rs:72` | One `SKILL.md`: the summary, three optional fields, a `metadata` map, and the body |
-| `Refusal` | `src/refusal.rs:13` | Why a file is not a skill, one variant per rule, one sentence on `Display` |
-| `parse`, `MAX_FRONTMATTER_BYTES`, `MAX_INSTRUCTIONS_BYTES` | `src/lib.rs:100,48,53` | Read one file against its directory name, and the two caps |
+| `SkillName` | `src/name.rs:18` | A validated name: 1..=64 characters, `[a-z0-9-]`, no leading or trailing hyphen, no `--` |
+| `SkillSummary` | `src/lib.rs:71` | The name and description the prompt advertises |
+| `Skill` | `src/lib.rs:80` | One `SKILL.md`: the summary, three optional fields, a `metadata` map, and the body |
+| `Refusal` | `src/refusal.rs:15` | Why a file is not a skill, one variant per rule, one sentence on `Display` |
+| `parse`, `MAX_FRONTMATTER_BYTES`, `MAX_INSTRUCTIONS_BYTES` | `src/lib.rs:108,56,61` | Read one file against its directory name, and the two caps |
 
-`frontmatter::read` (`src/frontmatter.rs:92`) checks the fences, the value subset, and one level of
+`frontmatter::read` (`src/frontmatter.rs:113`) checks the fences, the value subset, and one level of
 `metadata` nesting, and returns a shape-checked value. `parse` applies the field rules on top of it.
 
 # Owned state
@@ -56,25 +56,26 @@ the caller keeps the string it passed in.
 
 - The name is the directory. A file whose `name` is absent, malformed, or different from the
   directory it was read from is refused, and a name entering a decode is re-validated by the same
-  rule (`src/name.rs:25`, `src/lib.rs:108`).[^crate]
+  rule (`src/name.rs:27`, `src/lib.rs:115`).[^crate]
 - A key the format does not name is skipped with its value, and its indented lines are swallowed
-  rather than read as the next key (`src/frontmatter.rs:217`). A duplicate key naming a known field
-  is refused, while a duplicate unknown key is tolerated (`src/frontmatter.rs:222`).
+  rather than read as the next key (`src/frontmatter.rs:259`). A duplicate key naming a known field
+  is refused, while a duplicate unknown key is tolerated (`src/frontmatter.rs:264`).
 - The value subset is a plain scalar, a single-quoted scalar, a double-quoted scalar with `\"`, `\\`,
   and `\n`, or a `|`/`>` block with a `-`, `+`, or absent chomp. Anything else is refused with the
-  line that carried it (`src/frontmatter.rs:470`, `src/frontmatter.rs:438`).
+  line that carried it (`src/frontmatter.rs:477`, `src/frontmatter.rs:445`).
 - The body is everything after the closing `---` line and its newline, verbatim, and the frontmatter
-  region between the fences is capped before the body is measured (`src/frontmatter.rs:104`,
-  `src/frontmatter.rs:119`).
+  region between the fences is capped before the body is measured (`src/frontmatter.rs:125`,
+  `src/frontmatter.rs:140`).
 - An oversized body is refused, never clipped, because a clipped instruction is a different
-  instruction (`src/lib.rs:156`).
+  instruction (`src/lib.rs:163`).
 
 # Dependencies
 
 `serde` and `thiserror` alone, with `serde` deriving on the types that ride a record and `SkillName`
 re-validating through `#[serde(try_from = "String")]`. Development adds `proptest`, which the property
-cases are the only consumer of, and `serde_json` for a decode case. The crate declares
-`purity = "adapter"` in its manifest and depends on no `mokmok-` crate.[^manifest]
+cases are the only consumer of, and `serde_json` for a decode case. The crate is `#![no_std]` with
+`extern crate alloc` (`src/lib.rs:8-10`), it declares `purity = "pure"` in its manifest, and it
+depends on no `mokmok-` crate.[^manifest]
 
 # Reconciliation
 
@@ -87,11 +88,12 @@ of that crate.
 
 # Tests
 
-`src/lib.rs` holds 31 cases, four of them property cases inside a single `proptest!` block. The
+`src/lib.rs` holds 42 cases, four of them property cases inside a single `proptest!` block. The
 property cases pin that `parse` never panics on arbitrary bytes, that a parsed name always equals its
 directory, that a refused oversize body is never truncated, and that a decoded name re-validates.
-`src/frontmatter.rs` holds 19 cases for the fences, the value subset, the block rendering, and the
-`metadata` block.
+`src/frontmatter.rs` holds 26 cases for the fences, the value subset, the block rendering, and the
+`metadata` block, one of them for an empty `metadata` value that the closing fence ends rather than a
+later key.
 
 ```
 cargo test -p mokmok-skill

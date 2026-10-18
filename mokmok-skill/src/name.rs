@@ -1,7 +1,9 @@
 //! The skill-name rule, owned here so every entry point shares one answer.
 
+use alloc::string::{String, ToString};
+use core::fmt::{self, Display};
+
 use crate::refusal::Refusal;
-use std::fmt::{self, Display};
 
 /// The largest name accepted, in characters.
 const MAX_NAME_CHARS: usize = 64;

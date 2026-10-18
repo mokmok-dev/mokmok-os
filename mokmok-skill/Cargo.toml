@@ -4,11 +4,11 @@ name = "mokmok-skill"
 version.workspace = true
 
 [package.metadata.mokmok]
-purity = "adapter"
+purity = "pure"
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
-thiserror = { workspace = true }
+serde = { workspace = true, features = ["alloc", "derive"] }
+thiserror = { workspace = true, default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }

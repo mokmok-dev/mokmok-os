@@ -5,6 +5,13 @@
 //! value subset, and one level of `metadata` nesting. [`parse`] applies the field rules section 2
 //! names. A key the spec does not name is skipped, value and all: nothing reads it.
 
+#![no_std]
+
+extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
+
 mod frontmatter;
 mod name;
 mod refusal;
@@ -42,7 +49,8 @@ pub(crate) fn answered<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'sta
     answer
 }
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 
 /// The largest frontmatter region accepted, in bytes, between the two `---` fences.
 pub const MAX_FRONTMATTER_BYTES: usize = 16 * 1024;
@@ -189,6 +197,8 @@ fn text_of(value: &frontmatter::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use super::*;
 
     /// [`crate::parse`], bounded. The shadowed name keeps every case below on the invariant the
