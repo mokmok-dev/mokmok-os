@@ -667,6 +667,7 @@ impl<E: Engine> Manager<E> {
             let mut stepping = std::pin::pin!(engine.step_watched(&mut watch));
             let mut tick = interval(STREAM_TICK);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut drawn = 0;
 
             loop {
                 tokio::select! {
@@ -676,10 +677,11 @@ impl<E: Engine> Manager<E> {
                             type_during_stream(screen, input, scroll, &mut deferred, &mut failure);
                         let text = pending.borrow().clone();
 
-                        if (changed || !text.is_empty())
+                        if (changed || text.len() > drawn)
                             && let Some(base) = &base
                         {
                             draw_stream(screen, base, input, *scroll, &text, &mut failure);
+                            drawn = text.len();
                         }
                     },
                 }
@@ -1421,6 +1423,20 @@ mod tests {
             .expect_err("the draw fails");
 
         assert!(matches!(error, Error::Terminal(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_draws_once_per_fragment() {
+        let mut manager = Manager::holding(Talking::of(&["one"]));
+        let folds = manager.folds().expect("the folds read");
+        let mut screen = Recording::with([]);
+
+        manager
+            .step(0, &mut screen, &folds)
+            .await
+            .expect("the step runs");
+
+        assert_eq!(screen.frames.len(), 1);
     }
 
     #[tokio::test]
