@@ -31,10 +31,10 @@ Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `s
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `next`, `advance`, `turn_id`, `execution_id` | `src/advance.rs:110,144,532,544` | The decision, the step, and the two derived identifiers |
+| `next`, `advance`, `advance_watched`, `turn_id`, `execution_id` | `src/advance.rs:110,144,176,563,575` | The decision, the step, the step that reports prose as it arrives, and the two derived identifiers |
 | `Move`, `Halt`, `Progress` | `src/advance.rs:28,76,94` | Begin, ask, act, find, load, edit, close, await, halt; the five halt reasons; the step result |
 | `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `skill_of`, `loaded`, `newest_answer`, `observation`, `shown_turns`, `shown` |
-| `Provider`, `Journal` | `src/model.rs:65,80` | The model and the log, the two ports every step drives |
+| `Provider`, `complete_watched`, `Journal` | `src/model.rs:64,79,96` | The model and the log, the two ports every step drives; the watched call reports prose fragments without changing the answer it returns |
 | `Finder`, `FindReport` | `src/find.rs:18,8` | The fourth port: the one tool that reads and changes nothing |
 | `Skills`, `Read`, `NO_SKILLS` | `src/skill.rs:27,19,15` | The sixth port: it reads one advertised body and changes nothing |
 | `Editor`, `EditCall`, `Plan`, `Ready` | `src/edit.rs:83,11,19,28` | The edit port, one patch about to be written, and the two answers planning gives |
@@ -59,7 +59,9 @@ port (`src/model.rs:80-122`), and large bytes are addressed by an artifact hash
 # Invariants
 
 - An intent is appended before the effect, and only `Receipt::Written` performs it. A
-  `Receipt::Replayed` intent yields instead, at every move that appends (`src/advance.rs:179`).
+  `Receipt::Replayed` intent yields instead, at every move that appends (`src/advance.rs:212`).
+- A watched step forwards each prose fragment the model emits and still records one whole `Answer`
+  per attempt; nothing partial is appended (`src/advance.rs:234`).
 - The fold refuses a content record with no admitting machine fact (`Floating`) and a second record
   under one key with different content (`Conflict`), at the one dispatch every record passes,
   `Record::apply` (`src/dialogue.rs:271`).
@@ -132,13 +134,14 @@ writes a file through the kernel's own process.
 
 # Tests
 
-There is no `tests/` directory. Eight `#[cfg(test)]` modules hold 144 cases, two of them property
+There is no `tests/` directory. Eight `#[cfg(test)]` modules hold 145 cases, two of them property
 cases.
 
-`src/advance.rs:1059` holds 41 cases for the begin, ask, act, find, load, edit, and close walk, a
+`src/advance.rs:1090` holds 42 cases for the begin, ask, act, find, load, edit, and close walk, a
 replayed intent performing no effect, an interrupted find re-deriving its step, a load settling in one
 step and a replayed load performing no second read, a refused edit spending one step, the three
-ceilings, the draining halt, and a line at the log's ceiling. `src/dialogue.rs:697`
+ceilings, the draining halt, a line at the log's ceiling, and a watched provider forwarding its
+fragments while the whole answer is recorded. `src/dialogue.rs:697`
 holds 39 cases and one proptest for the floating, late, and conflicting refusals, the query, patch,
 and skill mismatches, an edit outcome with no intent, and for refolding a history being invariant.
 `src/context.rs:425` holds 40 cases for byte accounting, budget trimming, an unknown outcome

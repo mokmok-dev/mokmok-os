@@ -1,7 +1,7 @@
 ---
 type: Crate
 title: mokmok-tui
-description: A terminal front end that holds as many agent sessions as the human opens, steps the ones behind the screen, and renders a pure function of their durable transcripts.
+description: A terminal front end that holds as many agent sessions as the human opens, steps the ones behind the screen, and draws their durable transcripts plus the answer a focused step is streaming.
 resource: ../../../mokmok-tui
 tags: [mokmok-os, crate, interface]
 status: draft
@@ -22,21 +22,22 @@ sources:
 
 Holds a conversation with the agent in a terminal, and holds as many of them at once as the human
 opens or adopts. It steps the same kernel loop `mokmokd agent run` drives, one bounded step of
-whichever session's turn it is, and draws a pure function of the transcripts the kernel keeps. A
-session the human is not looking at still moves, between his keystrokes.[^crate]
+whichever session's turn it is, and draws the durable transcripts, with the answer a focused step is
+streaming appended until the turn settles. A session the human is not looking at still moves, between
+his keystrokes.[^crate]
 
 # Public surface
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:657` | The driver loop over every session the process holds |
-| `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `reopen` |
-| `Roster` | `src/port.rs:71` | The log's sessions: `listed`, `resume`, `create` |
-| `Screen` | `src/port.rs:107` | `poll`, `event`, `draw` |
-| `Listing`, `Key`, `Event`, `Line` | `src/port.rs:59,135,160,173` | What the log holds of one session, the keys, and the five line kinds |
-| `View`, `Sheet`, `Row` | `src/port.rs:358,382,399` | The frame, the pane over the transcript, and one row of the listing |
+| `run` | `src/core.rs:783` | The driver loop over every session the process holds |
+| `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `step_watched`, `reopen` |
+| `Roster` | `src/port.rs:90` | The log's sessions: `listed`, `resume`, `create` |
+| `Screen` | `src/port.rs:126` | `poll`, `event`, `draw` |
+| `Listing`, `Key`, `Event`, `Line` | `src/port.rs:78,154,179,192` | What the log holds of one session, the keys, and the five line kinds |
+| `View`, `Sheet`, `Row` | `src/port.rs:377,401,418` | The frame, the pane over the transcript, and one row of the listing |
 | `Session` | `src/session.rs:15` | The kernel-backed engine |
-| `Sessions` | `src/session.rs:76` | The kernel-backed roster |
+| `Sessions` | `src/session.rs:83` | The kernel-backed roster |
 | `Terminal` | `src/terminal.rs:28` | The terminal mode, its restoration, and the key reader |
 | `Outcome`, `Left` | `src/lib.rs:27,34` | What each held session left behind, and how it stands |
 
@@ -44,7 +45,8 @@ session the human is not looking at still moves, between his keystrokes.[^crate]
 
 Per session, the engine that runs it, the line being typed in it, and how far back its transcript is
 scrolled (`src/core.rs:19-24`). Per process, which session the human is in, the log's own listing as
-it was when he opened the pane, and at most one open pane (`src/core.rs:66-74`). `Terminal` also owns
+it was when he opened the pane, at most one open pane, and the keys typed while a step held the loop
+(`src/core.rs:61-71`). `Terminal` also owns
 the terminal mode it entered, raw mode and the alternate screen, and restores both in its `Drop`
 (`src/terminal.rs:66-71`). The crate holds no file, no directory, and no database. The log, the
 artifact store, and the sandbox belong to the kernel.
@@ -61,7 +63,11 @@ artifact store, and the sandbox belong to the kernel.
 - An event the conversation does not act on is dropped where the terminal's report is classified,
   so the driver only ever sees a key or a resize (`src/terminal.rs:115-119`).
 - A step is taken only when the terminal reports nothing, so a keystroke is answered before another
-  session moves (`src/core.rs:618-649`).
+  session moves (`src/core.rs:811-819`).
+- While a focused session steps, `STREAM_TICK` redraws the fragments received so far and answers the
+  line's keys; every other key is queued and answered once the step returns (`src/core.rs:708`).
+- A session behind the screen steps without a tick and without reading the terminal, so nothing it
+  streams reaches a frame (`src/core.rs:666`).
 - The rotation starts at the session on screen, so it moves first and the ones behind it take their
   turns in between the human's keystrokes (`src/core.rs:350-359`).
 - A session this process already holds is focused instead of opened a second time: two engines on one
@@ -79,8 +85,8 @@ artifact store, and the sandbox belong to the kernel.
 - A settled turn that renders no act is one the model never finished, and it draws `Line::Trouble`
   (`src/core.rs:88-124`) naming the reason its highest attempt answered with, or the attempts it
   spent without answering.
-- The trouble row renders through `prose_rows` with the gutter `TROUBLE_GUTTER` (`src/port.rs:198`),
-  so the frame and the plain replay show the same text.
+- The trouble row renders through `prose_rows` with the gutter `TROUBLE_GUTTER`
+  (`src/port.rs:333,219`), so the frame and the plain replay show the same text.
 - The listing draws the sessions this process holds first and the ones only the log holds after them,
   and a row's status is the phrase the header shows when the process holds that session and a phrase
   for its folded phase when it does not (`src/core.rs:300-331`).
@@ -100,7 +106,7 @@ artifact store, and the sandbox belong to the kernel.
 # Dependencies
 
 `clap`, `mokmok-agent-runtime`, `mokmok-kernel`, `mokmok-protocol`, `mokmok-state-machine`,
-`ratatui`, `thiserror`, and `tokio` with `macros` and `rt-multi-thread`. Development adds
+`ratatui`, `thiserror`, and `tokio` with `macros`, `rt-multi-thread`, and `time`. Development adds
 `mokmok-artifact`, `nix`, `proptest`, `serde_json`, and `uuid`. The crate declares no rusqlite and no
 axum dependency, and it reaches the log through `mokmok-kernel`'s `sessions` rather than by opening
 the file itself.
@@ -123,16 +129,16 @@ printed after the terminal is handed back (`src/bin/mokmok-tui.rs:57-77`), scrol
 the only way out of a live process, `--steps` accepted and ignored, and the `Engine` and `Roster`
 ports that let the loop be driven without a terminal (`src/port.rs:17-104`).
 
-One limit is deliberate. Background progress is cooperative: the loop steps a session between the
-human's keystrokes, and a step runs to completion, so a keystroke waits for the step in flight the
-way a single-session conversation already did. Nothing here runs a step on another thread or in
-another process.
+One limit is deliberate. A focused step redraws on a timer and answers the keys that edit the line,
+but every other key waits for the step to return, and a step whose work never awaits, such as a tool
+run, holds the loop the way it always did. A background step reads no terminal. Nothing here runs a
+step on another thread or in another process.
 
 # Tests
 
-90 cases: 9 in `tests/` and 81 across four `#[cfg(test)]` modules, two of them property cases.
+98 cases: 10 in `tests/` and 88 across four `#[cfg(test)]` modules, two of them property cases.
 
-Six of the nine cases in `tests/` are asynchronous conversation cases.
+Six of the ten cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
 One asserts that a provider holding no answer settles turn 1 failed and leaves the conversation open.
 One asserts that a line is refused while the turn is in flight.
@@ -141,23 +147,29 @@ One asserts that a session the human left keeps moving while he is in another, a
 the new session reports the one working in the background (`tests/conversation.rs:530`).
 One asserts that the listing shows a session only the log holds and that choosing it opens it
 (`tests/conversation.rs:608`).
-Three are binary cases: one asserts that a pipe on each standard stream refuses the run and says why,
-one drives a conversation on a pseudo-terminal through a frame and back to the shell, and one asserts
+Four are binary cases: one asserts that a pipe on each standard stream refuses the run and says why,
+one drives a conversation on a pseudo-terminal through a frame and back to the shell, one asserts
 that a frame drawn while a turn is in flight, the listing, and the prompt that names a goal all reach
-a real terminal (`tests/binary.rs:374`).
+a real terminal (`tests/binary.rs:377`), and one serves a held server-sent stream and asserts that
+the first fragment is drawn before the second is sent, that a key typed during the stream echoes, and
+that the rest of the answer follows in order (`tests/binary.rs:542`).
 
 Four modules hold the rest.
-One holds 39 cases and one property case for the trouble row, the work row, a dispatched command with
+One holds 46 cases and one property case for the trouble row, the work row, a dispatched command with
 no call record, the empty-line guard, the byte ceiling of the typed line and of a named goal, the
 status phrase of each mode, the rotation and its order, the listing's rows and cursor, adopting and
-creating a session, each pane's keys, and the frame the manager builds (`src/core.rs:681`).
+creating a session, each pane's keys, the frame the manager builds, a streamed fragment being drawn
+before the next arrives, a key typed during a stream reaching the line, a deferred key waiting for the
+step and being answered in order, a background stream drawing nothing, a pane covering the session
+keeping the stream off the screen, and a terminal that fails while a stream is read or drawn
+(`src/core.rs:834`).
 One holds 19 cases and one property case for gutters, multi-row replies, row-wise windowing, the
 trouble row, a find row, an edit row, escaped control characters, the replay, and the rows of the
-listing (`src/port.rs:497`).
+listing (`src/port.rs:517`).
 One holds 7 cases for a step another writer committed becoming visible after the engine reopens the
 ledger, the goal and the checkout the log holds being the ones a resumed session runs under, a
 session with no task being refused, a created session running under the goal the human typed, and the
-listing mapping onto what the kernel holds (`src/session.rs:194`).
+listing mapping onto what the kernel holds (`src/session.rs:202`).
 One holds 16 cases for the layout, scrollback, the key map, the press rule, the event
 classification, the terminal check, a find row, and the two panes (`src/terminal.rs:208`).
 
