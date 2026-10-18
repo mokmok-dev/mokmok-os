@@ -53,6 +53,9 @@ pub enum Error {
     /// Standard input or output is not a terminal, so there is no screen to draw on.
     #[error("this is not a terminal; use 'mokmokd agent run' for a run that writes no screen")]
     NotATerminal,
+    /// The working directory could not be read, so a bare start has no checkout to offer.
+    #[error("the working directory could not be read")]
+    Directory(#[source] std::io::Error),
     /// The log holds a history for the session and no task in it.
     #[error(
         "the session {} recorded no task, and a session runs under the task its log holds; read it \

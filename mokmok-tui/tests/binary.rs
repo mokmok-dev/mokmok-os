@@ -281,6 +281,15 @@ mod tests {
         scratch: &Path,
         arguments: Vec<String>,
     ) -> (Reaped, File, File) {
+        on_a_pty_in(scratch, arguments, None)
+    }
+
+    /// The same, started in `directory` when the case needs a working directory of its own.
+    fn on_a_pty_in(
+        scratch: &Path,
+        arguments: Vec<String>,
+        directory: Option<&Path>,
+    ) -> (Reaped, File, File) {
         // The 80x10 screen the asserted moves belong to.
         let size = Winsize {
             ws_row: 10,
@@ -302,17 +311,19 @@ mod tests {
         )
         .expect("the master is made non-blocking");
 
-        let child = Reaped::new(
-            Command::new(env!("CARGO_BIN_EXE_mokmok-tui"))
-                .env("XDG_CONFIG_HOME", scratch.join("config"))
-                .env("MOKMOK_TEST_KEY", "test-key")
-                .args(arguments)
-                .stdin(Stdio::from(input))
-                .stdout(Stdio::from(pty.slave))
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("the binary runs"),
-        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mokmok-tui"));
+        command
+            .env("XDG_CONFIG_HOME", scratch.join("config"))
+            .env("MOKMOK_TEST_KEY", "test-key")
+            .env("SHELL", shell())
+            .args(arguments)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(pty.slave))
+            .stderr(Stdio::piped());
+        if let Some(directory) = directory {
+            command.current_dir(directory);
+        }
+        let child = Reaped::new(command.spawn().expect("the binary runs"));
 
         (child, master, File::from(kept))
     }
@@ -488,6 +499,91 @@ mod tests {
             "the plain replay names the session it hands back: {}",
             transcript.escape_ascii(),
         );
+    }
+
+    /// The bare start: no session, goal, checkout, grant, search root, or skill root on the command
+    /// line, so every one comes from the process's own surroundings.
+    #[test]
+    fn a_bare_start_works_in_the_current_checkout_and_loads_the_configured_skill() {
+        let scratch = Scratch::new("pty-bare");
+        let checkout = scratch.0.join("checkout");
+        let skill = scratch.0.join("config/mokmok/skills/demo/SKILL.md");
+        std::fs::create_dir_all(skill.parent().expect("the skill has a directory"))
+            .expect("the skill directory is made");
+        std::fs::write(
+            &skill,
+            "---\nname: demo\ndescription: Demonstrate the bare start.\n---\nSay the demonstration.\n",
+        )
+        .expect("the skill is written");
+        let script = scratch.0.join("script.json");
+        std::fs::write(
+            &script,
+            serde_json::to_vec(&[
+                serde_json::json!({"action": "use_skill", "name": "demo"}),
+                serde_json::json!({"action": "final", "say": "the bare start replied"}),
+            ])
+            .expect("the script encodes"),
+        )
+        .expect("the script is written");
+
+        let (mut child, mut master, _kept) = on_a_pty_in(
+            &scratch.0,
+            vec![
+                "--data-dir".to_owned(),
+                scratch.0.join("data").display().to_string(),
+                "--confiner".to_owned(),
+                shell().display().to_string(),
+                "--script".to_owned(),
+                script.display().to_string(),
+            ],
+            Some(&checkout),
+        );
+        let deadline = Instant::now() + PATIENCE;
+        let mut transcript = Vec::new();
+
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            "the conversation's own screen is up: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(b"hi\r").expect("a line is submitted");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"replied"], deadline),
+            "the bare start answers in the checkout it was started in: {}",
+            transcript.escape_ascii(),
+        );
+        // The answer is streamed before its turn settles, and a turn with no speech enters the
+        // transcript when it settles. Give the following step time to draw the durable line.
+        std::thread::sleep(Duration::from_millis(200));
+
+        master.write_all(CTRL_C).expect("the interrupt is typed");
+        let status = await_exit(&mut child, &master, &mut transcript, deadline);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the conversation leaves when the human does: {}",
+            transcript.escape_ascii(),
+        );
+
+        let replay = found(&transcript, b"--- session", 0).unwrap_or_else(|| {
+            panic!(
+                "the plain replay names the session it hands back: {}",
+                transcript.escape_ascii(),
+            )
+        });
+        for wanted in [
+            b"you    hi".as_slice(),
+            b"loaded skill demo",
+            b"the bare start replied",
+        ] {
+            assert!(
+                found(&transcript, wanted, replay).is_some(),
+                "the replay carries {:?}: {}",
+                String::from_utf8_lossy(wanted),
+                transcript.escape_ascii(),
+            );
+        }
     }
 
     fn stream_args(

@@ -18,6 +18,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use clap::builder::TypedValueParser as _;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -305,13 +306,19 @@ pub enum Agent {
 #[derive(Clone, Debug, clap::Args)]
 pub struct Run {
     /// The session to work in. Its first run opens it.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     pub session: String,
     /// What the agent is asked to do.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     pub goal: String,
     /// The scratch checkout the goal lives in. A `--allow-write` grant must cover it.
-    #[arg(long, value_name = "DIR")]
+    // clap's own path parser refuses the empty default, which is the sentinel for an unnamed flag.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "",
+        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from)
+    )]
     pub checkout: PathBuf,
     /// How many turns the session may open.
     #[arg(long, default_value_t = 8)]
@@ -407,7 +414,8 @@ impl Config {
     /// # Errors
     ///
     /// Returns a [`ConfigError`] when a directory cannot be created, a program is not absolute or
-    /// not a runnable file, a named path is not a directory, a search root no grant covers, or the
+    /// not a runnable file, a named path is not a directory, an agent run names no session, goal,
+    /// or checkout, a search root no grant covers, or the
     /// configuration file is missing, unreadable, invalid, or holds a path key that leaves it, or a
     /// reference in it names a variable the environment does not answer, is not a reference at all,
     /// or expands to a path that leaves the file's directory.
@@ -453,9 +461,16 @@ impl Config {
             .iter()
             .map(|path| reachable_directory(path))
             .collect::<Result<Vec<_>, _>>()?;
-        // The checkout is reached only through a write grant, so a run whose checkout no grant
-        // covers would be refused by the sandbox halfway through; refusing it here names the path.
         if let Command::Agent(Agent::Run(run)) = &args.command {
+            if run.session.is_empty() {
+                return Err(ConfigError::NoSession);
+            }
+            if run.goal.trim().is_empty() {
+                return Err(ConfigError::NoGoal);
+            }
+            if run.checkout.as_os_str().is_empty() {
+                return Err(ConfigError::NoCheckout);
+            }
             // A second grant would be dropped rather than becoming a second tool, which is the
             // kind of silent narrowing an operator will not notice.
             if allow_tool.len() > 1 {
@@ -463,6 +478,9 @@ impl Config {
                     count: allow_tool.len(),
                 });
             }
+            // The checkout is reached only through a write grant, so a run whose checkout no grant
+            // covers would be refused by the sandbox halfway through; refusing it here names the
+            // path.
             if !allow_write
                 .iter()
                 .any(|grant| run.checkout.starts_with(grant))
@@ -1095,6 +1113,12 @@ pub enum ConfigError {
     NotAnAssignment(String),
     #[error("the checkout {checkout} is not covered by any --allow-write grant")]
     CheckoutUngranted { checkout: PathBuf },
+    #[error("no --session is named, so there is no session to work in")]
+    NoSession,
+    #[error("no --goal is named, so the agent has nothing to do")]
+    NoGoal,
+    #[error("no --checkout is named, so the agent has no workspace")]
+    NoCheckout,
     #[error(
         "the search root {path} is not covered by any --allow-path or --allow-write grant, so the \
          finder would read what the operator never opened"
