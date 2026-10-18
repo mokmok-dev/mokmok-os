@@ -176,14 +176,15 @@ workspace's only wall-clock read (`src/bin/mokmokd.rs:80-88`).
 
 # Tests
 
-250 cases: 189 in `#[cfg(test)]` modules, one of them ignored, and 61 across six integration files.
+254 cases: 193 in `#[cfg(test)]` modules, one of them ignored, and 61 across six integration files.
 
-`src/provider.rs` holds 43 cases for the measured model exchange, malformed output, the request
+`src/provider.rs` holds 47 cases for the measured model exchange, malformed output, the request
 body, endpoint parsing, the tool list a session's grants and skills decide, not following a redirect,
 the `use_skill` call's decode and its two malformed shapes, the loaded bodies in the system
 message, and the streamed answer: fragment order, a tool call split across fragments, a JSON
-endpoint that ignores `stream`, an error event, a stream with no answer, and a `[DONE]` event that
-ends the call before the connection does. One of them is ignored:
+endpoint that ignores `stream`, an error event, a stream with no answer, a `[DONE]` event that
+ends the call before the connection does, an answer with no finish event, an unterminated final
+event, an unterminated `[DONE]`, and an event split across `data:` lines. One of them is ignored:
 it reaches a live endpoint by hand. `src/config.rs` holds 66 cases
 for resolution and refusal, 33 of them driving a configuration file the test wrote.
 `src/editor.rs` holds 26 cases for planning an edit and committing one: the plan for one file, for a

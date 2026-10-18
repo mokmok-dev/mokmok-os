@@ -30,7 +30,7 @@ his keystrokes.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:791` | The driver loop over every session the process holds |
+| `run` | `src/core.rs:793` | The driver loop over every session the process holds |
 | `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `step_watched`, `reopen` |
 | `Roster` | `src/port.rs:90` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:126` | `poll`, `event`, `draw` |
@@ -63,11 +63,11 @@ artifact store, and the sandbox belong to the kernel.
 - An event the conversation does not act on is dropped where the terminal's report is classified,
   so the driver only ever sees a key or a resize (`src/terminal.rs:115-119`).
 - A step is taken only when the terminal reports nothing, so a keystroke is answered before another
-  session moves (`src/core.rs:819-827`).
+  session moves (`src/core.rs:818-826`).
 - While a focused session steps, `STREAM_TICK` redraws the fragments received so far and answers the
-  line's keys; every other key is queued and answered once the step returns (`src/core.rs:716`).
+  line's keys; every other key is queued and answered once the step returns (`src/core.rs:718`).
 - A session behind the screen steps without a tick and without reading the terminal, so nothing it
-  streams reaches a frame (`src/core.rs:674`).
+  streams reaches a frame (`src/core.rs:675`).
 - The rotation starts at the session on screen, so it moves first and the ones behind it take their
   turns in between the human's keystrokes (`src/core.rs:350-359`).
 - A session this process already holds is focused instead of opened a second time: two engines on one
@@ -136,7 +136,7 @@ step on another thread or in another process.
 
 # Tests
 
-98 cases: 10 in `tests/` and 88 across four `#[cfg(test)]` modules, two of them property cases.
+99 cases: 10 in `tests/` and 89 across four `#[cfg(test)]` modules, two of them property cases.
 
 Six of the ten cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -155,14 +155,14 @@ the first fragment is drawn before the second is sent, that a key typed during t
 that the rest of the answer follows in order (`tests/binary.rs:542`).
 
 Four modules hold the rest.
-One holds 46 cases and one property case for the trouble row, the work row, a dispatched command with
+One holds 47 cases and one property case for the trouble row, the work row, a dispatched command with
 no call record, the empty-line guard, the byte ceiling of the typed line and of a named goal, the
 status phrase of each mode, the rotation and its order, the listing's rows and cursor, adopting and
 creating a session, each pane's keys, the frame the manager builds, a streamed fragment being drawn
-before the next arrives, a key typed during a stream reaching the line, a deferred key waiting for the
-step and being answered in order, a background stream drawing nothing, a pane covering the session
-keeping the stream off the screen, and a terminal that fails while a stream is read or drawn
-(`src/core.rs:835`).
+before the next arrives, a stream drawing once per fragment, a key typed during a stream reaching the
+line, a deferred key waiting for the step and being answered in order, a background stream drawing
+nothing, a pane covering the session keeping the stream off the screen, and a terminal that fails
+while a stream is read or drawn (`src/core.rs:837`).
 One holds 19 cases and one property case for gutters, multi-row replies, row-wise windowing, the
 trouble row, a find row, an edit row, escaped control characters, the replay, and the rows of the
 listing (`src/port.rs:517`).
