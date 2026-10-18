@@ -1,6 +1,6 @@
 {
-  "harness": "51eaa67e070d3832fc8d9815923df1086f638c4a6cdfcda6c09debfc8f82f74a",
-  "generated": "2026-10-18T12:36:50Z",
+  "harness": "a504206f1e443cb4d7c4441ae0e0dd6b7c53282ed1ac6cdf1806e3b03a5a79e6",
+  "generated": "2026-10-18T13:45:20Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
@@ -171,12 +171,12 @@
       "name": "mokmok-tui",
       "score": 100.0,
       "target": 100.0,
-      "tested": 155,
-      "caught": 155,
+      "tested": 174,
+      "caught": 174,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "eef30790504d978c3e688f2dd1785249971125f5b147983ce9147fed839169ca"
+      "digest": "d5736d75326253f44eb6c9108ebdfebec83dd3a870af545067e3647511fb0c14"
     }
   ]
 }

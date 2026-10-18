@@ -92,6 +92,25 @@ mod tests {
         panic!("no shell on PATH");
     }
 
+    /// The sandbox's confiner, which is what actually runs a command. A package-scoped build
+    /// leaves it out, because it belongs to another package, so a case that dispatches a command
+    /// needs the workspace built first.
+    fn confiner() -> PathBuf {
+        if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
+            let path = PathBuf::from(named);
+            assert!(path.is_file(), "{} is not a file", path.display());
+
+            return path;
+        }
+
+        let sibling = PathBuf::from(env!("CARGO_BIN_EXE_mokmok-tui"))
+            .parent()
+            .expect("the binary has a directory")
+            .join("mokmok-sandbox-confine");
+
+        if sibling.is_file() { sibling } else { shell() }
+    }
+
     /// The flags the configuration resolves for a scripted run.
     fn args(
         scratch: &Path,
@@ -103,9 +122,11 @@ mod tests {
             "--data-dir".to_owned(),
             scratch.join("data").display().to_string(),
             "--confiner".to_owned(),
-            shell().display().to_string(),
+            confiner().display().to_string(),
             "--allow-tool".to_owned(),
             shell().display().to_string(),
+            "--allow-path".to_owned(),
+            "/nix/store".to_owned(),
             "--allow-write".to_owned(),
             checkout.display().to_string(),
             "--session".to_owned(),
@@ -479,9 +500,11 @@ mod tests {
             "--data-dir".to_owned(),
             scratch.join("data").display().to_string(),
             "--confiner".to_owned(),
-            shell().display().to_string(),
+            confiner().display().to_string(),
             "--allow-tool".to_owned(),
             shell().display().to_string(),
+            "--allow-path".to_owned(),
+            "/nix/store".to_owned(),
             "--allow-write".to_owned(),
             checkout.display().to_string(),
             "--session".to_owned(),
@@ -533,6 +556,71 @@ mod tests {
         });
 
         port
+    }
+
+    #[test]
+    fn a_key_typed_while_a_command_runs_is_drawn_before_the_answer() {
+        // The confiner belongs to another package. A package-scoped build, which is what the
+        // mutation gate makes, leaves it out, and a shell standing in for it refuses every
+        // command. The unit case over the worker covers the same screen behaviour without one.
+        if !confiner()
+            .to_string_lossy()
+            .ends_with("mokmok-sandbox-confine")
+        {
+            return;
+        }
+
+        let scratch = Scratch::new("pty-command");
+        let script = scratch.0.join("script.json");
+        std::fs::write(
+            &script,
+            br#"[{"action":"command","command":"sleep 2"},{"action":"final","say":"done"}]"#,
+        )
+        .expect("the script is written");
+
+        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, args(&scratch.0, &script));
+        let deadline = Instant::now() + PATIENCE;
+        let mut transcript = Vec::new();
+
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            "the conversation's own screen is up: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(b"hi\r").expect("a line is submitted");
+        std::thread::sleep(Duration::from_millis(500));
+        master
+            .write_all(b"z")
+            .expect("a key is typed while the command runs");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"\x1b[9;3Hz"], deadline),
+            "a key typed during the command is echoed: {}",
+            transcript.escape_ascii(),
+        );
+
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"done"], deadline),
+            "the command's answer follows: {}",
+            transcript.escape_ascii(),
+        );
+
+        let typed_at = found(&transcript, b"\x1b[9;3Hz", 0).expect("the key is drawn");
+        let answered_at = found(&transcript, b"done", 0).expect("the answer is drawn");
+        assert!(
+            typed_at < answered_at,
+            "the key is drawn while the command still runs: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(CTRL_C).expect("the interrupt is typed");
+        let status = await_exit(&mut child, &master, &mut transcript, deadline);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the conversation leaves when the human does: {}",
+            transcript.escape_ascii(),
+        );
     }
 
     #[test]

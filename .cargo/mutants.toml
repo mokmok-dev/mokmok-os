@@ -66,4 +66,8 @@ exclude_re = [
   # kept it would make this mutant killable; that is a change to the audit entry's shape, and the
   # gap it names is that a connection cannot be attributed to an execution after the fact.
   '^mokmok-kernel/src/provider\.rs:\d+:\d+: replace model_audit_id -> Uuid with Default::default\(\)$',
+  # `Engine::drain`'s default body is `Vec::new()`, and cargo-mutants rewrites it as `vec![]`, which
+  # is the same empty vector. An engine that runs its step inline is the only one that reaches the
+  # default, and an empty drain is its contract; the worker overrides the method.
+  '^mokmok-tui/src/port\.rs:\d+:\d+: replace Engine::drain -> Vec<Update> with vec!\[\]$',
 ]

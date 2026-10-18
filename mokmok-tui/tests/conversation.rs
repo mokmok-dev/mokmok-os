@@ -8,6 +8,7 @@
 mod tests {
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use clap::Parser as _;
     use mokmok_agent_runtime::{Progress, turn_id};
@@ -16,7 +17,8 @@ mod tests {
     use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Phase, Turn, TurnOutcome};
     use mokmok_tui::{
-        Engine, Error, Event, Key, Line, Screen, Session, Sessions, Sheet, View, run,
+        Engine, Error, Event, Key, Line, Outcome, Screen, Session, Sessions, Sheet, View, Worker,
+        run,
     };
     use serde_json::json;
 
@@ -280,6 +282,18 @@ mod tests {
         panic!("the session did not settle");
     }
 
+    /// Runs a conversation under a deadline, so a driver that stopped moving fails the case instead
+    /// of parking the mutation gate in a timeout.
+    async fn bounded(
+        world: &Sessions,
+        first: Worker,
+        screen: &mut ScriptedScreen,
+    ) -> Result<Outcome, Error> {
+        tokio::time::timeout(Duration::from_secs(5), run(world, first, screen))
+            .await
+            .expect("the conversation ended before its deadline")
+    }
+
     #[tokio::test]
     async fn a_conversation_shows_the_line_it_answers_and_survives_two_exchanges() {
         let scratch = Scratch::new("conversation");
@@ -300,7 +314,7 @@ mod tests {
             frames: Vec::new(),
         };
 
-        let outcome = run(&world, first, &mut screen)
+        let outcome = bounded(&world, first, &mut screen)
             .await
             .expect("the conversation ends when the human leaves");
         assert_eq!(outcome.left.len(), 1, "the process held one session");
@@ -387,7 +401,7 @@ mod tests {
             frames: Vec::new(),
         };
 
-        let outcome = run(&world, first, &mut screen)
+        let outcome = bounded(&world, first, &mut screen)
             .await
             .expect("a provider failure does not end the conversation");
         assert!(
@@ -497,7 +511,7 @@ mod tests {
             frames: Vec::new(),
         };
 
-        run(&world, first, &mut screen)
+        bounded(&world, first, &mut screen)
             .await
             .expect("the conversation ends when the human leaves");
 
@@ -559,7 +573,7 @@ mod tests {
             frames: Vec::new(),
         };
 
-        let outcome = run(&world, first, &mut screen)
+        let outcome = bounded(&world, first, &mut screen)
             .await
             .expect("the conversation ends when the human leaves");
 
@@ -644,7 +658,7 @@ mod tests {
             frames: Vec::new(),
         };
 
-        let outcome = run(&world, first, &mut screen)
+        let outcome = bounded(&world, first, &mut screen)
             .await
             .expect("the conversation ends when the human leaves");
 

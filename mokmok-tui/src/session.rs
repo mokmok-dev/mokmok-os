@@ -7,6 +7,7 @@ use mokmok_protocol::{Moment, SessionID};
 
 use crate::Error;
 use crate::port::{Engine, Listing, Roster};
+use crate::worker::Worker;
 
 /// The engine one session runs on: the kernel's own driver, one bounded step at a time.
 ///
@@ -102,11 +103,11 @@ impl Sessions {
     ///
     /// Returns [`Error::Untasked`] when the log holds a taskless history for that session, and the
     /// errors of opening the session's world.
-    pub fn start(&self) -> Result<Session, Error> {
+    pub fn start(&self) -> Result<Worker, Error> {
         let session = SessionID::from_uuid(mokmok_kernel::uuid_of(&self.run.session, "session")?);
         let run = self.run_for(session)?;
 
-        Session::open(&self.config, &run, self.at)
+        Worker::open(Session::open(&self.config, &run, self.at)?)
     }
 
     /// The run one session is opened with: the command line's own, refused when the log holds a
@@ -161,7 +162,7 @@ impl Sessions {
 }
 
 impl Roster for Sessions {
-    type Engine = Session;
+    type Engine = Worker;
 
     fn listed(&self) -> Result<Vec<Listing>, Error> {
         Ok(mokmok_kernel::sessions(&self.config)?
@@ -181,7 +182,7 @@ impl Roster for Sessions {
     ) -> Result<Self::Engine, Error> {
         let run = self.run_for(listing.session)?;
 
-        Session::open(&self.config, &run, self.at)
+        Worker::open(Session::open(&self.config, &run, self.at)?)
     }
 
     fn create(
@@ -194,7 +195,7 @@ impl Roster for Sessions {
             ..self.run_for(session)?
         };
 
-        Session::open(&self.config, &run, self.at)
+        Worker::open(Session::open(&self.config, &run, self.at)?)
     }
 }
 
@@ -213,9 +214,43 @@ mod tests {
 
     use super::{Session, Sessions};
     use crate::Error;
-    use crate::port::{Engine, Listing, Roster};
+    use crate::port::{Engine, Listing, Roster, Update};
+    use crate::worker::Worker;
     use mokmok_protocol::SessionID;
     use mokmok_state_machine::Phase;
+
+    fn step_once(
+        worker: &mut Worker,
+        runtime: &tokio::runtime::Runtime,
+    ) -> mokmok_agent_runtime::Progress {
+        // The line spoken just before this call is a command of its own; a step dispatched over it
+        // would be the no-op the port promises, not the step this helper waits for.
+        for _ in 0..2_000 {
+            worker.drain();
+
+            if !worker.busy() {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        runtime.block_on(async {
+            worker.step().await.expect("the step dispatches");
+        });
+
+        for _ in 0..10_000 {
+            for update in worker.drain() {
+                if let Update::Stepped(result) = update {
+                    return result.expect("the step runs");
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        panic!("the step never reported back");
+    }
 
     const SESSION: &str = "018f2f1e-0000-7000-8000-000000000000";
 
@@ -400,15 +435,13 @@ mod tests {
             .create("count the quokkas")
             .expect("the session opens");
         let id = created.session();
-        runtime.block_on(async {
-            for _ in 0..4 {
-                match created.step().await.expect("the step runs") {
-                    mokmok_agent_runtime::Progress::Awaiting
-                    | mokmok_agent_runtime::Progress::Terminal(_) => break,
-                    _ => {},
-                }
+        for _ in 0..4 {
+            match step_once(&mut created, &runtime) {
+                mokmok_agent_runtime::Progress::Awaiting
+                | mokmok_agent_runtime::Progress::Terminal(_) => break,
+                _ => {},
             }
-        });
+        }
 
         let listing = Listing {
             session: id,
@@ -510,15 +543,13 @@ mod tests {
             .enable_all()
             .build()
             .expect("a runtime");
-        runtime.block_on(async {
-            for _ in 0..8 {
-                match engine.step().await.expect("the step runs") {
-                    mokmok_agent_runtime::Progress::Awaiting
-                    | mokmok_agent_runtime::Progress::Terminal(_) => break,
-                    _ => {},
-                }
+        for _ in 0..8 {
+            match step_once(&mut engine, &runtime) {
+                mokmok_agent_runtime::Progress::Awaiting
+                | mokmok_agent_runtime::Progress::Terminal(_) => break,
+                _ => {},
             }
-        });
+        }
 
         let listed = sessions.listed().expect("the log is read");
 

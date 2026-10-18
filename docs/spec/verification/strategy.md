@@ -18,7 +18,11 @@ sources:
   - id: mutants
     resource: ../../../scripts/mutants.sh
     title: the mutation gate script
-    last_modified: 2026-10-16T03:55:52Z
+    last_modified: 2026-10-18T00:00:00Z
+  - id: rust
+    resource: ../../../.github/workflows/rust.yaml
+    title: the Rust workflow that runs the mutation gate
+    last_modified: 2026-10-18T00:00:00Z
 ---
 
 # How to read this bundle
@@ -45,7 +49,7 @@ The table below is that strategy with a third column for what exists in this tre
 | --- | --- | --- |
 | Unit | Local behaviour | `#[test]` and `#[tokio::test]` cases in every crate |
 | Property and model-based | Invariants across generated sequences | `proptest` in twelve crates, and `proptest-state-machine` in `mokmok-state-machine` |
-| Mutation | Weak assertions | `scripts/mutants.sh`: one package per run at a 95% floor, a `pure` member must kill every mutant and time none out, `--all` scores every member into `mutation.json` |
+| Mutation | Weak assertions | `scripts/mutants.sh`: one package per run at a 95% floor, a `pure` member must kill every mutant and time none out, `--all` scores every member into `mutation.json`; the `rust` workflow runs the sweep and the gate on every pull request |
 | Fuzzing | Unexpected input | Absent |
 | Concurrency | Controlled interleavings | Real concurrent tests using two stores, two writers, and a churning publisher; no Loom |
 | Integration | Real boundary behaviour | Real SQLite files, real Unix sockets, real Landlock confinement, real subprocesses |
@@ -54,21 +58,28 @@ The table below is that strategy with a third column for what exists in this tre
 
 # What runs in CI
 
-One command, `nix flake check`, and the flake declares five checks over the whole workspace:
-`cargoClippy` with warnings denied, `cargoDocTest`, `cargoTest` through crane's `cargoNextest`,
-`treefmt` for Nix, Rust, and TOML, and `pre-commit` for `actionlint`, `deadnix`, and `statix`.[^flake]
+Two workflows. The `nix` workflow runs one command, `nix flake check`, and the flake declares five
+checks over the whole workspace: `cargoClippy` with warnings denied, `cargoDocTest`, `cargoTest`
+through crane's `cargoNextest`, `treefmt` for Nix, Rust, and TOML, and `pre-commit` for
+`actionlint`, `deadnix`, and `statix`.[^flake]
 Two further checks cover the systemd unit and the NixOS module.
 
-The mutation gate is a script the operator runs, not a check. One package per invocation, selected
-by `MUTANTS_PACKAGE`, enforces a floor of 95% by default. `--all` sweeps every member, writes each
-one's score and target to `mutation.json`, and exports the confiner the kernel's and the tui's
-integration tests need; `--check-baseline` reads that ledger back and reports which rows moved.
-That read also holds the policy to the purity ladder: a member whose role is `pure` must report no
-surviving and no timed-out mutant, every workspace member must have a row, and the counted mutants
-across the ledger must reach 98% killed. Twelve mutants across six members are excluded as
-equivalent, each with its proof beside the exclusion in `.cargo/mutants.toml`, and one of those
-twelve is a scope limit rather than an equivalence. All sixteen members score 100% over the mutants
-that remain.[^mutants]
+The `rust` workflow adds the fast loop the Rust workspace is developed in: a `check` job runs
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+and `cargo test --workspace` inside the dev shell. A `mutants` job then runs
+`scripts/mutants.sh --all --jobs 2` and reads the ledger back with `--check-baseline`, so the
+mutation gate is enforced on every pull request instead of being a script the operator has to
+remember.[^rust]
+
+One package per invocation, selected by `MUTANTS_PACKAGE`, still gives a fast local score with a
+floor of 95% by default. `--all` sweeps every member, writes each one's score and target to
+`mutation.json`, and exports the confiner the kernel's and the tui's integration tests need;
+`--check-baseline` reads that ledger back and reports which rows moved. That read also holds the
+policy to the purity ladder: a member whose role is `pure` must report no surviving and no timed-out
+mutant, every workspace member must have a row, and the counted mutants across the ledger must reach
+98% killed. Thirteen mutants across seven members are excluded as equivalent, each with its proof
+beside the exclusion in `.cargo/mutants.toml`, and one of those thirteen is a scope limit rather
+than an equivalence. All sixteen members score 100% over the mutants that remain.[^mutants]
 
 # The four attested computations
 
