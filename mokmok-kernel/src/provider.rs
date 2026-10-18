@@ -614,8 +614,6 @@ fn provider_error(error: Error) -> AgentError {
     AgentError::Provider(Box::new(error))
 }
 
-/// Reads one streamed answer, forwarding content fragments to `watch` and returning the canonical
-/// non-streaming body so one decoder serves both paths.
 async fn stream_answer(
     response: reqwest::Response,
     watch: &mut dyn FnMut(&str),
@@ -657,7 +655,6 @@ async fn stream_answer(
     build_answer(&content, tool_calls, &finish_reason, usage, model)
 }
 
-/// Strips SSE framing from one non-empty line, returning `None` for comments or malformed prefixes.
 fn parse_event_line(line: &[u8]) -> Option<Vec<u8>> {
     let line = trim_carriage_return(line);
     line.strip_prefix(b"data:")
@@ -665,17 +662,14 @@ fn parse_event_line(line: &[u8]) -> Option<Vec<u8>> {
         .map(<[u8]>::to_vec)
 }
 
-/// Drops a trailing carriage return from a line that ended with `\r\n`.
 fn trim_carriage_return(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
-/// Drops the single leading space the SSE `data:` prefix is followed by.
 fn trim_leading_space(event: &[u8]) -> &[u8] {
     event.strip_prefix(b" ").unwrap_or(event)
 }
 
-/// Applies one streamed JSON event to the accumulating answer state.
 fn apply_event(
     event: &[u8],
     content: &mut String,
@@ -740,7 +734,6 @@ fn apply_event(
     Ok(())
 }
 
-/// Builds the canonical non-streaming body from accumulated stream state and decodes it.
 fn build_answer(
     content: &str,
     tool_calls: BTreeMap<u32, serde_json::Value>,
@@ -772,8 +765,6 @@ fn build_answer(
     Ok((answer, bytes))
 }
 
-/// Merges one `tool_calls` delta into the accumulated call for its index, concatenating function
-/// argument fragments as strings.
 fn merge_tool_call(
     base: &mut serde_json::Value,
     delta: &serde_json::Value,
@@ -800,7 +791,6 @@ fn merge_tool_call(
     }
 }
 
-/// Merges the `function` object of a tool-call delta, concatenating `arguments` strings.
 fn merge_function(
     base: &mut serde_json::Value,
     delta: &serde_json::Value,
