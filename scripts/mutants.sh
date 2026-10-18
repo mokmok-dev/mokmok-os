@@ -9,6 +9,10 @@ cd "$(dirname "$0")/.."
 # gate's own sensitivity can be demonstrated without editing it.
 readonly FLOOR="${MUTANTS_TARGET:-95}"
 
+# The floor over every member's counted mutants together. A pure member's row is held to a stricter
+# rule below, because a branch a direct test cannot reach is the whole cost a pure crate carries.
+readonly WORKSPACE_FLOOR="${MUTANTS_WORKSPACE_TARGET:-98}"
+
 # The scored member for the single-package mode. Overridable so one gate serves every package; the
 # default is the package it was written for, so an existing invocation keeps scoring that crate.
 readonly PACKAGE="${MUTANTS_PACKAGE:-mokmok-event-bus}"
@@ -88,8 +92,25 @@ score_of() {
   echo $((caught * 1000 / tested))
 }
 
+# `cargo metadata` is asked once per invocation; the baseline reads it for every member.
+METADATA=""
+
+metadata() {
+  if [ -z "$METADATA" ]; then
+    METADATA=$(cargo metadata --no-deps --format-version 1)
+  fi
+
+  printf '%s' "$METADATA"
+}
+
 members() {
-  cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | LC_ALL=C sort
+  metadata | jq -r '.packages[].name' | LC_ALL=C sort
+}
+
+# The role a member declares for the purity ladder, or the empty string when it declares none.
+purity_of() {
+  metadata | jq -r --arg name "$1" \
+    '.packages[] | select(.name == $name) | .metadata.mokmok.purity // empty'
 }
 
 # A score is about the tree it was measured on. Sorting the file list keeps the digest stable
@@ -341,8 +362,16 @@ check_baseline() {
     return 1
   fi
 
-  local failures=0 below=0 rows=0
-  local name score target digest note stale
+  local failures=0 below=0 rows=0 caught_total=0 tested_total=0
+  local name score target digest note stale purity missed_count timeout caught tested
+
+  # Every workspace member has a row, so a member added without a sweep cannot read as present.
+  while read -r name; do
+    if [ "$(jq -r --arg n "$name" '[.members[] | select(.name == $n)] | length' "$LEDGER")" -eq 0 ]; then
+      echo "$name: in the workspace, not in the ledger" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(members)
 
   while read -r name; do
     rows=$((rows + 1))
@@ -351,6 +380,10 @@ check_baseline() {
     target=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | .target // "null"' "$LEDGER")
     digest=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | .digest' "$LEDGER")
     note=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | .note // empty' "$LEDGER")
+    missed_count=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | (.missed | length)' "$LEDGER")
+    timeout=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | .timeout // 0' "$LEDGER")
+    caught=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | .caught // 0' "$LEDGER")
+    tested=$(jq -r --arg n "$name" '.members[] | select(.name == $n) | .tested // 0' "$LEDGER")
 
     if [ ! -d "$name" ]; then
       echo "$name: in the ledger, not in the workspace" >&2
@@ -390,8 +423,45 @@ check_baseline() {
       failures=$((failures + 1))
     fi
 
+    purity=$(purity_of "$name")
+
+    case "$purity" in
+      pure)
+        # A pure member's branch is reachable from a direct test by construction, so a survivor or
+        # a timeout there is a missing test rather than a property of the code.
+        if ! awk -v s="$score" 'BEGIN { exit (s + 0 == 100) ? 0 : 1 }' \
+          || [ "$missed_count" -ne 0 ] || [ "$timeout" -ne 0 ]; then
+          echo "$name: pure, so it must kill every mutant and time none out (score=$score missed=$missed_count timeout=$timeout)" >&2
+          failures=$((failures + 1))
+        fi
+        ;;
+      adapter | shell) ;;
+      *)
+        echo "$name: declares no purity role, so the gate cannot hold it to one" >&2
+        failures=$((failures + 1))
+        ;;
+    esac
+
+    caught_total=$((caught_total + caught))
+    tested_total=$((tested_total + tested))
+
     awk -v s="$score" 'BEGIN { exit !(s + 0 < 100) }' && below=$((below + 1))
   done < <(jq -r '.members[].name' "$LEDGER")
+
+  local tenths=""
+  if [ "$tested_total" -gt 0 ]; then
+    tenths=$(score_of "$caught_total" "$tested_total")
+
+    echo "workspace: caught=$caught_total tested=$tested_total score=$((tenths / 10)).$((tenths % 10))% target=${WORKSPACE_FLOOR}%"
+
+    if [ $((caught_total * 100)) -lt $((WORKSPACE_FLOOR * tested_total)) ]; then
+      echo "workspace: below the ${WORKSPACE_FLOOR}% floor" >&2
+      failures=$((failures + 1))
+    fi
+  else
+    echo "workspace: no member tested a mutant, so the score is undefined" >&2
+    failures=$((failures + 1))
+  fi
 
   echo "ledger rows=$rows below-100=$below failures=$failures"
 
