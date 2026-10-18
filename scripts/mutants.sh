@@ -135,7 +135,10 @@ build_confiner() {
 report_single() {
   local status=0
 
-  cargo mutants --package "$PACKAGE" "${ARGUMENTS[@]}" || status=$?
+  # The whole-run timeout, not only the per-mutant one: without it cargo-mutants auto-sets twenty
+  # seconds, and a suite whose own deadlines total more than that is cut off before its cases can
+  # fail, so a mutation that stops the driver reads as a timeout instead of the failure it is.
+  cargo mutants --package "$PACKAGE" --timeout "$TIMEOUT" --no-shuffle "${ARGUMENTS[@]}" || status=$?
 
   for argument in "${ARGUMENTS[@]}"; do
     if [ "$argument" = "--list" ]; then
@@ -199,7 +202,7 @@ sweep_all() {
 
     local status=0
     set +e
-    cargo mutants --package "$member" --jobs "$JOBS" --timeout "$TIMEOUT" \
+    cargo mutants --package "$member" --jobs "$JOBS" --timeout "$TIMEOUT" --no-shuffle \
       --output "$scratch/$member" 2>&1 | tee "$scratch/$member.log"
     status=${PIPESTATUS[0]}
     set -e

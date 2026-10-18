@@ -14,14 +14,18 @@ mod core;
 mod port;
 mod session;
 mod terminal;
+mod worker;
 
 use mokmok_protocol::SessionID;
 use mokmok_state_machine::Ending;
 
 pub use crate::core::run;
-pub use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, View};
+pub use crate::port::{
+    Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Update, View,
+};
 pub use crate::session::{Session, Sessions};
 pub use crate::terminal::Terminal;
+pub use crate::worker::Worker;
 
 /// What the process left behind: every session it held, and how each one stands.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,4 +70,10 @@ pub enum Error {
     /// The agent loop failed: the journal, the provider, or the tools.
     #[error("{0}")]
     Agent(#[from] mokmok_agent_runtime::Error),
+    /// The thread a session stepped on stopped answering.
+    #[error("the session worker stopped; its log holds everything it committed")]
+    Worker,
+    /// The thread a session would have stepped on could not be started.
+    #[error("the session worker could not start")]
+    WorkerStart(#[source] std::io::Error),
 }

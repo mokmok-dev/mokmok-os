@@ -37,8 +37,12 @@ pub trait Engine {
 
     /// Performs at most one bounded step of the loop.
     ///
-    /// The future is not `Send`: a streamed step may hold the terminal and the line being typed,
-    /// and this loop runs on the thread that owns them.
+    /// The future is not `Send`: a streamed step may hold the line being typed and a callback that
+    /// writes to it, and a session worker owns both on its own thread.
+    ///
+    /// A step dispatched while [`busy`](Self::busy) is true is not performed: the dispatch answers
+    /// [`Progress::Awaiting`] and the work already in flight reports through
+    /// [`drain`](Self::drain).
     ///
     /// # Errors
     ///
@@ -48,8 +52,9 @@ pub trait Engine {
     /// Performs one bounded step, forwarding each prose fragment the model emits while it streams.
     ///
     /// The default takes the step whole and forwards nothing, which is what an engine with no
-    /// stream to report does. The observer is not `Send`: it holds the screen and the typed line,
-    /// and a draw happens on the thread that owns the terminal.
+    /// stream to report does. The observer is not `Send`: an engine on the loop's thread holds the
+    /// screen, and one on a worker holds the channel it reports through, so both stay on the thread
+    /// that will call the observer.
     ///
     /// # Errors
     ///
@@ -67,6 +72,35 @@ pub trait Engine {
     ///
     /// Returns the store's failure when the session cannot be re-opened.
     fn reopen(&mut self) -> Result<(), Error>;
+
+    /// Whether a step this engine dispatched has not reported back yet.
+    ///
+    /// An engine that runs its step inline is never busy, because the step returned before the
+    /// caller could ask. One that runs its step on another thread answers this from the dispatch
+    /// it made, so the loop can keep reading the terminal while that step works.
+    fn busy(&self) -> bool {
+        false
+    }
+
+    /// Takes everything a step reported since the last call, without waiting.
+    ///
+    /// An engine that runs its step inline reports nothing here: its result already went back
+    /// through [`step`](Self::step). One that runs its step elsewhere reports the fragments it
+    /// streamed and the result it reached.
+    fn drain(&mut self) -> Vec<Update> {
+        Vec::new()
+    }
+}
+
+/// What a step working elsewhere reported, in the order it reported it.
+#[derive(Debug)]
+pub enum Update {
+    /// A prose fragment the model emitted while the step streams.
+    Fragment(String),
+    /// The step returned, or the engine could not finish dispatching it.
+    Stepped(Result<Progress, Error>),
+    /// The session's world failed somewhere a step did not cover, such as the line being spoken.
+    Failed(Error),
 }
 
 /// One session the log holds, as a chooser shows it.

@@ -12,7 +12,7 @@ use mokmok_protocol::{SessionID, TurnID};
 use mokmok_state_machine::{Attempt, Ending, Phase};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, View};
+use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Update, View};
 use crate::{Error, Left, Outcome};
 
 /// One session this process holds: its engine, the line being typed in it, and how far back its
@@ -24,6 +24,7 @@ struct Held<E> {
     engine: E,
     input: String,
     scroll: u16,
+    streaming: Rc<RefCell<String>>,
 }
 
 /// Whose turn it is, read off the fold.
@@ -256,6 +257,7 @@ impl<E: Engine> Manager<E> {
                 engine,
                 input: String::new(),
                 scroll: 0,
+                streaming: Rc::new(RefCell::new(String::new())),
             }],
             focus: 0,
             listed: Vec::new(),
@@ -296,10 +298,16 @@ impl<E: Engine> Manager<E> {
         folds: &[Transcript],
     ) -> View {
         let held = &self.held[self.focus];
+        let mut shown = lines(&folds[self.focus]);
+        let streaming = held.streaming.borrow();
+
+        if !streaming.is_empty() {
+            shown.push(Line::Agent(streaming.clone()));
+        }
 
         View {
             session: folds[self.focus].session.id(),
-            lines: lines(&folds[self.focus]),
+            lines: shown,
             input: held.input.clone(),
             status: self.status(folds),
             scroll: held.scroll,
@@ -392,7 +400,48 @@ impl<E: Engine> Manager<E> {
 
         (0..count)
             .map(|offset| (self.focus + offset) % count)
-            .find(|index| matches!(mode(&folds[*index]), Mode::Working))
+            .find(|index| {
+                matches!(mode(&folds[*index]), Mode::Working) && !self.held[*index].engine.busy()
+            })
+    }
+
+    fn any_busy(&self) -> bool {
+        self.held.iter().any(|held| held.engine.busy())
+    }
+
+    /// A fragment belongs to the session's screen line until the step returns, so it is cleared
+    /// then; the fold the worker reports carries the same prose, and keeping both would draw it
+    /// twice.
+    fn drain(&mut self) -> Result<(), Error> {
+        for index in 0..self.held.len() {
+            for update in self.held[index].engine.drain() {
+                match update {
+                    Update::Fragment(fragment) => {
+                        self.held[index].streaming.borrow_mut().push_str(&fragment);
+                    },
+                    Update::Stepped(result) => {
+                        self.held[index].streaming.borrow_mut().clear();
+                        match result {
+                            Ok(
+                                Progress::Yielded | Progress::Advanced(Move::Halt(Halt::Draining)),
+                            ) => {
+                                self.held[index].engine.reopen()?;
+                            },
+                            Ok(_) | Err(Error::Agent(mokmok_agent_runtime::Error::Provider(_))) => {
+                            },
+                            Err(failure) => return Err(failure),
+                        }
+                    },
+                    Update::Failed(failure) => {
+                        self.held[index].streaming.borrow_mut().clear();
+
+                        return Err(failure);
+                    },
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn hold(
@@ -403,6 +452,7 @@ impl<E: Engine> Manager<E> {
             engine,
             input: String::new(),
             scroll: 0,
+            streaming: Rc::new(RefCell::new(String::new())),
         });
         self.focus = self.held.len() - 1;
         self.pane = None;
@@ -650,7 +700,7 @@ impl<E: Engine> Manager<E> {
     ) -> Result<(), Error> {
         let on_screen = index == self.focus && self.pane.is_none();
         let base = on_screen.then(|| self.view(folds));
-        let pending = Rc::new(RefCell::new(String::new()));
+        let pending = Rc::clone(&self.held[index].streaming);
         let mut deferred = Vec::new();
         let mut failure = None;
 
@@ -659,6 +709,7 @@ impl<E: Engine> Manager<E> {
                 engine,
                 input,
                 scroll,
+                streaming: _,
             } = &mut self.held[index];
             let streamed = Rc::clone(&pending);
             let mut watch = move |fragment: &str| {
@@ -688,6 +739,7 @@ impl<E: Engine> Manager<E> {
             }
         };
 
+        self.held[index].streaming.borrow_mut().clear();
         self.deferred.extend(deferred);
 
         match result {
@@ -713,8 +765,8 @@ impl<E: Engine> Manager<E> {
     }
 }
 
-/// How often a frame is redrawn while a step runs, so a key and a fragment never wait on the
-/// provider's next byte. Sixteen milliseconds is one frame at sixty hertz.
+/// How often a frame is redrawn while a step runs. Sixteen milliseconds is one frame at sixty
+/// hertz.
 const STREAM_TICK: Duration = Duration::from_millis(16);
 
 fn type_during_stream(
@@ -798,6 +850,11 @@ pub async fn run<R: Roster>(
     let mut manager = Manager::holding(first);
 
     loop {
+        // A driver whose step answered without yielding would spin against the executor, and a
+        // caller's deadline could never fire. One yield per pass keeps the loop cancellable.
+        tokio::task::yield_now().await;
+        manager.drain()?;
+
         let mut folds = manager.folds()?;
 
         if manager.flush_deferred(&folds, world)? == Keep::Leaving {
@@ -812,23 +869,33 @@ pub async fn run<R: Roster>(
             return Ok(outcome(&folds));
         }
 
-        match manager.next_to_step(&folds) {
+        if let Some(index) = manager.next_to_step(&folds) {
             // What the human pressed is answered before another session takes its step, so typing
             // never has to wait for a session he is not looking at.
-            Some(index) => match screen.poll()? {
+            match screen.poll()? {
                 Some(event) => {
                     if manager.event(event, &folds, world)? == Keep::Leaving {
                         return Ok(outcome(&manager.folds()?));
                     }
                 },
                 None => manager.step(index, screen, &folds).await?,
-            },
+            }
+        } else if manager.any_busy() {
+            // The screen keeps reading keys and drawing the fragments they report, then waits one
+            // frame so a silent step does not spin the loop.
+            match screen.poll()? {
+                Some(event) => {
+                    if manager.event(event, &folds, world)? == Keep::Leaving {
+                        return Ok(outcome(&manager.folds()?));
+                    }
+                },
+                None => tokio::time::sleep(STREAM_TICK).await,
+            }
+        } else {
             // Nothing can move, so the process waits on the human and on nothing else.
-            None => {
-                if manager.event(screen.event()?, &folds, world)? == Keep::Leaving {
-                    return Ok(outcome(&manager.folds()?));
-                }
-            },
+            if manager.event(screen.event()?, &folds, world)? == Keep::Leaving {
+                return Ok(outcome(&manager.folds()?));
+            }
         }
     }
 }
@@ -838,6 +905,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Duration;
 
     use proptest::prelude::*;
@@ -848,6 +918,7 @@ mod tests {
     };
     use crate::Error;
     use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, View};
+    use crate::worker::Worker;
     use mokmok_agent_runtime::{
         Action, AnswerRecord, ArtifactRef, Budget, CallRecord, MAX_SPEECH_BYTES, Progress, Record,
         Setting, SpeechRecord, Task, TaskRecord, Transcript, UNKNOWN_WARNING, Usage, execution_id,
@@ -1316,6 +1387,170 @@ mod tests {
 
             Ok(())
         }
+    }
+
+    struct Blocking {
+        session: SessionID,
+        working: Transcript,
+        closed: Transcript,
+        started: Arc<AtomicBool>,
+        gate: Receiver<()>,
+        released: bool,
+    }
+
+    impl Engine for Blocking {
+        fn session(&self) -> SessionID {
+            self.session
+        }
+
+        fn fold(&self) -> Result<Transcript, Error> {
+            Ok(if self.released {
+                self.closed.clone()
+            } else {
+                self.working.clone()
+            })
+        }
+
+        fn speak(
+            &mut self,
+            _line: &str,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn step(&mut self) -> impl std::future::Future<Output = Result<Progress, Error>> {
+            std::future::ready(Ok(Progress::Awaiting))
+        }
+
+        fn step_watched<'a>(
+            &'a mut self,
+            _watch: &'a mut dyn FnMut(&str),
+        ) -> impl std::future::Future<Output = Result<Progress, Error>> + 'a {
+            self.started.store(true, Ordering::SeqCst);
+            let _ = self.gate.recv();
+            self.released = true;
+
+            std::future::ready(Ok(Progress::Terminal(Ending::Completed)))
+        }
+
+        fn reopen(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    struct BlockingWorld;
+
+    impl Roster for BlockingWorld {
+        type Engine = Worker;
+
+        fn listed(&self) -> Result<Vec<Listing>, Error> {
+            Ok(Vec::new())
+        }
+
+        fn resume(
+            &self,
+            _listing: &Listing,
+        ) -> Result<Worker, Error> {
+            Err(Error::Worker)
+        }
+
+        fn create(
+            &self,
+            _goal: &str,
+        ) -> Result<Worker, Error> {
+            Err(Error::Worker)
+        }
+    }
+
+    struct ProbeScreen {
+        frames: Vec<View>,
+        started: Arc<AtomicBool>,
+        release: Option<Sender<()>>,
+        typed: bool,
+    }
+
+    impl Screen for ProbeScreen {
+        fn poll(&mut self) -> Result<Option<Event>, Error> {
+            if !self.typed && self.started.load(Ordering::SeqCst) {
+                self.typed = true;
+
+                return Ok(Some(Event::Key(Key::Char('z'))));
+            }
+
+            if self.frames.iter().any(|view| view.input == "z")
+                && let Some(release) = self.release.take()
+            {
+                let _ = release.send(());
+            }
+
+            Ok(None)
+        }
+
+        fn event(&mut self) -> Result<Event, Error> {
+            Err(Error::Worker)
+        }
+
+        fn draw(
+            &mut self,
+            view: &View,
+        ) -> Result<(), Error> {
+            self.frames.push(view.clone());
+
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_step_holds_only_its_own_session() {
+        let session = session();
+        let turn = turn_id(session, 1);
+        let (release, gate) = channel();
+        let started = Arc::new(AtomicBool::new(false));
+        let engine = Blocking {
+            session,
+            working: Transcript::replay(session, &in_flight(turn)).expect("a working fold"),
+            closed: Transcript::replay(session, &closed()).expect("a closed fold"),
+            started: Arc::clone(&started),
+            gate,
+            released: false,
+        };
+        let first = Worker::open(engine).expect("the worker starts");
+        let mut screen = ProbeScreen {
+            frames: Vec::new(),
+            started,
+            release: Some(release),
+            typed: false,
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            run(&BlockingWorld, first, &mut screen),
+        )
+        .await
+        .expect("the conversation ends")
+        .expect("the run succeeds");
+
+        assert!(
+            screen.frames.iter().any(|view| view.input == "z"),
+            "the key pressed while the step blocked was drawn",
+        );
+        assert_eq!(outcome.left.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_answered_while_a_session_can_move_leaves() {
+        let world = EmptyWorld {
+            listed: Rc::new(std::cell::Cell::new(false)),
+        };
+        let first = Talking::of(&[]);
+        let mut screen = Recording::with([Event::Key(Key::Interrupt)]);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run(&world, first, &mut screen))
+            .await
+            .expect("the run ends")
+            .expect("the conversation ends");
+
+        assert_eq!(outcome.left.len(), 1);
     }
 
     #[tokio::test]
