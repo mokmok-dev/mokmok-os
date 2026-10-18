@@ -2000,10 +2000,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// Serves one raw HTTP response over a local socket, returning the provider that points at it.
-    ///
-    /// The spawned handler reads the whole request, and when `assert_stream` is true it checks the
-    /// body carried `stream: true`.
     fn serve(
         response_body: &[u8],
         content_type: &str,
@@ -2058,7 +2054,6 @@ mod tests {
         (provider, directory)
     }
 
-    /// Encodes one SSE event per JSON value, terminated by `[DONE]`.
     fn sse(events: impl IntoIterator<Item = serde_json::Value>) -> Vec<u8> {
         let mut body = Vec::new();
         for event in events {
@@ -2183,7 +2178,6 @@ mod tests {
     fn the_streaming_request_body_sets_stream_true_while_request_body_keeps_false() {
         let non_streaming = request_body(&context(), "m", 1);
         assert_eq!(non_streaming["stream"], serde_json::Value::Bool(false));
-        // The watched call builds the same body but overrides stream; the mock server asserts it.
     }
 
     #[tokio::test]

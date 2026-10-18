@@ -30,7 +30,7 @@ his keystrokes.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:783` | The driver loop over every session the process holds |
+| `run` | `src/core.rs:791` | The driver loop over every session the process holds |
 | `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `step_watched`, `reopen` |
 | `Roster` | `src/port.rs:90` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:126` | `poll`, `event`, `draw` |
@@ -63,11 +63,11 @@ artifact store, and the sandbox belong to the kernel.
 - An event the conversation does not act on is dropped where the terminal's report is classified,
   so the driver only ever sees a key or a resize (`src/terminal.rs:115-119`).
 - A step is taken only when the terminal reports nothing, so a keystroke is answered before another
-  session moves (`src/core.rs:811-819`).
+  session moves (`src/core.rs:819-827`).
 - While a focused session steps, `STREAM_TICK` redraws the fragments received so far and answers the
-  line's keys; every other key is queued and answered once the step returns (`src/core.rs:708`).
+  line's keys; every other key is queued and answered once the step returns (`src/core.rs:716`).
 - A session behind the screen steps without a tick and without reading the terminal, so nothing it
-  streams reaches a frame (`src/core.rs:666`).
+  streams reaches a frame (`src/core.rs:674`).
 - The rotation starts at the session on screen, so it moves first and the ones behind it take their
   turns in between the human's keystrokes (`src/core.rs:350-359`).
 - A session this process already holds is focused instead of opened a second time: two engines on one
@@ -162,7 +162,7 @@ creating a session, each pane's keys, the frame the manager builds, a streamed f
 before the next arrives, a key typed during a stream reaching the line, a deferred key waiting for the
 step and being answered in order, a background stream drawing nothing, a pane covering the session
 keeping the stream off the screen, and a terminal that fails while a stream is read or drawn
-(`src/core.rs:834`).
+(`src/core.rs:835`).
 One holds 19 cases and one property case for gutters, multi-row replies, row-wise windowing, the
 trouble row, a find row, an edit row, escaped control characters, the replay, and the rows of the
 listing (`src/port.rs:517`).

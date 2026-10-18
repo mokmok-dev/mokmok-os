@@ -469,7 +469,6 @@ mod tests {
         );
     }
 
-    /// The flags an endpoint run resolves: the provider is a local socket, so no network is reached.
     fn stream_args(
         scratch: &Path,
         port: u16,
@@ -502,8 +501,6 @@ mod tests {
         ]
     }
 
-    /// Serves one SSE answer on a local socket, holding its second fragment until `release` fires.
-    ///
     /// The hold is what makes the assertion about the first fragment mean something: the second
     /// fragment does not exist on the wire while the first is being drawn.
     fn serve_stream(release: std::sync::mpsc::Receiver<()>) -> u16 {

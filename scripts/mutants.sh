@@ -9,8 +9,6 @@ cd "$(dirname "$0")/.."
 # gate's own sensitivity can be demonstrated without editing it.
 readonly FLOOR="${MUTANTS_TARGET:-95}"
 
-# The floor over every member's counted mutants together. A pure member's row is held to a stricter
-# rule below, because a branch a direct test cannot reach is the whole cost a pure crate carries.
 readonly WORKSPACE_FLOOR="${MUTANTS_WORKSPACE_TARGET:-98}"
 
 # The scored member for the single-package mode. Overridable so one gate serves every package; the
@@ -92,7 +90,6 @@ score_of() {
   echo $((caught * 1000 / tested))
 }
 
-# `cargo metadata` is asked once per invocation; the baseline reads it for every member.
 METADATA=""
 
 metadata() {
@@ -107,7 +104,6 @@ members() {
   metadata | jq -r '.packages[].name' | LC_ALL=C sort
 }
 
-# The role a member declares for the purity ladder, or the empty string when it declares none.
 purity_of() {
   metadata | jq -r --arg name "$1" \
     '.packages[] | select(.name == $name) | .metadata.mokmok.purity // empty'
@@ -365,7 +361,6 @@ check_baseline() {
   local failures=0 below=0 rows=0 caught_total=0 tested_total=0
   local name score target digest note stale purity missed_count timeout caught tested
 
-  # Every workspace member has a row, so a member added without a sweep cannot read as present.
   while read -r name; do
     if [ "$(jq -r --arg n "$name" '[.members[] | select(.name == $n)] | length' "$LEDGER")" -eq 0 ]; then
       echo "$name: in the workspace, not in the ledger" >&2
@@ -427,8 +422,6 @@ check_baseline() {
 
     case "$purity" in
       pure)
-        # A pure member's branch is reachable from a direct test by construction, so a survivor or
-        # a timeout there is a missing test rather than a property of the code.
         if ! awk -v s="$score" 'BEGIN { exit (s + 0 == 100) ? 0 : 1 }' \
           || [ "$missed_count" -ne 0 ] || [ "$timeout" -ne 0 ]; then
           echo "$name: pure, so it must kill every mutant and time none out (score=$score missed=$missed_count timeout=$timeout)" >&2

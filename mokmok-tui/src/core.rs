@@ -64,7 +64,6 @@ struct Manager<E> {
     /// The log's own listing, as it was when the listing pane was opened.
     listed: Vec<Listing>,
     pane: Option<Pane>,
-    /// Keys typed while a step held the loop, answered when the step returns.
     deferred: Vec<Event>,
 }
 
@@ -265,9 +264,22 @@ impl<E: Engine> Manager<E> {
         }
     }
 
-    /// The keys typed while a step held the loop, in the order they arrived.
     fn take_deferred(&mut self) -> Vec<Event> {
         mem::take(&mut self.deferred)
+    }
+
+    fn flush_deferred(
+        &mut self,
+        folds: &[Transcript],
+        world: &impl Roster<Engine = E>,
+    ) -> Result<Keep, Error> {
+        for event in self.take_deferred() {
+            if self.event(event, folds, world)? == Keep::Leaving {
+                return Ok(Keep::Leaving);
+            }
+        }
+
+        Ok(Keep::Running)
     }
 
     /// Every held session's past, in roster order.
@@ -626,10 +638,6 @@ impl<E: Engine> Manager<E> {
 
     /// Performs one bounded step of the session at `index`.
     ///
-    /// The session on screen redraws while the step runs, unless a pane covers it, and keys typed
-    /// then are answered here or queued for the loop. A session behind the screen takes its step
-    /// without either, so no frame shows work the human is not looking at.
-    ///
     /// # Errors
     ///
     /// Returns the failure of a step that is not the provider's own, and the terminal's failure
@@ -790,18 +798,11 @@ pub async fn run<R: Roster>(
     loop {
         let mut folds = manager.folds()?;
 
-        // A key typed while a step held the loop was drawn and queued there; it is answered here,
-        // before the frame that follows the step, so the human's next line is not lost to a stream.
-        let deferred = manager.take_deferred();
-        if !deferred.is_empty() {
-            for event in deferred {
-                if manager.event(event, &folds, world)? == Keep::Leaving {
-                    return Ok(outcome(&manager.folds()?));
-                }
-            }
-
-            folds = manager.folds()?;
+        if manager.flush_deferred(&folds, world)? == Keep::Leaving {
+            return Ok(outcome(&manager.folds()?));
         }
+
+        folds = manager.folds()?;
 
         screen.draw(&manager.view(&folds))?;
 
@@ -1110,7 +1111,6 @@ mod tests {
         manager.folds().expect("the folds read")
     }
 
-    /// An engine that streams the fragments a case names, then waits for the human.
     struct Talking {
         session: SessionID,
         working: Transcript,
@@ -1204,7 +1204,6 @@ mod tests {
         }
     }
 
-    /// A roster the run cases never open a session through.
     struct EmptyWorld {
         listed: Rc<std::cell::Cell<bool>>,
     }
@@ -1237,7 +1236,6 @@ mod tests {
         }
     }
 
-    /// A screen whose events and failures a case names, recording every frame drawn.
     struct Recording {
         script: VecDeque<Event>,
         after: VecDeque<Event>,
