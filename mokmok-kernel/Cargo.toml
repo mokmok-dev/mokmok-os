@@ -8,6 +8,7 @@ purity = "shell"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+futures-util = { workspace = true }
 mokmok-agent-runtime = { workspace = true }
 mokmok-artifact = { workspace = true }
 mokmok-capability = { workspace = true }

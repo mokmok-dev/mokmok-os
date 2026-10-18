@@ -16,7 +16,7 @@ use std::time::Duration;
 use mokmok_agent_runtime::{
     Action, Answer, AnswerRecord, ArtifactRef, Budget, Context, Error as AgentError, Exit, Halt,
     Journal, Move, Progress, Provider, Receipt, Record, Setting, Step, Task, ToolCall, ToolReport,
-    Tools, Transcript, Usage, advance, observation,
+    Tools, Transcript, Usage, advance, advance_watched, observation,
 };
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome};
@@ -438,6 +438,16 @@ impl Provider for Scripted {
 
         std::future::ready(answer)
     }
+
+    async fn complete_watched<'a>(
+        &'a self,
+        context: &'a Context,
+        watch: &'a mut dyn FnMut(&str),
+    ) -> Result<Answer, AgentError> {
+        let answer = self.complete(context).await?;
+        watch(&answer.prose);
+        Ok(answer)
+    }
 }
 
 /// One scripted answer, as the file holds it.
@@ -532,6 +542,17 @@ impl Provider for Model {
         match self {
             Self::Scripted(provider) => provider.complete(context).await,
             Self::Ollama(provider) => provider.complete(context).await,
+        }
+    }
+
+    async fn complete_watched<'a>(
+        &'a self,
+        context: &'a Context,
+        watch: &'a mut dyn FnMut(&str),
+    ) -> Result<Answer, AgentError> {
+        match self {
+            Self::Scripted(provider) => provider.complete_watched(context, watch).await,
+            Self::Ollama(provider) => provider.complete_watched(context, watch).await,
         }
     }
 }
@@ -694,6 +715,31 @@ impl Driver {
             &self.skills,
             self.session,
             self.at,
+        )
+        .await
+    }
+
+    /// Like [`step`], but forwards every prose fragment the model emits while streaming to `watch`.
+    ///
+    /// The journal still records one whole answer per attempt; the stream is display-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`step`].
+    pub async fn step_watched(
+        &mut self,
+        watch: &mut dyn FnMut(&str),
+    ) -> Result<Progress, AgentError> {
+        advance_watched(
+            &mut self.ledger,
+            &self.provider,
+            &self.shell,
+            &self.index,
+            &self.editor,
+            &self.skills,
+            self.session,
+            self.at,
+            watch,
         )
         .await
     }

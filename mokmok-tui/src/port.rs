@@ -37,10 +37,29 @@ pub trait Engine {
 
     /// Performs at most one bounded step of the loop.
     ///
+    /// The future is not `Send`: a streamed step may hold the terminal and the line being typed,
+    /// and this loop runs on the thread that owns them.
+    ///
     /// # Errors
     ///
     /// Returns the journal's, the provider's, or the tools' own failure.
-    fn step(&mut self) -> impl Future<Output = Result<Progress, Error>> + Send;
+    fn step(&mut self) -> impl Future<Output = Result<Progress, Error>>;
+
+    /// Performs one bounded step, forwarding each prose fragment the model emits while it streams.
+    ///
+    /// The default takes the step whole and forwards nothing, which is what an engine with no
+    /// stream to report does. The observer is not `Send`: it holds the screen and the typed line,
+    /// and a draw happens on the thread that owns the terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's, the provider's, or the tools' own failure.
+    fn step_watched<'a>(
+        &'a mut self,
+        _watch: &'a mut dyn FnMut(&str),
+    ) -> impl Future<Output = Result<Progress, Error>> + 'a {
+        async move { self.step().await }
+    }
 
     /// Re-opens the session, settling what a dead process left in flight.
     ///

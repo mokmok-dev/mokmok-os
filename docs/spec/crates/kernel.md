@@ -41,7 +41,7 @@ carries.[^crate]
 | `skill::discover`, `Library` | `src/skill.rs:30,136` | Discovery of a root's immediate subdirectories into adverts, and the recorded-task library activation reads |
 | `editor::Editor` | `src/editor.rs:32` | The model's editor: it plans a patch against the checkout, asks the authority for the write, and commits the bytes through a resolved directory |
 | `Authority::may_write_at`, `access_at` | `src/authority.rs:127,163` | The one place the write answer is decided, from the grants the operator named |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:720,593,576,379` | The agent loop and its scripted model |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:765,613,596,379` | The agent loop and its scripted model |
 | `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:591` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
@@ -127,6 +127,9 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   (`src/serve.rs:196-207`, readiness at `src/serve.rs:265`).
 - The provider validates its destination through `mokmok-egress`, pins the validated address, and
   disables redirects (`src/provider.rs:442-465`).
+- A watched provider call streams an answer over server-sent events, synthesizes the canonical whole
+  body from the fragments, and decodes it with the same parser as the non-streaming path; an endpoint
+  that answers JSON instead is read whole (`src/provider.rs:554`).
 - The keep-alive interval is half of `WATCHDOG_USEC` and is ignored when `WATCHDOG_PID` names
   another process (`src/notify.rs:148-167`).
 - A turn's identity derives from the command that opened it, so a retried command owns the turn it
@@ -173,12 +176,16 @@ workspace's only wall-clock read (`src/bin/mokmokd.rs:80-88`).
 
 # Tests
 
-243 cases: 182 in `#[cfg(test)]` modules, one of them ignored, and 61 across six integration files.
+254 cases: 193 in `#[cfg(test)]` modules, one of them ignored, and 61 across six integration files.
 
-`src/provider.rs` holds 36 cases for the measured model exchange, malformed output, the request
+`src/provider.rs` holds 47 cases for the measured model exchange, malformed output, the request
 body, endpoint parsing, the tool list a session's grants and skills decide, not following a redirect,
-the `use_skill` call's decode and its two malformed shapes, and the loaded bodies in the system
-message. One of them is ignored: it reaches a live endpoint by hand. `src/config.rs` holds 66 cases
+the `use_skill` call's decode and its two malformed shapes, the loaded bodies in the system
+message, and the streamed answer: fragment order, a tool call split across fragments, a JSON
+endpoint that ignores `stream`, an error event, a stream with no answer, a `[DONE]` event that
+ends the call before the connection does, an answer with no finish event, an unterminated final
+event, an unterminated `[DONE]`, and an event split across `data:` lines. One of them is ignored:
+it reaches a live endpoint by hand. `src/config.rs` holds 66 cases
 for resolution and refusal, 33 of them driving a configuration file the test wrote.
 `src/editor.rs` holds 26 cases for planning an edit and committing one: the plan for one file, for a
 file that does not exist, at the size ceiling, and through a checkout the operator reached by a
