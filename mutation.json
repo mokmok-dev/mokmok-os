@@ -1,6 +1,6 @@
 {
-  "harness": "6226ed3075df0ef21d41f32532f843d740c70b587dea0c5da1d3e57b7e9688d6",
-  "generated": "2026-10-17T15:17:45Z",
+  "harness": "3a2d9f6841b1aeafefbe6173aaafb3afa8ebd5a2451c2056689bbdea09a47e08",
+  "generated": "2026-10-18T11:49:04Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
@@ -11,7 +11,7 @@
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "63aaa196918a6c4a6f82a9ccbea496091d0e93fa9634a20b8f7f289d8ee4cffe"
+      "digest": "547a865cc89009afc922a696502ccecb0a33c90909e3f8f067608c629c41633a"
     },
     {
       "name": "mokmok-artifact",
@@ -72,12 +72,12 @@
       "name": "mokmok-kernel",
       "score": 100.0,
       "target": 100.0,
-      "tested": 318,
-      "caught": 318,
+      "tested": 341,
+      "caught": 341,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "168720838478c19cc41454ec03b3b06e61b4246bb3eab089a58370c7bae5ea0b"
+      "digest": "747f0ca1abc52eb4f8f4bfaad824111f999d1b38678b79c8389203f1e87b047a"
     },
     {
       "name": "mokmok-observability",
@@ -171,12 +171,12 @@
       "name": "mokmok-tui",
       "score": 100.0,
       "target": 100.0,
-      "tested": 144,
-      "caught": 144,
+      "tested": 155,
+      "caught": 155,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "185a3de147a8bebb10d06160d97368335233cca1db368f6e613f22d43c399c5d"
+      "digest": "80490c1b67e0fe1160e8128e84edf9e517bc5ec7b84398dc185c24ed3f8adb18"
     }
   ]
 }
