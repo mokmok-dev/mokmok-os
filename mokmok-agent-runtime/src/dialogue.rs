@@ -3,14 +3,17 @@
 use std::collections::BTreeMap;
 
 use mokmok_protocol::{ExecutionID, SessionID, TurnID};
-use mokmok_state_machine::{Ack, Attempt, Rejection, Session, State, Turn, TurnFact, TurnNumber};
+use mokmok_state_machine::{
+    Ack, Attempt, Rejection, Resolution, Session, State, Turn, TurnFact, TurnNumber,
+};
 
 use crate::context::ContextSkill;
 use crate::edit::{EditOutcome, EditReport};
 use crate::model::Action;
 use crate::record::{
     AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
-    PromptRecord, Record, RecordKey, Refusal, SkillOutcome, SkillRecord, SpeechRecord, TaskRecord,
+    PromptRecord, Record, RecordKey, Refusal, SkillOutcome, SkillRecord, SpeechRecord,
+    SubagentIntentRecord, SubagentOutcomeRecord, TaskRecord,
 };
 use crate::task::Task;
 use crate::tool::{self, ToolReport};
@@ -51,6 +54,10 @@ pub struct Transcript {
     pub edit_intents: BTreeMap<ExecutionID, EditIntentRecord>,
     /// The outcome of one edit.
     pub edit_outcomes: BTreeMap<ExecutionID, EditReport>,
+    /// A delegation one turn asked for, when its answer asked for one.
+    pub subagent_intents: BTreeMap<ExecutionID, SubagentIntentRecord>,
+    /// A child session's final reply.
+    pub subagent_outcomes: BTreeMap<ExecutionID, SubagentOutcomeRecord>,
 }
 
 impl Transcript {
@@ -70,6 +77,8 @@ impl Transcript {
             runs: BTreeMap::new(),
             edit_intents: BTreeMap::new(),
             edit_outcomes: BTreeMap::new(),
+            subagent_intents: BTreeMap::new(),
+            subagent_outcomes: BTreeMap::new(),
         }
     }
 
@@ -221,6 +230,28 @@ impl Transcript {
         self.edit_outcomes.get(&execution)
     }
 
+    /// The subagent intent one turn recorded, if any.
+    #[must_use]
+    pub fn subagent_intent_of(
+        &self,
+        turn: TurnID,
+    ) -> Option<&SubagentIntentRecord> {
+        self.subagent_intents
+            .values()
+            .find(|record| record.turn == turn)
+    }
+
+    /// The subagent outcome one turn recorded, if any.
+    #[must_use]
+    pub fn subagent_outcome_of(
+        &self,
+        turn: TurnID,
+    ) -> Option<&SubagentOutcomeRecord> {
+        self.subagent_outcomes
+            .values()
+            .find(|record| record.turn == turn)
+    }
+
     /// The newest attempt's answer for one turn, if the fold holds one.
     #[must_use]
     pub fn newest_answer(
@@ -284,6 +315,8 @@ impl Record {
             Self::Skill(record) => apply_skill(into, record),
             Self::EditIntent(record) => apply_edit_intent(into, record),
             Self::EditOutcome(record) => apply_edit_outcome(into, record),
+            Self::SubagentIntent(record) => apply_subagent_intent(into, record),
+            Self::SubagentOutcome(record) => apply_subagent_outcome(into, record),
             Self::Speech(record) => apply_speech(into, record),
         }
     }
@@ -490,6 +523,13 @@ fn apply_call(
                 call: record.command.clone(),
             });
         },
+        Some(Action::Subagent { goal }) => {
+            return Err(Refusal::CommandMismatch {
+                turn: record.turn,
+                answer: goal.clone(),
+                call: record.command.clone(),
+            });
+        },
         None | Some(Action::Command { .. } | Action::Final | Action::Malformed { .. }) => {},
     }
 
@@ -517,6 +557,7 @@ fn apply_find(
         Action::Find { query } => query,
         Action::Edit { patch, .. } => patch,
         Action::UseSkill { name } => name.as_str(),
+        Action::Subagent { goal } => goal.as_str(),
         Action::Command { .. } | Action::Final | Action::Malformed { .. } => "",
     };
     if named != record.query {
@@ -551,6 +592,7 @@ fn apply_skill(
         Action::UseSkill { name } => name.as_str(),
         Action::Find { query } => query,
         Action::Edit { patch, .. } => patch,
+        Action::Subagent { goal } => goal.as_str(),
         Action::Command { .. } | Action::Final | Action::Malformed { .. } => "",
     };
     if named != record.name.as_str() {
@@ -611,6 +653,13 @@ fn apply_edit_intent(
             return Err(Refusal::EditMismatch {
                 turn: record.turn,
                 answer: name.to_string(),
+                edit: record.patch.clone(),
+            });
+        },
+        Some(Action::Subagent { goal }) => {
+            return Err(Refusal::EditMismatch {
+                turn: record.turn,
+                answer: goal.clone(),
                 edit: record.patch.clone(),
             });
         },
@@ -678,6 +727,102 @@ fn apply_edit_outcome(
 
     into.edit_outcomes
         .insert(record.execution, record.report.clone());
+    Ok(Ack::Applied)
+}
+
+fn apply_subagent_intent(
+    into: &mut Transcript,
+    record: &SubagentIntentRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::SubagentIntent(record.execution);
+    if let Some(recorded) = into.subagent_intents.get(&record.execution) {
+        return if recorded == record {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let requested = into
+        .turn(record.turn)
+        .is_some_and(|turn| turn.tool(record.execution).is_some());
+    if !requested {
+        return Err(Refusal::Floating(key));
+    }
+
+    match into.newest_answer(record.turn).map(|answer| &answer.action) {
+        Some(Action::Subagent { goal }) if goal == &record.goal => {},
+        Some(Action::Subagent { goal }) => {
+            return Err(Refusal::SubagentMismatch {
+                turn: record.turn,
+                answer: goal.clone(),
+                goal: record.goal.clone(),
+            });
+        },
+        Some(other) => {
+            return Err(Refusal::SubagentMismatch {
+                turn: record.turn,
+                answer: format!("{other:?}"),
+                goal: record.goal.clone(),
+            });
+        },
+        None => return Err(Refusal::Floating(key)),
+    }
+
+    into.subagent_intents
+        .insert(record.execution, record.clone());
+    Ok(Ack::Applied)
+}
+
+fn apply_subagent_outcome(
+    into: &mut Transcript,
+    record: &SubagentOutcomeRecord,
+) -> Result<Ack, Refusal> {
+    let key = RecordKey::SubagentOutcome(record.execution);
+    if let Some(recorded) = into.subagent_outcomes.get(&record.execution) {
+        return if recorded == record {
+            Ok(Ack::Duplicate)
+        } else {
+            Err(Refusal::Conflict(key))
+        };
+    }
+
+    let Some(turn) = into
+        .turns
+        .iter()
+        .find(|(_, state)| state.tool(record.execution).is_some())
+        .map(|(turn, _)| *turn)
+    else {
+        return Err(Refusal::Floating(key));
+    };
+    if turn != record.turn {
+        return Err(Refusal::Floating(key));
+    }
+
+    if !into.subagent_intents.contains_key(&record.execution) {
+        return Err(Refusal::Unprepared(record.execution));
+    }
+
+    let resolution = Resolution::Applied;
+    let settled = match into
+        .session
+        .execution(record.execution)
+        .map(|held| held.state())
+    {
+        Some(
+            State::Settled(recorded)
+            | State::Applied {
+                resolution: recorded,
+            },
+        ) => recorded == resolution,
+        Some(State::InFlight) | None => false,
+    };
+    if !settled {
+        return Err(Refusal::Floating(key));
+    }
+
+    into.subagent_outcomes
+        .insert(record.execution, record.clone());
     Ok(Ack::Applied)
 }
 
@@ -1825,6 +1970,7 @@ mod tests {
                 deadline: Duration::from_secs(120),
                 search: Vec::new(),
                 skills: Vec::new(),
+                delegate: false,
             },
             budget: Budget {
                 turns,

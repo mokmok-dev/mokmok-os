@@ -105,6 +105,17 @@ fn lines(fold: &Transcript) -> Vec<Line> {
             Some(ContextAct::Edited { observation }) => {
                 lines.push(Line::Edit { observation });
             },
+            Some(ContextAct::Subagent {
+                child_session,
+                goal,
+                reply,
+            }) => {
+                lines.push(Line::Delegate {
+                    child_session,
+                    goal,
+                    reply,
+                });
+            },
             // A loaded skill is not one of the agent's own words, so it draws as its own line; a
             // refused load made the turn fail, so it is the reason the turn could not finish.
             Some(ContextAct::Loaded { name }) => {
@@ -146,7 +157,8 @@ fn reason(
             | Action::Command { .. }
             | Action::Find { .. }
             | Action::Edit { .. }
-            | Action::UseSkill { .. } => None,
+            | Action::UseSkill { .. }
+            | Action::Subagent { .. } => None,
         });
 
     malformed.map_or_else(
@@ -1005,6 +1017,7 @@ mod tests {
                     deadline: std::time::Duration::from_secs(120),
                     search: Vec::new(),
                     skills: Vec::new(),
+                    delegate: false,
                 },
                 budget: Budget::default(),
             },

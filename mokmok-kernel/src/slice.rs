@@ -393,6 +393,7 @@ pub fn status(
 }
 
 /// One agent record as the single line `status` prints for it.
+#[allow(clippy::too_many_lines)]
 fn transcript_line(
     record: &mokmok_agent_runtime::Record,
     numbers: &std::collections::BTreeMap<TurnID, Option<TurnNumber>>,
@@ -483,6 +484,21 @@ fn transcript_line(
                     format!("refused {reason:?}")
                 },
             },
+        )),
+        mokmok_agent_runtime::Record::SubagentIntent(subagent) => Some(format!(
+            "subagent turn={} number={} execution={} child={} goal={:?}",
+            subagent.turn.as_uuid(),
+            number(subagent.turn),
+            subagent.execution.as_uuid(),
+            subagent.child_session.as_uuid(),
+            subagent.goal,
+        )),
+        mokmok_agent_runtime::Record::SubagentOutcome(subagent) => Some(format!(
+            "subagent turn={} number={} execution={} reply={:?}",
+            subagent.turn.as_uuid(),
+            number(subagent.turn),
+            subagent.execution.as_uuid(),
+            subagent.reply,
         )),
         mokmok_agent_runtime::Record::Session { .. }
         | mokmok_agent_runtime::Record::Turn { .. } => None,

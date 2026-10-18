@@ -29,20 +29,20 @@ carries.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `Config`, `Args`, `Command` | `src/config.rs:365,249,259` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
-| `ProviderLayer`, `ProviderSettings`, `config_path`, `ProcessEnvironment` | `src/config.rs:61,89,536,570` | The provider group as the flags and the configuration file's keys at once, the same group once every layer has spoken, which owns the credential the environment answered, the path discovery looks in, and the process environment a value may name and a credential arrives in, read once by a binary and handed in |
-| `Global`, `Config` | `src/config.rs:201,368` | The flags every invocation shares, including `--skill-root`, and the resolved configuration that carries `skill_root` |
+| `Config`, `Args`, `Command` | `src/config.rs:375,253,263` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
+| `ProviderLayer`, `ProviderSettings`, `config_path`, `ProcessEnvironment` | `src/config.rs:61,89,554,588` | The provider group as the flags and the configuration file's keys at once, the same group once every layer has spoken, which owns the credential the environment answered, the path discovery looks in, and the process environment a value may name and a credential arrives in, read once by a binary and handed in |
+| `Global`, `Config` | `src/config.rs:201,375` | The flags every invocation shares, including `--skill-root`, and the resolved configuration that carries `skill_root` |
 | `Db`, `Log`, `Entry`, `TurnRecord`, `ResultRecord` | `src/db.rs:276,103,45,89,96` | The appender over the event log and the folded view of one session |
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
 | `Relay`, `serve` | `src/serve.rs:52,138` | The outbox relay and the daemon loop |
-| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,498,517` | The vertical slice |
+| `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,514,533` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
 | `skill::discover`, `Library` | `src/skill.rs:30,136` | Discovery of a root's immediate subdirectories into adverts, and the recorded-task library activation reads |
 | `editor::Editor` | `src/editor.rs:32` | The model's editor: it plans a patch against the checkout, asks the authority for the write, and commits the bytes through a resolved directory |
 | `Authority::may_write_at`, `access_at` | `src/authority.rs:127,163` | The one place the write answer is decided, from the grants the operator named |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:765,613,596,379` | The agent loop and its scripted model |
-| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:591` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:930,761,730,393` | The agent loop, its one-session world, and its scripted model. `Driver` shares one provider with the child sessions it delegates to |
+| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:607` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
 `authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`,
@@ -71,6 +71,9 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
 - A `skill_root` is not an authority grant. It must be an absolute existing directory, and it is
   resolved the way the configuration file is, so a root no grant covers is a root the sandbox is
   never asked about (`src/config.rs:451`).
+- An `agent run` with no `--session`, `--goal`, or `--checkout` is refused by name before any grant
+  is checked (`src/config.rs:461`). The three fields carry an empty default so the TUI can fill them
+  from its working directory; `mokmokd` never fills them, so its command line still names all three.
 - One name held by two skill roots is refused with both files, because one name must name one skill
   (`src/skill.rs:50`).
 - Discovery skips an invalid or oversized skill and continues, reporting each with its path and the
@@ -81,6 +84,12 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   (`src/skill.rs:189`).
 - The advertisement is built from the recorded task, so a resumed session keeps exactly the skills it
   was opened with (`src/agent.rs:639`).
+- A delegation runs the child through a `Driver` opened with the parent's recorded task, the child
+  goal, and a budget capped at eight turns, with `delegate` turned off and the parent's provider
+  shared (`src/agent.rs:685`). The child's own stream is the durable record of its work; the parent
+  keeps one intent and one outcome.
+- A parent's task sets `delegate: true`, so the subagent tool is offered without a flag; a child's
+  task sets it false, so delegation is one level deep (`src/agent.rs:75`).
 - Every stream the commit log holds is one session's, so `Db::streams` is the whole list of them and
   the position of a stream's newest commit is the order a chooser reads (`src/db.rs:388-414`).
 - A session that committed no task is listed with no goal and no checkout, and a stream that
@@ -101,7 +110,7 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   the one place a dollar means anything: `$$` writes one literal dollar, and any other dollar is
   refused rather than passed through (`src/config.rs:685`).
 - The environment a reference names is read once by the two binaries and handed to resolution as
-  data, which `ProcessEnvironment` carries (`src/config.rs:570`).
+  data, which `ProcessEnvironment` carries (`src/config.rs:588`).
 - `config_path` decides the file from the environment, and `--config` names it outright; the two
   binaries also read the environment a value may name, and a file the operator named and that is not
   there is refused, while a file discovery looked for and did not find is silence
@@ -176,7 +185,7 @@ workspace's only wall-clock read (`src/bin/mokmokd.rs:80-88`).
 
 # Tests
 
-254 cases: 193 in `#[cfg(test)]` modules, one of them ignored, and 61 across six integration files.
+256 cases: 194 in `#[cfg(test)]` modules, one of them ignored, and 62 across six integration files.
 
 `src/provider.rs` holds 47 cases for the measured model exchange, malformed output, the request
 body, endpoint parsing, the tool list a session's grants and skills decide, not following a redirect,

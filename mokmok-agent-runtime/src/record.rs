@@ -61,8 +61,9 @@ pub fn clip_prose(text: &str) -> String {
     clipped(text, MAX_PROSE_BYTES)
 }
 
+/// The head of `text`, clipped to `limit` without splitting a character.
 #[must_use]
-fn clipped(
+pub fn clipped(
     text: &str,
     limit: usize,
 ) -> String {
@@ -206,6 +207,24 @@ pub struct EditOutcomeRecord {
     pub report: EditReport,
 }
 
+/// A delegation to a child session, written before the child runs.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SubagentIntentRecord {
+    pub turn: TurnID,
+    pub execution: ExecutionID,
+    pub child_session: SessionID,
+    pub goal: String,
+}
+
+/// A child session's final reply, written after the child completes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SubagentOutcomeRecord {
+    pub turn: TurnID,
+    pub execution: ExecutionID,
+    pub reply: String,
+    pub usage: Usage,
+}
+
 /// One durable record.
 ///
 /// The machine facts and the result ride the same vocabulary as the runtime's own content records,
@@ -243,6 +262,10 @@ pub enum Record {
     EditIntent(EditIntentRecord),
     /// An edit's outcome.
     EditOutcome(EditOutcomeRecord),
+    /// A delegation to a child session, written before the child runs.
+    SubagentIntent(SubagentIntentRecord),
+    /// A child session's final reply, written after the child completes.
+    SubagentOutcome(SubagentOutcomeRecord),
     /// A human's line, which opened this turn.
     Speech(SpeechRecord),
 }
@@ -274,6 +297,10 @@ pub enum StepKey {
     EditIntent { turn: u64 },
     /// One turn's edit outcome, written after the effect.
     EditOutcome { turn: u64 },
+    /// One turn's subagent intent, written before the child runs.
+    SubagentIntent { turn: u64 },
+    /// One turn's subagent outcome, written after the child completes.
+    SubagentOutcome { turn: u64 },
     /// One turn's find, written with its settlement in the one step a find takes.
     Find { turn: u64 },
     /// One turn's activation, written with its settlement in the one step a load takes.
@@ -317,6 +344,8 @@ impl StepKey {
             Self::ActOutcome { turn } => format!("act-outcome:{turn}"),
             Self::EditIntent { turn } => format!("edit-intent:{turn}"),
             Self::EditOutcome { turn } => format!("edit-outcome:{turn}"),
+            Self::SubagentIntent { turn } => format!("subagent-intent:{turn}"),
+            Self::SubagentOutcome { turn } => format!("subagent-outcome:{turn}"),
             Self::Find { turn } => format!("find:{turn}"),
             Self::UseSkill { turn } => format!("use-skill:{turn}"),
             Self::Close {
@@ -383,6 +412,8 @@ pub enum RecordKey {
     UseSkill(TurnID),
     EditIntent(ExecutionID),
     EditOutcome(ExecutionID),
+    SubagentIntent(ExecutionID),
+    SubagentOutcome(ExecutionID),
     Speech {
         turn: TurnID,
     },
@@ -439,6 +470,12 @@ pub enum Refusal {
     },
     /// An edit outcome whose intent the fold does not hold.
     Unprepared(ExecutionID),
+    /// A subagent call whose goal disagreed with the answer that asked for it.
+    SubagentMismatch {
+        turn: TurnID,
+        answer: String,
+        goal: String,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -484,6 +521,11 @@ impl std::fmt::Display for Refusal {
                 "the edit for execution {} has no intent",
                 execution.as_uuid(),
             ),
+            Self::SubagentMismatch { turn, answer, goal } => write!(
+                formatter,
+                "the subagent for turn {} asks {goal:?} but its answer named {answer:?}",
+                turn.as_uuid(),
+            ),
         }
     }
 }
@@ -525,6 +567,16 @@ impl std::fmt::Display for RecordKey {
             Self::EditOutcome(execution) => write!(
                 formatter,
                 "the edit outcome for execution {}",
+                execution.as_uuid(),
+            ),
+            Self::SubagentIntent(execution) => write!(
+                formatter,
+                "the subagent intent for execution {}",
+                execution.as_uuid(),
+            ),
+            Self::SubagentOutcome(execution) => write!(
+                formatter,
+                "the subagent outcome for execution {}",
                 execution.as_uuid(),
             ),
             Self::Speech { turn } => {

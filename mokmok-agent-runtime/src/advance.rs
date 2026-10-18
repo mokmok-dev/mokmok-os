@@ -14,9 +14,11 @@ use crate::find::{FindReport, Finder};
 use crate::model::{Journal, Provider};
 use crate::record::{
     AnswerRecord, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord, PromptRecord,
-    Receipt, Record, SkillOutcome, SkillRecord, Step, StepId, StepKey,
+    Receipt, Record, SkillOutcome, SkillRecord, Step, StepId, StepKey, SubagentIntentRecord,
+    SubagentOutcomeRecord,
 };
 use crate::skill::{NO_SKILLS, Read, Skills};
+use crate::subagent::{SubagentCall, SubagentOutcome, Subagents};
 use crate::task::Task;
 use crate::tool::{DEFAULT_DEADLINE, ToolCall, ToolReport, Tools};
 
@@ -55,6 +57,11 @@ pub enum Move {
     Edit {
         turn: TurnID,
         call: EditCall,
+    },
+    /// Delegate to a child session with a goal of its own.
+    Subagent {
+        turn: TurnID,
+        call: SubagentCall,
     },
     /// Settle a turn, and close the session when `ending` is set.
     Close {
@@ -148,6 +155,7 @@ pub async fn advance(
     finder: &impl Finder,
     editor: &impl Editor,
     skills: &impl Skills,
+    subagents: &impl Subagents,
     session: SessionID,
     at: Moment,
 ) -> Result<Progress, Error> {
@@ -158,6 +166,7 @@ pub async fn advance(
         finder,
         editor,
         skills,
+        subagents,
         session,
         at,
         Ask::Whole,
@@ -186,6 +195,7 @@ pub async fn advance_watched(
     finder: &impl Finder,
     editor: &impl Editor,
     skills: &impl Skills,
+    subagents: &impl Subagents,
     session: SessionID,
     at: Moment,
     watch: &mut dyn FnMut(&str),
@@ -197,6 +207,7 @@ pub async fn advance_watched(
         finder,
         editor,
         skills,
+        subagents,
         session,
         at,
         Ask::Watched(watch),
@@ -205,6 +216,7 @@ pub async fn advance_watched(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn advance_inner(
     journal: &mut impl Journal,
     provider: &impl Provider,
@@ -212,6 +224,7 @@ async fn advance_inner(
     finder: &impl Finder,
     editor: &impl Editor,
     skills: &impl Skills,
+    subagents: &impl Subagents,
     session: SessionID,
     at: Moment,
     ask: Ask<'_>,
@@ -301,6 +314,20 @@ async fn advance_inner(
             {
                 return Ok(progress);
             }
+        },
+        Move::Subagent { turn, call } => {
+            let intent = subagent_intent_step(session, &transcript, *turn, call);
+            if journal.append(intent)? == Receipt::Replayed {
+                return Ok(Progress::Yielded);
+            }
+            let outcome = subagents.run(call).await?;
+            journal.append(subagent_outcome_step(
+                session,
+                &transcript,
+                *turn,
+                call.execution,
+                outcome,
+            ))?;
         },
         Move::Close {
             turn,
@@ -448,6 +475,7 @@ fn accepting(transcript: &Transcript) -> Move {
                         | crate::model::Action::Find { .. }
                         | crate::model::Action::Edit { .. }
                         | crate::model::Action::UseSkill { .. }
+                        | crate::model::Action::Subagent { .. }
                 )
             });
         if awaiting_human {
@@ -542,6 +570,27 @@ fn open_turn(
                         },
                     }
                 },
+                crate::model::Action::Subagent { goal } => {
+                    if !transcript
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| task.setting.delegate)
+                    {
+                        return reask(turn, number, state, transcript);
+                    }
+                    let goal = transcript
+                        .subagent_intent_of(turn)
+                        .map_or_else(|| goal.clone(), |intent| intent.goal.clone());
+                    Move::Subagent {
+                        turn,
+                        call: SubagentCall {
+                            session: transcript.session.id(),
+                            turn,
+                            execution: execution_id(turn),
+                            goal,
+                        },
+                    }
+                },
                 crate::model::Action::Malformed { .. } => reask(turn, number, state, transcript),
             },
         )
@@ -586,11 +635,17 @@ fn ask(
 }
 
 fn spent_tokens(transcript: &Transcript) -> u64 {
-    transcript
+    let answer_tokens = transcript
         .answers
         .values()
         .map(|answer| answer.usage.input.saturating_add(answer.usage.output))
-        .fold(0, u64::saturating_add)
+        .fold(0, u64::saturating_add);
+    let subagent_tokens = transcript
+        .subagent_outcomes
+        .values()
+        .map(|outcome| outcome.usage.input.saturating_add(outcome.usage.output))
+        .fold(0, u64::saturating_add);
+    answer_tokens.saturating_add(subagent_tokens)
 }
 
 /// The identity a turn number always derives.
@@ -848,6 +903,90 @@ fn edit_outcome_step(
 
     Step::new(
         StepId::derive(session, StepKey::EditOutcome { turn: number }),
+        session,
+        records,
+    )
+}
+
+fn subagent_intent_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    call: &SubagentCall,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let execution = call.execution;
+    let records = vec![
+        Record::Session {
+            fact: Fact::ExecutionLaunched {
+                execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::Turn {
+            turn,
+            fact: TurnFact::ToolRequested {
+                execution,
+                deadline: Deadline::Unbounded,
+            },
+        },
+        Record::SubagentIntent(SubagentIntentRecord {
+            turn,
+            execution,
+            child_session: crate::subagent::child_session(execution),
+            goal: call.goal.clone(),
+        }),
+    ];
+
+    Step::new(
+        StepId::derive(session, StepKey::SubagentIntent { turn: number }),
+        session,
+        records,
+    )
+}
+
+fn subagent_outcome_step(
+    session: SessionID,
+    transcript: &Transcript,
+    turn: TurnID,
+    execution: ExecutionID,
+    outcome: SubagentOutcome,
+) -> Step {
+    let number = number_of(transcript, turn);
+    let resolution = Resolution::Applied;
+    let records = vec![
+        Record::Session {
+            fact: Fact::ExecutionSettled {
+                execution,
+                resolution,
+            },
+        },
+        Record::Session {
+            fact: Fact::ResultApplied { execution },
+        },
+        Record::SubagentOutcome(SubagentOutcomeRecord {
+            turn,
+            execution,
+            reply: outcome.reply,
+            usage: outcome.usage,
+        }),
+        Record::Turn {
+            turn,
+            fact: TurnFact::ToolResolved {
+                execution,
+                resolution,
+            },
+        },
+        Record::Turn {
+            turn,
+            fact: TurnFact::TurnSettled {
+                outcome: TurnOutcome::Completed,
+            },
+        },
+    ];
+
+    Step::new(
+        StepId::derive(session, StepKey::SubagentOutcome { turn: number }),
         session,
         records,
     )
@@ -1129,19 +1268,24 @@ mod tests {
     use crate::error::Error;
     use crate::find::{FindReport, NO_SEARCH_ROOT};
     use crate::model::{Action, Answer, Journal, Provider, Usage};
-    use crate::record::{MAX_SPEECH_BYTES, Receipt, Record, SkillOutcome, StepId, StepKey};
+    use crate::record::{
+        MAX_SPEECH_BYTES, Receipt, Record, Refusal, SkillOutcome, StepId, StepKey,
+    };
     use crate::skill::Read;
     use crate::speech::speak;
     use crate::task::{Advert, Task};
     use crate::test_support::{
-        FakeEditor, FakeFinder, FakeSkills, TestJournal, act_intent_records, act_outcome_records,
-        answer_records, apply_all, artifact, begin_records, execution_id, find_records,
-        open_records, report, session, skill_advert, skill_records, speech_records, task, turn_id,
+        FakeEditor, FakeFinder, FakeSkills, NoSubagents, TestJournal, act_intent_records,
+        act_outcome_records, answer_records, apply_all, artifact, begin_records, execution_id,
+        find_records, open_records, report, session, skill_advert, skill_records, speech_records,
+        task, turn_id,
     };
     use crate::tool::{Exit, ToolCall, ToolReport, Tools};
     use mokmok_protocol::{Moment, SessionID, TurnID};
     use mokmok_skill::{MAX_INSTRUCTIONS_BYTES, SkillName};
-    use mokmok_state_machine::{Attempt, Ending, Fact, Phase, TurnNumber, TurnOutcome};
+    use mokmok_state_machine::{
+        Ack, Attempt, Deadline, Ending, Fact, Phase, Resolution, TurnFact, TurnNumber, TurnOutcome,
+    };
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1413,6 +1557,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
             &mut |fragment| seen.push(fragment.to_owned()),
@@ -1479,6 +1624,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -1504,6 +1650,7 @@ mod tests {
             &unasked(),
             editor,
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -1591,6 +1738,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -1625,6 +1773,7 @@ mod tests {
             &unasked(),
             &FakeEditor::of([Err(Error::Editor("planned".into()))], []),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -1660,6 +1809,7 @@ mod tests {
             &unasked(),
             &FakeEditor::of([Ok(Plan::Refused("no file".to_owned()))], []),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -1711,6 +1861,7 @@ mod tests {
             &unasked(),
             &editor,
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -1793,6 +1944,7 @@ mod tests {
             &unasked(),
             &editor,
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2050,6 +2202,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2089,6 +2242,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2121,6 +2275,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2154,6 +2309,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2179,6 +2335,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2384,6 +2541,7 @@ mod tests {
             &finder,
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2418,6 +2576,7 @@ mod tests {
             &finder,
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2460,6 +2619,7 @@ mod tests {
             &finder,
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2504,6 +2664,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &no_skills(),
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2716,6 +2877,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &skills,
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2764,6 +2926,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &skills,
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2804,6 +2967,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &skills,
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2846,6 +3010,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &skills,
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2875,6 +3040,7 @@ mod tests {
             &unasked(),
             &unedited(),
             &skills,
+            &NoSubagents::new(""),
             session,
             Moment::EPOCH,
         )
@@ -2921,5 +3087,436 @@ mod tests {
             matches!(next(&transcript), Move::Ask { number, .. } if number == TurnNumber::new(2)),
             "a load keeps the agent working rather than handing the turn to the human",
         );
+    }
+
+    fn task_with_delegate(turns: u32) -> Task {
+        let mut task = task(turns);
+        task.setting.delegate = true;
+        task
+    }
+
+    fn subagent_answer(goal: &str) -> Answer {
+        Answer {
+            action: Action::Subagent {
+                goal: goal.to_owned(),
+            },
+            prose: String::new(),
+            text: artifact(0xcc),
+            model: "test".to_owned(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subagent_answer_writes_intent_calls_the_port_and_settles_completed() {
+        let session = session();
+        let task = task_with_delegate(4);
+        let turn = turn_id(1);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+
+        let provider = ScriptedProvider::of([subagent_answer("do the thing")]);
+        let subagents = NoSubagents::new("done");
+
+        // First the model answers `subagent`; then the derived move runs the child.
+        let first = advance(
+            &mut journal,
+            &provider,
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &no_skills(),
+            &subagents,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(first, Progress::Advanced(Move::Ask { .. })));
+
+        let second = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &no_skills(),
+            &subagents,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(second, Progress::Advanced(Move::Subagent { .. })));
+
+        let transcript = journal.transcript(session).unwrap();
+        let intent = transcript
+            .subagent_intent_of(turn)
+            .expect("the intent is recorded");
+        assert_eq!(intent.goal, "do the thing");
+        assert_eq!(
+            intent.child_session,
+            crate::subagent::child_session(intent.execution)
+        );
+
+        let outcome = transcript
+            .subagent_outcome_of(turn)
+            .expect("the outcome is recorded");
+        assert_eq!(outcome.reply, "done");
+        assert_eq!(
+            transcript.turn(turn).unwrap().outcome(),
+            Some(TurnOutcome::Completed),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_subagent_intent_does_not_call_the_port_again() {
+        let session = session();
+        let task = task_with_delegate(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut journal = TestJournal::new(session, task.clone());
+        journal.seed(&begin_records(&task));
+        journal.seed(&open_records(turn, 1, 1));
+        journal.seed(&answer_records(
+            turn,
+            1,
+            Action::Subagent {
+                goal: "do the thing".to_owned(),
+            },
+        ));
+        let intent_records = vec![
+            Record::Session {
+                fact: Fact::ExecutionLaunched {
+                    execution,
+                    deadline: Deadline::Unbounded,
+                },
+            },
+            Record::Turn {
+                turn,
+                fact: TurnFact::ToolRequested {
+                    execution,
+                    deadline: Deadline::Unbounded,
+                },
+            },
+            Record::SubagentIntent(crate::record::SubagentIntentRecord {
+                turn,
+                execution,
+                child_session: crate::subagent::child_session(execution),
+                goal: "do the thing".to_owned(),
+            }),
+        ];
+        journal.seed(&intent_records);
+        journal.mark(StepId::derive(session, StepKey::SubagentIntent { turn: 1 }));
+
+        let subagents = NoSubagents::new("done");
+        let progress = advance(
+            &mut journal,
+            &ScriptedProvider::of([]),
+            &FakeTools::of([]),
+            &unasked(),
+            &unedited(),
+            &no_skills(),
+            &subagents,
+            session,
+            Moment::EPOCH,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(progress, Progress::Yielded);
+    }
+
+    #[test]
+    fn the_context_shows_a_delegated_act() {
+        let task = task_with_delegate(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Subagent {
+                    goal: "do the thing".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &[
+                Record::Session {
+                    fact: Fact::ExecutionLaunched {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolRequested {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+                Record::SubagentIntent(crate::record::SubagentIntentRecord {
+                    turn,
+                    execution,
+                    child_session: crate::subagent::child_session(execution),
+                    goal: "do the thing".to_owned(),
+                }),
+                Record::Session {
+                    fact: Fact::ExecutionSettled {
+                        execution,
+                        resolution: Resolution::Applied,
+                    },
+                },
+                Record::Session {
+                    fact: Fact::ResultApplied { execution },
+                },
+                Record::SubagentOutcome(crate::record::SubagentOutcomeRecord {
+                    turn,
+                    execution,
+                    reply: "done".to_owned(),
+                    usage: Usage {
+                        input: 1,
+                        output: 1,
+                    },
+                }),
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolResolved {
+                        execution,
+                        resolution: Resolution::Applied,
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::TurnSettled {
+                        outcome: TurnOutcome::Completed,
+                    },
+                },
+            ],
+        );
+
+        let context = crate::context::context(&transcript);
+        assert!(context.delegate);
+        let act = context
+            .turns
+            .iter()
+            .find(|turn| turn.number == TurnNumber::new(1))
+            .and_then(|turn| turn.act.clone())
+            .expect("the turn has an act");
+        assert!(
+            matches!(
+                act,
+                ContextAct::Subagent { ref goal, ref reply, .. }
+                if goal == "do the thing" && reply == "done"
+            ),
+            "the context shows the delegation and the child reply: {act:?}",
+        );
+    }
+
+    #[test]
+    fn a_subagent_intent_refuses_a_mismatched_goal() {
+        let task = task_with_delegate(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Subagent {
+                    goal: "do this".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &[
+                Record::Session {
+                    fact: Fact::ExecutionLaunched {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolRequested {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+            ],
+        );
+
+        let record = Record::SubagentIntent(crate::record::SubagentIntentRecord {
+            turn,
+            execution,
+            child_session: crate::subagent::child_session(execution),
+            goal: "do that".to_owned(),
+        });
+        let refusal = transcript.apply(&record).unwrap_err();
+        assert!(
+            matches!(refusal, Refusal::SubagentMismatch { .. }),
+            "a goal that disagrees with the answer is refused: {refusal:?}",
+        );
+    }
+
+    #[test]
+    fn a_repeated_subagent_intent_is_a_duplicate_and_a_different_goal_conflicts() {
+        let task = task_with_delegate(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Subagent {
+                    goal: "do the thing".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &[
+                Record::Session {
+                    fact: Fact::ExecutionLaunched {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolRequested {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+            ],
+        );
+        let intent = Record::SubagentIntent(crate::record::SubagentIntentRecord {
+            turn,
+            execution,
+            child_session: crate::subagent::child_session(execution),
+            goal: "do the thing".to_owned(),
+        });
+        assert_eq!(transcript.apply(&intent).unwrap(), Ack::Applied);
+        assert_eq!(transcript.apply(&intent).unwrap(), Ack::Duplicate);
+
+        let different = Record::SubagentIntent(crate::record::SubagentIntentRecord {
+            turn,
+            execution,
+            child_session: crate::subagent::child_session(execution),
+            goal: "do another thing".to_owned(),
+        });
+        assert_eq!(
+            transcript.apply(&different).unwrap_err(),
+            Refusal::Conflict(crate::record::RecordKey::SubagentIntent(execution)),
+        );
+    }
+
+    #[test]
+    fn a_repeated_subagent_outcome_is_a_duplicate_and_a_different_reply_conflicts() {
+        let task = task_with_delegate(4);
+        let turn = turn_id(1);
+        let execution = execution_id(turn);
+        let mut transcript = Transcript::new(session());
+        apply_all(&mut transcript, &begin_records(&task));
+        apply_all(&mut transcript, &open_records(turn, 1, 1));
+        apply_all(
+            &mut transcript,
+            &answer_records(
+                turn,
+                1,
+                Action::Subagent {
+                    goal: "do the thing".to_owned(),
+                },
+            ),
+        );
+        apply_all(
+            &mut transcript,
+            &[
+                Record::Session {
+                    fact: Fact::ExecutionLaunched {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+                Record::Turn {
+                    turn,
+                    fact: TurnFact::ToolRequested {
+                        execution,
+                        deadline: Deadline::Unbounded,
+                    },
+                },
+                Record::SubagentIntent(crate::record::SubagentIntentRecord {
+                    turn,
+                    execution,
+                    child_session: crate::subagent::child_session(execution),
+                    goal: "do the thing".to_owned(),
+                }),
+                Record::Session {
+                    fact: Fact::ExecutionSettled {
+                        execution,
+                        resolution: Resolution::Applied,
+                    },
+                },
+                Record::Session {
+                    fact: Fact::ResultApplied { execution },
+                },
+            ],
+        );
+        let outcome = Record::SubagentOutcome(crate::record::SubagentOutcomeRecord {
+            turn,
+            execution,
+            reply: "done".to_owned(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+            },
+        });
+        assert_eq!(transcript.apply(&outcome).unwrap(), Ack::Applied);
+        assert_eq!(transcript.apply(&outcome).unwrap(), Ack::Duplicate);
+
+        let different = Record::SubagentOutcome(crate::record::SubagentOutcomeRecord {
+            turn,
+            execution,
+            reply: "not done".to_owned(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+            },
+        });
+        assert_eq!(
+            transcript.apply(&different).unwrap_err(),
+            Refusal::Conflict(crate::record::RecordKey::SubagentOutcome(execution)),
+        );
+    }
+
+    #[test]
+    fn a_task_without_delegation_does_not_advertise_the_subagent_tool() {
+        let without = task(4);
+        let prompt = crate::context::system_prompt(&without);
+        assert!(!prompt.contains("subagent"), "{prompt}");
+
+        let mut with = task(4);
+        with.setting.delegate = true;
+        let prompt = crate::context::system_prompt(&with);
+        assert!(prompt.contains("subagent"), "{prompt}");
     }
 }

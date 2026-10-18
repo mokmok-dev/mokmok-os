@@ -419,6 +419,28 @@ mod tests {
             .expect("the session holds one edit outcome record")
     }
 
+    fn subagent_intent_of(log: &mokmok_kernel::Log) -> &mokmok_agent_runtime::SubagentIntentRecord {
+        log.ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::SubagentIntent(subagent) => Some(subagent),
+                _ => None,
+            })
+            .expect("the session holds one subagent intent record")
+    }
+
+    fn subagent_outcome_of(
+        log: &mokmok_kernel::Log
+    ) -> &mokmok_agent_runtime::SubagentOutcomeRecord {
+        log.ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::SubagentOutcome(subagent) => Some(subagent),
+                _ => None,
+            })
+            .expect("the session holds one subagent outcome record")
+    }
+
     #[test]
     fn the_whole_loop_runs_a_command_and_closes_the_session() {
         let scratch = Scratch::new("loop");
@@ -1584,6 +1606,82 @@ mod tests {
         assert!(
             context.contains("sha256"),
             "and names both hashes:\n{context}",
+        );
+    }
+
+    #[test]
+    fn a_scripted_subagent_spawns_a_child_session_and_returns_its_final_reply() {
+        let scratch = Scratch::new("subagent");
+        let path = scratch.0.join("script.json");
+        let command = format!(
+            "cd {} && printf hello > child.txt",
+            scratch.checkout().display(),
+        );
+        script(
+            &path,
+            &[
+                // Parent turn 1: delegate to a child.
+                json!({
+                    "action": "subagent",
+                    "goal": "write hello into child.txt in the checkout",
+                }),
+                // Child turn 1: run the command.
+                json!({"action": "command", "command": command}),
+                // Child turn 2: finish.
+                json!({"action": "final", "say": "the child wrote the file"}),
+                // Parent turn 2: finish with the child's reply as the human-facing prose.
+                json!({"action": "final", "say": "the child wrote the file"}),
+            ],
+        );
+
+        let ran = run(&scratch, &agent_args(&scratch, &path, &[]));
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+        assert_eq!(
+            std::fs::read_to_string(scratch.checkout().join("child.txt"))
+                .expect("the child command wrote"),
+            "hello",
+        );
+
+        let (parent_log, parent_session) = log_of(&scratch);
+        let intent = subagent_intent_of(&parent_log);
+        assert_eq!(intent.goal, "write hello into child.txt in the checkout");
+        let outcome = subagent_outcome_of(&parent_log);
+        assert_eq!(outcome.reply, "the child wrote the file");
+
+        let child_session = intent.child_session;
+        assert_ne!(
+            child_session, parent_session,
+            "the child session is not the parent session",
+        );
+        let child_db = Db::open(&scratch.data().join("events.sqlite")).expect("the log opens");
+        let child_log = child_db.log(child_session).expect("the child stream reads");
+        assert!(
+            child_log
+                .ordered
+                .iter()
+                .any(|record| matches!(record, Record::Task(_))),
+            "the child stream holds its task",
+        );
+        assert!(
+            child_log.ordered.iter().any(|record| match record {
+                Record::Answer(answer) => {
+                    answer.action == Action::Final && answer.prose == "the child wrote the file"
+                },
+                _ => false,
+            }),
+            "the child stream holds its final answer",
+        );
+
+        let report = status(&scratch);
+        assert!(report.ok, "{}\n{}", report.out, report.err);
+        let final_answer = report
+            .out
+            .lines()
+            .find(|line| line.starts_with("answer ") && line.contains("action=Final"))
+            .expect("the final answer is reported");
+        assert!(
+            final_answer.contains("say=\"the child wrote the file\""),
+            "the parent's final prose is the human reply: {final_answer}",
         );
     }
 }

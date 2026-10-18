@@ -23,6 +23,7 @@ mod model;
 mod record;
 mod skill;
 mod speech;
+mod subagent;
 mod task;
 mod tool;
 
@@ -40,10 +41,13 @@ pub use record::{
     AnswerRecord, ArtifactRef, CallRecord, EditIntentRecord, EditOutcomeRecord, FindRecord,
     MAX_PATCH_BYTES, MAX_PROSE_BYTES, MAX_QUERY_BYTES, MAX_SPEECH_BYTES, PromptRecord, Receipt,
     Record, RecordKey, Refusal, SkillOutcome, SkillRecord, SpeechRecord, Step, StepId, StepKey,
-    TaskRecord, clip_prose, clip_query, patch_refusal,
+    SubagentIntentRecord, SubagentOutcomeRecord, TaskRecord, clip_prose, clip_query, patch_refusal,
 };
 pub use skill::{NO_SKILLS, Read, Skills};
 pub use speech::speak;
+pub use subagent::{
+    SubagentCall, SubagentOutcome, Subagents, child_budget, child_session, child_task, clip_goal,
+};
 pub use task::{Advert, Budget, Setting, Task};
 pub use tool::{
     DEFAULT_DEADLINE, Exit, ToolCall, ToolReport, Tools, UNKNOWN_WARNING, clip, observation,

@@ -9,14 +9,18 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use mokmok_agent_runtime::{
     Action, Answer, AnswerRecord, ArtifactRef, Budget, Context, Error as AgentError, Exit, Halt,
-    Journal, Move, Progress, Provider, Receipt, Record, Setting, Step, Task, ToolCall, ToolReport,
-    Tools, Transcript, Usage, advance, advance_watched, observation,
+    Journal, Move, Progress, Provider, Receipt, Record, Setting, Step, SubagentCall,
+    SubagentOutcome, Subagents, Task, ToolCall, ToolReport, Tools, Transcript, Usage, advance,
+    advance_watched, child_session, child_task, observation,
 };
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome};
@@ -68,6 +72,7 @@ impl Run {
                 deadline: Duration::from_secs(self.tool_deadline_seconds),
                 search: config.search_root.clone(),
                 skills: crate::skill::discover(&config.skill_root)?,
+                delegate: true,
             },
             budget: Budget {
                 turns: self.max_turns,
@@ -173,6 +178,15 @@ impl Ledger {
                     turn = Some(edit.turn);
                     execution = Some(edit.execution);
                     resolution = Some(edit.report.outcome.resolution());
+                },
+                Record::SubagentIntent(subagent) => {
+                    turn = Some(subagent.turn);
+                    execution = Some(subagent.execution);
+                },
+                Record::SubagentOutcome(subagent) => {
+                    turn = Some(subagent.turn);
+                    execution = Some(subagent.execution);
+                    resolution = Some(mokmok_state_machine::Resolution::Applied);
                 },
                 Record::Task(_)
                 | Record::Prompt(_)
@@ -476,6 +490,12 @@ enum Script {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         say: Option<String>,
     },
+    /// Hand a goal to a child coding agent in its own durable session.
+    Subagent {
+        goal: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        say: Option<String>,
+    },
     /// The model is done.
     Final {
         /// The model's own words, when the script supplies them, so an offline run shows prose.
@@ -498,6 +518,7 @@ impl Script {
             | Self::Find { say, .. }
             | Self::Edit { say, .. }
             | Self::UseSkill { say, .. }
+            | Self::Subagent { say, .. }
             | Self::Final { say }
             | Self::Malformed { say, .. } => say.as_deref(),
         }
@@ -520,6 +541,9 @@ impl From<Script> for Action {
                     },
                     |name| Self::UseSkill { name },
                 ),
+            Script::Subagent { goal, .. } => Self::Subagent {
+                goal: mokmok_agent_runtime::clip_goal(&goal),
+            },
             Script::Final { .. } => Self::Final,
             Script::Malformed { reason, .. } => Self::Malformed { reason },
         }
@@ -591,6 +615,116 @@ fn model(
 #[error("the script holds no answer for this attempt")]
 struct Exhausted;
 
+/// Runs a child session for one parent delegation, enforcing the one-level invariant.
+struct ChildRunner {
+    config: Config,
+    parent: Task,
+    provider: Arc<Model>,
+    at: Moment,
+}
+
+impl ChildRunner {
+    fn new(
+        config: &Config,
+        parent: Task,
+        provider: Arc<Model>,
+        at: Moment,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            parent,
+            provider,
+            at,
+        }
+    }
+}
+
+impl Subagents for ChildRunner {
+    #[allow(refining_impl_trait)]
+    fn run(
+        &self,
+        call: &SubagentCall,
+    ) -> Pin<Box<dyn Future<Output = Result<SubagentOutcome, AgentError>> + '_>> {
+        let config = self.config.clone();
+        let parent = self.parent.clone();
+        let provider = Arc::clone(&self.provider);
+        let at = self.at;
+        let call = call.clone();
+
+        Box::pin(async move {
+            let child = child_session(call.execution);
+            let child_task = child_task(&parent, &call.goal);
+
+            let run = Run {
+                session: child.as_uuid().to_string(),
+                goal: call.goal.clone(),
+                checkout: child_task.setting.checkout.clone(),
+                max_turns: child_task.budget.turns,
+                token_budget: child_task.budget.tokens,
+                context_bytes: child_task.budget.context_bytes,
+                observation_bytes: child_task.budget.observation_bytes,
+                context_turns: child_task.budget.context_turns,
+                tool_deadline_seconds: child_task.setting.deadline.as_secs(),
+                steps: 64,
+            };
+
+            let mut driver = Driver::open_with(&config, &run, at, child_task, provider)
+                .map_err(|error| AgentError::Subagent(Box::new(error)))?;
+
+            for _ in 0..run.steps {
+                match driver.step().await {
+                    Ok(
+                        Progress::Terminal(_)
+                        | Progress::Awaiting
+                        | Progress::Advanced(Move::Halt(_)),
+                    ) => break,
+                    Err(error) => return Err(AgentError::Subagent(Box::new(error))),
+                    Ok(_) => {},
+                }
+            }
+
+            let transcript = driver
+                .transcript()
+                .map_err(|error| AgentError::Subagent(Box::new(error)))?;
+            let reply = extract_child_reply(&transcript);
+            let usage = Usage {
+                input: transcript
+                    .answers
+                    .values()
+                    .map(|answer| answer.usage.input)
+                    .fold(0, u64::saturating_add),
+                output: transcript
+                    .answers
+                    .values()
+                    .map(|answer| answer.usage.output)
+                    .fold(0, u64::saturating_add),
+            };
+
+            Ok(SubagentOutcome { reply, usage })
+        })
+    }
+}
+
+/// The child session's final prose, newest turn first, or a status sentence if none.
+fn extract_child_reply(transcript: &Transcript) -> String {
+    transcript
+        .turns_in_order()
+        .into_iter()
+        .rev()
+        .find_map(|(turn, _)| {
+            transcript
+                .newest_answer(turn)
+                .filter(|answer| answer.action == Action::Final)
+                .map(|answer| answer.prose.clone())
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "the subagent stopped before producing a final answer ({phase:?})",
+                phase = transcript.session.phase()
+            )
+        })
+}
+
 /// What one `agent run` invocation did, step by step.
 #[derive(Debug)]
 pub struct Report {
@@ -616,7 +750,8 @@ pub struct Driver {
     index: Index,
     skills: Library,
     editor: Editor,
-    provider: Model,
+    provider: Arc<Model>,
+    delegates: ChildRunner,
     config: Config,
     session: SessionID,
     task: Task,
@@ -638,7 +773,18 @@ impl Driver {
     ) -> Result<Self, Error> {
         let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
         let task = run.task(config)?;
-        let provider = model(config, session)?;
+        let provider = Arc::new(model(config, session)?);
+        Self::open_with(config, run, at, task, provider)
+    }
+
+    fn open_with(
+        config: &Config,
+        run: &Run,
+        at: Moment,
+        task: Task,
+        provider: Arc<Model>,
+    ) -> Result<Self, Error> {
+        let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
         let shell = Shell::new(config, task.setting.program.clone(), at)?;
         let ledger = Ledger::open(config, session, Some(task.clone()), at)?;
         // The task the fold holds, not the one this invocation built: the prompt the model was
@@ -657,6 +803,7 @@ impl Driver {
             Index::open(&task.setting.search, &config.search_index)?
         };
         let skills = Library::open(&task.setting.skills);
+        let delegates = ChildRunner::new(config, task.clone(), Arc::clone(&provider), at);
 
         Ok(Self {
             ledger,
@@ -665,6 +812,7 @@ impl Driver {
             skills,
             editor,
             provider,
+            delegates,
             config: config.clone(),
             session,
             task,
@@ -708,11 +856,12 @@ impl Driver {
     pub async fn step(&mut self) -> Result<Progress, AgentError> {
         advance(
             &mut self.ledger,
-            &self.provider,
+            &*self.provider,
             &self.shell,
             &self.index,
             &self.editor,
             &self.skills,
+            &self.delegates,
             self.session,
             self.at,
         )
@@ -732,11 +881,12 @@ impl Driver {
     ) -> Result<Progress, AgentError> {
         advance_watched(
             &mut self.ledger,
-            &self.provider,
+            &*self.provider,
             &self.shell,
             &self.index,
             &self.editor,
             &self.skills,
+            &self.delegates,
             self.session,
             self.at,
             watch,
@@ -942,6 +1092,13 @@ fn step_line(
         Move::Edit { turn, .. } => {
             format!("move=edit turn={}", number_of(ledger, session, *turn))
         },
+        Move::Subagent { turn, call } => {
+            format!(
+                "move=subagent turn={} child={}",
+                number_of(ledger, session, *turn),
+                child_session(call.execution).as_uuid(),
+            )
+        },
         Move::Close {
             turn,
             outcome,
@@ -984,6 +1141,9 @@ fn ask_line(
             },
             Action::Edit { patch, .. } => {
                 format!("move=ask turn={number} attempt={attempt} answer=edit patch={patch:?}")
+            },
+            Action::Subagent { goal } => {
+                format!("move=ask turn={number} attempt={attempt} answer=subagent goal={goal:?}")
             },
             Action::Malformed { reason } => {
                 format!(
@@ -1076,6 +1236,7 @@ mod tests {
                 deadline: Duration::from_secs(1),
                 search: Vec::new(),
                 skills: Vec::new(),
+                delegate: false,
             },
             budget: Budget::default(),
         }

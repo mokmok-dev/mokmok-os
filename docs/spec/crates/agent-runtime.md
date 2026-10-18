@@ -27,82 +27,103 @@ replayed intent performs nothing.[^crate]
 # Public surface
 
 Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `skill`, `speech`,
-`task`, and `tool`.
+`subagent`, `task`, and `tool`.
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `next`, `advance`, `advance_watched`, `turn_id`, `execution_id` | `src/advance.rs:110,144,182,598,610` | The decision, the step, the step that reports prose as it arrives, and the two derived identifiers |
-| `Move`, `Halt`, `Progress` | `src/advance.rs:28,76,94` | Begin, ask, act, find, load, edit, close, await, halt; the five halt reasons; the step result |
-| `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `skill_of`, `loaded`, `newest_answer`, `observation`, `shown_turns`, `shown` |
-| `Provider`, `complete_watched`, `Journal` | `src/model.rs:64,79,96` | The model and the log, the two ports every step drives; the watched call reports prose fragments without changing the answer it returns |
+| `next`, `advance`, `advance_watched`, `turn_id`, `execution_id` | `src/advance.rs:117,151,191,653,665` | The decision, the step, the step that reports prose as it arrives, and the two derived identifiers |
+| `Move`, `Halt`, `Progress` | `src/advance.rs:28,76,101` | Begin, ask, act, find, load, edit, close, await, halt; the five halt reasons; the step result |
+| `Transcript` | `src/dialogue.rs:23` | `replay`, `apply`, `turn`, `newest_turn`, `holds_speech`, `call_of`, `find_of`, `skill_of`, `subagent_intent_of`, `subagent_outcome_of`, `loaded`, `newest_answer`, `observation`, `shown_turns`, `shown` |
+| `Provider`, `complete_watched`, `Journal` | `src/model.rs:68,83,100` | The model and the log, the two ports every step drives; the watched call reports prose fragments without changing the answer it returns |
 | `Finder`, `FindReport` | `src/find.rs:18,8` | The fourth port: the one tool that reads and changes nothing |
 | `Skills`, `Read`, `NO_SKILLS` | `src/skill.rs:27,19,15` | The sixth port: it reads one advertised body and changes nothing |
+| `Subagents`, `SubagentCall`, `SubagentOutcome` | `src/subagent.rs:43,24,37` | The seventh port: it runs a child session to completion and returns its final reply and spend |
+| `child_session`, `child_budget`, `child_task`, `clip_goal` | `src/subagent.rs:56,68,84,62` | The child's derived identity and budget, the task it inherits with delegation off, and the goal cap |
 | `Editor`, `EditCall`, `Plan`, `Ready` | `src/edit.rs:83,11,19,28` | The edit port, one patch about to be written, and the two answers planning gives |
 | `EditReport`, `EditOutcome` | `src/edit.rs:77,46` | What one edit produced: applied, stale, or refused |
-| `Action`, `Answer`, `Usage` | `src/model.rs:14,43,59` | A final answer, a command, a find, an edit, a skill to load, or malformed output |
+| `Action`, `Answer`, `Usage` | `src/model.rs:14,47,63` | A final answer, a command, a find, an edit, a skill to load, a subagent to run, or malformed output |
 | `Tools`, `ToolCall`, `ToolReport`, `Exit` | `src/tool.rs:90,22,76,31` | The execution port and its vocabulary |
-| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:217,337,258,369,360,399` | The durable record, the step key, and the two answers to an append |
+| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:236,366,281,398,389,422` | The durable record, the step key, and the two answers to an append |
 | `FindRecord`, `MAX_QUERY_BYTES`, `clip_query`, `clip_prose` | `src/record.rs:141,24,36,60` | One find's durable record, and the caps on the query it holds and the prose the model said |
 | `EditIntentRecord`, `EditOutcomeRecord`, `MAX_PATCH_BYTES`, `patch_refusal` | `src/record.rs:183,203,29,42` | One edit's two durable records, and the cap on the patch it carries |
+| `SubagentIntentRecord`, `SubagentOutcomeRecord` | `src/record.rs:211,221` | One delegation's two durable records: the child identity and goal, then its reply and spend |
 | `SkillRecord`, `SkillOutcome` | `src/record.rs:175,150` | One activation's durable record, and whether it loaded or refused |
-| `Task`, `Setting`, `Budget` | `src/task.rs:30,41,67` | The goal, its limits, and the ceilings |
+| `Task`, `Setting`, `Budget` | `src/task.rs:30,41,67` | The goal, its limits (including whether `delegate` is offered), and the ceilings |
 | `Advert` | `src/task.rs:14` | The metadata of one discovered skill, frozen into the task |
-| `Context`, `ContextAct`, `ContextSkill` | `src/context.rs:16,70,42` | The bytes the model is handed, what one settled turn reads as, and one loaded body |
+| `Context`, `ContextAct`, `ContextSkill` | `src/context.rs:16,74,46` | The bytes the model is handed, what one settled turn reads as (including a delegated one), and one loaded body |
 
 # Owned state
 
 Nothing durable. `Transcript` holds in-memory maps of turns, speeches, prompts, answers, calls,
-finds, skills, runs, and edits (`src/dialogue.rs:23-54`). Persistence arrives through the `Journal`
-port (`src/model.rs:80-122`), and large bytes are addressed by an artifact hash
-(`src/record.rs:87`).
+finds, skills, runs, edits, and subagent intents and outcomes (`src/dialogue.rs:23-60`). Persistence
+arrives through the `Journal` port (`src/model.rs:100`), and large bytes are addressed by an
+artifact hash (`src/record.rs:87`).
 
 # Invariants
 
 - An intent is appended before the effect, and only `Receipt::Written` performs it. A
-  `Receipt::Replayed` intent yields instead, at every move that appends (`src/advance.rs:244`).
+  `Receipt::Replayed` intent yields instead, at every move that appends (`src/advance.rs:257`).
 - A watched step forwards each prose fragment the model emits and still records one whole `Answer`
   per attempt; the unwatched step asks for the whole body and reports nothing
   (`src/advance.rs:268`).
 - The fold refuses a content record with no admitting machine fact (`Floating`) and a second record
   under one key with different content (`Conflict`), at the one dispatch every record passes,
-  `Record::apply` (`src/dialogue.rs:271`).
+  `Record::apply` (`src/dialogue.rs:302`).
 - A call's command must equal the command the answer named (`src/dialogue.rs:465`), a find's query
   the query its answer named (`src/dialogue.rs:523`), and a load's name the name its answer named
   (`src/dialogue.rs:557`).
-- A speech record folded after an attempt was requested is `Late` (`src/dialogue.rs:384`), and
+- A speech record folded after an attempt was requested is `Late` (`src/dialogue.rs:417`), and
   `speak` is refused unless the fold is at `Begin` or `Await` (`src/speech.rs:40`).
 - A find commits in one transaction, and only one: the record and the turn's settlement share a
   step, so a crash before it re-derives the same move and searches again, because a find changes
-  nothing (`src/advance.rs:856`).
+  nothing (`src/advance.rs:1061`).
 - An activation commits in one transaction too, because it is read-only: the `SkillRecord` and the
   turn's settlement share a step, a load settles `Completed`, a refusal settles `Failed`, and a crash
-  before the append retries a read that changes nothing (`src/advance.rs:891`).
+  before the append retries a read that changes nothing (`src/advance.rs:1096`).
 - The advertisement is built from the recorded task alone, so a re-ask is byte-identical and a
-  resumed session keeps exactly the skills it was opened with (`src/context.rs:184`).
+  resumed session keeps exactly the skills it was opened with (`src/context.rs:184`). The subagent
+  tool is advertised by the same rule: `Context.delegate` and the system prompt both read
+  `Setting.delegate`, so a task that refuses delegation offers no tool to call (`src/context.rs:184`).
 - The runtime bounds a port's answer itself. A body over `MAX_INSTRUCTIONS_BYTES` is refused off the
   runtime's own bat, so a record stays bounded whatever a `Skills` implementation returns
-  (`src/advance.rs:926`).
+  (`src/advance.rs:1131`).
 - `Context::loaded` is a floor the turn trim cannot remove, so the operator's `--context-bytes`
   stays the real ceiling (`src/context.rs:37`).
 - An edit spends two transactions, because it changes the world. The intent records the file's
   pre-image and post-image as content-addressed references before anything is written
-  (`src/advance.rs:703`), so a crash between the two steps leaves a state the daemon can name rather
+  (`src/advance.rs:824`), so a crash between the two steps leaves a state the daemon can name rather
   than assume: recovery settles the execution `Unknown`, and the next prompt prints both hashes.
 - A refusal decided before anything was written spends one transaction and records no intent
-  (`src/advance.rs:790`), because nothing was about to happen. An edit's outcome still reaches the
+  (`src/advance.rs:995`), because nothing was about to happen. An edit's outcome still reaches the
   model through `ContextAct::Edited` when no intent stands beside it, so a refused edit never reads
   as a command that was not recorded.
+- A delegation spends two transactions like an edit. The intent names the child session derived from
+  the parent execution and the goal the answer named, before the child runs; the outcome records the
+  reply and the child's spend after it (`src/advance.rs:318`). A replayed intent yields without
+  running a second child. A crash before the outcome is recovery's: it settles the parent execution
+  Unknown and the parent turn Failed, and the child's own stream stays in the log under its derived
+  identity, openable from the listing, while the parent makes no claim about a reply it never
+  recorded.
+- A child task is built from the recorded parent task with `delegate` turned off
+  (`src/subagent.rs:92`), so delegation is one level deep. The parent's tool list and system prompt
+  both read `Setting.delegate`, and an answer that asks for a subagent when the recorded task forbids
+  it is re-asked as a malformed answer rather than run (`src/advance.rs:569`).
+- A delegated turn's act carries the child's session identity, goal, and reply, clipped to the
+  observation budget (`src/context.rs:321`). The child's own tool records stay in its stream; the
+  parent renders the one act the parent model asked for.
+- The token ceiling counts the child's spend through its outcome record as well as the parent's
+  answers, so a child cannot spend the parent's budget invisibly (`src/advance.rs:631`).
 - A step identifier is derived from the session and the step key as a version-5 UUID, so a repeated
-  step replays (`src/record.rs:303`).
-- Three ceilings halt the loop: tokens (`src/advance.rs:359`), turns (`src/advance.rs:405`), and
-  attempts (`src/advance.rs:496`).
+  step replays (`src/record.rs:326`).
+- Three ceilings halt the loop: tokens (`src/advance.rs:452`), turns (`src/advance.rs:499`), and
+  attempts (`src/advance.rs:611`).
 - Every refusal returns before any mutation, so a refused record leaves the fold untouched.
-- `shown_turns` pairs each rendering with the turn it names (`src/context.rs:229`), which is what a
+- `shown_turns` pairs each rendering with the turn it names (`src/context.rs:253`), which is what a
   front end draws a turn's own settlement, attempts, and answers beside; `shown` is its projection.
 - An absent `act` means the turn being asked now, or a settled turn the model never finished: such
   a turn requested no tool, so no command ran and its prompt carries only the human's line
   (`src/context.rs:261`). A settled turn that did dispatch a command without a call record still
-  renders `MISSING_COMMAND` (`src/context.rs:327`).
+  renders `MISSING_COMMAND` (`src/context.rs:239`).
 
 # Dependencies
 
@@ -121,8 +142,8 @@ There is no `recovery` module. Recovery lives in `mokmok-kernel/src/recovery.rs`
 in-flight executions from the durable log.
 
 The design names `ToolExecutor` and persistence interfaces as the ports. The ports the crate
-declares are `Provider`, `Journal`, `Tools`, `Finder`, `Editor`, and `Skills`. The name `SrtBackend`
-appears in no Rust file in the workspace.
+declares are `Provider`, `Journal`, `Tools`, `Finder`, `Editor`, `Skills`, and `Subagents`. The name
+`SrtBackend` appears in no Rust file in the workspace.
 
 The design's `orchestrator` module has no counterpart. The kernel owns the loop that calls
 `advance`, in `mokmok-kernel/src/agent.rs`.
@@ -135,26 +156,29 @@ writes a file through the kernel's own process.
 
 # Tests
 
-There is no `tests/` directory. Eight `#[cfg(test)]` modules hold 146 cases, two of them property
+There is no `tests/` directory. Nine `#[cfg(test)]` modules hold 161 cases, two of them property
 cases.
 
-`src/advance.rs:1124` holds 43 cases for the begin, ask, act, find, load, edit, and close walk, a
-replayed intent performing no effect, an interrupted find re-deriving its step, a load settling in one
-step and a replayed load performing no second read, a refused edit spending one step, the three
+`src/advance.rs:1262` holds 50 cases for the begin, ask, act, find, load, edit, subagent, and close
+walk, a replayed intent performing no effect, an interrupted find re-deriving its step, a load
+settling in one step and a replayed load performing no second read, a refused edit spending one step,
+a delegation settling the parent turn and a replayed intent not running the child again, the three
 ceilings, the draining halt, a line at the log's ceiling, a watched provider forwarding its
 fragments while the whole answer is recorded, and the unwatched step asking the whole-body path.
-`src/dialogue.rs:697`
+`src/subagent.rs:102` holds 5 cases for the derived child identity, the goal cap, the child budget,
+and the child task that turns delegation off.
+`src/dialogue.rs:841`
 holds 39 cases and one proptest for the floating, late, and conflicting refusals, the query, patch,
 and skill mismatches, an edit outcome with no intent, and for refolding a history being invariant.
-`src/context.rs:425` holds 40 cases for byte accounting, budget trimming, an unknown outcome
+`src/context.rs:462` holds 41 cases for byte accounting, budget trimming, an unknown outcome
 rendered as its warning, a byte-identical re-ask, the prompt a granted root or a writable checkout
 adds, the advertisement a task adds and the loaded body it carries, a rendering paired with the turn
 it names, a settled edit shown from its outcome, an interrupted one shown from its intent, and a
 settled turn the model never finished carrying no act.
-`src/record.rs:544` holds 8 cases for the query, prose, and patch caps and the two byte bounds the
+`src/record.rs:589` holds 8 cases for the query, prose, and patch caps and the two byte bounds the
 log declares, and `src/edit.rs:152` holds 7 for the outcome-to-settlement map and the three
 renderers. `src/tool.rs:183` holds 5 cases for the exit-to-outcome map, `src/speech.rs:106` holds 2
-cases and one property case for the line bound in both directions, and `src/task.rs:101` holds 2 for a
+cases and one property case for the line bound in both directions, and `src/task.rs:103` holds 2 for a
 task record written before the finding grant existed and one written before the skills field did.
 
 ```
