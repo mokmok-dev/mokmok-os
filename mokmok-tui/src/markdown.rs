@@ -113,28 +113,33 @@ fn find_pair<'a>(
     marker: &str,
 ) -> Option<(usize, &'a str, &'a str, &'a str)> {
     let marker_len = marker.len();
-    let mut start = 0;
+    let mut rest = text;
 
-    while let Some(at) = text[start..].find(marker) {
-        let absolute = start + at;
+    while let Some(at) = rest.find(marker) {
+        let absolute = text.len() - rest.len() + at;
+        let (_, tail) = rest.split_at(at);
+        let after_marker = tail.get(marker_len..)?;
+
         if is_escaped(text, absolute) {
-            start = absolute + marker_len;
+            rest = after_marker;
             continue;
         }
 
-        let after_open = absolute + marker_len;
-        if let Some(close) = text[after_open..].find(marker) {
-            let close_absolute = after_open + close;
+        if let Some(close) = after_marker.find(marker) {
+            let close_absolute = text.len() - after_marker.len() + close;
             if is_escaped(text, close_absolute) {
-                start = absolute + marker_len;
+                rest = after_marker;
                 continue;
             }
+
             let before = &text[..absolute];
-            let inner = &text[after_open..close_absolute];
-            let after = &text[close_absolute + marker_len..];
+            let inner = &after_marker[..close];
+            let after = after_marker.get(close + marker_len..)?;
+
             return Some((absolute, before, inner, after));
         }
-        start = absolute + marker_len;
+
+        rest = after_marker;
     }
 
     None
@@ -208,6 +213,18 @@ mod tests {
         assert_eq!(
             spans("**not closed and `not closed"),
             vec![("**not closed and `not closed".to_owned(), Tone::Agent)],
+        );
+    }
+
+    #[test]
+    fn a_backslash_keeps_a_marker_literal() {
+        assert_eq!(
+            spans(r"\**not bold**"),
+            vec![(r"\**not bold**".to_owned(), Tone::Agent)],
+        );
+        assert_eq!(
+            spans(r"\`not code\`"),
+            vec![(r"\`not code\`".to_owned(), Tone::Agent)],
         );
     }
 

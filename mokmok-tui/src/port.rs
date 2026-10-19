@@ -1481,6 +1481,21 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_skips_a_blank_line_between_its_rows() {
+        let view = view(
+            vec![Line::Edit {
+                observation: "first\n\nsecond\n".to_owned(),
+            }],
+            0,
+        );
+
+        assert_eq!(
+            texts(&view.visible(40, 10)),
+            vec!["  ✎ first", "    second"],
+        );
+    }
+
+    #[test]
     fn a_delegate_row_shows_the_goal_the_child_and_the_reply() {
         let session = named(2);
         let view = view(
