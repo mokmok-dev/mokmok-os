@@ -1,5 +1,6 @@
 //! The ports: what the core needs from one session, from the log, and where a frame goes.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 
@@ -849,36 +850,30 @@ fn wrap_spans(
     spans: &[Span],
     width: usize,
 ) -> Vec<Vec<Span>> {
-    let tokens = tokens(spans);
+    let mut tokens: VecDeque<Token> = tokens(spans).into();
     let mut rows = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut used = 0;
-    let mut index = 0;
 
-    while index < tokens.len() {
-        let token = &tokens[index];
-
+    while let Some(token) = tokens.pop_front() {
         if token.space {
             if used == 0 {
-                index += 1;
                 continue;
             }
 
-            let next = tokens[index + 1..].iter().find(|token| !token.space);
-            let fits = next.is_none_or(|word| used + 1 + word.text.width() <= width);
+            let Some(next) = tokens.iter().find(|token| !token.space) else {
+                continue;
+            };
 
-            if fits && used < width {
+            if used + 1 + next.text.width() <= width {
                 push_text(&mut current, " ", token.tone);
                 used += 1;
-                index += 1;
-            } else if next.is_some() {
+            } else {
                 rows.push(std::mem::take(&mut current));
                 used = 0;
-                while tokens.get(index).is_some_and(|token| token.space) {
-                    index += 1;
+                while tokens.front().is_some_and(|token| token.space) {
+                    tokens.pop_front();
                 }
-            } else {
-                index += 1;
             }
             continue;
         }
@@ -888,10 +883,10 @@ fn wrap_spans(
         if used + word_width <= width {
             push_text(&mut current, &token.text, token.tone);
             used += word_width;
-            index += 1;
         } else if used > 0 {
             rows.push(std::mem::take(&mut current));
             used = 0;
+            tokens.push_front(token);
         } else {
             let mut rest = token.text.as_str();
 
@@ -908,8 +903,6 @@ fn wrap_spans(
                 rows.push(vec![Span::new(head, token.tone)]);
                 rest = tail;
             }
-
-            index += 1;
         }
     }
 
