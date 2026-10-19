@@ -21,7 +21,7 @@ use mokmok_state_machine::Ending;
 
 pub use crate::core::run;
 pub use crate::port::{
-    Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Update, View,
+    Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Typing, Update, View,
 };
 pub use crate::session::{Session, Sessions};
 pub use crate::terminal::Terminal;

@@ -15,6 +15,7 @@ mokmok-state-machine = { workspace = true }
 ratatui = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 mokmok-artifact = { workspace = true }
