@@ -1,0 +1,61 @@
+{
+  "testRunner": "vitest",
+  "vitest": {
+    "configFile": "vitest.mutation.config.ts"
+  },
+  "mutate": [
+    "packages/protocol/src/**/*.ts",
+    "!packages/protocol/src/**/*.test.ts",
+    "packages/consumer/src/**/*.ts",
+    "!packages/consumer/src/**/*.test.ts"
+  ],
+  "reporters": [
+    "clear-text",
+    "progress",
+    "json",
+    "html"
+  ],
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "htmlReporter": {
+    "fileName": "reports/mutation/mutation.html"
+  },
+  "thresholds": {
+    "high": 100,
+    "low": 100,
+    "break": 100
+  },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true,
+  "timeoutMS": 20000,
+  "concurrency": 4,
+  "plugins": [
+    "@stryker-mutator/vitest-runner"
+  ],
+  "ignorePatterns": [
+    ".direnv",
+    ".audit",
+    "target",
+    "result",
+    "result-*",
+    "mutants.out",
+    "mutants.out.old",
+    "mutation.json",
+    "mokmok-*",
+    "docs",
+    "deploy",
+    "examples",
+    ".cargo",
+    ".github",
+    "flake.nix",
+    "flake.lock",
+    ".envrc",
+    "Cargo.toml",
+    "Cargo.lock",
+    "mokmok-os-architecture.md",
+    "e2e",
+    "reports",
+    "coverage"
+  ]
+}

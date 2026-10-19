@@ -5,3 +5,13 @@
 /result
 /result-*
 /target
+
+# JavaScript workspace
+node_modules/
+dist/
+coverage/
+reports/
+.stryker-tmp/
+.vite/
+*.tsbuildinfo
+.mokmok-web/

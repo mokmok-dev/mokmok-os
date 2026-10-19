@@ -1,0 +1,30 @@
+{
+  "name": "@mokmok/web-console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@cloudflare/kumo": "^2.14.0",
+    "@mokmok/web-consumer": "workspace:*",
+    "@mokmok/web-protocol": "workspace:*",
+    "@phosphor-icons/react": "^2.1.10",
+    "@tanstack/react-query": "^5.104.4",
+    "@tanstack/react-router": "^1.170.45",
+    "@tanstack/react-table": "^9.3.1",
+    "effect": "^4.0.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "jsdom": "^30.1.3",
+    "vite": "^8.3.4"
+  }
+}
