@@ -166,7 +166,7 @@ impl std::fmt::Display for Refusal {
 impl Refusal {
     /// Parses the body of an HTTP 503 WebSocket-upgrade refusal.
     #[must_use]
-    pub fn from_upgrade_body(body: &str) -> Option<Self> {
+    pub(crate) fn from_upgrade_body(body: &str) -> Option<Self> {
         match body {
             "connection_limit" => Some(Self::ConnectionLimit),
             "shutting_down" => Some(Self::ShuttingDown),
@@ -324,7 +324,7 @@ impl Batch {
 
 #[cfg(test)]
 mod tests {
-    use super::{Batch, Event, LogEpoch, Seq, Window};
+    use super::{Batch, Event, LogEpoch, Refusal, Seq, Window};
     use crate::payload::Payload;
     use crate::topic::Topic;
     use mokmok_protocol::EventID;
@@ -341,6 +341,19 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             Payload::json(&0).unwrap(),
         ))
+    }
+
+    #[test]
+    fn an_upgrade_body_names_the_refusal_it_stands_for() {
+        assert_eq!(
+            Refusal::from_upgrade_body("connection_limit"),
+            Some(Refusal::ConnectionLimit),
+        );
+        assert_eq!(
+            Refusal::from_upgrade_body("shutting_down"),
+            Some(Refusal::ShuttingDown),
+        );
+        assert_eq!(Refusal::from_upgrade_body("something else"), None);
     }
 
     proptest! {

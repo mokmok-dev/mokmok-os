@@ -90,14 +90,13 @@ impl Client {
             .await
             .map_err(|error| Error::Transport(Box::new(error)))?;
 
-        let (stream, response) = tokio_tungstenite::client_async(URL, stream)
+        let (stream, _response) = tokio_tungstenite::client_async(URL, stream)
             .await
             .map_err(map_handshake)?;
 
         let (sender, receiver) = mpsc::unbounded_channel();
         tokio::spawn(driver(stream, receiver));
 
-        let _ = response;
         Ok(Self { sender })
     }
 
@@ -241,8 +240,13 @@ fn map_handshake(error: tokio_tungstenite::tungstenite::Error) -> Error {
         .as_ref()
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_default();
-    let reason = Refusal::from_upgrade_body(&body).unwrap_or(Refusal::ShuttingDown);
-    Error::Refused(reason)
+
+    Refusal::from_upgrade_body(&body).map_or_else(
+        // A 503 this client does not understand stays a transport failure: reporting it as a
+        // shutdown would name a cause the bus never stated.
+        || Error::Transport(Box::new(WsError::Http(response))),
+        Error::Refused,
+    )
 }
 
 async fn driver(
@@ -256,7 +260,7 @@ async fn driver(
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
-                    fail_rest(&mut outstanding, true);
+                    fail_rest(&mut outstanding, &Ending::Clean);
                     return;
                 };
                 if !send_command(
@@ -356,10 +360,11 @@ async fn send_command(
             true
         },
         Err(error) => {
+            let detail = error.to_string();
             if let Some(current) = outstanding.remove(&req_id) {
                 let _ = current.reply.send(Err(Error::Transport(Box::new(error))));
             }
-            fail_rest(outstanding, false);
+            fail_rest(outstanding, &Ending::Lost(detail));
             false
         },
     }
@@ -371,12 +376,11 @@ fn receive_frame(
 ) -> bool {
     match frame {
         None | Some(Ok(Message::Close(_))) => {
-            fail_rest(outstanding, true);
+            fail_rest(outstanding, &Ending::Clean);
             false
         },
         Some(Err(error)) => {
-            fail_rest(outstanding, false);
-            let _ = error;
+            fail_rest(outstanding, &Ending::Lost(error.to_string()));
             false
         },
         Some(Ok(Message::Text(text))) => {
@@ -443,17 +447,29 @@ fn fail_all(
     }
 }
 
+/// How the connection ended, for requests that were already written.
+enum Ending {
+    /// The peer closed the WebSocket, or the last client handle dropped.
+    Clean,
+    /// The socket failed; the text names what happened for callers whose request was not a
+    /// publish.
+    Lost(String),
+}
+
 fn fail_rest(
     outstanding: &mut HashMap<u64, Pending>,
-    clean_close: bool,
+    ending: &Ending,
 ) {
     for (_req_id, pending) in outstanding.drain() {
         let error = if pending.written && matches!(pending.request, Request::Publish { .. }) {
             Error::Indeterminate
-        } else if clean_close {
-            Error::Closed
         } else {
-            Error::Transport(Box::new(io::Error::other("connection ended")))
+            match ending {
+                Ending::Clean => Error::Closed,
+                Ending::Lost(detail) => {
+                    Error::Transport(Box::new(io::Error::other(detail.clone())))
+                },
+            }
         };
         let _ = pending.reply.send(Err(error));
     }

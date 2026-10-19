@@ -320,9 +320,9 @@ async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
 }
 
 /// A socket file is not a bus: a process killed with SIGKILL leaves one behind, and the bus that
-/// replaces it unlinks and rebinds, so the file says nothing until a peer answers. Opening a
-/// session moves no checkpoint and appends no event; the only durable effect is the topic row the
-/// bus creates for a topic it has not seen.
+/// replaces it unlinks and rebinds, so the file says nothing until a peer answers. A WebSocket
+/// upgrade is that answer: it needs the live server, and it creates no topic and moves no
+/// checkpoint.
 async fn bus_answers(socket: &Path) -> bool {
     // A dropped probe closes the connection it opened, so a peer that never answers costs one
     // `PROBE` and leaves nothing behind.

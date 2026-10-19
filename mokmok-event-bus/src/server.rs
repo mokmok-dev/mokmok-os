@@ -251,7 +251,7 @@ async fn session(
                 }
             }
             () = any_window_changed(&mut session.subscriptions) => {
-                if !recheck(&mut socket, &server, &limits, &mut session, timeouts).await {
+                if !recheck(&mut socket, &limits, &mut session, timeouts).await {
                     return;
                 }
             }
@@ -300,21 +300,9 @@ async fn apply(
     request: Request,
     timeouts: Timeouts,
 ) -> bool {
-    match handle(server, limits, session, request).await {
-        Outcome::Answers(responses) => {
-            for response in responses {
-                if !send(socket, &response, timeouts).await {
-                    return false;
-                }
-            }
-            true
-        },
-        Outcome::Quiet => true,
-        Outcome::Close(code) => {
-            close(socket, code, "frame out of turn", timeouts).await;
-            false
-        },
-    }
+    let outcome = handle(server, limits, session, request).await;
+
+    apply_outcome(socket, outcome, timeouts).await
 }
 
 async fn handle(
@@ -349,6 +337,8 @@ async fn publish(
     topic: Topic,
     payload: Payload,
 ) -> Outcome {
+    // Held until the append resolves: a topic with no receiver is a reclaim candidate, and a
+    // swept entry's watch would not wake the reader that attached after the sweep.
     let (entry, _ticks) = match server.bus.open_topic(topic).await {
         Ok(opened) => opened,
         Err(OpenError::Refused(reason)) => {
@@ -599,7 +589,6 @@ async fn ack(
 /// Re-polls every reader that was parked caught-up, because one of their watches changed.
 async fn recheck(
     socket: &mut WebSocket,
-    _server: &Server,
     limits: &Limits,
     session: &mut Session,
     timeouts: Timeouts,
@@ -620,7 +609,7 @@ async fn recheck(
         reader.parked = None;
 
         let outcome = pull_reader(reader, limits, req_id, sub, max).await;
-        if !apply_outcome(socket, session, outcome, timeouts).await {
+        if !apply_outcome(socket, outcome, timeouts).await {
             return false;
         }
     }
@@ -631,7 +620,6 @@ async fn recheck(
 /// Applies an outcome that arrived outside a normal request frame.
 async fn apply_outcome(
     socket: &mut WebSocket,
-    _session: &mut Session,
     outcome: Outcome,
     timeouts: Timeouts,
 ) -> bool {

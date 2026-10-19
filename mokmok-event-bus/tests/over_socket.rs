@@ -1150,7 +1150,7 @@ mod tests {
     async fn a_peer_that_stops_reading_is_closed() {
         let bus = Bus::start(Config {
             limits: Limits {
-                connections: NonZeroUsize::new(2).unwrap(),
+                connections: NonZeroUsize::new(1).unwrap(),
                 ..Limits::default()
             },
             timeouts: Timeouts {
@@ -1161,28 +1161,15 @@ mod tests {
         })
         .await;
 
-        // A raw peer that opens a subscription and then never reads from its socket never answers
-        // the bus's pings, so the bus hangs up long before the sleep is over.
-        let mut peer = connect(&bus.path).await;
-        send_json(
-            &mut peer,
-            &serde_json::json!({
-                "op": "subscribe",
-                "req_id": 1,
-                "topic": "global",
-                "subscriber": SubscriberId::new().to_string(),
-            }),
-        )
-        .await;
-        let _subscribed = next_frame(&mut peer).await;
-        drop(peer);
-
+        // Nothing ever reads this peer, so it cannot answer the bus's ping. The bus must hang up
+        // and release the only connection permit, which the next connect proves.
+        let _peer = connect(&bus.path).await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
         let client = within("connect", Client::connect(&bus.path)).await.unwrap();
         assert!(
             client.publish(Topic::Global, payload(&1)).await.is_ok(),
-            "the bus closed the peer that stopped reading",
+            "the bus freed the permit held by the silent peer",
         );
     }
 

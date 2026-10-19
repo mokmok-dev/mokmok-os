@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use mokmok_protocol::EventID;
 
-use crate::event::{Cursor, Event, Lapsed, Published, Refusal, Seq, Window};
+use crate::event::{Cursor, Event, Lapsed, Refusal, Seq, Window};
 use crate::payload::Payload;
 use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
@@ -89,17 +89,6 @@ impl Response {
             | Self::Batch { req_id, .. }
             | Self::Acked { req_id, .. }
             | Self::Refused { req_id, .. } => req_id,
-        }
-    }
-}
-
-impl From<Published> for Response {
-    fn from(published: Published) -> Self {
-        Self::Published {
-            req_id: 0,
-            id: published.id(),
-            seq: published.seq(),
-            at: published.at(),
         }
     }
 }
