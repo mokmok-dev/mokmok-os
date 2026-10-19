@@ -1055,10 +1055,6 @@ fn window(
     cursor: usize,
     height: usize,
 ) -> Vec<Row> {
-    if height == 0 || rows.is_empty() {
-        return Vec::new();
-    }
-
     let start = cursor
         .saturating_sub(height / 2)
         .min(rows.len().saturating_sub(height));
@@ -1083,10 +1079,6 @@ impl View {
         width: usize,
         height: usize,
     ) -> Vec<Row> {
-        if width == 0 || height == 0 {
-            return Vec::new();
-        }
-
         let rows: Vec<Row> = self
             .lines
             .iter()
@@ -1232,10 +1224,6 @@ impl View {
         width: usize,
         height: usize,
     ) -> Vec<Row> {
-        if width == 0 || height == 0 {
-            return Vec::new();
-        }
-
         let mut rows = Vec::new();
 
         // A header is worth a row only when the pane can spare one beside a list worth scanning.
@@ -1254,7 +1242,7 @@ impl View {
                 false,
             ));
 
-            return rows;
+            return rows.into_iter().take(height).collect();
         }
 
         let status_width = entries
@@ -1730,6 +1718,16 @@ mod tests {
             5,
             "a pane that fits shows every entry",
         );
+    }
+
+    #[test]
+    fn a_two_row_listing_keeps_the_cursor_on_the_second_row() {
+        let goals = [None; 5];
+        let rows = listing(5, 2, &goals).body(30, 2);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].text().starts_with(' '));
+        assert!(rows[1].text().starts_with('›'));
     }
 
     #[test]
