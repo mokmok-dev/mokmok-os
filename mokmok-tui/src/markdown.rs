@@ -120,14 +120,13 @@ fn find_pair<'a>(
         let (_, tail) = rest.split_at(at);
         let after_marker = tail.get(marker_len..)?;
 
-        if is_escaped(text, absolute) {
+        if is_escaped(&text[..absolute]) {
             rest = after_marker;
             continue;
         }
 
         if let Some(close) = after_marker.find(marker) {
-            let close_absolute = text.len() - after_marker.len() + close;
-            if is_escaped(text, close_absolute) {
+            if is_escaped(&after_marker[..close]) {
                 rest = after_marker;
                 continue;
             }
@@ -145,11 +144,7 @@ fn find_pair<'a>(
     None
 }
 
-fn is_escaped(
-    text: &str,
-    position: usize,
-) -> bool {
-    let prefix = &text[..position];
+fn is_escaped(prefix: &str) -> bool {
     prefix.ends_with('\\') && !prefix.ends_with("\\\\")
 }
 
