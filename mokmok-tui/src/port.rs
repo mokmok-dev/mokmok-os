@@ -242,6 +242,12 @@ pub enum Line {
     Find { query: String, observation: String },
     /// An edit the agent asked for, and what came of it.
     Edit { observation: String },
+    /// A delegation to a child session, with the goal it was given and what it answered.
+    Delegate {
+        child_session: SessionID,
+        goal: String,
+        reply: String,
+    },
     /// A turn the agent could not finish, and why.
     Trouble(String),
 }
@@ -260,6 +266,8 @@ const COMMAND_PREFIX: &str = "  $ ";
 const QUERY_PREFIX: &str = "  ? ";
 
 const EDIT_PREFIX: &str = "  ✎ ";
+
+const DELEGATE_PREFIX: &str = "  ⤷ ";
 
 const OBSERVATION_PREFIX: &str = "    ";
 
@@ -288,6 +296,19 @@ impl std::fmt::Display for Line {
             Self::Edit { observation } => {
                 let mut rows = vec![edit_row(observation)];
                 rows.extend(observation.lines().skip(1).map(observation_row));
+                rows
+            },
+            Self::Delegate {
+                child_session,
+                goal,
+                reply,
+            } => {
+                let mut rows = vec![format!("{DELEGATE_PREFIX}delegate: {}", escaped(goal))];
+                rows.push(observation_row(&format!(
+                    "child: {}",
+                    child_session.as_uuid()
+                )));
+                rows.extend(reply.lines().map(observation_row));
                 rows
             },
             other => rows_of(other),
@@ -337,6 +358,22 @@ fn rows_of(line: &Line) -> Vec<String> {
                 .filter(|second| !second.is_empty())
             {
                 rows.push(observation_row(outcome));
+            }
+
+            rows
+        },
+        Line::Delegate {
+            child_session,
+            goal,
+            reply,
+        } => {
+            let mut rows = vec![format!("{DELEGATE_PREFIX}delegate: {}", escaped(goal))];
+            rows.push(observation_row(&format!(
+                "child: {}",
+                child_session.as_uuid()
+            )));
+            if let Some(first) = reply.lines().next().filter(|first| !first.is_empty()) {
+                rows.push(observation_row(first));
             }
 
             rows
@@ -789,6 +826,34 @@ mod tests {
         assert_eq!(
             edit_row("applied to src/x.rs"),
             "  ✎ applied to src/x.rs".to_owned(),
+        );
+    }
+
+    #[test]
+    fn a_delegate_line_renders_its_goal_child_and_reply() {
+        let session = SessionID::from_uuid(Uuid::from_u128(2));
+        let line = Line::Delegate {
+            child_session: session,
+            goal: "find the license".to_owned(),
+            reply: "MIT license\nsummary here".to_owned(),
+        };
+
+        assert_eq!(
+            view(vec![line.clone()], 0).visible(3),
+            vec![
+                "  ⤷ delegate: find the license".to_owned(),
+                format!("    child: {}", session.as_uuid()),
+                "    MIT license".to_owned(),
+            ],
+            "the frame shows the goal, the child session, and the first reply line",
+        );
+
+        let replayed = format!("{line}");
+        assert!(
+            replayed.contains("delegate: find the license")
+                && replayed.contains(&session.as_uuid().to_string())
+                && replayed.contains("summary here"),
+            "the replay carries every line: {replayed:?}",
         );
     }
 

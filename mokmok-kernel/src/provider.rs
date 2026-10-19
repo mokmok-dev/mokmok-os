@@ -40,6 +40,8 @@ const EDIT_TOOL: &str = "apply_patch";
 
 const USE_SKILL_TOOL: &str = "use_skill";
 
+const SUBAGENT_TOOL: &str = "subagent";
+
 const SHELL_DESCRIPTION: &str = "Run one shell command with `sh -c` in a fresh, empty working \
      directory. The checkout is reached by absolute path, stdin is empty, and there is no TCP \
      network.";
@@ -56,6 +58,10 @@ const EDIT_DESCRIPTION: &str = "Apply a unified diff to one file under the check
 const USE_SKILL_DESCRIPTION: &str = "Load one advertised skill's instructions by name. The name \
      must be one the system prompt lists under \"Skills you may load by name with use_skill\"; the \
      instructions then ride every later prompt for the session.";
+
+const SUBAGENT_DESCRIPTION: &str = "Hand a goal to a child coding agent running in its own \
+     durable session with the same tools. The child returns its final reply and cannot delegate \
+     further.";
 
 /// The chat-completions path appended to a configured endpoint.
 const COMPLETIONS: &str = "/chat/completions";
@@ -935,6 +941,9 @@ fn tools(context: &Context) -> Vec<serde_json::Value> {
     if context.skills {
         tools.push(use_skill_tool());
     }
+    if context.delegate {
+        tools.push(subagent_tool());
+    }
 
     tools
 }
@@ -1008,6 +1017,21 @@ fn use_skill_tool() -> serde_json::Value {
     })
 }
 
+fn subagent_tool() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": SUBAGENT_TOOL,
+            "description": SUBAGENT_DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {"goal": {"type": "string"}},
+                "required": ["goal"],
+            },
+        },
+    })
+}
+
 /// The goal the model was asked to reach, with the settled turns appended once there are any.
 fn user_text(context: &Context) -> String {
     let turns = turns_text(context);
@@ -1072,6 +1096,18 @@ fn turn_text(turn: &ContextTurn) -> String {
             text.push_str(name.as_str());
             text.push_str("\nreason: ");
             text.push_str(reason);
+        },
+        Some(ContextAct::Subagent {
+            child_session,
+            goal,
+            reply,
+        }) => {
+            text.push_str("\nsubagent: ");
+            text.push_str(goal);
+            text.push_str("\nchild: ");
+            text.push_str(&child_session.as_uuid().to_string());
+            text.push_str("\nreply: ");
+            text.push_str(reply);
         },
         None => {},
     }
@@ -1146,6 +1182,7 @@ fn action_of(
 ///
 /// The function name is what selects the decoder, so a call naming a tool this session was offered
 /// no way to reach is malformed rather than silently read as a command.
+#[allow(clippy::too_many_lines)]
 fn tool_call(message: &serde_json::Value) -> Action {
     let Some(function) = message
         .get("tool_calls")
@@ -1237,6 +1274,17 @@ fn tool_call(message: &serde_json::Value) -> Action {
                     },
                 },
             ),
+        SUBAGENT_TOOL => decoded
+            .get("goal")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || Action::Malformed {
+                    reason: "the tool arguments name no goal string".to_owned(),
+                },
+                |goal| Action::Subagent {
+                    goal: mokmok_agent_runtime::clip_goal(goal),
+                },
+            ),
         other => Action::Malformed {
             reason: format!("the answer called {other:?}, which is not a tool of this session"),
         },
@@ -1313,7 +1361,15 @@ mod tests {
             search: false,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
+        }
+    }
+
+    fn delegating() -> Context {
+        Context {
+            delegate: true,
+            ..context()
         }
     }
 
@@ -1508,6 +1564,7 @@ mod tests {
             search: false,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
         };
 
@@ -1535,6 +1592,7 @@ mod tests {
             search: true,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
         };
 
@@ -1619,6 +1677,23 @@ mod tests {
                 .is_some_and(|description| description.contains("contents")),
             "the finder's description must say it reads a file's contents",
         );
+    }
+
+    #[test]
+    fn the_body_offers_the_subagent_exactly_when_the_task_may_delegate() {
+        let one_tool = request_body(&context(), "m", 1);
+        assert_eq!(one_tool["tools"].as_array().unwrap().len(), 1);
+
+        let two = request_body(&delegating(), "m", 1);
+        let tools = two["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["function"]["name"], "subagent");
+        assert_eq!(
+            tools[1]["function"]["parameters"]["properties"]["goal"]["type"],
+            "string",
+        );
+        assert_eq!(tools[1]["function"]["parameters"]["required"][0], "goal");
     }
 
     #[test]
@@ -1737,6 +1812,7 @@ mod tests {
             search: false,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
         };
 
@@ -1888,6 +1964,7 @@ mod tests {
             search: false,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
         };
 

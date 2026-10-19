@@ -22,6 +22,7 @@ use crate::record::{
     TaskRecord,
 };
 use crate::skill::{Read, Skills};
+use crate::subagent::{SubagentCall, SubagentOutcome, Subagents};
 use crate::task::{Advert, Budget, Setting, Task};
 use crate::tool::{Exit, ToolReport, observation};
 
@@ -66,6 +67,7 @@ pub fn task(turns: u32) -> Task {
             deadline: Duration::from_secs(120),
             search: vec!["/srv/checkout".into()],
             skills: Vec::new(),
+            delegate: false,
         },
         budget: Budget {
             turns,
@@ -583,6 +585,37 @@ impl Editor for FakeEditor {
             .unwrap()
             .pop_front()
             .expect("the fake editor holds a commit")
+    }
+}
+
+/// A subagent port that always answers the same reply, so a parent step can run without a child.
+pub struct NoSubagents {
+    reply: String,
+    usage: Usage,
+}
+
+impl NoSubagents {
+    #[must_use]
+    pub fn new(reply: &str) -> Self {
+        Self {
+            reply: reply.to_owned(),
+            usage: Usage {
+                input: 0,
+                output: 0,
+            },
+        }
+    }
+}
+
+impl Subagents for NoSubagents {
+    fn run(
+        &self,
+        _call: &SubagentCall,
+    ) -> impl std::future::Future<Output = Result<SubagentOutcome, crate::error::Error>> {
+        std::future::ready(Ok(SubagentOutcome {
+            reply: self.reply.clone(),
+            usage: self.usage,
+        }))
     }
 }
 

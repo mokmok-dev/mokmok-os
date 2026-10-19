@@ -153,6 +153,7 @@ mod tests {
                 deadline: Duration::from_secs(1),
                 search: Vec::new(),
                 skills: Vec::new(),
+                delegate: false,
             },
             budget: Budget::default(),
         }

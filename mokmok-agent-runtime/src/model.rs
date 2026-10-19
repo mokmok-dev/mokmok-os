@@ -28,6 +28,10 @@ pub enum Action {
     UseSkill {
         name: SkillName,
     },
+    /// The model asked to hand a goal to a child coding agent in its own durable session.
+    Subagent {
+        goal: String,
+    },
     /// The model's tool arguments could not be decoded; it is recorded, never silently retried.
     Malformed {
         reason: String,

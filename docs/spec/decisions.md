@@ -59,7 +59,7 @@ protocol (`mokmok-kernel/src/notify.rs`), so there is no endpoint to probe and n
 supervision tests bind their own notification socket to assert it.
 
 Crash injection takes two signals. A crash point fires only when the `--crash-after` flag names it
-and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:953`), so a production process cannot be
+and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:987`), so a production process cannot be
 crashed by a flag alone.
 
 The provider group comes from a file, and authority does not. Both binaries read the provider, the

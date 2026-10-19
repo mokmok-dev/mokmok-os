@@ -31,13 +31,13 @@ the turn settles.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:845` | The driver loop over every session the process holds |
+| `run` | `src/core.rs:857` | The driver loop over every session the process holds |
 | `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `step_watched`, `reopen`, `busy`, `drain` |
 | `Update` | `src/port.rs:98` | What a step working elsewhere reported: a fragment, its result, or a failure |
 | `Roster` | `src/port.rs:125` | The log's sessions: `listed`, `resume`, `create` |
 | `Screen` | `src/port.rs:161` | `poll`, `event`, `draw` |
-| `Listing`, `Key`, `Event`, `Line` | `src/port.rs:113,189,214,227` | What the log holds of one session, the keys, and the five line kinds |
-| `View`, `Sheet`, `Row` | `src/port.rs:412,436,453` | The frame, the pane over the transcript, and one row of the listing |
+| `Listing`, `Key`, `Event`, `Line` | `src/port.rs:113,189,214,227` | What the log holds of one session, the keys, and the seven line kinds, including a delegation's child, goal, and reply |
+| `View`, `Sheet`, `Row` | `src/port.rs:448,472,489` | The frame, the pane over the transcript, and one row of the listing |
 | `Session` | `src/session.rs:16` | The kernel-backed engine |
 | `Sessions` | `src/session.rs:84` | The kernel-backed roster, which opens every session on a worker |
 | `Worker` | `src/worker.rs:32` | The thread one session's world runs on, and the cached fold it reports |
@@ -112,7 +112,15 @@ to the kernel.
 - The binary declares no flag of its own. It flattens the kernel's `Global` and `Run`, so every rule
   the kernel applies to a flag applies to a conversation, and `--config` and the provider keys reach
   the TUI through the kernel's own resolution, which reads the process environment once into
-  `ProcessEnvironment` and hands it in (`src/bin/mokmok-tui.rs:53-55`).
+  `ProcessEnvironment` and hands it in (`src/bin/mokmok-tui.rs:71`).
+- A bare start fills only the flags the operator did not name (`src/bin/mokmok-tui.rs:107`). It
+  mints a session, takes a default goal, anchors the data directory, checkout, search root, and
+  write grant at the canonical working directory, and discovers skills under the configuration
+  directory and `.mokmok/skills`. The data directory becomes absolute because the confiner does not
+  share this process's working directory and opens the plan beside the sandbox root.
+- A delegation reaches the screen as `Line::Delegate`: the goal, the child session identity, and the
+  child's reply. The child's own find, edit, and command lines stay in its transcript, which the
+  listing opens like any other session (`src/core.rs:110`, `src/port.rs:227`).
 
 # Dependencies
 
@@ -148,7 +156,7 @@ already covers.
 
 # Tests
 
-106 cases: 11 in `tests/` and 95 across five `#[cfg(test)]` modules, two of them property cases.
+112 cases: 12 in `tests/` and 100 across six `#[cfg(test)]` modules, two of them property cases.
 
 Six of the eleven cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -159,17 +167,21 @@ One asserts that a session the human left keeps moving while he is in another, a
 the new session reports the one working in the background (`tests/conversation.rs:545`).
 One asserts that the listing shows a session only the log holds and that choosing it opens it
 (`tests/conversation.rs:623`).
-Five are binary cases: one asserts that a pipe on each standard stream refuses the run and says why,
+Six are binary cases: one asserts that a pipe on each standard stream refuses the run and says why,
 one drives a conversation on a pseudo-terminal through a frame and back to the shell, one asserts
 that a frame drawn while a turn is in flight, the listing, and the prompt that names a goal all reach
 a real terminal (`tests/binary.rs:398`), one serves a held server-sent stream and asserts that the
 first fragment is drawn before the second is sent, that a key typed during the stream echoes, and
-that the rest of the answer follows in order (`tests/binary.rs:629`), and one runs a command that
-sleeps and asserts that a key typed while it runs is drawn before the answer
-(`tests/binary.rs:564`). The command case returns early when the sandbox's confiner is absent, which
-is the shape of a package-scoped build.
+that the rest of the answer follows in order (`tests/binary.rs:629`), one runs a command that sleeps
+and asserts that a key typed while it runs is drawn before the answer
+(`tests/binary.rs:564`), and one starts with no session, goal, checkout, grant, search root, or skill
+root and asserts that the current checkout, the configured skill, and the reply all reach the
+replay. The command case returns early when the sandbox's confiner is absent, which is the shape of a
+package-scoped build.
 
-Five modules hold the rest.
+Six modules hold the rest. The binary holds 4 cases for a bare start's minted session and anchored
+paths, an explicit flag surviving the defaults, the path guards skipping a directory the working
+directory already covers, and the shell rule.
 One holds 49 cases and one property case for the trouble row, the work row, a dispatched command with
 no call record, the empty-line guard, the byte ceiling of the typed line and of a named goal, the
 status phrase of each mode, the rotation and its order, the listing's rows and cursor, adopting and
@@ -179,9 +191,9 @@ line, a deferred key waiting for the step and being answered in order, a backgro
 nothing, a pane covering the session keeping the stream off the screen, a terminal that fails while a
 stream is read or drawn, a key drawn while a worker's step is parked, and an interrupt answered while
 a session can move leaving (`src/core.rs:914`).
-One holds 19 cases and one property case for gutters, multi-row replies, row-wise windowing, the
-trouble row, a find row, an edit row, escaped control characters, the replay, and the rows of the
-listing (`src/port.rs:552`).
+One holds 20 cases and one property case for gutters, multi-row replies, row-wise windowing, the
+trouble row, a find row, an edit row, a delegated row, escaped control characters, the replay, and
+the rows of the listing (`src/port.rs:552`).
 One holds 7 cases for a step another writer committed becoming visible after the engine reopens the
 ledger, the goal and the checkout the log holds being the ones a resumed session runs under, a
 session with no task being refused, a created session running under the goal the human typed, and the

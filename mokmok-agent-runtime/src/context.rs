@@ -4,7 +4,7 @@ use crate::dialogue::Transcript;
 use crate::record::SkillOutcome;
 use crate::task::Task;
 use crate::tool::clip;
-use mokmok_protocol::TurnID;
+use mokmok_protocol::{SessionID, TurnID};
 use mokmok_skill::SkillName;
 use mokmok_state_machine::{Turn, TurnNumber};
 
@@ -13,6 +13,7 @@ use mokmok_state_machine::{Turn, TurnNumber};
 /// It carries no attempt number, step id, or clock, so a re-ask after a crash rebuilds byte-for-byte
 /// the content the first attempt sent.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Context {
     pub system: String,
     pub goal: String,
@@ -29,6 +30,10 @@ pub struct Context {
     /// is true, because both are built from the same recorded task.
     #[serde(default)]
     pub skills: bool,
+    /// Whether the session may offer the `subagent` tool. The tool list and the prompt both use this
+    /// flag, so a session whose task forbids delegation never advertises it.
+    #[serde(default)]
+    pub delegate: bool,
     /// The bodies activation has loaded, in turn order, deduped by name.
     ///
     /// They ride every prompt from the turn that loaded them on, so this is a floor the turn-level
@@ -94,6 +99,12 @@ pub enum ContextAct {
         name: SkillName,
         reason: String,
     },
+    /// The agent asked to hand a goal to a child session, and this is what the child answered.
+    Subagent {
+        child_session: SessionID,
+        goal: String,
+        reply: String,
+    },
 }
 
 impl Context {
@@ -130,6 +141,9 @@ impl Context {
                             Some(ContextAct::Loaded { name }) => name.as_str().len(),
                             Some(ContextAct::Refused { name, reason }) => {
                                 name.as_str().len() + reason.len()
+                            },
+                            Some(ContextAct::Subagent { goal, reply, .. }) => {
+                                goal.len() + reply.len() + 8
                             },
                             None => 0,
                         }
@@ -170,9 +184,20 @@ pub fn system_prompt(task: &Task) -> String {
         ))
     };
 
+    let delegate = if task.setting.delegate {
+        Some(String::from(
+            "subagent takes a goal string and hands it to a child coding agent in its own durable \
+             session with the same tools; the child returns its final reply and cannot delegate \
+             further",
+        ))
+    } else {
+        None
+    };
+
     let mut tools = vec![shell.to_owned()];
     tools.extend(find);
     tools.extend(edit);
+    tools.extend(delegate);
     let tooling = if tools.is_empty() {
         String::new()
     } else {
@@ -296,6 +321,18 @@ impl Transcript {
             });
         }
 
+        if let Some(intent) = self.subagent_intent_of(turn) {
+            let reply = self.subagent_outcome_of(turn).map_or_else(
+                || String::from("the subagent was not proven to finish"),
+                |record| clip(record.reply.as_bytes(), self.observation_limit()),
+            );
+            return Some(ContextAct::Subagent {
+                child_session: intent.child_session,
+                goal: intent.goal.clone(),
+                reply,
+            });
+        }
+
         // A skill turn requested no tool, so the fallback below would read it as a turn the model
         // never finished. The record is what the turn is shown by, whether it loaded or refused.
         if let Some(record) = self.skill_of(turn) {
@@ -364,6 +401,7 @@ pub fn context(transcript: &Transcript) -> Context {
             search: false,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
         };
     };
@@ -378,6 +416,7 @@ pub fn context(transcript: &Transcript) -> Context {
         search: !task.setting.search.is_empty(),
         writable: !task.setting.writable.is_empty(),
         skills: !task.setting.skills.is_empty(),
+        delegate: task.setting.delegate,
         loaded: transcript.loaded(),
     };
     while context.bytes() > bytes_of(task.budget.context_bytes) && !context.turns.is_empty() {
@@ -586,6 +625,7 @@ mod tests {
             search: false,
             writable: false,
             skills: false,
+            delegate: false,
             loaded: Vec::new(),
         };
 
@@ -593,6 +633,30 @@ mod tests {
             built.bytes(),
             3 + 6 + ("command-1".len() + "observation-1".len() + 8)
         );
+    }
+
+    #[test]
+    fn a_delegated_act_costs_its_goal_and_reply() {
+        let built = Context {
+            system: String::new(),
+            goal: String::new(),
+            turns: vec![ContextTurn {
+                number: TurnNumber::new(1),
+                speech: None,
+                act: Some(ContextAct::Subagent {
+                    child_session: session(),
+                    goal: "ggg".to_owned(),
+                    reply: "rr".to_owned(),
+                }),
+            }],
+            search: false,
+            writable: false,
+            skills: false,
+            delegate: true,
+            loaded: Vec::new(),
+        };
+
+        assert_eq!(built.bytes(), ("ggg".len() + "rr".len() + 8) + 8);
     }
 
     #[test]
@@ -1255,6 +1319,7 @@ mod tests {
                 search: false,
                 writable: false,
                 skills: false,
+                delegate: false,
                 loaded: Vec::new(),
             },
         );
@@ -1574,6 +1639,7 @@ mod tests {
             search: false,
             writable: false,
             skills: true,
+            delegate: false,
             loaded: Vec::new(),
         };
 

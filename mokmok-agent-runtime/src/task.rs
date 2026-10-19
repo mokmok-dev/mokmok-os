@@ -60,6 +60,9 @@ pub struct Setting {
     /// `default` keeps a task record written before the field readable, the same rule as `search`.
     #[serde(default)]
     pub skills: Vec<Advert>,
+    /// Whether the session may offer the `subagent` tool. False keeps old logs readable.
+    #[serde(default)]
+    pub delegate: bool,
 }
 
 /// The ceilings one session runs under.
@@ -124,6 +127,7 @@ mod tests {
                 deadline: Duration::from_secs(120),
                 search: Vec::new(),
                 skills: Vec::new(),
+                delegate: false,
             },
         );
     }

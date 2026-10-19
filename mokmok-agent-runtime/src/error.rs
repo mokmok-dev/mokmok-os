@@ -31,6 +31,8 @@ pub enum Error {
     Editor(#[source] Source),
     #[error("the skills failed: {0}")]
     Skills(#[source] Source),
+    #[error("the subagent failed: {0}")]
+    Subagent(#[source] Source),
     /// The fold refused a record.
     #[error("{0}")]
     Refused(#[from] Refusal),
