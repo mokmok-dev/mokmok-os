@@ -164,14 +164,20 @@ impl std::fmt::Display for Refusal {
 }
 
 impl Refusal {
-    /// Parses the body of an HTTP 503 WebSocket-upgrade refusal.
     #[must_use]
-    pub(crate) fn from_upgrade_body(body: &str) -> Option<Self> {
-        match body {
-            "connection_limit" => Some(Self::ConnectionLimit),
-            "shutting_down" => Some(Self::ShuttingDown),
+    pub(crate) const fn upgrade_body(self) -> Option<&'static str> {
+        match self {
+            Self::ConnectionLimit => Some("connection_limit"),
+            Self::ShuttingDown => Some("shutting_down"),
             _ => None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn from_upgrade_body(body: &str) -> Option<Self> {
+        [Self::ConnectionLimit, Self::ShuttingDown]
+            .into_iter()
+            .find(|reason| reason.upgrade_body() == Some(body))
     }
 }
 

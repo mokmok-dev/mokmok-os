@@ -121,8 +121,7 @@ pub enum ResponseOp {
 #[serde(deny_unknown_fields)]
 pub struct RequestFrame {
     op: RequestOp,
-    #[serde(default)]
-    req_id: Option<u64>,
+    req_id: u64,
     #[serde(default)]
     topic: Option<Topic>,
     #[serde(default)]
@@ -142,8 +141,7 @@ pub struct RequestFrame {
 #[derive(serde::Deserialize)]
 pub struct ResponseFrame {
     op: ResponseOp,
-    #[serde(default)]
-    req_id: Option<u64>,
+    req_id: u64,
     #[serde(default)]
     sub: Option<SubId>,
     #[serde(default)]
@@ -188,17 +186,18 @@ impl TryFrom<RequestFrame> for Request {
     type Error = InvalidFrame;
 
     fn try_from(frame: RequestFrame) -> Result<Self, Self::Error> {
-        let req_id = frame.req_id.ok_or(InvalidFrame)?;
+        let RequestFrame {
+            op,
+            req_id,
+            topic,
+            payload,
+            sub,
+            max,
+            through,
+            subscriber,
+        } = frame;
 
-        match (
-            frame.op,
-            frame.topic,
-            frame.payload,
-            frame.sub,
-            frame.max,
-            frame.through,
-            frame.subscriber,
-        ) {
+        match (op, topic, payload, sub, max, through, subscriber) {
             (RequestOp::Publish, Some(topic), Some(payload), None, None, None, None) => {
                 Ok(Self::Publish {
                     req_id,
@@ -230,19 +229,22 @@ impl TryFrom<ResponseFrame> for Response {
     type Error = InvalidFrame;
 
     fn try_from(frame: ResponseFrame) -> Result<Self, Self::Error> {
-        let req_id = frame.req_id.ok_or(InvalidFrame)?;
+        let ResponseFrame {
+            op,
+            req_id,
+            sub,
+            window,
+            id,
+            seq,
+            at,
+            lapsed,
+            events,
+            through,
+            reason,
+        } = frame;
 
         match (
-            frame.op,
-            frame.sub,
-            frame.window,
-            frame.id,
-            frame.seq,
-            frame.at,
-            frame.lapsed,
-            frame.events,
-            frame.through,
-            frame.reason,
+            op, sub, window, id, seq, at, lapsed, events, through, reason,
         ) {
             (
                 ResponseOp::Published,

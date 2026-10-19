@@ -172,17 +172,23 @@ async fn upgrade(
 
     let Some(permit) = server.bus.try_connect() else {
         tracing::warn!("refused a connection at the ceiling");
-        return (StatusCode::SERVICE_UNAVAILABLE, "connection_limit").into_response();
+        return refusal(Refusal::ConnectionLimit);
     };
 
     if *server.bus.stop_receiver().borrow_and_update() {
         drop(permit);
-        return (StatusCode::SERVICE_UNAVAILABLE, "shutting_down").into_response();
+        return refusal(Refusal::ShuttingDown);
     }
 
     upgrade
         .max_message_size(frame_bytes)
         .on_upgrade(move |socket| session(socket, server, permit))
+}
+
+fn refusal(reason: Refusal) -> Response {
+    let body = reason.upgrade_body().unwrap_or_default();
+
+    (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
 }
 
 struct Reader {
@@ -206,7 +212,6 @@ enum Parked {
     Spent { req_id: u64, max: NonZeroUsize },
 }
 
-/// The result of handling one request: zero or more responses to send, or a close code.
 enum Outcome {
     Answers(Vec<wire::Response>),
     Quiet,
@@ -470,6 +475,11 @@ async fn pull_reader(
 
     if count == 0 {
         if delivered < window.first() {
+            // The checkpoint is behind the retained floor, so the events it names can never be
+            // handed over. The gap travels alone, with no event and no credit spent: the caller
+            // acks the lapse, which moves the checkpoint to the floor and frees the credit.
+            // Handing an event over instead would let a subscriber that never acks keep drawing
+            // them, because eviction raises the floor the credit is measured against.
             reader.delivered = window.first();
             return Outcome::Answers(vec![wire::Response::Batch {
                 req_id,
@@ -586,7 +596,6 @@ async fn ack(
     Outcome::Answers(responses)
 }
 
-/// Re-polls every reader that was parked caught-up, because one of their watches changed.
 async fn recheck(
     socket: &mut WebSocket,
     limits: &Limits,
@@ -617,7 +626,6 @@ async fn recheck(
     true
 }
 
-/// Applies an outcome that arrived outside a normal request frame.
 async fn apply_outcome(
     socket: &mut WebSocket,
     outcome: Outcome,
@@ -640,7 +648,7 @@ async fn apply_outcome(
     }
 }
 
-/// Waits until any parked caught-up reader's window changes.
+/// `select_all` panics on an empty set, and a session with nothing parked must stay pending.
 async fn any_window_changed(subs: &mut HashMap<SubId, Reader>) {
     let waits: Vec<std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>> = subs
         .values_mut()

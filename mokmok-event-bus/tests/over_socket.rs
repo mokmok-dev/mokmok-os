@@ -917,7 +917,6 @@ mod tests {
         assert_eq!(batch.events()[0].seq(), receipt.seq());
         assert_eq!(batch.events()[0].id(), receipt.id());
 
-        // A recheck that answered the parked pull must leave the session open for the next one.
         let publisher = client.clone();
         let publishing = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1115,7 +1114,6 @@ mod tests {
             second.subscribe(Topic::Global, SubscriberId::new()),
         )
         .await;
-        let _ = second.subscribe(Topic::Global, SubscriberId::new()).await;
 
         let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
 
@@ -1203,8 +1201,7 @@ mod tests {
         })
         .await;
 
-        // Nothing ever reads this peer, so it cannot answer the bus's ping. The bus must hang up
-        // and release the only connection permit, which the next connect proves.
+        // Nothing ever reads this peer, so it cannot answer the bus's ping.
         let _peer = connect(&bus.path).await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -1285,12 +1282,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Park a pull before any event exists.
         let publisher = client.clone();
         let publishing = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            // The same connection publishes while the subscription is parked.
             publisher
                 .publish(topic, payload(&serde_json::json!({"same": true})))
                 .await

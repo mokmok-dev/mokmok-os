@@ -97,7 +97,6 @@ impl Relay {
         Ok(published)
     }
 
-    /// Publishes one payload, reusing the open client or opening one.
     async fn publish(
         &mut self,
         topic: Topic,
@@ -108,7 +107,7 @@ impl Relay {
         } else {
             let opened = mokmok_event_bus::Client::connect(&self.socket)
                 .await
-                .map_err(bus_to_kernel)?;
+                .map_err(Error::Bus)?;
             self.client = Some(opened.clone());
             opened
         };
@@ -118,16 +117,13 @@ impl Relay {
             .await
             .map(|_published| ())
             .map_err(|error| {
-                self.client = None;
-                bus_to_kernel(error)
-            })
-    }
-}
+                // An in-band refusal leaves the connection healthy; only a broken one is dropped.
+                if !matches!(error, BusError::Refused(_)) {
+                    self.client = None;
+                }
 
-fn bus_to_kernel(error: BusError) -> Error {
-    match error {
-        BusError::Refused(reason) => Error::BusRefused(reason),
-        _ => Error::Bus(error),
+                Error::Bus(error)
+            })
     }
 }
 

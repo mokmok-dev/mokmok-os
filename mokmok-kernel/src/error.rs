@@ -27,10 +27,8 @@ pub enum Error {
     Refusal(#[from] mokmok_sandbox::Refusal),
     #[error("the execution failed after the workload may have started")]
     Sandbox(#[from] mokmok_sandbox::Error),
-    #[error("the event bus refused the connection or the append")]
+    #[error("the event bus failed: {0}")]
     Bus(#[from] mokmok_event_bus::Error),
-    #[error("the event bus refused: {0}")]
-    BusRefused(mokmok_event_bus::Refusal),
     #[error("the bus server failed: {0}")]
     BusServe(#[from] mokmok_event_bus::ServeError),
     #[error("the bus stopped, so this process has nothing to serve")]

@@ -69,7 +69,6 @@ enum Outcome {
 
 struct Pending {
     request: Request,
-    written: bool,
     reply: oneshot::Sender<Result<Outcome, Error>>,
 }
 
@@ -346,20 +345,11 @@ async fn send_command(
         return true;
     };
 
-    let pending = Pending {
-        request,
-        written: false,
-        reply,
-    };
+    let pending = Pending { request, reply };
     let _ = outstanding.insert(req_id, pending);
 
     match stream.send(Message::Text(text.into())).await {
-        Ok(()) => {
-            if let Some(pending) = outstanding.get_mut(&req_id) {
-                pending.written = true;
-            }
-            true
-        },
+        Ok(()) => true,
         Err(error) => {
             let detail = error.to_string();
             if let Some(current) = outstanding.remove(&req_id) {
@@ -462,7 +452,7 @@ fn fail_rest(
     ending: &Ending,
 ) {
     for (_req_id, pending) in outstanding.drain() {
-        let error = if pending.written && matches!(pending.request, Request::Publish { .. }) {
+        let error = if matches!(pending.request, Request::Publish { .. }) {
             Error::Indeterminate
         } else {
             match ending {
@@ -529,14 +519,7 @@ mod tests {
             | Request::Ack { req_id, .. } => *req_id,
         };
         let mut pending = HashMap::new();
-        pending.insert(
-            req_id,
-            Pending {
-                request,
-                written: true,
-                reply,
-            },
-        );
+        pending.insert(req_id, Pending { request, reply });
 
         (pending, answered)
     }
