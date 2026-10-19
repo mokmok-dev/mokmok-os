@@ -256,6 +256,10 @@ impl TopicEntry {
         *self.appended.borrow()
     }
 
+    pub(crate) const fn store(&self) -> &Store {
+        &self.store
+    }
+
     fn is_idle(
         &self,
         now: SystemTime,

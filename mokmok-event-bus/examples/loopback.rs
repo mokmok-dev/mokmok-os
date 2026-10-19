@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use mokmok_event_bus::{Config, Payload, Publisher, Subscriber, SubscriberId, Topic, serve};
+use mokmok_event_bus::{Client, Config, Payload, SubscriberId, Topic, serve};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -34,17 +34,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let topic = Topic::Global;
     let id = SubscriberId::new();
-    let mut subscriber = Subscriber::open(&path, topic, id).await?;
-    let mut publisher = Publisher::open(&path, topic).await?;
+
+    let first = Client::connect(&path).await?;
+    let mut reader = first.subscribe(topic, id).await?;
 
     for turn in 1..=3 {
-        let receipt = publisher.publish(Payload::json(&Turn { turn })?).await?;
+        let receipt = first.publish(topic, Payload::json(&Turn { turn })?).await?;
         println!("published turn {turn} as seq {}", receipt.seq().get());
     }
 
     let mut seen = Vec::new();
     while seen.len() < 3 {
-        let batch = subscriber.next().await?;
+        let batch = reader.next().await?;
         println!(
             "pulled the batch covering seq {}..{}",
             batch.window().first().get(),
@@ -53,22 +54,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for event in batch.events() {
             let turn = event.payload().decode::<Turn>()?.turn;
-
             println!("read seq {} carrying turn {turn}", event.seq().get());
             seen.push(turn);
         }
 
         // Acked before the effect is real here, but the example has no effect to await.
-        subscriber.ack(batch.after()).await?;
+        reader.ack(batch.after()).await?;
     }
     assert_eq!(seen, [1, 2, 3]);
     println!("read every published turn back, in order");
-    drop(subscriber);
+    drop(reader);
 
-    let receipt = publisher.publish(Payload::json(&Turn { turn: 4 })?).await?;
+    let receipt = first
+        .publish(topic, Payload::json(&Turn { turn: 4 })?)
+        .await?;
     println!("published turn 4 as seq {}", receipt.seq().get());
+    drop(first);
 
-    let mut resumed = Subscriber::open(&path, topic, id).await?;
+    let second = Client::connect(&path).await?;
+    let mut resumed = second.subscribe(topic, id).await?;
     let batch = resumed.next().await?;
 
     assert_eq!(batch.events().len(), 1);

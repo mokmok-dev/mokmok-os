@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use futures_util::SinkExt;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -12,12 +14,14 @@ use crate::event::{Batch, Cursor, Published, Refusal};
 use crate::payload::Payload;
 use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
-use crate::wire::{Request, Response, ResponseFrame};
+use crate::wire::{self, Request, Response, SubId};
 
 /// The path `serve` routes; the host is ignored for a socket the client opened itself.
 const URL: &str = "ws://localhost/ws";
 
+const FRAME: &str = "the bus sent a frame that is not a response";
 const UNEXPECTED: &str = "the bus answered a request that was not made";
+const MISMATCHED: &str = "the bus answered a request with the wrong kind of response";
 
 #[derive(thiserror::Error)]
 pub enum Error {
@@ -33,31 +37,71 @@ pub enum Error {
     Indeterminate,
 }
 
-pub struct Publisher {
-    stream: WebSocketStream<UnixStream>,
+enum Command {
+    Publish {
+        topic: Topic,
+        payload: Payload,
+        reply: oneshot::Sender<Result<Outcome, Error>>,
+    },
+    Subscribe {
+        topic: Topic,
+        subscriber: SubscriberId,
+        reply: oneshot::Sender<Result<Outcome, Error>>,
+    },
+    Pull {
+        sub: SubId,
+        reply: oneshot::Sender<Result<Outcome, Error>>,
+    },
+    Ack {
+        sub: SubId,
+        through: Cursor,
+        reply: oneshot::Sender<Result<Outcome, Error>>,
+    },
 }
 
-pub struct Subscriber {
-    stream: WebSocketStream<UnixStream>,
+enum Outcome {
+    Published(Published),
+    Subscribed(SubId),
+    Batch(Batch),
+    Acked,
 }
 
-impl Publisher {
-    /// Opens a connection and names the one topic every later publish appends to.
+struct Pending {
+    request: Request,
+    written: bool,
+    reply: oneshot::Sender<Result<Outcome, Error>>,
+}
+
+/// One connection to the bus that can both publish and subscribe.
+#[derive(Clone)]
+pub struct Client {
+    sender: mpsc::UnboundedSender<Command>,
+}
+
+impl Client {
+    /// Opens a WebSocket on `socket` and starts the driver task.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the socket cannot be reached, if the bus refuses the topic, or
-    /// if the bus closes the connection.
-    pub async fn open(
-        socket: &Path,
-        topic: Topic,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            stream: open(socket, topic, None).await?,
-        })
+    /// Returns [`Error::Refused`] when the bus rejects the handshake (for example, at its
+    /// connection ceiling), and [`Error::Transport`] when the socket cannot be reached.
+    pub async fn connect(socket: &Path) -> Result<Self, Error> {
+        let stream = UnixStream::connect(socket)
+            .await
+            .map_err(|error| Error::Transport(Box::new(error)))?;
+
+        let (stream, response) = tokio_tungstenite::client_async(URL, stream)
+            .await
+            .map_err(map_handshake)?;
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        tokio::spawn(driver(stream, receiver));
+
+        let _ = response;
+        Ok(Self { sender })
     }
 
-    /// Appends `payload` and returns once the bus has stored it.
+    /// Appends `payload` to `topic` and returns once the bus has stored it.
     ///
     /// # Errors
     ///
@@ -65,40 +109,70 @@ impl Publisher {
     /// back: the append may or may not have happened, and only the caller can decide whether to
     /// retry. Every other failure names itself.
     pub async fn publish(
-        &mut self,
+        &self,
+        topic: Topic,
         payload: Payload,
     ) -> Result<Published, Error> {
-        send(&mut self.stream, &Request::Publish { payload }).await?;
+        let (reply, answered) = oneshot::channel();
+        self.send(Command::Publish {
+            topic,
+            payload,
+            reply,
+        })?;
 
-        match receive(&mut self.stream).await {
-            Ok(Some(Response::Published { id, seq, at })) => Ok(Published::new(id, seq, at)),
-            Ok(Some(Response::Refused { reason })) => Err(Error::Refused(reason)),
-            Ok(Some(_)) => Err(Error::Protocol(UNEXPECTED)),
-            Ok(None) | Err(_) => Err(Error::Indeterminate),
+        match answered.await.map_err(|_| Error::Closed)? {
+            Ok(Outcome::Published(published)) => Ok(published),
+            Ok(_) => Err(Error::Protocol(MISMATCHED)),
+            Err(error) => Err(error),
         }
     }
-}
 
-impl Subscriber {
-    /// Opens a connection and resumes `subscriber`'s checkpoint on `topic`. A fresh id starts at
-    /// the oldest retained event; an id whose checkpoint names another epoch is refused with
-    /// [`Refusal::Unresumable`].
+    /// Opens a subscription to `topic` for `subscriber`. Two subscriptions on one topic are
+    /// independent; two with the same `SubscriberId` share the durable checkpoint.
     ///
     /// # Errors
     ///
-    /// Returns an [`Error`] if the socket cannot be reached, if the bus refuses the subscriber,
-    /// or if the bus closes the connection.
-    pub async fn open(
-        socket: &Path,
+    /// Returns [`Error::Refused`] when the bus refuses the subscriber or topic, and the other
+    /// errors a connection failure can produce.
+    pub async fn subscribe(
+        &self,
         topic: Topic,
         subscriber: SubscriberId,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            stream: open(socket, topic, Some(subscriber)).await?,
-        })
+    ) -> Result<Subscription, Error> {
+        let (reply, answered) = oneshot::channel();
+        self.send(Command::Subscribe {
+            topic,
+            subscriber,
+            reply,
+        })?;
+
+        match answered.await.map_err(|_| Error::Closed)? {
+            Ok(Outcome::Subscribed(sub)) => Ok(Subscription {
+                client: self.clone(),
+                sub,
+            }),
+            Ok(_) => Err(Error::Protocol(MISMATCHED)),
+            Err(error) => Err(error),
+        }
     }
 
-    /// Reads the next delivery, waiting for one while the topic has nothing newer to hand over.
+    fn send(
+        &self,
+        command: Command,
+    ) -> Result<(), Error> {
+        self.sender.send(command).map_err(|_| Error::Closed)
+    }
+}
+
+/// A handle to one subscription on a [`Client`]. `next` and `ack` take `&mut self` so a single
+/// handle cannot issue two outstanding pulls.
+pub struct Subscription {
+    client: Client,
+    sub: SubId,
+}
+
+impl Subscription {
+    /// Reads the next delivery, waiting while the subscription has nothing newer to hand over.
     ///
     /// An answer that carries a [`Lapsed`](crate::Lapsed) and no events means the checkpoint fell
     /// behind the retained window, so the events it named can no longer be read. Acking that
@@ -110,20 +184,16 @@ impl Subscriber {
     /// Returns an [`Error`] if the bus refuses the held checkpoint, closes the connection, or if
     /// the socket fails.
     pub async fn next(&mut self) -> Result<Batch, Error> {
-        // Asking for as much as the bus will give keeps the client free of a second place that
-        // has to know the batch limit; the bus clamps the request to its own configuration and its
-        // in-flight ceiling.
-        let max = NonZeroUsize::MAX;
+        let (reply, answered) = oneshot::channel();
+        self.client.send(Command::Pull {
+            sub: self.sub,
+            reply,
+        })?;
 
-        match exchange(&mut self.stream, &Request::Pull { max }).await? {
-            Some(Response::Batch {
-                window,
-                lapsed,
-                events,
-            }) => Ok(Batch::new(window, lapsed, events)),
-            Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
-            Some(_) => Err(Error::Protocol(UNEXPECTED)),
-            None => Err(Error::Closed),
+        match answered.await.map_err(|_| Error::Closed)? {
+            Ok(Outcome::Batch(batch)) => Ok(batch),
+            Ok(_) => Err(Error::Protocol(MISMATCHED)),
+            Err(error) => Err(error),
         }
     }
 
@@ -140,93 +210,252 @@ impl Subscriber {
         &mut self,
         through: Cursor,
     ) -> Result<(), Error> {
-        match exchange(&mut self.stream, &Request::Ack { through }).await? {
-            Some(Response::Acked { .. }) => Ok(()),
-            Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
-            Some(_) => Err(Error::Protocol(UNEXPECTED)),
-            None => Err(Error::Closed),
+        let (reply, answered) = oneshot::channel();
+        self.client.send(Command::Ack {
+            sub: self.sub,
+            through,
+            reply,
+        })?;
+
+        match answered.await.map_err(|_| Error::Closed)? {
+            Ok(Outcome::Acked) => Ok(()),
+            Ok(_) => Err(Error::Protocol(MISMATCHED)),
+            Err(error) => Err(error),
         }
     }
 }
 
-async fn connect(socket: &Path) -> Result<WebSocketStream<UnixStream>, Error> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .map_err(|error| Error::Transport(Box::new(error)))?;
+fn map_handshake(error: tokio_tungstenite::tungstenite::Error) -> Error {
+    use tokio_tungstenite::tungstenite::Error as WsError;
 
-    let (stream, _) = tokio_tungstenite::client_async(URL, stream)
-        .await
-        .map_err(|error| Error::Transport(Box::new(error)))?;
-
-    Ok(stream)
-}
-
-/// Opens a session and names its topic. The bus refuses a connection at its ceiling before it
-/// reads anything, so a failed write is not fatal here: the refusal may already be waiting, and
-/// dropping it would turn a typed refusal into a broken pipe.
-async fn open(
-    socket: &Path,
-    topic: Topic,
-    subscriber: Option<SubscriberId>,
-) -> Result<WebSocketStream<UnixStream>, Error> {
-    let mut stream = connect(socket).await?;
-    let written = send(&mut stream, &Request::Open { topic, subscriber }).await;
-
-    let answered = match receive(&mut stream).await {
-        Ok(answered) => answered,
-        Err(error) => return Err(written.err().unwrap_or(error)),
+    let WsError::Http(response) = error else {
+        return Error::Transport(Box::new(error));
     };
 
-    match answered {
-        Some(Response::Opened { .. }) => Ok(stream),
-        Some(Response::Refused { reason }) => Err(Error::Refused(reason)),
-        Some(_) => Err(Error::Protocol(UNEXPECTED)),
-        None => Err(Error::Closed),
+    if response.status() != 503 {
+        return Error::Transport(Box::new(WsError::Http(response)));
+    }
+
+    let body = response
+        .body()
+        .as_ref()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+    let reason = Refusal::from_upgrade_body(&body).unwrap_or(Refusal::ShuttingDown);
+    Error::Refused(reason)
+}
+
+async fn driver(
+    mut stream: WebSocketStream<UnixStream>,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+) {
+    let mut next_id: u64 = 1;
+    let mut outstanding: HashMap<u64, Pending> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    fail_rest(&mut outstanding, true);
+                    return;
+                };
+                if !send_command(
+                    &mut stream,
+                    &mut next_id,
+                    &mut outstanding,
+                    command,
+                ).await {
+                    return;
+                }
+            }
+            frame = stream.next() => {
+                if !receive_frame(
+                    &mut outstanding,
+                    frame,
+                ) {
+                    return;
+                }
+            }
+        }
     }
 }
 
-async fn exchange(
+async fn send_command(
     stream: &mut WebSocketStream<UnixStream>,
-    request: &Request,
-) -> Result<Option<Response>, Error> {
-    send(stream, request).await?;
-    receive(stream).await
-}
+    next_id: &mut u64,
+    outstanding: &mut HashMap<u64, Pending>,
+    command: Command,
+) -> bool {
+    let req_id = *next_id;
+    *next_id += 1;
 
-async fn send(
-    stream: &mut WebSocketStream<UnixStream>,
-    request: &Request,
-) -> Result<(), Error> {
-    let text = serde_json::to_string(request)
-        .map_err(|_| Error::Protocol("the request could not be encoded"))?;
-
-    stream
-        .send(Message::Text(text.into()))
-        .await
-        .map_err(|error| Error::Transport(Box::new(error)))
-}
-
-/// Reads the frame that answers the last request; `None` means the peer closed the connection.
-async fn receive(stream: &mut WebSocketStream<UnixStream>) -> Result<Option<Response>, Error> {
-    loop {
-        match stream.next().await {
-            None | Some(Ok(Message::Close(_))) => return Ok(None),
-            Some(Err(error)) => return Err(Error::Transport(Box::new(error))),
-            Some(Ok(Message::Text(text))) => {
-                let Some(response) = ResponseFrame::decode(text.as_str()) else {
-                    return Err(Error::Protocol(
-                        "the bus sent a frame that is not a response",
-                    ));
-                };
-
-                return Ok(Some(response));
+    let (request, reply) = match command {
+        Command::Publish {
+            topic,
+            payload,
+            reply,
+        } => (
+            Request::Publish {
+                req_id,
+                topic,
+                payload,
             },
-            // A ping is answered by tungstenite's read loop, which flushes the queued pong on
-            // the next read, so the client never has to write one itself.
-            Some(Ok(
-                Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_),
-            )) => {},
-        }
+            reply,
+        ),
+        Command::Subscribe {
+            topic,
+            subscriber,
+            reply,
+        } => (
+            Request::Subscribe {
+                req_id,
+                topic,
+                subscriber,
+            },
+            reply,
+        ),
+        Command::Pull { sub, reply } => (
+            Request::Pull {
+                req_id,
+                sub,
+                max: NonZeroUsize::MAX,
+            },
+            reply,
+        ),
+        Command::Ack {
+            sub,
+            through,
+            reply,
+        } => (
+            Request::Ack {
+                req_id,
+                sub,
+                through,
+            },
+            reply,
+        ),
+    };
+
+    let Ok(text) = serde_json::to_string(&request) else {
+        let _ = reply.send(Err(Error::Protocol("the request could not be encoded")));
+        return true;
+    };
+
+    let pending = Pending {
+        request,
+        written: false,
+        reply,
+    };
+    let _ = outstanding.insert(req_id, pending);
+
+    match stream.send(Message::Text(text.into())).await {
+        Ok(()) => {
+            if let Some(pending) = outstanding.get_mut(&req_id) {
+                pending.written = true;
+            }
+            true
+        },
+        Err(error) => {
+            if let Some(current) = outstanding.remove(&req_id) {
+                let _ = current.reply.send(Err(Error::Transport(Box::new(error))));
+            }
+            fail_rest(outstanding, false);
+            false
+        },
+    }
+}
+
+fn receive_frame(
+    outstanding: &mut HashMap<u64, Pending>,
+    frame: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+) -> bool {
+    match frame {
+        None | Some(Ok(Message::Close(_))) => {
+            fail_rest(outstanding, true);
+            false
+        },
+        Some(Err(error)) => {
+            fail_rest(outstanding, false);
+            let _ = error;
+            false
+        },
+        Some(Ok(Message::Text(text))) => {
+            let Some(response) = wire::ResponseFrame::decode(text.as_str()) else {
+                fail_all(outstanding, FRAME);
+                return false;
+            };
+
+            let req_id = response.req_id();
+            let Some(pending) = outstanding.remove(&req_id) else {
+                fail_all(outstanding, UNEXPECTED);
+                return false;
+            };
+
+            let outcome = if let Response::Refused { reason, .. } = response {
+                Err(Error::Refused(reason))
+            } else if let Ok(outcome) = resolve(&pending.request, response) {
+                Ok(outcome)
+            } else {
+                fail_all(outstanding, MISMATCHED);
+                return false;
+            };
+
+            let _ = pending.reply.send(outcome);
+            true
+        },
+        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_))) => {
+            true
+        },
+    }
+}
+
+fn resolve(
+    request: &Request,
+    response: Response,
+) -> Result<Outcome, Error> {
+    match (request, response) {
+        (Request::Publish { .. }, Response::Published { id, seq, at, .. }) => {
+            Ok(Outcome::Published(Published::new(id, seq, at)))
+        },
+        (Request::Subscribe { .. }, Response::Subscribed { sub, .. }) => {
+            Ok(Outcome::Subscribed(sub))
+        },
+        (
+            Request::Pull { .. },
+            Response::Batch {
+                window,
+                lapsed,
+                events,
+                ..
+            },
+        ) => Ok(Outcome::Batch(Batch::new(window, lapsed, events))),
+        (Request::Ack { .. }, Response::Acked { .. }) => Ok(Outcome::Acked),
+        _ => Err(Error::Protocol(MISMATCHED)),
+    }
+}
+
+fn fail_all(
+    outstanding: &mut HashMap<u64, Pending>,
+    message: &'static str,
+) {
+    for (_req_id, pending) in outstanding.drain() {
+        let _ = pending.reply.send(Err(Error::Protocol(message)));
+    }
+}
+
+fn fail_rest(
+    outstanding: &mut HashMap<u64, Pending>,
+    clean_close: bool,
+) {
+    for (_req_id, pending) in outstanding.drain() {
+        let error = if pending.written && matches!(pending.request, Request::Publish { .. }) {
+            Error::Indeterminate
+        } else if clean_close {
+            Error::Closed
+        } else {
+            Error::Transport(Box::new(io::Error::other("connection ended")))
+        };
+        let _ = pending.reply.send(Err(error));
     }
 }
 

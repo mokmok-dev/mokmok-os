@@ -1,13 +1,13 @@
 //! A durable, bounded append-only log per topic, served over WebSocket on a Unix socket.
 //!
-//! One process is the bus; publishers and subscribers are WebSocket clients of it. A connection
-//! names one topic in its first frame and then publishes or pulls from that topic. Every event is
-//! committed to SQLite before any subscriber can receive it, and each subscriber resumes from a
-//! checkpoint the bus keeps for it, so a crash between commit and delivery loses nothing.
+//! One process is the bus; clients connect once and then publish to any topic and subscribe to
+//! any topic over that one connection. Every event is committed to SQLite before any subscriber
+//! can receive it, and each subscriber resumes from a checkpoint the bus keeps for it, so a crash
+//! between commit and delivery loses nothing.
 //!
 //! ```no_run
 //! use mokmok_event_bus::{
-//!     Config, Payload, Publisher, Subscriber, SubscriberId, Topic, serve, signals,
+//!     Client, Config, Payload, SubscriberId, Topic, serve, signals,
 //! };
 //!
 //! # async fn handle(event: &mokmok_event_bus::Event) -> Result<(), Box<dyn std::error::Error>> {
@@ -22,22 +22,23 @@
 //! let socket = config.path.clone();
 //! tokio::spawn(serve(config, signals()));
 //!
+//! let client = Client::connect(&socket).await?;
 //! let topic = Topic::Global;
-//! let mut publisher = Publisher::open(&socket, topic).await?;
-//! publisher.publish(Payload::json(&"turn finished")?).await?;
+//! let mut orders = client.subscribe(topic, load_id()).await?;
 //!
-//! let mut subscriber = Subscriber::open(&socket, topic, load_id()).await?;
+//! client.publish(topic, Payload::json(&"turn finished")?).await?;
+//!
 //! loop {
-//!     let batch = subscriber.next().await?;   // parks until a commit lands
+//!     let batch = orders.next().await?;   // parks until a commit lands
 //!     for event in batch.events() {
 //!         handle(event).await?;
 //!     }
-//!     subscriber.ack(batch.after()).await?;   // only after the effect is durable
+//!     orders.ack(batch.after()).await?;   // only after the effect is durable
 //! }
 //! # }
 //! ```
 //!
-//! [`Subscriber::open`] takes the [`SubscriberId`] whose checkpoint resumes the read, so a cold
+//! [`Client::subscribe`] takes the [`SubscriberId`] whose checkpoint resumes the read, so a cold
 //! start and a restart differ only in whether that id has been seen before. Delivery is
 //! at-least-once: a batch not yet acked is replayed, so a consumer must tolerate duplicates.
 
@@ -54,7 +55,7 @@ mod subscriber;
 mod topic;
 mod wire;
 
-pub use client::{Error, Publisher, Subscriber};
+pub use client::{Client, Error, Subscription};
 pub use config::{Config, Limits, Retention, Timeouts};
 pub use event::{Batch, Cursor, Event, Lapsed, LogEpoch, Published, Refusal, Seq, Window};
 pub use payload::{Payload, PayloadError};

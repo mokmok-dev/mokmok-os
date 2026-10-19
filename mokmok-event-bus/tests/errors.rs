@@ -71,6 +71,18 @@ fn client_error_writes_every_variant_and_keeps_its_debug() {
         refused.to_string(),
         "the bus refused: the bus has no room for another topic",
     );
+
+    let unknown = Error::Refused(Refusal::UnknownSubscription);
+    assert_eq!(
+        unknown.to_string(),
+        "the bus refused: no subscription with that id on this connection",
+    );
+
+    let in_flight = Error::Refused(Refusal::PullInFlight);
+    assert_eq!(
+        in_flight.to_string(),
+        "the bus refused: a pull is already waiting on that subscription",
+    );
     assert_eq!(closed.to_string(), "the bus closed the connection");
     assert_eq!(
         indeterminate.to_string(),

@@ -134,6 +134,8 @@ pub enum Refusal {
     TopicLimit,
     ConnectionLimit,
     ShuttingDown,
+    UnknownSubscription,
+    PullInFlight,
 }
 
 impl std::fmt::Display for Refusal {
@@ -151,6 +153,24 @@ impl std::fmt::Display for Refusal {
             Self::TopicLimit => formatter.write_str("the bus has no room for another topic"),
             Self::ConnectionLimit => formatter.write_str("the bus is at its connection ceiling"),
             Self::ShuttingDown => formatter.write_str("the bus is shutting down"),
+            Self::UnknownSubscription => {
+                formatter.write_str("no subscription with that id on this connection")
+            },
+            Self::PullInFlight => {
+                formatter.write_str("a pull is already waiting on that subscription")
+            },
+        }
+    }
+}
+
+impl Refusal {
+    /// Parses the body of an HTTP 503 WebSocket-upgrade refusal.
+    #[must_use]
+    pub fn from_upgrade_body(body: &str) -> Option<Self> {
+        match body {
+            "connection_limit" => Some(Self::ConnectionLimit),
+            "shutting_down" => Some(Self::ShuttingDown),
+            _ => None,
         }
     }
 }

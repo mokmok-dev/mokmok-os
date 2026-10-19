@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -10,20 +11,22 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 
-use crate::bus::{Bus, OpenError, TopicEntry};
-use crate::config::{Config, Timeouts};
+use crate::bus::{Bus, ConnectionPermit, OpenError, TopicEntry};
+use crate::config::{Config, Limits, Timeouts};
 use crate::event::{Cursor, Lapsed, Refusal, Seq, Window};
 use crate::payload::Payload;
 use crate::store::StoreError;
 use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
-use crate::wire::{self, Request, RequestFrame};
+use crate::wire::{self, Request, SubId};
 
 const GOING_AWAY: u16 = 1001;
 const PROTOCOL_ERROR: u16 = 1002;
@@ -167,106 +170,78 @@ async fn upgrade(
     // make the always-on process allocate a frame of any size before the check ran.
     let frame_bytes = server.config.limits.frame_bytes.get();
 
+    let Some(permit) = server.bus.try_connect() else {
+        tracing::warn!("refused a connection at the ceiling");
+        return (StatusCode::SERVICE_UNAVAILABLE, "connection_limit").into_response();
+    };
+
+    if *server.bus.stop_receiver().borrow_and_update() {
+        drop(permit);
+        return (StatusCode::SERVICE_UNAVAILABLE, "shutting_down").into_response();
+    }
+
     upgrade
         .max_message_size(frame_bytes)
-        .on_upgrade(move |socket| session(socket, server))
+        .on_upgrade(move |socket| session(socket, server, permit))
 }
 
-enum Phase {
-    Unopened,
-    Publisher {
-        topic: Topic,
-        entry: Arc<TopicEntry>,
-    },
-    Subscriber {
-        topic: Topic,
-        entry: Arc<TopicEntry>,
-        subscriber: SubscriberId,
-        /// The next seq this session may hand out.
-        delivered: Seq,
-        /// The checkpoint, cached; the database is the truth.
-        acked: Seq,
-    },
+struct Reader {
+    topic: Topic,
+    entry: Arc<TopicEntry>,
+    subscriber: SubscriberId,
+    /// The next seq this session may hand out.
+    delivered: Seq,
+    /// The checkpoint, cached; the database is the truth.
+    acked: Seq,
+    ticks: watch::Receiver<Window>,
+    parked: Option<Parked>,
 }
 
 /// Why a pull that found nothing is waiting. Conflating the two either spins the bus on a commit
 /// that cannot help or floods a consumer whose credit is spent.
 enum Parked {
     /// Caught up: the next event will come from a commit, so wait on the topic's watch.
-    CaughtUp { max: NonZeroUsize },
+    CaughtUp { req_id: u64, max: NonZeroUsize },
     /// The credit is spent: only an `Ack` can free more, so a commit must not wake this.
-    Spent,
+    Spent { req_id: u64, max: NonZeroUsize },
 }
 
-/// Carries the values a frame changed back out of the handler, because a `select!` arm holds its
-/// borrows while its handler runs.
-enum Step {
-    Answer {
-        response: wire::Response,
-        phase: Phase,
-    },
-    Park {
-        phase: Phase,
-        parked: Parked,
-    },
-    Watch {
-        response: wire::Response,
-        phase: Phase,
-        ticks: watch::Receiver<Window>,
-    },
+/// The result of handling one request: zero or more responses to send, or a close code.
+enum Outcome {
+    Answers(Vec<wire::Response>),
+    Quiet,
     Close(u16),
 }
 
 struct Session {
-    phase: Phase,
-    ticks: Option<watch::Receiver<Window>>,
-    parked: Option<Parked>,
+    subscriptions: HashMap<SubId, Reader>,
+    next_sub: u64,
     pinged: Option<tokio::time::Instant>,
 }
 
 async fn session(
     mut socket: WebSocket,
     server: Server,
+    _permit: ConnectionPermit,
 ) {
-    let Some(_permit) = server.bus.try_connect() else {
-        tracing::warn!("refused a connection at the ceiling");
-        let refused = wire::Response::Refused {
-            reason: Refusal::ConnectionLimit,
-        };
-        send(&mut socket, &refused, server.config.timeouts).await;
-        close(
-            &mut socket,
-            GOING_AWAY,
-            "no room for another connection",
-            server.config.timeouts,
-        )
-        .await;
-        return;
-    };
-
     tracing::debug!(connections = server.bus.connections(), "session opened");
 
     let timeouts = server.config.timeouts;
+    let limits = server.config.limits;
     let mut stop = server.bus.stop_receiver();
     let mut heartbeat = tokio::time::interval(millis(timeouts.heartbeat));
     let mut session = Session {
-        phase: Phase::Unopened,
-        ticks: None,
-        parked: None,
+        subscriptions: HashMap::new(),
+        next_sub: 0,
         pinged: None,
     };
-
-    if *stop.borrow_and_update() {
-        close(&mut socket, GOING_AWAY, "shutting down", timeouts).await;
-        return;
-    }
 
     loop {
         tokio::select! {
             frame = socket.recv() => {
                 let Some(Ok(frame)) = frame else { return };
 
-                if !deliver(&mut socket, &server, &mut session, frame, timeouts).await {
+                if !deliver(&mut socket, &server, &limits, &mut session, frame, timeouts).await {
                     return;
                 }
             }
@@ -275,8 +250,8 @@ async fn session(
                     return;
                 }
             }
-            () = window_changed(&mut session.ticks), if matches!(session.parked, Some(Parked::CaughtUp { .. })) => {
-                if !recheck(&mut socket, &server, &mut session, timeouts).await {
+            () = any_window_changed(&mut session.subscriptions) => {
+                if !recheck(&mut socket, &server, &limits, &mut session, timeouts).await {
                     return;
                 }
             }
@@ -292,29 +267,22 @@ async fn session(
 async fn deliver(
     socket: &mut WebSocket,
     server: &Server,
+    limits: &Limits,
     session: &mut Session,
     frame: Message,
     timeouts: Timeouts,
 ) -> bool {
     match frame {
         Message::Text(text) => {
-            let Some(request) = RequestFrame::decode(&text) else {
+            let Some(request) = wire::RequestFrame::decode(&text) else {
                 close(socket, PROTOCOL_ERROR, "not a request frame", timeouts).await;
-
                 return false;
             };
 
-            // Snapshot before the log is read, so an append landing during the read is seen by
-            // the log rather than lost behind the park that follows an empty batch.
-            if let Some(watching) = session.ticks.as_mut() {
-                watching.borrow_and_update();
-            }
-
-            apply(socket, server, session, request, timeouts).await
+            apply(socket, server, limits, session, request, timeouts).await
         },
         Message::Pong(_) => {
             session.pinged = None;
-
             true
         },
         Message::Close(_) => false,
@@ -327,54 +295,381 @@ async fn deliver(
 async fn apply(
     socket: &mut WebSocket,
     server: &Server,
+    limits: &Limits,
     session: &mut Session,
     request: Request,
     timeouts: Timeouts,
 ) -> bool {
-    match handle(server, &session.phase, request).await {
-        Step::Answer { response, phase } => {
-            session.phase = phase;
-            session.parked = None;
-
-            send(socket, &response, timeouts).await
-        },
-        Step::Park { phase, parked } => {
-            session.phase = phase;
-            session.parked = Some(parked);
-
+    match handle(server, limits, session, request).await {
+        Outcome::Answers(responses) => {
+            for response in responses {
+                if !send(socket, &response, timeouts).await {
+                    return false;
+                }
+            }
             true
         },
-        Step::Watch {
-            response,
-            phase,
-            ticks,
-        } => {
-            session.phase = phase;
-            session.ticks = Some(ticks);
-            session.parked = None;
-
-            send(socket, &response, timeouts).await
-        },
-        Step::Close(code) => {
+        Outcome::Quiet => true,
+        Outcome::Close(code) => {
             close(socket, code, "frame out of turn", timeouts).await;
-
             false
         },
     }
 }
 
-/// A parked pull re-attempts once the topic's window changes; `false` means the session ends.
+async fn handle(
+    server: &Server,
+    limits: &Limits,
+    session: &mut Session,
+    request: Request,
+) -> Outcome {
+    match request {
+        Request::Publish {
+            req_id,
+            topic,
+            payload,
+        } => publish(server, req_id, topic, payload).await,
+        Request::Subscribe {
+            req_id,
+            topic,
+            subscriber,
+        } => subscribe(server, session, req_id, topic, subscriber).await,
+        Request::Pull { req_id, sub, max } => pull(limits, session, req_id, sub, max).await,
+        Request::Ack {
+            req_id,
+            sub,
+            through,
+        } => ack(server, limits, session, req_id, sub, through).await,
+    }
+}
+
+async fn publish(
+    server: &Server,
+    req_id: u64,
+    topic: Topic,
+    payload: Payload,
+) -> Outcome {
+    let (entry, _ticks) = match server.bus.open_topic(topic).await {
+        Ok(opened) => opened,
+        Err(OpenError::Refused(reason)) => {
+            tracing::warn!(%topic, %reason, "refused a topic");
+            return Outcome::Answers(vec![wire::Response::Refused { req_id, reason }]);
+        },
+        Err(OpenError::Store(error)) => {
+            tracing::error!(%error, "the store could not open the topic");
+            return Outcome::Close(INTERNAL_ERROR);
+        },
+    };
+
+    match entry.append(topic, payload).await {
+        Ok(published) => Outcome::Answers(vec![wire::Response::Published {
+            req_id,
+            id: published.id(),
+            seq: published.seq(),
+            at: published.at(),
+        }]),
+        Err(error) => {
+            tracing::error!(%error, "the append failed");
+            Outcome::Close(INTERNAL_ERROR)
+        },
+    }
+}
+
+async fn subscribe(
+    server: &Server,
+    session: &mut Session,
+    req_id: u64,
+    topic: Topic,
+    subscriber: SubscriberId,
+) -> Outcome {
+    let (entry, ticks) = match server.bus.open_topic(topic).await {
+        Ok(opened) => opened,
+        Err(OpenError::Refused(reason)) => {
+            tracing::warn!(%topic, %reason, "refused a topic");
+            return Outcome::Answers(vec![wire::Response::Refused { req_id, reason }]);
+        },
+        Err(OpenError::Store(error)) => {
+            tracing::error!(%error, "the store could not open the topic");
+            return Outcome::Close(INTERNAL_ERROR);
+        },
+    };
+
+    let window = *ticks.borrow();
+    let acked = match server.bus.store().checkpoint(subscriber, topic).await {
+        Ok(None) => window.first(),
+        Ok(Some(cursor)) if cursor.epoch() == window.epoch() => cursor.seq(),
+        Ok(Some(_)) => {
+            tracing::warn!(%topic, "refused a subscriber from another epoch");
+            return Outcome::Answers(vec![wire::Response::Refused {
+                req_id,
+                reason: Refusal::Unresumable { window },
+            }]);
+        },
+        Err(error) => {
+            tracing::error!(%error, "the checkpoint could not be read");
+            return Outcome::Close(INTERNAL_ERROR);
+        },
+    };
+
+    let sub = next_sub(session);
+    let reader = Reader {
+        topic,
+        entry,
+        subscriber,
+        delivered: acked,
+        acked,
+        ticks,
+        parked: None,
+    };
+    session.subscriptions.insert(sub, reader);
+
+    Outcome::Answers(vec![wire::Response::Subscribed {
+        req_id,
+        sub,
+        window,
+    }])
+}
+
+const fn next_sub(session: &mut Session) -> SubId {
+    let sub = SubId::new(session.next_sub);
+    session.next_sub += 1;
+    sub
+}
+
+async fn pull(
+    limits: &Limits,
+    session: &mut Session,
+    req_id: u64,
+    sub: SubId,
+    max: NonZeroUsize,
+) -> Outcome {
+    let Some(reader) = session.subscriptions.get_mut(&sub) else {
+        return Outcome::Answers(vec![wire::Response::Refused {
+            req_id,
+            reason: Refusal::UnknownSubscription,
+        }]);
+    };
+
+    if reader.parked.is_some() {
+        return Outcome::Answers(vec![wire::Response::Refused {
+            req_id,
+            reason: Refusal::PullInFlight,
+        }]);
+    }
+
+    pull_reader(reader, limits, req_id, sub, max).await
+}
+
+async fn pull_reader(
+    reader: &mut Reader,
+    limits: &Limits,
+    req_id: u64,
+    sub: SubId,
+    max: NonZeroUsize,
+) -> Outcome {
+    reader.ticks.borrow_and_update();
+    let window = *reader.ticks.borrow();
+    let delivered = reader.delivered;
+    let acked = reader.acked;
+
+    let max = max.min(limits.batch);
+    let from = Seq::new(delivered.get().max(window.first().get()));
+    let ceiling = acked.get().saturating_add(limits.in_flight.get() as u64);
+    let credit = usize::try_from(ceiling.saturating_sub(from.get())).unwrap_or(usize::MAX);
+    let count = max.get().min(credit);
+
+    if count == 0 {
+        if delivered < window.first() {
+            reader.delivered = window.first();
+            return Outcome::Answers(vec![wire::Response::Batch {
+                req_id,
+                sub,
+                window,
+                lapsed: Some(Lapsed::new(
+                    Cursor::new(window.epoch(), delivered),
+                    window.first(),
+                )),
+                events: Vec::new(),
+            }]);
+        }
+
+        reader.parked = Some(Parked::Spent { req_id, max });
+        return Outcome::Quiet;
+    }
+
+    let count = NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN);
+
+    match reader.entry.store().read(reader.topic, from, count).await {
+        Ok((state, events)) if !events.is_empty() => {
+            let next = events
+                .last()
+                .map_or(from, |event| Seq::new(event.seq().get() + 1));
+            let window = Window::new(state.epoch, state.first, state.next);
+            let lapsed = (delivered < state.first)
+                .then(|| Lapsed::new(Cursor::new(state.epoch, delivered), state.first));
+            reader.delivered = next;
+
+            Outcome::Answers(vec![wire::Response::Batch {
+                req_id,
+                sub,
+                window,
+                lapsed,
+                events,
+            }])
+        },
+        Ok(_) => {
+            reader.parked = Some(Parked::CaughtUp { req_id, max });
+            Outcome::Quiet
+        },
+        Err(error) => {
+            tracing::error!(%error, "the read failed");
+            Outcome::Close(INTERNAL_ERROR)
+        },
+    }
+}
+
+async fn ack(
+    server: &Server,
+    limits: &Limits,
+    session: &mut Session,
+    req_id: u64,
+    sub: SubId,
+    through: Cursor,
+) -> Outcome {
+    let Some(reader) = session.subscriptions.get_mut(&sub) else {
+        return Outcome::Answers(vec![wire::Response::Refused {
+            req_id,
+            reason: Refusal::UnknownSubscription,
+        }]);
+    };
+
+    let window = reader.entry.window();
+
+    if through.epoch() != window.epoch() {
+        return Outcome::Answers(vec![wire::Response::Acked {
+            req_id,
+            sub,
+            through: Cursor::new(window.epoch(), reader.acked),
+        }]);
+    }
+
+    let clamped = through
+        .seq()
+        .get()
+        .min(reader.delivered.get())
+        .max(reader.acked.get());
+    let through = Cursor::new(window.epoch(), Seq::new(clamped));
+
+    let stored = match server
+        .bus
+        .store()
+        .advance(reader.subscriber, reader.topic, through)
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::error!(%error, "the checkpoint could not be advanced");
+            return Outcome::Close(INTERNAL_ERROR);
+        },
+    };
+    reader.acked = stored.seq();
+
+    let mut responses = vec![wire::Response::Acked {
+        req_id,
+        sub,
+        through: stored,
+    }];
+
+    if let Some(Parked::Spent {
+        req_id: parked_id,
+        max,
+    }) = reader.parked.take()
+    {
+        let freed = pull_reader(reader, limits, parked_id, sub, max).await;
+        match freed {
+            Outcome::Answers(mut more) => responses.append(&mut more),
+            Outcome::Quiet => {},
+            Outcome::Close(code) => return Outcome::Close(code),
+        }
+    }
+
+    Outcome::Answers(responses)
+}
+
+/// Re-polls every reader that was parked caught-up, because one of their watches changed.
 async fn recheck(
     socket: &mut WebSocket,
-    server: &Server,
+    _server: &Server,
+    limits: &Limits,
     session: &mut Session,
     timeouts: Timeouts,
 ) -> bool {
-    let Some(Parked::CaughtUp { max }) = session.parked else {
-        return true;
-    };
+    let caught_up: Vec<(SubId, u64, NonZeroUsize)> = session
+        .subscriptions
+        .iter()
+        .filter_map(|(sub, reader)| match reader.parked {
+            Some(Parked::CaughtUp { req_id, max }) => Some((*sub, req_id, max)),
+            _ => None,
+        })
+        .collect();
 
-    apply(socket, server, session, Request::Pull { max }, timeouts).await
+    for (sub, req_id, max) in caught_up {
+        let Some(reader) = session.subscriptions.get_mut(&sub) else {
+            continue;
+        };
+        reader.parked = None;
+
+        let outcome = pull_reader(reader, limits, req_id, sub, max).await;
+        if !apply_outcome(socket, session, outcome, timeouts).await {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Applies an outcome that arrived outside a normal request frame.
+async fn apply_outcome(
+    socket: &mut WebSocket,
+    _session: &mut Session,
+    outcome: Outcome,
+    timeouts: Timeouts,
+) -> bool {
+    match outcome {
+        Outcome::Answers(responses) => {
+            for response in responses {
+                if !send(socket, &response, timeouts).await {
+                    return false;
+                }
+            }
+            true
+        },
+        Outcome::Quiet => true,
+        Outcome::Close(code) => {
+            close(socket, code, "frame out of turn", timeouts).await;
+            false
+        },
+    }
+}
+
+/// Waits until any parked caught-up reader's window changes.
+async fn any_window_changed(subs: &mut HashMap<SubId, Reader>) {
+    let waits: Vec<std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>> = subs
+        .values_mut()
+        .filter(|reader| matches!(reader.parked, Some(Parked::CaughtUp { .. })))
+        .map(|reader| {
+            let wait: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> = Box::pin(async {
+                let _ = reader.ticks.changed().await;
+            });
+            wait
+        })
+        .collect();
+
+    if waits.is_empty() {
+        std::future::pending::<()>().await;
+    } else {
+        let _ = futures_util::future::select_all(waits).await;
+    }
 }
 
 /// `false` means the peer stopped answering and the session ends.
@@ -389,7 +684,6 @@ async fn beat(
     {
         tracing::warn!("closed a peer that stopped answering pings");
         close(socket, POLICY_VIOLATION, "no answer to a ping", timeouts).await;
-
         return false;
     }
 
@@ -402,303 +696,6 @@ async fn beat(
     }
 
     true
-}
-
-/// Waits until the watched topic's window changes.
-///
-/// The `None` branch cannot run, because only a parked session reaches this arm and a parked
-/// session always holds a receiver. It stays because the alternative is an `unwrap` the lint set
-/// denies.
-async fn window_changed(ticks: &mut Option<watch::Receiver<Window>>) {
-    match ticks {
-        Some(ticks) => {
-            let _ = ticks.changed().await;
-        },
-        None => std::future::pending().await,
-    }
-}
-
-async fn handle(
-    server: &Server,
-    phase: &Phase,
-    request: Request,
-) -> Step {
-    match (phase, request) {
-        (Phase::Unopened, Request::Open { topic, subscriber }) => {
-            open(server, topic, subscriber).await
-        },
-        (Phase::Publisher { topic, entry }, Request::Publish { payload }) => {
-            publish(*topic, entry, payload).await
-        },
-        (
-            Phase::Subscriber {
-                topic,
-                entry,
-                subscriber,
-                delivered,
-                acked,
-            },
-            Request::Pull { max },
-        ) => pull(server, *topic, entry, *subscriber, *delivered, *acked, max).await,
-        (
-            Phase::Subscriber {
-                topic,
-                entry,
-                subscriber,
-                delivered,
-                acked,
-            },
-            Request::Ack { through },
-        ) => {
-            // Only the checkpoint moves here. Serving the freed backlog in the same breath would
-            // put two responses behind one request, and a client reads exactly one.
-            ack(
-                server,
-                *topic,
-                entry,
-                *subscriber,
-                *delivered,
-                *acked,
-                through,
-            )
-            .await
-        },
-        _ => Step::Close(PROTOCOL_ERROR),
-    }
-}
-
-async fn open(
-    server: &Server,
-    topic: Topic,
-    subscriber: Option<SubscriberId>,
-) -> Step {
-    let (entry, ticks) = match server.bus.open_topic(topic).await {
-        Ok(opened) => opened,
-        Err(OpenError::Refused(reason)) => {
-            tracing::warn!(%topic, %reason, "refused a topic");
-
-            return Step::Answer {
-                response: wire::Response::Refused { reason },
-                phase: Phase::Unopened,
-            };
-        },
-        Err(OpenError::Store(error)) => {
-            tracing::error!(%error, "the store could not open the topic");
-
-            return Step::Close(INTERNAL_ERROR);
-        },
-    };
-
-    let window = *ticks.borrow();
-    let phase = match subscriber {
-        None => Phase::Publisher { topic, entry },
-        Some(subscriber) => {
-            let acked = match server.bus.store().checkpoint(subscriber, topic).await {
-                Ok(None) => window.first(),
-                Ok(Some(cursor)) if cursor.epoch() == window.epoch() => cursor.seq(),
-                Ok(Some(_)) => {
-                    tracing::warn!(%topic, "refused a subscriber from another epoch");
-
-                    return Step::Answer {
-                        response: wire::Response::Refused {
-                            reason: Refusal::Unresumable { window },
-                        },
-                        phase: Phase::Unopened,
-                    };
-                },
-                Err(error) => {
-                    tracing::error!(%error, "the checkpoint could not be read");
-
-                    return Step::Close(INTERNAL_ERROR);
-                },
-            };
-
-            Phase::Subscriber {
-                topic,
-                entry,
-                subscriber,
-                delivered: acked,
-                acked,
-            }
-        },
-    };
-
-    Step::Watch {
-        response: wire::Response::Opened { window },
-        phase,
-        ticks,
-    }
-}
-
-async fn publish(
-    topic: Topic,
-    entry: &Arc<TopicEntry>,
-    payload: Payload,
-) -> Step {
-    match entry.append(topic, payload).await {
-        Ok(published) => Step::Answer {
-            response: wire::Response::from(published),
-            phase: Phase::Publisher {
-                topic,
-                entry: Arc::clone(entry),
-            },
-        },
-        Err(error) => {
-            tracing::error!(%error, "the append failed");
-
-            Step::Close(INTERNAL_ERROR)
-        },
-    }
-}
-
-async fn pull(
-    server: &Server,
-    topic: Topic,
-    entry: &Arc<TopicEntry>,
-    subscriber: SubscriberId,
-    delivered: Seq,
-    acked: Seq,
-    max: NonZeroUsize,
-) -> Step {
-    let limits = server.config.limits;
-    let max = max.min(limits.batch);
-    let window = entry.window();
-
-    let from = Seq::new(delivered.get().max(window.first().get()));
-    let ceiling = acked.get().saturating_add(limits.in_flight.get() as u64);
-    let credit = usize::try_from(ceiling.saturating_sub(from.get())).unwrap_or(usize::MAX);
-    let count = max.get().min(credit);
-
-    if count == 0 {
-        if delivered < window.first() {
-            // The checkpoint is behind the retained floor, so the events it names can never be
-            // handed over. The gap travels on its own, with no event and no credit spent: the
-            // caller acks the lapse, which moves its checkpoint to the floor and frees the credit.
-            // Handing an event over instead would let a subscriber that never acks keep drawing
-            // them, because eviction raises the floor the credit is measured against.
-            return Step::Answer {
-                response: wire::Response::Batch {
-                    window,
-                    lapsed: Some(Lapsed::new(
-                        Cursor::new(window.epoch(), delivered),
-                        window.first(),
-                    )),
-                    events: Vec::new(),
-                },
-                phase: Phase::Subscriber {
-                    topic,
-                    entry: Arc::clone(entry),
-                    subscriber,
-                    delivered: window.first(),
-                    acked,
-                },
-            };
-        }
-
-        // Only an ack can free spent credit, so this park must not be woken by a commit.
-        return Step::Park {
-            phase: Phase::Subscriber {
-                topic,
-                entry: Arc::clone(entry),
-                subscriber,
-                delivered,
-                acked,
-            },
-            parked: Parked::Spent,
-        };
-    }
-
-    let count = NonZeroUsize::new(count).unwrap_or(NonZeroUsize::MIN);
-
-    match server.bus.store().read(topic, from, count).await {
-        Ok((state, events)) if !events.is_empty() => {
-            let next = events
-                .last()
-                .map_or(from, |event| Seq::new(event.seq().get() + 1));
-            let window = Window::new(state.epoch, state.first, state.next);
-            let lapsed = (delivered < state.first)
-                .then(|| Lapsed::new(Cursor::new(state.epoch, delivered), state.first));
-
-            Step::Answer {
-                response: wire::Response::Batch {
-                    window,
-                    lapsed,
-                    events,
-                },
-                phase: Phase::Subscriber {
-                    topic,
-                    entry: Arc::clone(entry),
-                    subscriber,
-                    delivered: next,
-                    acked,
-                },
-            }
-        },
-        Ok(_) => Step::Park {
-            phase: Phase::Subscriber {
-                topic,
-                entry: Arc::clone(entry),
-                subscriber,
-                delivered,
-                acked,
-            },
-            parked: Parked::CaughtUp { max },
-        },
-        Err(error) => {
-            tracing::error!(%error, "the read failed");
-
-            Step::Close(INTERNAL_ERROR)
-        },
-    }
-}
-
-async fn ack(
-    server: &Server,
-    topic: Topic,
-    entry: &Arc<TopicEntry>,
-    subscriber: SubscriberId,
-    delivered: Seq,
-    acked: Seq,
-    through: Cursor,
-) -> Step {
-    let window = entry.window();
-
-    if through.epoch() != window.epoch() {
-        // A stale frame is answered with the stored cursor, so the caller can see nothing moved.
-        return Step::Answer {
-            response: wire::Response::Acked {
-                through: Cursor::new(window.epoch(), acked),
-            },
-            phase: Phase::Subscriber {
-                topic,
-                entry: Arc::clone(entry),
-                subscriber,
-                delivered,
-                acked,
-            },
-        };
-    }
-
-    let clamped = through.seq().get().min(delivered.get()).max(acked.get());
-    let through = Cursor::new(window.epoch(), Seq::new(clamped));
-
-    match server.bus.store().advance(subscriber, topic, through).await {
-        Ok(stored) => Step::Answer {
-            response: wire::Response::Acked { through: stored },
-            phase: Phase::Subscriber {
-                topic,
-                entry: Arc::clone(entry),
-                subscriber,
-                delivered,
-                acked: stored.seq(),
-            },
-        },
-        Err(error) => {
-            tracing::error!(%error, "the checkpoint could not be advanced");
-
-            Step::Close(INTERNAL_ERROR)
-        },
-    }
 }
 
 async fn send(
@@ -725,12 +722,10 @@ async fn write(
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
             tracing::debug!(%error, "a write failed");
-
             false
         },
         Err(_) => {
             tracing::warn!("a write did not drain within the deadline");
-
             false
         },
     }
@@ -757,8 +752,8 @@ fn millis(value: NonZeroU32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        Parked, Phase, ServeError, Server, SocketFile, Step, is_stale, pull, signals,
-        window_changed,
+        Outcome, Parked, Reader, ServeError, Server, Session, SocketFile, is_stale, next_sub, pull,
+        signals,
     };
     use crate::bus::Bus;
     use crate::config::{Config, Limits, Retention};
@@ -768,6 +763,7 @@ mod tests {
     use crate::topic::Topic;
     use crate::wire::Response;
     use proptest::prelude::*;
+    use std::collections::HashMap;
     use std::io;
     use std::num::NonZeroUsize;
     use std::os::unix::fs::PermissionsExt;
@@ -780,7 +776,7 @@ mod tests {
 
     fn scratch(name: &str) -> PathBuf {
         let unique = format!(
-            "mokmok-bind-{}-{}-{name}",
+            "mokmok-bind-{}-{name}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed),
         );
@@ -885,37 +881,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_window_wait_stays_pending_until_the_window_changes() {
-        let config = Config {
-            store: PathBuf::from(":memory:"),
-            ..Config::default()
-        };
-        let bus = Bus::open(config).unwrap();
-        bus.store().open_topic(Topic::Global).await.unwrap();
-        let Ok((entry, watching)) = bus.open_topic(Topic::Global).await else {
-            panic!("the topic could not be opened");
-        };
-        let mut ticks = Some(watching);
-
-        let unresolved =
-            tokio::time::timeout(Duration::from_millis(50), window_changed(&mut ticks)).await;
-
-        assert!(
-            unresolved.is_err(),
-            "the window wait resolved while the window stood still",
-        );
-
-        entry.append(Topic::Global, payload(8)).await.unwrap();
-        let resolved =
-            tokio::time::timeout(Duration::from_millis(50), window_changed(&mut ticks)).await;
-
-        assert!(
-            resolved.is_ok(),
-            "the window wait did not resolve after an append",
-        );
-    }
-
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1024))]
 
@@ -954,7 +919,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                let Ok((entry, _ticks)) = bus.open_topic(Topic::Global).await else {
+                let Ok((entry, ticks)) = bus.open_topic(Topic::Global).await else {
                     panic!("the topic could not be opened");
                 };
                 let server = Server {
@@ -963,86 +928,80 @@ mod tests {
                 };
                 let subscriber = SubscriberId::new();
                 let max = NonZeroUsize::new(max).unwrap();
-                let ceiling = acked.saturating_add(in_flight as u64);
 
-                let step = pull(
-                    &server,
-                    Topic::Global,
-                    &entry,
+                let mut session = Session {
+                    subscriptions: HashMap::new(),
+                    next_sub: 0,
+                    pinged: None,
+                };
+                let sub = next_sub(&mut session);
+                let delivered = Seq::new(delivered);
+                let acked = Seq::new(acked);
+                session.subscriptions.insert(sub, Reader {
+                    topic: Topic::Global,
+                    entry: Arc::clone(&entry),
                     subscriber,
-                    Seq::new(delivered),
-                    Seq::new(acked),
-                    max,
-                )
-                .await;
+                    delivered,
+                    acked,
+                    ticks,
+                    parked: None,
+                });
 
-                match step {
-                    Step::Answer {
-                        response: Response::Batch { window, lapsed, events },
-                        phase,
-                    } => {
+                let outcome = pull(
+                    &server.config.limits,
+                    &mut session,
+                    1,
+                    sub,
+                    max,
+                ).await;
+
+                match outcome {
+                    Outcome::Answers(responses) => {
+                        let Response::Batch { window, lapsed, events, .. } = &responses[0] else {
+                            return Err(TestCaseError::fail("pull answered something other than a batch"));
+                        };
                         prop_assert!(events.len() <= max.get());
                         for pair in events.windows(2) {
                             prop_assert_eq!(pair[1].seq().get(), pair[0].seq().get() + 1);
                         }
 
                         let first = window.first().get();
-                        let from = delivered.max(first);
-                        prop_assert_eq!(lapsed.is_some(), delivered < first);
+                        let from = delivered.get().max(first);
+                        prop_assert_eq!(lapsed.is_some(), delivered.get() < first);
                         if let Some(lapsed) = lapsed {
                             prop_assert_eq!(
                                 lapsed.held(),
-                                Cursor::new(window.epoch(), Seq::new(delivered)),
+                                Cursor::new(window.epoch(), Seq::new(delivered.get())),
                             );
                             prop_assert_eq!(lapsed.from(), window.first());
                         }
 
-                        let Phase::Subscriber { delivered: next, .. } = phase else {
-                            return Err(TestCaseError::fail(
-                                "a batch left the subscriber phase",
-                            ));
-                        };
-
+                        let reader = session.subscriptions.get(&sub).unwrap();
                         if events.is_empty() {
-                            // Only the lapse travels alone, and the cursor it leaves behind is the
-                            // floor, which is the ack that moves the checkpoint up and frees the
-                            // credit. An empty batch without a lapse would be an answer with
-                            // nothing in it.
                             prop_assert!(lapsed.is_some(), "an empty batch carried no lapse");
-                            prop_assert_eq!(next.get(), first);
+                            prop_assert_eq!(reader.delivered.get(), first);
                         } else {
                             prop_assert_eq!(events.first().unwrap().seq().get(), from);
                             let last = events.last().unwrap().seq().get();
-                            prop_assert_eq!(next.get(), last + 1);
-                            prop_assert!(next.get() <= ceiling, "a batch ran past the credit");
+                            prop_assert_eq!(reader.delivered.get(), last + 1);
+                            prop_assert!(reader.delivered.get() <= acked.get() + in_flight as u64, "a batch ran past the credit");
                         }
                     },
-                    Step::Answer { .. } => {
-                        return Err(TestCaseError::fail(
-                            "pull answered something other than a batch",
-                        ));
-                    },
-                    Step::Park { phase, parked } => {
+                    Outcome::Quiet => {
                         let window = entry.window();
-                        let from = delivered.max(window.first().get());
+                        let from = delivered.get().max(window.first().get());
+                        let reader = session.subscriptions.get(&sub).unwrap();
                         prop_assert!(
-                            from >= window.next().get() || delivered >= ceiling,
+                            from >= window.next().get() || delivered.get() >= acked.get() + in_flight as u64,
                             "pull parked although the read had events and credit remained",
                         );
-                        // Spent is chosen exactly when the credit is gone, which is what keeps a
-                        // commit from waking this park: only an Ack can free credit.
-                        let spent = matches!(parked, Parked::Spent);
-                        prop_assert_eq!(spent, delivered >= ceiling);
-                        let still_subscribed = matches!(phase, Phase::Subscriber { .. });
-                        prop_assert!(still_subscribed);
+                        let spent = matches!(reader.parked, Some(Parked::Spent { .. }));
+                        prop_assert_eq!(spent, delivered.get() >= acked.get() + in_flight as u64);
                     },
-                    Step::Close(code) => {
+                    Outcome::Close(code) => {
                         return Err(TestCaseError::fail(format!(
                             "pull closed the session with {code}",
                         )));
-                    },
-                    Step::Watch { .. } => {
-                        return Err(TestCaseError::fail("pull returned the watch step"));
                     },
                 }
 
