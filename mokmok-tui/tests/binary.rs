@@ -403,6 +403,86 @@ mod tests {
         );
     }
 
+    /// The pane is 80 columns wide, so a line wider than it has to wrap rather than lose its tail.
+    #[test]
+    fn a_line_wider_than_the_pane_wraps_and_keeps_its_tail_on_screen() {
+        let scratch = Scratch::new("pty-wrap");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, br#"[{"action": "final", "say": "done"}]"#)
+            .expect("the script is written");
+
+        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, args(&scratch.0, &script));
+        let deadline = Instant::now() + PATIENCE;
+        let mut transcript = Vec::new();
+
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            "the conversation's own screen is up: {}",
+            transcript.escape_ascii(),
+        );
+
+        let line = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike tail-end-marker";
+        master
+            .write_all(format!("{line}\r").as_bytes())
+            .expect("a line wider than the pane is submitted");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"done"], deadline),
+            "the turn is answered: {}",
+            transcript.escape_ascii(),
+        );
+        assert!(
+            found(&transcript, b"tail-end-marker", 0).is_some(),
+            "the tail of a wrapped line is on screen: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(CTRL_C).expect("the interrupt is typed");
+        let status = await_exit(&mut child, &master, &mut transcript, deadline);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the conversation leaves when the human does: {}",
+            transcript.escape_ascii(),
+        );
+    }
+
+    /// Each wide character occupies two columns, so the cursor past three of them sits six columns
+    /// further along than their count says.
+    #[test]
+    fn a_wide_character_moves_the_cursor_by_its_columns() {
+        let scratch = Scratch::new("pty-wide");
+        let script = scratch.0.join("script.json");
+        std::fs::write(&script, b"[]").expect("the script is written");
+
+        let (mut child, mut master, _kept) = on_a_pty(&scratch.0, args(&scratch.0, &script));
+        let deadline = Instant::now() + PATIENCE;
+        let mut transcript = Vec::new();
+
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            "the conversation's own screen is up: {}",
+            transcript.escape_ascii(),
+        );
+
+        master
+            .write_all("日本語".as_bytes())
+            .expect("wide characters are typed");
+        assert!(
+            await_bytes(&master, &mut transcript, &[b"\x1b[9;9H"], deadline),
+            "the cursor sits past the six columns the characters occupy: {}",
+            transcript.escape_ascii(),
+        );
+
+        master.write_all(CTRL_C).expect("the interrupt is typed");
+        let status = await_exit(&mut child, &master, &mut transcript, deadline);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the conversation leaves when the human does: {}",
+            transcript.escape_ascii(),
+        );
+    }
+
     /// A session whose turn the model holds is drawn before the human's next key is read, which is
     /// the state in which the adapter has to ask the terminal what it holds instead of waiting on it.
     #[test]
