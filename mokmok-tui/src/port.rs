@@ -897,6 +897,9 @@ fn wrap_spans(
 
                 while !rest.is_empty() {
                     let cut = char_boundary(rest, width);
+                    if cut == 0 {
+                        break;
+                    }
                     let (head, tail) = rest.split_at(cut);
 
                     if tail.is_empty() {
@@ -932,6 +935,9 @@ fn wrap_preformatted(
 
         while !rest.is_empty() {
             let cut = char_boundary(rest, width.saturating_sub(used).max(1));
+            if cut == 0 {
+                break;
+            }
             let (head, tail) = rest.split_at(cut);
             push_text(&mut current, head, span.tone);
             used += head.width();
