@@ -39,7 +39,7 @@ the turn settles.[^crate]
 | `Listing`, `Key`, `Event`, `Line` | `src/port.rs:114,190,215,228` | What the log holds of one session, the keys, and the seven line kinds, including a delegation's child, goal, and reply |
 | `Tone`, `Span`, `Row` | `src/port.rs:381,404,425` | How one drawn span reads, one span, and one drawn row with its spans and selection |
 | `View`, `Typing`, `Sheet`, `Entry` | `src/port.rs:455,486,500,517` | The frame, the typed line laid out for a width, the pane over the transcript, and one entry of the listing |
-| `clipped` | `src/port.rs:1013` | The display-width clip a heading, a status, and a goal share |
+| `clipped` | `src/port.rs:1018` | The display-width clip a heading, a status, and a goal share |
 | `Session` | `src/session.rs:16` | The kernel-backed engine |
 | `Sessions` | `src/session.rs:84` | The kernel-backed roster, which opens every session on a worker |
 | `Worker` | `src/worker.rs:32` | The thread one session's world runs on, and the cached fold it reports |
@@ -182,7 +182,7 @@ already covers.
 
 # Tests
 
-146 cases: 14 in `tests/` and 132 across seven `#[cfg(test)]` modules, two of them property cases.
+149 cases: 14 in `tests/` and 135 across seven `#[cfg(test)]` modules, two of them property cases.
 
 Six of the fourteen cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -232,10 +232,10 @@ One holds 7 cases for a step another writer committed becoming visible after the
 ledger, the goal and the checkout the log holds being the ones a resumed session runs under, a
 session with no task being refused, a created session running under the goal the human typed, and the
 listing mapping onto what the kernel holds (`src/session.rs:203`).
-One holds 23 cases for the layout, the rule, the heading and its truncation, a wrapped body,
-scrollback, the composer's prompt, placeholder, wrapped input, and cursor, the spinner and the
-hints, the key map, the press rule, the event classification, the terminal check, a find row, and
-the two panes (`src/terminal.rs:404`).
+One holds 26 cases for the layout, the rule, the heading and its truncation, a wrapped body,
+scrollback, the composer.s rows, prompt, placeholder, wrapped input, and cursor, the selected row.s
+fill, the spinner, the hint boundary, the key map, the press rule, the event classification, the
+terminal check, a find row, and the two panes (`src/terminal.rs:411`).
 One holds 4 cases for a step's fragments and result, a parked step leaving the screen thread free, a
 spoken line's fold ending its flight, and a reopen reaching the engine (`src/worker.rs:213`).
 

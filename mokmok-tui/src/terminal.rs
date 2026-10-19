@@ -188,15 +188,7 @@ fn render(
     let area = frame.area();
     let height = area.height;
     let typing = view.typing(usize::from(area.width));
-    let chrome = 1 + usize::from(height >= 10) + usize::from(height >= 5);
-    let max_composer = usize::from(height).saturating_sub(chrome + 1).max(1);
-    let composer_height = typing
-        .rows
-        .len()
-        .min(max_composer)
-        .max(1)
-        .try_into()
-        .unwrap_or(u16::MAX);
+    let composer_height = frame_rows(height, typing.rows.len());
 
     let mut constraints = vec![Constraint::Length(1)];
     if height >= 10 {
@@ -282,6 +274,19 @@ fn render(
     }
 
     frame.set_cursor_position(cursor);
+}
+
+/// The rows the composer takes when the frame is `height` rows tall and the typed line needs
+/// `typing` rows. The body keeps at least one row.
+fn frame_rows(
+    height: u16,
+    typing: usize,
+) -> u16 {
+    let chrome = 1 + usize::from(height >= 10) + usize::from(height >= 5);
+    let room = usize::from(height).saturating_sub(chrome + 1).max(1);
+    let rows = typing.min(room).max(1);
+
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 fn header_line(
@@ -382,8 +387,10 @@ fn footer_line(
     spans.push(TextSpan::styled(status, tone_style(Tone::Muted)));
 
     let hints = view.hints.width();
-    if !view.hints.is_empty() && used + 2 + hints <= width {
-        spans.push(TextSpan::raw(" ".repeat(width - used - hints)));
+    let gap = width.saturating_sub(used + hints);
+
+    if !view.hints.is_empty() && gap >= 2 {
+        spans.push(TextSpan::raw(" ".repeat(gap)));
         spans.push(TextSpan::styled(
             view.hints.clone(),
             tone_style(Tone::Muted),
@@ -409,10 +416,11 @@ mod tests {
         Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     };
     use ratatui::layout::Position;
+    use ratatui::style::Modifier;
     use uuid::Uuid;
 
-    use super::{both_are_terminals, classified, mapped, render};
-    use crate::port::{Entry, Event, Key, Line, Sheet, View};
+    use super::{body_line, both_are_terminals, classified, frame_rows, mapped, render};
+    use crate::port::{Entry, Event, Key, Line, Row, Sheet, Span, Tone, View};
     use mokmok_protocol::SessionID;
 
     #[test]
@@ -580,6 +588,47 @@ mod tests {
             .expect("the frame draws");
 
         terminal
+    }
+
+    #[test]
+    fn the_composer_takes_its_rows_up_to_the_room_the_body_leaves() {
+        assert_eq!(frame_rows(10, 1), 1);
+        assert_eq!(frame_rows(10, 100), 6);
+        assert_eq!(frame_rows(5, 100), 2);
+        assert_eq!(frame_rows(4, 100), 2);
+        assert_eq!(frame_rows(3, 100), 1);
+        assert_eq!(frame_rows(2, 100), 1);
+    }
+
+    #[test]
+    fn a_selected_row_is_padded_and_reversed() {
+        let row = Row {
+            spans: vec![Span {
+                text: "› entry".to_owned(),
+                tone: Tone::Accent,
+            }],
+            selected: true,
+        };
+        let line = body_line(row, 10);
+
+        assert_eq!(line.width(), 10);
+        let fill = line.spans.last().expect("a fill span");
+        assert_eq!(fill.content, "   ");
+        assert!(fill.style.add_modifier.contains(Modifier::REVERSED));
+
+        let exact = Row {
+            spans: vec![Span {
+                text: "0123456789".to_owned(),
+                tone: Tone::Agent,
+            }],
+            selected: true,
+        };
+
+        assert_eq!(
+            body_line(exact, 10).spans.len(),
+            1,
+            "a full row needs no empty fill",
+        );
     }
 
     #[test]
@@ -900,9 +949,7 @@ mod tests {
         let terminal = draw(&view, 30, 10);
         let heading = row(terminal.backend().buffer(), 0, 30);
 
-        assert!(heading.starts_with("mokmok  00000000  hold"));
-        assert!(heading.ends_with('…'), "a clipped goal says it was clipped");
-        assert!(heading.chars().count() <= 30);
+        assert_eq!(heading, "mokmok  00000000  hold a conv…");
     }
 
     #[test]
@@ -935,6 +982,30 @@ mod tests {
 
         assert_eq!(footer, "⠋ the agent is work…");
         assert!(!footer.contains("enter"), "a clipped hint is dropped whole");
+    }
+
+    #[test]
+    fn the_footer_keeps_hints_at_two_columns_and_drops_them_below() {
+        let view = View {
+            status: "the agent is working".to_owned(),
+            hints: "enter send".to_owned(),
+            spinner: Some(0),
+            ..view(Vec::new(), 0)
+        };
+        let terminal = draw(&view, 34, 10);
+
+        assert_eq!(
+            row(terminal.backend().buffer(), 9, 34),
+            "⠋ the agent is working  enter send",
+        );
+
+        let terminal = draw(&view, 33, 10);
+
+        assert_eq!(
+            row(terminal.backend().buffer(), 9, 33),
+            "⠋ the agent is working",
+            "one column of gap is not enough to separate the hints",
+        );
     }
 
     #[test]
