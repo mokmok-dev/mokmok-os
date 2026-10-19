@@ -403,7 +403,6 @@ mod tests {
         );
     }
 
-    /// The pane is 80 columns wide, so a line wider than it has to wrap rather than lose its tail.
     #[test]
     fn a_line_wider_than_the_pane_wraps_and_keeps_its_tail_on_screen() {
         let scratch = Scratch::new("pty-wrap");
@@ -446,8 +445,6 @@ mod tests {
         );
     }
 
-    /// Each wide character occupies two columns, so the cursor past three of them sits six columns
-    /// further along than their count says.
     #[test]
     fn a_wide_character_moves_the_cursor_by_its_columns() {
         let scratch = Scratch::new("pty-wide");

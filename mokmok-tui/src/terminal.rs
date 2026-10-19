@@ -17,12 +17,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal as RtTerminal};
 
 use crate::Error;
-use crate::port::{Event, Key, Screen, Sheet, View};
-
-/// What the input row starts with, so the line being typed and the goal being named are told apart.
-const INPUT_PREFIX: &str = "> ";
-
-const GOAL_PREFIX: &str = "goal> ";
+use crate::port::{Event, Key, Screen, View};
 
 /// The real terminal: keys from crossterm, one frame to the alternate screen.
 pub struct Terminal {
@@ -164,10 +159,13 @@ fn render(
     frame: &mut Frame<'_>,
     view: &View,
 ) {
+    let width = usize::from(frame.area().width);
+    let typing = view.typing(width);
+    let typed_height = u16::try_from(typing.rows.len()).unwrap_or(u16::MAX);
     let [header, body, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(typed_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -185,24 +183,24 @@ fn render(
     frame.render_widget(Paragraph::new(TextLine::raw(heading)), header);
 
     let lines: Vec<TextLine<'static>> = view
-        .body(usize::from(body.height))
+        .body(width, usize::from(body.height))
         .into_iter()
         .map(TextLine::raw)
         .collect();
     frame.render_widget(Paragraph::new(lines), body);
 
-    let typed = match &view.sheet {
-        Some(Sheet::List { .. }) => String::new(),
-        Some(Sheet::New { goal }) => format!("{GOAL_PREFIX}{goal}"),
-        None => format!("{INPUT_PREFIX}{}", view.input),
-    };
-    frame.render_widget(Paragraph::new(TextLine::raw(typed.as_str())), input);
+    let typed_rows: Vec<TextLine<'static>> = typing.rows.into_iter().map(TextLine::raw).collect();
+    frame.render_widget(Paragraph::new(typed_rows), input);
     frame.render_widget(Paragraph::new(TextLine::raw(view.status.as_str())), status);
 
     // `Screen::draw` hands over a `View` and nothing else, so the adapter cannot tell a waiting fold
     // from a working one; parking the cursor on the input row is the one cursor the frame can place.
-    let column = u16::try_from(typed.chars().count()).unwrap_or(u16::MAX);
-    frame.set_cursor_position(Position::new(input.x.saturating_add(column), input.y));
+    let column = u16::try_from(typing.column).unwrap_or(u16::MAX);
+    let row = u16::try_from(typing.row).unwrap_or(u16::MAX);
+    frame.set_cursor_position(Position::new(
+        input.x.saturating_add(column),
+        input.y.saturating_add(row),
+    ));
 }
 
 #[cfg(test)]
@@ -667,6 +665,46 @@ mod tests {
             terminal.backend().cursor_position(),
             Position::new(11, 8),
             "the cursor sits one column past the goal",
+        );
+    }
+
+    #[test]
+    fn the_cursor_sits_past_the_columns_a_wide_character_takes() {
+        let view = View {
+            input: "日本語".to_owned(),
+            ..view(vec![Line::Human("hello".to_owned())], 0)
+        };
+        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("the frame draws");
+
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(8, 8),
+            "three characters of two columns each sit beside the two-column prompt",
+        );
+    }
+
+    #[test]
+    fn a_line_wider_than_the_pane_wraps_the_input_and_the_cursor_follows() {
+        let view = View {
+            input: "alpha bravo charlie".to_owned(),
+            ..view(vec![Line::Human("hello".to_owned())], 0)
+        };
+        let mut terminal = RtTerminal::new(TestBackend::new(20, 10)).expect("the screen opens");
+        terminal
+            .draw(|frame| render(frame, &view))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(row(buffer, 7, 20), "> alpha bravo");
+        assert_eq!(row(buffer, 8, 20), "  charlie");
+        assert_eq!(row(buffer, 9, 20), "your turn");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(9, 8),
+            "the cursor follows the wrapped line onto its last row",
         );
     }
 
