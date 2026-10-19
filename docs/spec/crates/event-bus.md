@@ -131,7 +131,7 @@ A new subscriber identity starts at the retained floor without an error
 
 # Tests
 
-Eight `#[cfg(test)]` modules hold 59 cases, of which 25 are `#[tokio::test]` and 6 are proptest
+Eight `#[cfg(test)]` modules hold 68 cases, of which 26 are `#[tokio::test]` and 6 are proptest
 cases. `tests/over_socket.rs` adds 28 cases over a real socket: publish before subscribe, two
 subscribers each seeing every event, an event surviving a restart, reconnect replaying unacknowledged
 events with the same identifier, a slow consumer receiving at most its in-flight credit, a

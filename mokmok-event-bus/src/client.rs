@@ -59,6 +59,7 @@ enum Command {
     },
 }
 
+#[derive(Debug)]
 enum Outcome {
     Published(Published),
     Subscribed(SubId),
@@ -489,5 +490,173 @@ impl fmt::Debug for Error {
             Self::Closed => formatter.write_str("Closed"),
             Self::Indeterminate => formatter.write_str("Indeterminate"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ending, FRAME, Pending, fail_all, fail_rest, map_handshake, receive_frame};
+    use crate::event::Refusal;
+    use crate::payload::Payload;
+    use crate::topic::Topic;
+    use crate::wire::{Request, SubId};
+    use std::collections::HashMap;
+    use std::io;
+    use std::num::NonZeroUsize;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    use tokio_tungstenite::tungstenite::Message;
+
+    fn publish(req_id: u64) -> Request {
+        Request::Publish {
+            req_id,
+            topic: Topic::Global,
+            payload: Payload::json(&1).unwrap(),
+        }
+    }
+
+    fn outstanding(
+        request: Request
+    ) -> (
+        HashMap<u64, Pending>,
+        oneshot::Receiver<Result<super::Outcome, super::Error>>,
+    ) {
+        let (reply, answered) = oneshot::channel();
+        let req_id = match &request {
+            Request::Publish { req_id, .. }
+            | Request::Subscribe { req_id, .. }
+            | Request::Pull { req_id, .. }
+            | Request::Ack { req_id, .. } => *req_id,
+        };
+        let mut pending = HashMap::new();
+        pending.insert(
+            req_id,
+            Pending {
+                request,
+                written: true,
+                reply,
+            },
+        );
+
+        (pending, answered)
+    }
+
+    #[test]
+    fn a_written_publish_is_indeterminate_and_another_written_request_is_closed() {
+        let (mut pending, mut answered) = outstanding(publish(1));
+        fail_rest(&mut pending, &Ending::Clean);
+
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(Err(super::Error::Indeterminate)),
+        ));
+
+        let (mut pending, mut answered) = outstanding(Request::Ack {
+            req_id: 2,
+            sub: SubId::new(0),
+            through: crate::event::Cursor::new(
+                crate::event::LogEpoch::new(uuid::Uuid::nil()),
+                crate::event::Seq::new(0),
+            ),
+        });
+        fail_rest(&mut pending, &Ending::Clean);
+
+        assert!(matches!(answered.try_recv(), Ok(Err(super::Error::Closed)),));
+    }
+
+    #[test]
+    fn a_lost_socket_names_the_failure_for_a_request_that_was_not_a_publish() {
+        let (mut pending, mut answered) = outstanding(Request::Pull {
+            req_id: 3,
+            sub: SubId::new(0),
+            max: NonZeroUsize::MIN,
+        });
+        fail_rest(&mut pending, &Ending::Lost("the pipe broke".to_owned()));
+
+        let error = answered.try_recv().unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "the socket failed: the pipe broke");
+    }
+
+    #[test]
+    fn a_bad_frame_answers_every_outstanding_request_and_ends_the_driver() {
+        let (mut pending, mut answered) = outstanding(publish(1));
+
+        assert!(!receive_frame(
+            &mut pending,
+            Some(Ok(Message::Text("not a frame".into()))),
+        ));
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(Err(super::Error::Protocol(FRAME))),
+        ));
+    }
+
+    #[test]
+    fn a_closed_socket_fails_the_outstanding_request() {
+        let (mut pending, mut answered) = outstanding(publish(1));
+
+        assert!(!receive_frame(&mut pending, None));
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(Err(super::Error::Indeterminate)),
+        ));
+    }
+
+    #[test]
+    fn a_protocol_failure_answers_every_outstanding_request() {
+        let (mut pending, mut answered) = outstanding(publish(1));
+
+        fail_all(&mut pending, FRAME);
+
+        assert!(matches!(
+            answered.try_recv(),
+            Ok(Err(super::Error::Protocol(FRAME))),
+        ));
+    }
+
+    fn http_503(body: &'static [u8]) -> WsError {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(503)
+            .body(Some(body.to_vec()))
+            .unwrap();
+
+        WsError::Http(Box::new(response))
+    }
+
+    #[test]
+    fn a_503_body_names_the_refusal_it_carries() {
+        assert!(matches!(
+            map_handshake(http_503(b"connection_limit")),
+            super::Error::Refused(Refusal::ConnectionLimit),
+        ));
+        assert!(matches!(
+            map_handshake(http_503(b"shutting_down")),
+            super::Error::Refused(Refusal::ShuttingDown),
+        ));
+    }
+
+    #[test]
+    fn an_unknown_503_body_and_another_status_stay_transport_failures() {
+        assert!(matches!(
+            map_handshake(http_503(b"else")),
+            super::Error::Transport(_),
+        ));
+
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(403)
+            .body(None)
+            .unwrap();
+        assert!(matches!(
+            map_handshake(WsError::Http(Box::new(response))),
+            super::Error::Transport(_),
+        ));
+    }
+
+    #[test]
+    fn a_transport_error_with_no_http_response_stays_transport() {
+        assert!(matches!(
+            map_handshake(WsError::Io(io::Error::other("gone"))),
+            super::Error::Transport(_),
+        ));
     }
 }

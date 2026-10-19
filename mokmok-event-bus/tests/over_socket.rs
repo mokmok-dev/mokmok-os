@@ -27,7 +27,7 @@ mod tests {
 
     /// Long enough for a healthy bus to answer, short enough that a silenced one fails the test
     /// instead of hanging the suite.
-    const BOUND: Duration = Duration::from_secs(3);
+    const BOUND: Duration = Duration::from_secs(1);
 
     fn unique(name: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -692,9 +692,11 @@ mod tests {
         // dropped again so the first topic can be reopened; each retry waits out the old session.
         let mut forced = None;
         for _ in 0..100 {
-            let probe = Client::connect(&bus.path).await;
+            let probe = within("probe connect", Client::connect(&bus.path)).await;
             if let Ok(client) = probe
-                && client.publish(agent_topic(), payload(&0)).await.is_ok()
+                && within("probe publish", client.publish(agent_topic(), payload(&0)))
+                    .await
+                    .is_ok()
             {
                 forced = Some(client);
                 break;
@@ -705,9 +707,11 @@ mod tests {
 
         let mut reopened = None;
         for _ in 0..100 {
-            let probe = Client::connect(&bus.path).await;
+            let probe = within("probe connect", Client::connect(&bus.path)).await;
             if let Ok(client) = probe
-                && client.publish(Topic::Global, payload(&2)).await.is_ok()
+                && within("probe publish", client.publish(Topic::Global, payload(&2)))
+                    .await
+                    .is_ok()
             {
                 reopened = Some(client);
                 break;
@@ -817,10 +821,12 @@ mod tests {
         let busy = within("busy connect", Client::connect(&bus.path))
             .await
             .unwrap();
-        let _kept = busy
-            .subscribe(Topic::Global, SubscriberId::new())
-            .await
-            .unwrap();
+        let _kept = within(
+            "busy subscribe",
+            busy.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await
+        .unwrap();
 
         let second = within("second connect", Client::connect(&bus.path)).await;
 
@@ -863,7 +869,12 @@ mod tests {
         let mut accepted = None;
         for _ in 0..100 {
             if let Ok(publisher) = within("retry connect", Client::connect(&bus.path)).await
-                && publisher.publish(Topic::Global, payload(&0)).await.is_ok()
+                && within(
+                    "retry publish",
+                    publisher.publish(Topic::Global, payload(&0)),
+                )
+                .await
+                .is_ok()
             {
                 accepted = Some(publisher);
                 break;
@@ -888,24 +899,39 @@ mod tests {
         .await
         .unwrap();
 
-        let parked = tokio::spawn(async move { subscriber.next().await });
-        // The pull has to reach the server and park before the publish, or the subscriber reads
-        // a non-empty batch and the wake path never runs.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let publisher = client.clone();
+        let publishing = tokio::spawn(async move {
+            // The pull has to reach the server and park before the publish, or the subscriber
+            // reads a non-empty batch and the wake path never runs.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            publisher
+                .publish(Topic::Global, payload(&serde_json::json!({"turn": 9})))
+                .await
+        });
 
-        let receipt = within(
-            "publish",
-            client.publish(Topic::Global, payload(&serde_json::json!({"turn": 9}))),
-        )
-        .await
-        .unwrap();
-
-        let batch = within("parked next", parked).await.unwrap().unwrap();
+        let batch = within("parked next", subscriber.next()).await.unwrap();
+        let receipt = within("publish", publishing).await.unwrap().unwrap();
 
         assert_eq!(batch.events().len(), 1);
         assert_eq!(batch.events()[0].payload().as_str(), r#"{"turn":9}"#);
         assert_eq!(batch.events()[0].seq(), receipt.seq());
         assert_eq!(batch.events()[0].id(), receipt.id());
+
+        // A recheck that answered the parked pull must leave the session open for the next one.
+        let publisher = client.clone();
+        let publishing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            publisher
+                .publish(Topic::Global, payload(&serde_json::json!({"turn": 10})))
+                .await
+        });
+        let next = within("second parked next", subscriber.next())
+            .await
+            .unwrap();
+        let second = within("second publish", publishing).await.unwrap().unwrap();
+
+        assert_eq!(next.events().len(), 1);
+        assert_eq!(next.events()[0].id(), second.id());
     }
 
     #[tokio::test]
@@ -987,16 +1013,23 @@ mod tests {
         })
         .await;
         let client = within("connect", Client::connect(&bus.path)).await.unwrap();
-        client
-            .subscribe(Topic::Global, SubscriberId::new())
-            .await
-            .unwrap();
+        within(
+            "subscribe",
+            client.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await
+        .unwrap();
         drop(client);
 
         let mut accepted = None;
         for _ in 0..100 {
             if let Ok(publisher) = within("retry connect", Client::connect(&bus.path)).await
-                && publisher.publish(Topic::Global, payload(&0)).await.is_ok()
+                && within(
+                    "retry publish",
+                    publisher.publish(Topic::Global, payload(&0)),
+                )
+                .await
+                .is_ok()
             {
                 accepted = Some(publisher);
                 break;
@@ -1072,7 +1105,16 @@ mod tests {
         let second = within("second connect", Client::connect(&bus.path))
             .await
             .unwrap();
-        let _ = first.subscribe(Topic::Global, SubscriberId::new()).await;
+        let _ = within(
+            "first subscribe",
+            first.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await;
+        let _ = within(
+            "second subscribe",
+            second.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await;
         let _ = second.subscribe(Topic::Global, SubscriberId::new()).await;
 
         let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
@@ -1168,7 +1210,9 @@ mod tests {
 
         let client = within("connect", Client::connect(&bus.path)).await.unwrap();
         assert!(
-            client.publish(Topic::Global, payload(&1)).await.is_ok(),
+            within("publish", client.publish(Topic::Global, payload(&1)))
+                .await
+                .is_ok(),
             "the bus freed the permit held by the silent peer",
         );
     }
@@ -1237,19 +1281,23 @@ mod tests {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
         let client = within("connect", Client::connect(&bus.path)).await.unwrap();
-        let mut subscriber = client.subscribe(topic, SubscriberId::new()).await.unwrap();
-
-        // Park a pull before any event exists.
-        let parked = tokio::spawn(async move { subscriber.next().await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // The same connection publishes while the subscription is parked.
-        let receipt = client
-            .publish(topic, payload(&serde_json::json!({"same": true})))
+        let mut subscriber = within("subscribe", client.subscribe(topic, SubscriberId::new()))
             .await
             .unwrap();
 
-        let batch = parked.await.unwrap().unwrap();
+        // Park a pull before any event exists.
+        let publisher = client.clone();
+        let publishing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // The same connection publishes while the subscription is parked.
+            publisher
+                .publish(topic, payload(&serde_json::json!({"same": true})))
+                .await
+        });
+
+        let batch = within("parked next", subscriber.next()).await.unwrap();
+        let receipt = within("publish", publishing).await.unwrap().unwrap();
         assert_eq!(batch.events().len(), 1);
         assert_eq!(batch.events()[0].id(), receipt.id());
     }

@@ -869,6 +869,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_window_wait_with_no_parked_reader_stays_pending() {
+        let mut subscriptions = HashMap::new();
+        let resolved = tokio::time::timeout(
+            Duration::from_millis(50),
+            super::any_window_changed(&mut subscriptions),
+        )
+        .await;
+
+        assert!(
+            resolved.is_err(),
+            "a wait with nothing parked resolved immediately",
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1024))]
 
