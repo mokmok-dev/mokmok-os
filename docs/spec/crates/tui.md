@@ -182,7 +182,7 @@ already covers.
 
 # Tests
 
-145 cases: 14 in `tests/` and 131 across seven `#[cfg(test)]` modules, two of them property cases.
+146 cases: 14 in `tests/` and 132 across seven `#[cfg(test)]` modules, two of them property cases.
 
 Six of the fourteen cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -222,10 +222,10 @@ being answered in order, a background stream drawing nothing, a pane covering th
 stream off the screen, a terminal that fails while a stream is read or drawn, a key drawn while a
 worker's step is parked, and an interrupt answered while a session can move leaving
 (`src/core.rs:975`).
-One holds 35 cases and one property case for wrapping at display width, a wide character, a word
+One holds 36 cases and one property case for wrapping at display width, a wide character, a word
 wider than the line, the gutters and tones of each line kind, the markdown spans and fences, row-wise
 windowing, the welcome, the listing's entries and cursor, the typed line's own wrapping and cursor,
-escaped control characters, and the replay (`src/port.rs:1333`).
+escaped control characters, and the replay (`src/port.rs:1332`).
 One holds 7 cases for plain prose, bold, inline code, an unclosed marker, an escaped
 marker, a heading, and a fenced block (`src/markdown.rs:173`).
 One holds 7 cases for a step another writer committed becoming visible after the engine reopens the

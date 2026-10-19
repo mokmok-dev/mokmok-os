@@ -883,25 +883,31 @@ fn wrap_spans(
         if used + word_width <= width {
             push_text(&mut current, &token.text, token.tone);
             used += word_width;
-        } else if used > 0 {
-            rows.push(std::mem::take(&mut current));
-            used = 0;
-            tokens.push_front(token);
         } else {
-            let mut rest = token.text.as_str();
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                used = 0;
+            }
 
-            while !rest.is_empty() {
-                let cut = char_boundary(rest, width);
-                let (head, tail) = rest.split_at(cut);
+            if word_width <= width {
+                push_text(&mut current, &token.text, token.tone);
+                used = word_width;
+            } else {
+                let mut rest = token.text.as_str();
 
-                if tail.is_empty() {
-                    push_text(&mut current, head, token.tone);
-                    used = head.width();
-                    break;
+                while !rest.is_empty() {
+                    let cut = char_boundary(rest, width);
+                    let (head, tail) = rest.split_at(cut);
+
+                    if tail.is_empty() {
+                        push_text(&mut current, head, token.tone);
+                        used = head.width();
+                        break;
+                    }
+
+                    rows.push(vec![Span::new(head, token.tone)]);
+                    rest = tail;
                 }
-
-                rows.push(vec![Span::new(head, token.tone)]);
-                rest = tail;
             }
         }
     }
@@ -1590,6 +1596,16 @@ mod tests {
         assert_eq!(texts(&rows), vec!["• Title", "  │ let x = 1;", "  plain"],);
         assert_eq!(rows[0].spans[1].tone, Tone::Strong);
         assert_eq!(rows[1].spans[1].tone, Tone::Code);
+    }
+
+    #[test]
+    fn a_code_line_wider_than_the_pane_is_hard_wrapped() {
+        let view = view(vec![Line::Agent("```\nabcdefghij\n```".to_owned())], 0);
+
+        assert_eq!(
+            texts(&view.visible(6, 10)),
+            vec!["  │ ab", "  │ cd", "  │ ef", "  │ gh", "  │ ij"],
+        );
     }
 
     #[test]
