@@ -70,12 +70,16 @@ fn inline(text: &str) -> Vec<(String, Tone)> {
     let mut spans = Vec::new();
     let mut rest = text;
 
-    while let Some((marker, tone, before, inner, after)) = first_marker(rest) {
+    while let Some((tone, before, inner, after)) = first_marker(rest) {
         if !before.is_empty() {
             spans.push((escaped(before), Tone::Agent));
         }
         spans.push((escaped(inner), tone));
-        let _ = marker;
+
+        // A malformed marker that does not consume its own text would spin this loop.
+        if after.len() >= rest.len() {
+            break;
+        }
         rest = after;
     }
 
@@ -86,23 +90,20 @@ fn inline(text: &str) -> Vec<(String, Tone)> {
     spans
 }
 
-fn first_marker(text: &str) -> Option<(&'static str, Tone, &str, &str, &str)> {
+fn first_marker(text: &str) -> Option<(Tone, &str, &str, &str)> {
     let strong = find_pair(text, "**");
     let code = find_pair(text, "`");
 
     match (strong, code) {
-        (
-            Some((s_pos, s_before, s_marked, s_after)),
-            Some((c_pos, c_before, c_marked, c_after)),
-        ) => {
+        (Some((s_pos, s_before, s_inner, s_after)), Some((c_pos, c_before, c_inner, c_after))) => {
             if s_pos <= c_pos {
-                Some(("**", Tone::Strong, s_before, s_marked, s_after))
+                Some((Tone::Strong, s_before, s_inner, s_after))
             } else {
-                Some(("`", Tone::Code, c_before, c_marked, c_after))
+                Some((Tone::Code, c_before, c_inner, c_after))
             }
         },
-        (Some((_, before, inner, after)), None) => Some(("**", Tone::Strong, before, inner, after)),
-        (None, Some((_, before, inner, after))) => Some(("`", Tone::Code, before, inner, after)),
+        (Some((_, before, inner, after)), None) => Some((Tone::Strong, before, inner, after)),
+        (None, Some((_, before, inner, after))) => Some((Tone::Code, before, inner, after)),
         (None, None) => None,
     }
 }
