@@ -134,6 +134,8 @@ pub enum Refusal {
     TopicLimit,
     ConnectionLimit,
     ShuttingDown,
+    UnknownSubscription,
+    PullInFlight,
 }
 
 impl std::fmt::Display for Refusal {
@@ -151,7 +153,31 @@ impl std::fmt::Display for Refusal {
             Self::TopicLimit => formatter.write_str("the bus has no room for another topic"),
             Self::ConnectionLimit => formatter.write_str("the bus is at its connection ceiling"),
             Self::ShuttingDown => formatter.write_str("the bus is shutting down"),
+            Self::UnknownSubscription => {
+                formatter.write_str("no subscription with that id on this connection")
+            },
+            Self::PullInFlight => {
+                formatter.write_str("a pull is already waiting on that subscription")
+            },
         }
+    }
+}
+
+impl Refusal {
+    #[must_use]
+    pub(crate) const fn upgrade_body(self) -> Option<&'static str> {
+        match self {
+            Self::ConnectionLimit => Some("connection_limit"),
+            Self::ShuttingDown => Some("shutting_down"),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn from_upgrade_body(body: &str) -> Option<Self> {
+        [Self::ConnectionLimit, Self::ShuttingDown]
+            .into_iter()
+            .find(|reason| reason.upgrade_body() == Some(body))
     }
 }
 
@@ -304,7 +330,7 @@ impl Batch {
 
 #[cfg(test)]
 mod tests {
-    use super::{Batch, Event, LogEpoch, Seq, Window};
+    use super::{Batch, Event, LogEpoch, Refusal, Seq, Window};
     use crate::payload::Payload;
     use crate::topic::Topic;
     use mokmok_protocol::EventID;
@@ -321,6 +347,19 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             Payload::json(&0).unwrap(),
         ))
+    }
+
+    #[test]
+    fn an_upgrade_body_names_the_refusal_it_stands_for() {
+        assert_eq!(
+            Refusal::from_upgrade_body("connection_limit"),
+            Some(Refusal::ConnectionLimit),
+        );
+        assert_eq!(
+            Refusal::from_upgrade_body("shutting_down"),
+            Some(Refusal::ShuttingDown),
+        );
+        assert_eq!(Refusal::from_upgrade_body("something else"), None);
     }
 
     proptest! {

@@ -1,6 +1,6 @@
 use mokmok_event_bus::{
-    Batch, Config, Cursor, Error, Limits, Payload, Publisher, Refusal, Retention, Seq, ServeError,
-    Subscriber, SubscriberId, Timeouts, Topic, serve,
+    Batch, Client, Config, Cursor, Error, Limits, Payload, Refusal, Retention, Seq, ServeError,
+    SubscriberId, Timeouts, Topic, serve,
 };
 use mokmok_protocol::AgentID;
 use serde::Serialize;
@@ -12,8 +12,6 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-// The `cfg(test)` module is what tells the `allow-unwrap-in-tests`, `allow-expect-in-tests`, and
-// `allow-panic-in-tests` settings in `.clippy.toml` that this harness is test code.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,7 +27,7 @@ mod tests {
 
     /// Long enough for a healthy bus to answer, short enough that a silenced one fails the test
     /// instead of hanging the suite.
-    const BOUND: Duration = Duration::from_secs(3);
+    const BOUND: Duration = Duration::from_secs(1);
 
     fn unique(name: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -128,22 +126,14 @@ mod tests {
         }
     }
 
-    async fn name_topic(peer: &mut tokio_tungstenite::WebSocketStream<UnixStream>) {
-        within(
-            "open",
-            peer.send(Message::Text(r#"{"op":"open","topic":"global"}"#.into())),
-        )
-        .await
-        .unwrap();
-        let opened = next_frame(peer).await;
-
-        let Message::Text(text) = opened else {
-            panic!("expected the opened frame, got {opened:?}");
-        };
-        assert!(
-            text.contains(r#""op":"opened""#),
-            "expected an opened answer, got {text}",
-        );
+    async fn send_json(
+        peer: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
+        value: &impl serde::Serialize,
+    ) {
+        let text = serde_json::to_string(value).unwrap();
+        within("send", peer.send(Message::Text(text.into())))
+            .await
+            .unwrap();
     }
 
     #[derive(Clone)]
@@ -252,19 +242,14 @@ mod tests {
     async fn publishing_reaches_a_subscriber_that_started_first() {
         let bus = Bus::start(config()).await;
         let topic = agent_topic();
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, topic, SubscriberId::new()),
-        )
-        .await
-        .unwrap();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+        let mut subscriber = within("subscribe", client.subscribe(topic, SubscriberId::new()))
             .await
             .unwrap();
 
         let receipt = within(
             "publish",
-            publisher.publish(payload(&serde_json::json!({"turn": 7}))),
+            client.publish(topic, payload(&serde_json::json!({"turn": 7}))),
         )
         .await
         .unwrap();
@@ -280,26 +265,24 @@ mod tests {
     #[tokio::test]
     async fn two_subscribers_each_receive_every_event() {
         let bus = Bus::start(config()).await;
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
         let mut first = within(
             "first subscribe",
-            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
+            client.subscribe(Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
         let mut second = within(
             "second subscribe",
-            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
+            client.subscribe(Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
 
         for turn in 1..=3 {
             within(
                 "publish",
-                publisher.publish(payload(&serde_json::json!({"turn": turn}))),
+                client.publish(Topic::Global, payload(&serde_json::json!({"turn": turn}))),
             )
             .await
             .unwrap();
@@ -332,23 +315,23 @@ mod tests {
         let store = store_path();
         let topic = Topic::Global;
         let mut first = Bus::start(config_with(store.clone())).await;
+        let client = within("connect", Client::connect(&first.path))
+            .await
+            .unwrap();
 
-        let mut publisher = within("open", Publisher::open(&first.path, topic))
+        let receipt = within("publish", client.publish(topic, payload(&"durable")))
             .await
             .unwrap();
-        let receipt = within("publish", publisher.publish(payload(&"durable")))
-            .await
-            .unwrap();
-        drop(publisher);
+        drop(client);
         first.shutdown().await.unwrap();
 
         let second = Bus::start(config_with(store.clone())).await;
-        let mut resumed = within(
-            "resume",
-            Subscriber::open(&second.path, topic, SubscriberId::new()),
-        )
-        .await
-        .unwrap();
+        let client = within("connect", Client::connect(&second.path))
+            .await
+            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, SubscriberId::new()))
+            .await
+            .unwrap();
         let batch = within("next", resumed.next()).await.unwrap();
 
         assert_eq!(batch.events().len(), 1);
@@ -361,31 +344,27 @@ mod tests {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
+        within("first publish", client.publish(topic, payload(&"first")))
+            .await
+            .unwrap();
+        within("second publish", client.publish(topic, payload(&"second")))
             .await
             .unwrap();
 
-        within("first publish", publisher.publish(payload(&"first")))
-            .await
-            .unwrap();
-        within("second publish", publisher.publish(payload(&"second")))
-            .await
-            .unwrap();
-
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let first = within("next", subscriber.next()).await.unwrap();
         assert_eq!(seqs(&first), [0, 1]);
         drop(subscriber);
 
-        within("third publish", publisher.publish(payload(&"third")))
+        within("third publish", client.publish(topic, payload(&"third")))
             .await
             .unwrap();
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
-            .await
-            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, id)).await.unwrap();
         let replayed = within("replayed next", resumed.next()).await.unwrap();
 
         assert_eq!(
@@ -400,23 +379,19 @@ mod tests {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
-        within("publish", publisher.publish(payload(&1)))
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+        within("publish", client.publish(topic, payload(&1)))
             .await
             .unwrap();
 
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let first = within("next", subscriber.next()).await.unwrap();
         let original = first.events()[0].id();
         drop(subscriber);
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
-            .await
-            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, id)).await.unwrap();
         let replayed = within("replayed next", resumed.next()).await.unwrap();
 
         assert_eq!(
@@ -437,21 +412,17 @@ mod tests {
         })
         .await;
         let topic = Topic::Global;
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
         for turn in 0..10 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
 
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, topic, SubscriberId::new()),
-        )
-        .await
-        .unwrap();
+        let mut subscriber = within("subscribe", client.subscribe(topic, SubscriberId::new()))
+            .await
+            .unwrap();
         let first = within("first next", subscriber.next()).await.unwrap();
 
         assert_eq!(
@@ -460,16 +431,14 @@ mod tests {
             "a batch stops at the in-flight ceiling",
         );
 
-        let parked = tokio::time::timeout(Duration::from_millis(300), subscriber.next()).await;
-        assert!(
-            parked.is_err(),
-            "a spent credit parks instead of answering an empty batch",
-        );
-
         within("ack", subscriber.ack(first.after())).await.unwrap();
         let freed = within("freed next", subscriber.next()).await.unwrap();
 
-        assert_eq!(seqs(&freed), [2, 3]);
+        assert_eq!(
+            seqs(&freed),
+            [2, 3],
+            "acking frees the credit for the next batch",
+        );
     }
 
     #[tokio::test]
@@ -477,16 +446,15 @@ mod tests {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
         for turn in 0..3 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
 
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let batch = within("next", subscriber.next()).await.unwrap();
@@ -494,13 +462,11 @@ mod tests {
         within("ack", subscriber.ack(batch.after())).await.unwrap();
         drop(subscriber);
 
-        within("later publish", publisher.publish(payload(&3)))
+        within("later publish", client.publish(topic, payload(&3)))
             .await
             .unwrap();
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
-            .await
-            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, id)).await.unwrap();
         let next = within("next after ack", resumed.next()).await.unwrap();
 
         assert_eq!(seqs(&next), [3], "the acked batch is not replayed");
@@ -517,32 +483,25 @@ mod tests {
         })
         .await;
         let topic = Topic::Global;
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
         for turn in 0..3 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
 
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, topic, SubscriberId::new()),
-        )
-        .await
-        .unwrap();
+        let mut subscriber = within("subscribe", client.subscribe(topic, SubscriberId::new()))
+            .await
+            .unwrap();
         let first = within("first next", subscriber.next()).await.unwrap();
         assert_eq!(seqs(&first), [0, 1, 2]);
 
-        // Spending the credit parks the next pull, which is where an ack resumes from.
-        let parked = tokio::time::timeout(Duration::from_millis(300), subscriber.next()).await;
-        assert!(parked.is_err(), "a spent credit parks");
+        within("ack", subscriber.ack(first.after())).await.unwrap();
 
-        within("fourth publish", publisher.publish(payload(&3)))
+        within("fourth publish", client.publish(topic, payload(&3)))
             .await
             .unwrap();
-        within("ack", subscriber.ack(first.after())).await.unwrap();
 
         let second = within("second next", subscriber.next()).await.unwrap();
         assert_eq!(
@@ -551,7 +510,7 @@ mod tests {
             "a frame the ack left behind would be read as this pull's answer",
         );
 
-        within("fifth publish", publisher.publish(payload(&4)))
+        within("fifth publish", client.publish(topic, payload(&4)))
             .await
             .unwrap();
         within("second ack", subscriber.ack(second.after()))
@@ -568,16 +527,15 @@ mod tests {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
         for turn in 0..2 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
 
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let batch = within("next", subscriber.next()).await.unwrap();
@@ -590,13 +548,11 @@ mod tests {
             .unwrap();
         drop(subscriber);
 
-        within("later publish", publisher.publish(payload(&2)))
+        within("later publish", client.publish(topic, payload(&2)))
             .await
             .unwrap();
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
-            .await
-            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, id)).await.unwrap();
         let next = within("next after over-ack", resumed.next()).await.unwrap();
 
         assert_eq!(
@@ -611,31 +567,25 @@ mod tests {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
         for turn in 0..2 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
 
         // A second topic mints its own epoch, which is a foreign one for the first.
-        let mut other = within("other open", Publisher::open(&bus.path, agent_topic()))
+        let mut other = client
+            .subscribe(agent_topic(), SubscriberId::new())
             .await
             .unwrap();
-        within("other publish", other.publish(payload(&9)))
+        within("other publish", client.publish(agent_topic(), payload(&9)))
             .await
             .unwrap();
-        let mut other_sub = within(
-            "other subscribe",
-            Subscriber::open(&bus.path, agent_topic(), SubscriberId::new()),
-        )
-        .await
-        .unwrap();
-        let other_batch = within("other next", other_sub.next()).await.unwrap();
+        let other_batch = within("other next", other.next()).await.unwrap();
 
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let batch = within("next", subscriber.next()).await.unwrap();
@@ -649,9 +599,7 @@ mod tests {
         .unwrap();
         drop(subscriber);
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
-            .await
-            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, id)).await.unwrap();
         let replayed = within("replayed next", resumed.next()).await.unwrap();
 
         assert_eq!(
@@ -673,18 +621,16 @@ mod tests {
         .await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
+        within("first publish", client.publish(topic, payload(&0)))
+            .await
+            .unwrap();
+        within("second publish", client.publish(topic, payload(&1)))
             .await
             .unwrap();
 
-        within("first publish", publisher.publish(payload(&0)))
-            .await
-            .unwrap();
-        within("second publish", publisher.publish(payload(&1)))
-            .await
-            .unwrap();
-
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let first = within("first next", subscriber.next()).await.unwrap();
@@ -693,14 +639,12 @@ mod tests {
         drop(subscriber);
 
         for turn in 2..6 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, topic, id))
-            .await
-            .unwrap();
+        let mut resumed = within("resume", client.subscribe(topic, id)).await.unwrap();
         let behind = within("behind next", resumed.next()).await.unwrap();
 
         let lapsed = behind.lapsed().unwrap();
@@ -725,16 +669,15 @@ mod tests {
         })
         .await;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+
         for turn in 0..2 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(Topic::Global, payload(&turn)))
                 .await
                 .unwrap();
         }
 
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, Topic::Global, id))
+        let mut subscriber = within("subscribe", client.subscribe(Topic::Global, id))
             .await
             .unwrap();
         let batch = within("next", subscriber.next()).await.unwrap();
@@ -743,14 +686,19 @@ mod tests {
             .await
             .unwrap();
         drop(subscriber);
-        drop(publisher);
+        drop(client);
 
         // Only an open at the topic ceiling sweeps, so a second topic forces the reclaim. It is
         // dropped again so the first topic can be reopened; each retry waits out the old session.
         let mut forced = None;
         for _ in 0..100 {
-            if let Ok(opened) = within("force", Publisher::open(&bus.path, agent_topic())).await {
-                forced = Some(opened);
+            let probe = within("probe connect", Client::connect(&bus.path)).await;
+            if let Ok(client) = probe
+                && within("probe publish", client.publish(agent_topic(), payload(&0)))
+                    .await
+                    .is_ok()
+            {
+                forced = Some(client);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -759,18 +707,20 @@ mod tests {
 
         let mut reopened = None;
         for _ in 0..100 {
-            if let Ok(opened) = within("reopen", Publisher::open(&bus.path, Topic::Global)).await {
-                reopened = Some(opened);
+            let probe = within("probe connect", Client::connect(&bus.path)).await;
+            if let Ok(client) = probe
+                && within("probe publish", client.publish(Topic::Global, payload(&2)))
+                    .await
+                    .is_ok()
+            {
+                reopened = Some(client);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut reopened = reopened.expect("the first topic was never reopened");
-        within("reopened publish", reopened.publish(payload(&2)))
-            .await
-            .unwrap();
+        let reopened = reopened.expect("the first topic was never reopened");
 
-        let mut resumed = within("resume", Subscriber::open(&bus.path, Topic::Global, id))
+        let mut resumed = within("resume", reopened.subscribe(Topic::Global, id))
             .await
             .unwrap();
         let answered = within("resumed next", resumed.next()).await.unwrap();
@@ -790,14 +740,14 @@ mod tests {
         let topic = Topic::Global;
         let id = SubscriberId::new();
         let mut first = Bus::start(config_with(store.clone())).await;
+        let client = within("connect", Client::connect(&first.path))
+            .await
+            .unwrap();
 
-        let mut publisher = within("open", Publisher::open(&first.path, topic))
+        within("publish", client.publish(topic, payload(&1)))
             .await
             .unwrap();
-        within("publish", publisher.publish(payload(&1)))
-            .await
-            .unwrap();
-        let mut subscriber = within("subscribe", Subscriber::open(&first.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let batch = within("next", subscriber.next()).await.unwrap();
@@ -806,7 +756,7 @@ mod tests {
             .await
             .unwrap();
         drop(subscriber);
-        drop(publisher);
+        drop(client);
         first.shutdown().await.unwrap();
 
         // The topic row is replaced while the checkpoint survives, which is the one way the bus
@@ -816,7 +766,10 @@ mod tests {
         drop(connection);
 
         let second = Bus::start(config_with(store.clone())).await;
-        let refused = within("resume", Subscriber::open(&second.path, topic, id)).await;
+        let client = within("connect", Client::connect(&second.path))
+            .await
+            .unwrap();
+        let refused = within("resume", client.subscribe(topic, id)).await;
 
         assert!(
             matches!(refused, Err(Error::Refused(Refusal::Unresumable { .. }))),
@@ -829,18 +782,13 @@ mod tests {
     async fn a_burst_arrives_in_order_exactly_once() {
         let bus = Bus::start(config()).await;
         let topic = Topic::Global;
-        let mut subscriber = within(
-            "subscribe",
-            Subscriber::open(&bus.path, topic, SubscriberId::new()),
-        )
-        .await
-        .unwrap();
-
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+        let mut subscriber = within("subscribe", client.subscribe(topic, SubscriberId::new()))
             .await
             .unwrap();
+
         for turn in 0..1000 {
-            within("publish", publisher.publish(payload(&turn)))
+            within("publish", client.publish(topic, payload(&turn)))
                 .await
                 .unwrap();
         }
@@ -870,11 +818,17 @@ mod tests {
             ..config()
         })
         .await;
-        let _busy = within("busy open", Publisher::open(&bus.path, Topic::Global))
+        let busy = within("busy connect", Client::connect(&bus.path))
             .await
             .unwrap();
+        let _kept = within(
+            "busy subscribe",
+            busy.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await
+        .unwrap();
 
-        let second = within("second open", Publisher::open(&bus.path, Topic::Global)).await;
+        let second = within("second connect", Client::connect(&bus.path)).await;
 
         assert!(
             matches!(second, Err(Error::Refused(Refusal::ConnectionLimit))),
@@ -882,7 +836,7 @@ mod tests {
             second.err(),
         );
         assert!(
-            within("third open", Publisher::open(&bus.path, Topic::Global))
+            within("third connect", Client::connect(&bus.path))
                 .await
                 .is_err(),
         );
@@ -898,10 +852,11 @@ mod tests {
             ..config()
         })
         .await;
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
 
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
+            client.subscribe(Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
@@ -909,11 +864,17 @@ mod tests {
         // how long the test waits before abandoning the client.
         let _ = tokio::time::timeout(Duration::from_millis(150), subscriber.next()).await;
         drop(subscriber);
+        drop(client);
 
         let mut accepted = None;
         for _ in 0..100 {
-            if let Ok(publisher) =
-                within("retry open", Publisher::open(&bus.path, Topic::Global)).await
+            if let Ok(publisher) = within("retry connect", Client::connect(&bus.path)).await
+                && within(
+                    "retry publish",
+                    publisher.publish(Topic::Global, payload(&0)),
+                )
+                .await
+                .is_ok()
             {
                 accepted = Some(publisher);
                 break;
@@ -930,61 +891,100 @@ mod tests {
     #[tokio::test]
     async fn a_parked_pull_delivers_the_next_event() {
         let bus = Bus::start(config()).await;
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
+            client.subscribe(Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
 
-        let parked = tokio::spawn(async move { subscriber.next().await });
-        // The pull has to reach the server and park before the publish, or the subscriber reads
-        // a non-empty batch and the wake path never runs.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let publisher = client.clone();
+        let publishing = tokio::spawn(async move {
+            // The pull has to reach the server and park before the publish, or the subscriber
+            // reads a non-empty batch and the wake path never runs.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            publisher
+                .publish(Topic::Global, payload(&serde_json::json!({"turn": 9})))
+                .await
+        });
 
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
-        let receipt = within(
-            "publish",
-            publisher.publish(payload(&serde_json::json!({"turn": 9}))),
-        )
-        .await
-        .unwrap();
-
-        let batch = within("parked next", parked).await.unwrap().unwrap();
+        let batch = within("parked next", subscriber.next()).await.unwrap();
+        let receipt = within("publish", publishing).await.unwrap().unwrap();
 
         assert_eq!(batch.events().len(), 1);
         assert_eq!(batch.events()[0].payload().as_str(), r#"{"turn":9}"#);
         assert_eq!(batch.events()[0].seq(), receipt.seq());
         assert_eq!(batch.events()[0].id(), receipt.id());
+
+        let publisher = client.clone();
+        let publishing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            publisher
+                .publish(Topic::Global, payload(&serde_json::json!({"turn": 10})))
+                .await
+        });
+        let next = within("second parked next", subscriber.next())
+            .await
+            .unwrap();
+        let second = within("second publish", publishing).await.unwrap().unwrap();
+
+        assert_eq!(next.events().len(), 1);
+        assert_eq!(next.events()[0].id(), second.id());
     }
 
     #[tokio::test]
-    async fn a_frame_the_bus_cannot_answer_closes_the_session() {
-        let bus = Bus::start(config()).await;
+    async fn a_malformed_frame_closes_the_session() {
+        let bus = Bus::start(Config {
+            timeouts: Timeouts {
+                heartbeat: NonZeroU32::new(20).unwrap(),
+                deadline: NonZeroU32::new(300).unwrap(),
+            },
+            ..config()
+        })
+        .await;
         let mut peer = connect(&bus.path).await;
 
         // The bus pings on its first heartbeat tick, and tungstenite only queues the pong when it
         // reads that ping. Reading the ping before this client sends anything lets the pong leave
-        // with the open frame, while the bus is alive; a pong still queued for the close below is
-        // flushed after the bus has gone, and its `BrokenPipe` hides the close frame.
+        // with the open frame, while the bus is alive.
         let ping = within("first heartbeat ping", peer.next()).await;
         assert!(
             matches!(ping, Some(Ok(Message::Ping(_)))),
             "expected the heartbeat ping before any answer, got {ping:?}",
         );
 
-        name_topic(&mut peer).await;
-
-        // A second open is a valid frame the opened session cannot answer, so it reaches the
-        // handler that closes the session rather than the frame decoder.
-        within(
-            "out of turn",
-            peer.send(Message::Text(r#"{"op":"open","topic":"global"}"#.into())),
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "subscribe",
+                "req_id": 1,
+                "topic": "global",
+                "subscriber": SubscriberId::new().to_string(),
+            }),
         )
-        .await
-        .unwrap();
+        .await;
+        let subscribed = next_frame(&mut peer).await;
+        let Message::Text(text) = subscribed else {
+            panic!("expected the subscribed frame, got {subscribed:?}");
+        };
+        assert!(
+            text.contains(r#""op":"subscribed""#),
+            "expected a subscribed answer, got {text}",
+        );
+
+        // A publish frame that carries a subscription id is malformed under `deny_unknown_fields`.
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "publish",
+                "req_id": 2,
+                "topic": "global",
+                "payload": 1,
+                "sub": 0,
+            }),
+        )
+        .await;
 
         loop {
             match within("close answer", peer.next()).await {
@@ -1011,19 +1011,24 @@ mod tests {
             ..config()
         })
         .await;
-
-        let mut peer = connect(&bus.path).await;
-        name_topic(&mut peer).await;
-
-        within("close", peer.send(Message::Close(None)))
-            .await
-            .unwrap();
-        drop(peer);
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+        within(
+            "subscribe",
+            client.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await
+        .unwrap();
+        drop(client);
 
         let mut accepted = None;
         for _ in 0..100 {
-            if let Ok(publisher) =
-                within("retry open", Publisher::open(&bus.path, Topic::Global)).await
+            if let Ok(publisher) = within("retry connect", Client::connect(&bus.path)).await
+                && within(
+                    "retry publish",
+                    publisher.publish(Topic::Global, payload(&0)),
+                )
+                .await
+                .is_ok()
             {
                 accepted = Some(publisher);
                 break;
@@ -1048,7 +1053,18 @@ mod tests {
         })
         .await;
         let mut peer = connect(&bus.path).await;
-        name_topic(&mut peer).await;
+
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "subscribe",
+                "req_id": 1,
+                "topic": "global",
+                "subscriber": SubscriberId::new().to_string(),
+            }),
+        )
+        .await;
+        let _subscribed = next_frame(&mut peer).await;
 
         // Read past the deadline so tungstenite answers every ping; a peer that answers has to
         // stay connected. The pause keeps an answer in flight across a heartbeat tick, which is
@@ -1060,12 +1076,11 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_millis(50), peer.next()).await;
         }
 
-        within(
-            "publish",
-            peer.send(Message::Text(r#"{"op":"publish","payload":1}"#.into())),
+        send_json(
+            &mut peer,
+            &serde_json::json!({"op": "publish", "req_id": 2, "topic": "global", "payload": 1}),
         )
-        .await
-        .unwrap();
+        .await;
         let answer = next_frame(&mut peer).await;
 
         let Message::Text(text) = answer else {
@@ -1083,12 +1098,22 @@ mod tests {
         let capture = capture();
         capture.0.lock().unwrap().clear();
 
-        let _first = within("first open", Publisher::open(&bus.path, Topic::Global))
+        let first = within("first connect", Client::connect(&bus.path))
             .await
             .unwrap();
-        let _second = within("second open", Publisher::open(&bus.path, Topic::Global))
+        let second = within("second connect", Client::connect(&bus.path))
             .await
             .unwrap();
+        let _ = within(
+            "first subscribe",
+            first.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await;
+        let _ = within(
+            "second subscribe",
+            second.subscribe(Topic::Global, SubscriberId::new()),
+        )
+        .await;
 
         let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
 
@@ -1114,20 +1139,23 @@ mod tests {
     async fn a_frame_larger_than_the_limit_is_refused_without_stopping_the_bus() {
         let bus = Bus::start(Config {
             limits: Limits {
-                // Large enough for an `open` that names a subscriber, small enough that the
-                // oversized payload below is refused.
+                // Large enough for a subscribe, small enough that the oversized payload below is
+                // refused.
                 frame_bytes: NonZeroUsize::new(256).unwrap(),
                 ..Limits::default()
             },
             ..config()
         })
         .await;
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+        let publisher = client.clone();
         let oversized = "x".repeat(4096);
 
-        let refused = within("publish", publisher.publish(payload(&oversized))).await;
+        let refused = within(
+            "publish",
+            publisher.publish(Topic::Global, payload(&oversized)),
+        )
+        .await;
 
         // Tungstenite refuses the frame while assembling it and closes the connection, so the
         // caller gets no answer; what matters is that the bus is still there for everyone else.
@@ -1136,18 +1164,21 @@ mod tests {
             "expected the over-limit frame to be refused, got {refused:?}",
         );
 
-        let mut fresh = within("fresh open", Publisher::open(&bus.path, Topic::Global))
+        let fresh = within("fresh connect", Client::connect(&bus.path))
             .await
             .unwrap();
         let mut subscriber = within(
             "subscribe",
-            Subscriber::open(&bus.path, Topic::Global, SubscriberId::new()),
+            fresh.subscribe(Topic::Global, SubscriberId::new()),
         )
         .await
         .unwrap();
-        within("small publish", fresh.publish(payload(&"small")))
-            .await
-            .unwrap();
+        within(
+            "small publish",
+            fresh.publish(Topic::Global, payload(&"small")),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             payloads(&within("next", subscriber.next()).await.unwrap()),
@@ -1158,6 +1189,10 @@ mod tests {
     #[tokio::test]
     async fn a_peer_that_stops_reading_is_closed() {
         let bus = Bus::start(Config {
+            limits: Limits {
+                connections: NonZeroUsize::new(1).unwrap(),
+                ..Limits::default()
+            },
             timeouts: Timeouts {
                 heartbeat: NonZeroU32::new(20).unwrap(),
                 deadline: NonZeroU32::new(150).unwrap(),
@@ -1165,18 +1200,17 @@ mod tests {
             ..config()
         })
         .await;
-        let mut publisher = within("open", Publisher::open(&bus.path, Topic::Global))
-            .await
-            .unwrap();
 
-        // Nothing reads this client's socket, so it never answers a ping; the bus hangs up long
-        // before the sleep is over.
+        // Nothing ever reads this peer, so it cannot answer the bus's ping.
+        let _peer = connect(&bus.path).await;
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
         assert!(
-            within("publish", publisher.publish(payload(&1)))
+            within("publish", client.publish(Topic::Global, payload(&1)))
                 .await
-                .is_err(),
+                .is_ok(),
+            "the bus freed the permit held by the silent peer",
         );
     }
 
@@ -1196,14 +1230,12 @@ mod tests {
         .await;
         let topic = Topic::Global;
         let id = SubscriberId::new();
-        let mut publisher = within("open", Publisher::open(&bus.path, topic))
-            .await
-            .unwrap();
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
 
-        within("publish", publisher.publish(payload(&0)))
+        within("publish", client.publish(topic, payload(&0)))
             .await
             .unwrap();
-        let mut subscriber = within("subscribe", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("subscribe", client.subscribe(topic, id))
             .await
             .unwrap();
         let first = within("first next", subscriber.next()).await.unwrap();
@@ -1214,14 +1246,14 @@ mod tests {
         // Two more appends between every pull keeps moving the retained floor past the checkpoint,
         // which is what decides how far a subscriber may read. A consumer that never acks must
         // still be handed no more than its credit.
-        let mut subscriber = within("reconnect", Subscriber::open(&bus.path, topic, id))
+        let mut subscriber = within("reconnect", client.subscribe(topic, id))
             .await
             .unwrap();
         let mut handed = 0;
 
         for turn in (1..=6).rev() {
             for _ in 0..2 {
-                within("publish", publisher.publish(payload(&turn)))
+                within("publish", client.publish(topic, payload(&turn)))
                     .await
                     .unwrap();
             }
@@ -1239,5 +1271,205 @@ mod tests {
             handed <= 1,
             "a subscriber that never acked was handed {handed} events against a credit of 1",
         );
+    }
+
+    #[tokio::test]
+    async fn the_same_connection_publishes_while_a_subscription_is_parked() {
+        let bus = Bus::start(config()).await;
+        let topic = Topic::Global;
+        let client = within("connect", Client::connect(&bus.path)).await.unwrap();
+        let mut subscriber = within("subscribe", client.subscribe(topic, SubscriberId::new()))
+            .await
+            .unwrap();
+
+        let publisher = client.clone();
+        let publishing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            publisher
+                .publish(topic, payload(&serde_json::json!({"same": true})))
+                .await
+        });
+
+        let batch = within("parked next", subscriber.next()).await.unwrap();
+        let receipt = within("publish", publishing).await.unwrap().unwrap();
+        assert_eq!(batch.events().len(), 1);
+        assert_eq!(batch.events()[0].id(), receipt.id());
+    }
+
+    #[tokio::test]
+    async fn a_second_pull_on_a_parked_subscription_is_refused() {
+        let bus = Bus::start(config()).await;
+        let mut peer = connect(&bus.path).await;
+
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "subscribe",
+                "req_id": 1,
+                "topic": "global",
+                "subscriber": SubscriberId::new().to_string(),
+            }),
+        )
+        .await;
+        let subscribed = next_frame(&mut peer).await;
+        let Message::Text(text) = subscribed else {
+            panic!("expected a text frame, got {subscribed:?}");
+        };
+        let subscribed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let sub = subscribed["sub"].as_u64().unwrap();
+
+        send_json(
+            &mut peer,
+            &serde_json::json!({"op": "pull", "req_id": 2, "sub": sub, "max": 64}),
+        )
+        .await;
+        // Give the first pull time to reach the server and park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        send_json(
+            &mut peer,
+            &serde_json::json!({"op": "pull", "req_id": 3, "sub": sub, "max": 64}),
+        )
+        .await;
+        let refused = next_frame(&mut peer).await;
+        let Message::Text(text) = refused else {
+            panic!("expected a text frame, got {refused:?}");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["op"].as_str().unwrap(), "refused");
+        assert_eq!(parsed["req_id"].as_u64().unwrap(), 3);
+        assert_eq!(
+            parsed["reason"].as_str().unwrap(),
+            "pull_in_flight",
+            "a second pull on the same subscription must be refused, got {text}",
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn an_ack_frees_a_parked_spent_pull_on_the_same_connection() {
+        let bus = Bus::start(Config {
+            limits: Limits {
+                in_flight: NonZeroUsize::new(2).unwrap(),
+                ..Limits::default()
+            },
+            ..config()
+        })
+        .await;
+        let mut peer = connect(&bus.path).await;
+
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "subscribe",
+                "req_id": 1,
+                "topic": "global",
+                "subscriber": SubscriberId::new().to_string(),
+            }),
+        )
+        .await;
+        let subscribed = next_frame(&mut peer).await;
+        let Message::Text(text) = subscribed else {
+            panic!("expected a text frame, got {subscribed:?}");
+        };
+        let subscribed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let sub = subscribed["sub"].as_u64().unwrap();
+
+        // Publish enough events to fill the in-flight credit and leave the reader parked spent.
+        for turn in 0..2 {
+            send_json(
+                &mut peer,
+                &serde_json::json!({
+                    "op": "publish",
+                    "req_id": 10 + turn,
+                    "topic": "global",
+                    "payload": turn,
+                }),
+            )
+            .await;
+            let published = next_frame(&mut peer).await;
+            let Message::Text(text) = published else {
+                panic!("expected a text frame, got {published:?}");
+            };
+            assert!(
+                text.contains(r#""op":"published""#),
+                "expected published, got {text}"
+            );
+        }
+
+        send_json(
+            &mut peer,
+            &serde_json::json!({"op": "pull", "req_id": 2, "sub": sub, "max": 64}),
+        )
+        .await;
+        let batch = next_frame(&mut peer).await;
+        let Message::Text(text) = batch else {
+            panic!("expected a text frame, got {batch:?}");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["op"].as_str().unwrap(), "batch");
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 2);
+        let through = parsed["window"]["next"].as_u64().unwrap();
+
+        // This pull parks spent because every event is already delivered and un-acked.
+        send_json(
+            &mut peer,
+            &serde_json::json!({"op": "pull", "req_id": 3, "sub": sub, "max": 64}),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The ack frees the parked pull, but there are still no events, so it re-parks caught-up.
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "ack",
+                "req_id": 4,
+                "sub": sub,
+                "through": {
+                    "epoch": parsed["window"]["epoch"].as_str().unwrap(),
+                    "seq": through,
+                },
+            }),
+        )
+        .await;
+
+        let acked = next_frame(&mut peer).await;
+        let Message::Text(text) = acked else {
+            panic!("expected a text frame, got {acked:?}");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["op"].as_str().unwrap(), "acked");
+        assert_eq!(parsed["req_id"].as_u64().unwrap(), 4);
+
+        // A new event wakes the re-parked pull and answers it under its original request id.
+        send_json(
+            &mut peer,
+            &serde_json::json!({
+                "op": "publish",
+                "req_id": 5,
+                "topic": "global",
+                "payload": 2,
+            }),
+        )
+        .await;
+        let published = next_frame(&mut peer).await;
+        let Message::Text(text) = published else {
+            panic!("expected a text frame, got {published:?}");
+        };
+        assert!(
+            text.contains(r#""op":"published""#),
+            "expected published, got {text}"
+        );
+
+        let freed = next_frame(&mut peer).await;
+        let Message::Text(text) = freed else {
+            panic!("expected a text frame, got {freed:?}");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["op"].as_str().unwrap(), "batch");
+        assert_eq!(parsed["req_id"].as_u64().unwrap(), 3);
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 1);
     }
 }

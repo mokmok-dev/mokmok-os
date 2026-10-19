@@ -21,7 +21,7 @@ pub struct Limits {
     pub topics: NonZeroUsize,
     pub batch: NonZeroUsize,
     /// The most events one subscriber may hold un-ACKed. A pull that reaches this ceiling parks
-    /// until an [`Ack`](crate::Subscriber::ack) frees credit; when the checkpoint is also behind
+    /// until an [`Ack`](crate::Subscription::ack) frees credit; when the checkpoint is also behind
     /// the retained floor, the pull answers the lapse alone instead and spends no credit on it.
     pub in_flight: NonZeroUsize,
     pub frame_bytes: NonZeroUsize,

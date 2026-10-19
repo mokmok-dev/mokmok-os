@@ -76,8 +76,8 @@ frames in the protocol crate.[^architecture] Each of them lives with the compone
 | Contract | Where it lives |
 | --- | --- |
 | `CommitPosition`, `Version`, `Expected` | `mokmok-event-store/src/model.rs:187,161,222` |
-| `Cursor`, `Window`, `Lapsed`, `Batch` | `mokmok-event-bus/src/event.rs:42,68,100,243` |
-| Request and response frames | `mokmok-event-bus/src/wire.rs:14,34` |
+| `Cursor`, `Window`, `Lapsed`, `Batch` | `mokmok-event-bus/src/event.rs:42,68,100,269` |
+| Request and response frames | `mokmok-event-bus/src/wire.rs:28,53` |
 | `Payload` | `mokmok-event-store/src/payload.rs:20` and `mokmok-event-bus/src/payload.rs:3` |
 
 Two crates each define a `Payload` type and a `Kind` or `Seq` type of their own. The protocol crate

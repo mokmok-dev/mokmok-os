@@ -4,27 +4,46 @@ use std::time::SystemTime;
 
 use mokmok_protocol::EventID;
 
-use crate::event::{Batch, Cursor, Event, Lapsed, Published, Refusal, Seq, Window};
+use crate::event::{Cursor, Event, Lapsed, Refusal, Seq, Window};
 use crate::payload::Payload;
 use crate::subscriber::SubscriberId;
 use crate::topic::Topic;
 
+/// A subscription id minted by the server and echoed on every pull/ack.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
+pub struct SubId(u64);
+
+impl SubId {
+    #[must_use]
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Open {
-        topic: Topic,
-        /// `None` names a publisher; `Some` names the subscriber whose checkpoint resumes it.
-        subscriber: Option<SubscriberId>,
-    },
     Publish {
+        req_id: u64,
+        topic: Topic,
         payload: Payload,
     },
-    /// No position: the server is the authority on what this subscriber still needs.
+    Subscribe {
+        req_id: u64,
+        topic: Topic,
+        subscriber: SubscriberId,
+    },
     Pull {
+        req_id: u64,
+        sub: SubId,
         max: NonZeroUsize,
     },
     Ack {
+        req_id: u64,
+        sub: SubId,
         through: Cursor,
     },
 }
@@ -32,43 +51,44 @@ pub enum Request {
 #[derive(serde::Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
-    Opened {
-        window: Window,
-    },
     Published {
+        req_id: u64,
         id: EventID,
         seq: Seq,
         at: SystemTime,
     },
+    Subscribed {
+        req_id: u64,
+        sub: SubId,
+        window: Window,
+    },
     Batch {
+        req_id: u64,
+        sub: SubId,
         window: Window,
         lapsed: Option<Lapsed>,
         events: Vec<Arc<Event>>,
     },
     Acked {
+        req_id: u64,
+        sub: SubId,
         through: Cursor,
     },
     Refused {
+        req_id: u64,
         reason: Refusal,
     },
 }
 
-impl From<Batch> for Response {
-    fn from(batch: Batch) -> Self {
-        Self::Batch {
-            window: batch.window(),
-            lapsed: batch.lapsed(),
-            events: batch.events().to_vec(),
-        }
-    }
-}
-
-impl From<Published> for Response {
-    fn from(published: Published) -> Self {
-        Self::Published {
-            id: published.id(),
-            seq: published.seq(),
-            at: published.at(),
+impl Response {
+    #[must_use]
+    pub(crate) const fn req_id(&self) -> u64 {
+        match *self {
+            Self::Published { req_id, .. }
+            | Self::Subscribed { req_id, .. }
+            | Self::Batch { req_id, .. }
+            | Self::Acked { req_id, .. }
+            | Self::Refused { req_id, .. } => req_id,
         }
     }
 }
@@ -78,8 +98,8 @@ impl From<Published> for Response {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOp {
-    Open,
     Publish,
+    Subscribe,
     Pull,
     Ack,
 }
@@ -87,8 +107,8 @@ pub enum RequestOp {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseOp {
-    Opened,
     Published,
+    Subscribed,
     Batch,
     Acked,
     Refused,
@@ -101,10 +121,13 @@ pub enum ResponseOp {
 #[serde(deny_unknown_fields)]
 pub struct RequestFrame {
     op: RequestOp,
+    req_id: u64,
     #[serde(default)]
     topic: Option<Topic>,
     #[serde(default)]
     payload: Option<Payload>,
+    #[serde(default)]
+    sub: Option<SubId>,
     #[serde(default)]
     max: Option<NonZeroUsize>,
     #[serde(default)]
@@ -118,6 +141,9 @@ pub struct RequestFrame {
 #[derive(serde::Deserialize)]
 pub struct ResponseFrame {
     op: ResponseOp,
+    req_id: u64,
+    #[serde(default)]
+    sub: Option<SubId>,
     #[serde(default)]
     window: Option<Window>,
     #[serde(default)]
@@ -160,22 +186,40 @@ impl TryFrom<RequestFrame> for Request {
     type Error = InvalidFrame;
 
     fn try_from(frame: RequestFrame) -> Result<Self, Self::Error> {
-        match (
-            frame.op,
-            frame.topic,
-            frame.payload,
-            frame.max,
-            frame.through,
-            frame.subscriber,
-        ) {
-            (RequestOp::Open, Some(topic), None, None, None, subscriber) => {
-                Ok(Self::Open { topic, subscriber })
+        let RequestFrame {
+            op,
+            req_id,
+            topic,
+            payload,
+            sub,
+            max,
+            through,
+            subscriber,
+        } = frame;
+
+        match (op, topic, payload, sub, max, through, subscriber) {
+            (RequestOp::Publish, Some(topic), Some(payload), None, None, None, None) => {
+                Ok(Self::Publish {
+                    req_id,
+                    topic,
+                    payload,
+                })
             },
-            (RequestOp::Publish, None, Some(payload), None, None, None) => {
-                Ok(Self::Publish { payload })
+            (RequestOp::Subscribe, Some(topic), None, None, None, None, Some(subscriber)) => {
+                Ok(Self::Subscribe {
+                    req_id,
+                    topic,
+                    subscriber,
+                })
             },
-            (RequestOp::Pull, None, None, Some(max), None, None) => Ok(Self::Pull { max }),
-            (RequestOp::Ack, None, None, None, Some(through), None) => Ok(Self::Ack { through }),
+            (RequestOp::Pull, None, None, Some(sub), Some(max), None, None) => {
+                Ok(Self::Pull { req_id, sub, max })
+            },
+            (RequestOp::Ack, None, None, Some(sub), None, Some(through), None) => Ok(Self::Ack {
+                req_id,
+                sub,
+                through,
+            }),
             _ => Err(InvalidFrame),
         }
     }
@@ -185,22 +229,26 @@ impl TryFrom<ResponseFrame> for Response {
     type Error = InvalidFrame;
 
     fn try_from(frame: ResponseFrame) -> Result<Self, Self::Error> {
+        let ResponseFrame {
+            op,
+            req_id,
+            sub,
+            window,
+            id,
+            seq,
+            at,
+            lapsed,
+            events,
+            through,
+            reason,
+        } = frame;
+
         match (
-            frame.op,
-            frame.window,
-            frame.id,
-            frame.seq,
-            frame.at,
-            frame.lapsed,
-            frame.events,
-            frame.through,
-            frame.reason,
+            op, sub, window, id, seq, at, lapsed, events, through, reason,
         ) {
-            (ResponseOp::Opened, Some(window), None, None, None, None, None, None, None) => {
-                Ok(Self::Opened { window })
-            },
             (
                 ResponseOp::Published,
+                None,
                 None,
                 Some(id),
                 Some(seq),
@@ -209,9 +257,31 @@ impl TryFrom<ResponseFrame> for Response {
                 None,
                 None,
                 None,
-            ) => Ok(Self::Published { id, seq, at }),
+            ) => Ok(Self::Published {
+                req_id,
+                id,
+                seq,
+                at,
+            }),
+            (
+                ResponseOp::Subscribed,
+                Some(sub),
+                Some(window),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => Ok(Self::Subscribed {
+                req_id,
+                sub,
+                window,
+            }),
             (
                 ResponseOp::Batch,
+                Some(sub),
                 Some(window),
                 None,
                 None,
@@ -221,15 +291,30 @@ impl TryFrom<ResponseFrame> for Response {
                 None,
                 None,
             ) => Ok(Self::Batch {
+                req_id,
+                sub,
                 window,
                 lapsed,
                 events,
             }),
-            (ResponseOp::Acked, None, None, None, None, None, None, Some(through), None) => {
-                Ok(Self::Acked { through })
-            },
-            (ResponseOp::Refused, None, None, None, None, None, None, None, Some(reason)) => {
-                Ok(Self::Refused { reason })
+            (
+                ResponseOp::Acked,
+                Some(sub),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(through),
+                None,
+            ) => Ok(Self::Acked {
+                req_id,
+                sub,
+                through,
+            }),
+            (ResponseOp::Refused, _, None, None, None, None, None, None, None, Some(reason)) => {
+                Ok(Self::Refused { req_id, reason })
             },
             _ => Err(InvalidFrame),
         }

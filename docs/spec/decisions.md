@@ -50,6 +50,16 @@ store.[^architecture] The bus opens a second SQLite file with its own schema, an
 no position, no transaction, and no identifier space. A system that needed one durable order across
 both would have to build it.
 
+The bus connection is multiplexed. The design says subscription control and event delivery should be
+independently manageable, and it does not say how a connection maps to a topic. The tree gave one
+connection both roles and any number of topics: every request carries a `req_id`, `publish` names its
+topic, `subscribe` mints a subscription id, and `pull` and `ack` name that id. A parked pull is an
+unanswered request, so an ack that frees it answers it under the id it arrived with, and a second
+pull on the same reader is refused with `PullInFlight`. Connection admission is an HTTP 503 at the
+upgrade, before a session exists, so every response carries the request id. The cost is a driver
+task per client and a wire with no opening frame: a peer that sends the old `open` frame is closed as
+malformed.
+
 Recovery reads the commit log directly. `Db::unsettled_sessions` (`mokmok-kernel/src/db.rs:425`)
 groups the log by event stream and folds each one, so the log is the session index and no registry
 of live sessions exists. A session whose log is unreadable stops startup by design.

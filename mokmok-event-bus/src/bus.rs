@@ -256,6 +256,10 @@ impl TopicEntry {
         *self.appended.borrow()
     }
 
+    pub(crate) const fn store(&self) -> &Store {
+        &self.store
+    }
+
     fn is_idle(
         &self,
         now: SystemTime,
@@ -264,8 +268,8 @@ impl TopicEntry {
         self.last_append.idle(now, idle)
     }
 
-    /// Appends to this entry's topic. The registry lock is not touched: the session already holds
-    /// the entry from the `Open` frame, so two publishers on different topics never contend.
+    /// Appends to this entry's topic. The registry lock is not touched: the caller already holds
+    /// the entry it opened for this request, so two publishers on different topics never contend.
     ///
     /// # Errors
     ///

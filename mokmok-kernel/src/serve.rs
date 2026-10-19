@@ -1,18 +1,17 @@
 //! Serves the event bus and relays the log's committed notices to it.
 //!
 //! A notice is written inside the transaction that records the change it names, so it exists only
-//! after that history committed. The relay runs afterwards, one publisher per topic, and settles
+//! after that history committed. The relay runs afterwards through one bus client, and settles
 //! each row as the bus acknowledges it. A publish that fails leaves its row and every later row
 //! pending, so the next pass tries them again: delivery here is at-least-once, which is what a
 //! durable outbox buys and what makes a crash between the publish and the settle cost a redelivery
 //! rather than a lost event.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mokmok_event_bus::{
-    Config as BusConfig, Payload, Publisher, ServeError, Topic, serve as serve_bus, signals,
+    Config as BusConfig, Error as BusError, Payload, Topic, serve as serve_bus, signals,
 };
 use mokmok_observability::{Config as LogConfig, Redaction, init};
 use mokmok_protocol::Moment;
@@ -48,10 +47,10 @@ const PASS: Duration = Duration::from_millis(200);
 /// result its callers parse whatever this filter selects.
 const DEFAULT_LOG_FILTER: &str = "warn";
 
-/// The outbox relay: one open publisher per topic it has published to this run.
+/// The outbox relay: one bus client opened lazily and reused until it fails.
 pub struct Relay {
     socket: PathBuf,
-    publishers: BTreeMap<String, Publisher>,
+    client: Option<mokmok_event_bus::Client>,
 }
 
 impl Relay {
@@ -59,7 +58,7 @@ impl Relay {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
-            publishers: BTreeMap::new(),
+            client: None,
         }
     }
 
@@ -98,25 +97,33 @@ impl Relay {
         Ok(published)
     }
 
-    /// Publishes one payload, reusing this run's publisher for the topic or opening one.
     async fn publish(
         &mut self,
         topic: Topic,
         payload: Payload,
     ) -> Result<(), Error> {
-        let key = topic.to_string();
+        let client = if let Some(client) = &self.client {
+            client.clone()
+        } else {
+            let opened = mokmok_event_bus::Client::connect(&self.socket)
+                .await
+                .map_err(Error::Bus)?;
+            self.client = Some(opened.clone());
+            opened
+        };
 
-        if let Some(publisher) = self.publishers.get_mut(&key) {
-            publisher.publish(payload).await?;
+        client
+            .publish(topic, payload)
+            .await
+            .map(|_published| ())
+            .map_err(|error| {
+                // An in-band refusal leaves the connection healthy; only a broken one is dropped.
+                if !matches!(error, BusError::Refused(_)) {
+                    self.client = None;
+                }
 
-            return Ok(());
-        }
-
-        let mut publisher = Publisher::open(&self.socket, topic).await?;
-        publisher.publish(payload).await?;
-        self.publishers.insert(key, publisher);
-
-        Ok(())
+                Error::Bus(error)
+            })
     }
 }
 
@@ -292,6 +299,7 @@ fn install_logging() {
         eprintln!("mokmokd: the log subscriber was not installed: {error}");
     }
 }
+
 async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
     let deadline = Instant::now() + BIND;
 
@@ -308,18 +316,20 @@ async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
 }
 
 /// A socket file is not a bus: a process killed with SIGKILL leaves one behind, and the bus that
-/// replaces it unlinks and rebinds, so the file says nothing until a peer answers. Opening a
-/// session moves no checkpoint and appends no event; the only durable effect is the topic row the
-/// bus creates for a topic it has not seen.
+/// replaces it unlinks and rebinds, so the file says nothing until a peer answers. A WebSocket
+/// upgrade is that answer: it needs the live server, and it creates no topic and moves no
+/// checkpoint.
 async fn bus_answers(socket: &Path) -> bool {
     // A dropped probe closes the connection it opened, so a peer that never answers costs one
     // `PROBE` and leaves nothing behind.
-    tokio::time::timeout(PROBE, Publisher::open(socket, Topic::Global))
+    tokio::time::timeout(PROBE, mokmok_event_bus::Client::connect(socket))
         .await
         .is_ok_and(|opened| opened.is_ok())
 }
 
-fn bus_ended(result: Result<Result<(), ServeError>, tokio::task::JoinError>) -> Error {
+fn bus_ended(
+    result: Result<Result<(), mokmok_event_bus::ServeError>, tokio::task::JoinError>
+) -> Error {
     match result {
         Ok(Ok(())) | Err(_) => Error::BusStopped,
         Ok(Err(error)) => Error::BusServe(error),
