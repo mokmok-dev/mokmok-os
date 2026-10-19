@@ -17,7 +17,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use mokmok_event_bus::{Subscriber, SubscriberId, Topic};
+    use mokmok_event_bus::{Client, SubscriberId, Topic};
     use mokmok_event_store::{CommandId, Expected};
     use mokmok_kernel::{Db, Entry, Notice};
     use mokmok_protocol::{Moment, SessionID};
@@ -345,17 +345,19 @@ mod tests {
         want: usize,
     ) -> Vec<String> {
         runtime().block_on(async {
-            let mut subscriber = tokio::time::timeout(
-                Duration::from_secs(5),
-                Subscriber::open(socket, topic, subscriber),
-            )
-            .await
-            .expect("the subscriber connects within five seconds")
-            .expect("the bus accepts the session");
+            let client = tokio::time::timeout(Duration::from_secs(5), Client::connect(socket))
+                .await
+                .expect("the client connects within five seconds")
+                .expect("the bus accepts the session");
+            let mut subscription =
+                tokio::time::timeout(Duration::from_secs(5), client.subscribe(topic, subscriber))
+                    .await
+                    .expect("the subscription opens within five seconds")
+                    .expect("the bus accepts the subscriber");
             let mut seen = Vec::new();
             while seen.len() < want {
                 let Ok(Ok(batch)) =
-                    tokio::time::timeout(Duration::from_secs(5), subscriber.next()).await
+                    tokio::time::timeout(Duration::from_secs(5), subscription.next()).await
                 else {
                     break;
                 };
@@ -365,7 +367,10 @@ mod tests {
                         .iter()
                         .map(|event| event.payload().as_str().to_owned()),
                 );
-                subscriber.ack(batch.after()).await.expect("the ack lands");
+                subscription
+                    .ack(batch.after())
+                    .await
+                    .expect("the ack lands");
             }
 
             seen

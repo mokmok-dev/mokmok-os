@@ -18,7 +18,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use mokmok_event_bus::{Subscriber, SubscriberId, Topic};
+    use mokmok_event_bus::{Client, SubscriberId, Topic};
     use mokmok_kernel::Db;
     use mokmok_protocol::SessionID;
     use uuid::Uuid;
@@ -777,10 +777,11 @@ mod tests {
             .parse::<uuid::Uuid>()
             .map(mokmok_protocol::SessionID::from_uuid)
             .expect("the session is a uuid");
-        let mut subscriber =
-            Subscriber::open(&socket, Topic::Session(session), SubscriberId::new())
-                .await
-                .expect("a subscriber connects");
+        let client = Client::connect(&socket).await.expect("a client connects");
+        let mut subscriber = client
+            .subscribe(Topic::Session(session), SubscriberId::new())
+            .await
+            .expect("a subscriber connects");
 
         let mut notices = Vec::new();
         for _ in 0..20 {
