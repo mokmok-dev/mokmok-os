@@ -76,7 +76,7 @@ The design gives the modules the names `identifiers`, `command`, `event`, `envel
 
 The commit positions, publish receipts, subscription requests, and ACK frames the design places here
 live in the crates that use them. `CommitPosition` is in `mokmok-event-store/src/model.rs:187`, the
-`Cursor`, `Batch`, and `Refusal` types are in `mokmok-event-bus/src/event.rs:42,263,132`, and the
+`Cursor`, `Batch`, and `Refusal` types are in `mokmok-event-bus/src/event.rs:42,269,132`, and the
 acknowledgement frames are in `mokmok-event-bus/src/wire.rs:28`.
 
 The design names CloudEvents as the envelope. The token appears in no Rust file in the workspace.

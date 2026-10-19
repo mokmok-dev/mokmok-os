@@ -38,7 +38,7 @@ Modules `bus`, `client`, `config`, `event`, `payload`, `server`, `store`, `subsc
 | `Error` | `src/client.rs:27` | Transport, protocol, refusal, close, indeterminate publish |
 | `serve`, `ServeError`, `signals` | `src/server.rs:53,37,82` | The server, its failure, and its shutdown signals |
 | `Config`, `Limits`, `Retention`, `Timeouts` | `src/config.rs:7,19,31,38` | Paths, ceilings, retention, and deadlines |
-| `Cursor`, `Window`, `Lapsed`, `Refusal`, `Event`, `Published`, `Batch` | `src/event.rs:42,68,100,132,179,231,263` | The delivery vocabulary |
+| `Cursor`, `Window`, `Lapsed`, `Refusal`, `Event`, `Published`, `Batch` | `src/event.rs:42,68,100,132,185,237,269` | The delivery vocabulary |
 | `Seq`, `LogEpoch` | `src/event.rs:13,29` | Within-topic order and the retention generation |
 | `SubscriberId`, `Topic`, `Payload` | `src/subscriber.rs:12`, `src/topic.rs:7`, `src/payload.rs:3` | The identity, the scope, and the bytes |
 
@@ -65,10 +65,10 @@ entry.
 - Uncommitted events are never delivered. `TopicEntry::append` (`src/bus.rs:277`) awaits the store
   commit and calls `send_replace` afterwards (`src/bus.rs:288`).
 - A missed notification cannot lose an event. `pull_reader` (`src/server.rs:453`) snapshots the
-  watch with `borrow_and_update` before it reads the log (`src/server.rs:460`), and every pull
+  watch with `borrow_and_update` before it reads the log (`src/server.rs:465`), and every pull
   re-reads the store (`src/server.rs:492`).
-- A pull with no credit left is not woken by a commit. `Parked::Spent` (`src/server.rs:206`) is
-  filtered out of the watch set that `any_window_changed` waits on (`src/server.rs:644`).
+- A pull with no credit left is not woken by a commit. `Parked::Spent` (`src/server.rs:212`) is
+  filtered out of the watch set that `any_window_changed` waits on (`src/server.rs:652`).
 - A checkpoint never moves backward and never passes what was delivered. The advance is clamped to
   the acknowledged and delivered range (`src/server.rs:550`) and to the stored maximum
   (`src/store.rs:616`).
@@ -86,7 +86,7 @@ entry.
 - A reclaim keeps the epoch (`src/store.rs:638`), and eviction keeps the newest event whatever its
   size.
 - One connection can hold several subscriptions. A pull already waiting on a reader is refused with
-  `PullInFlight` rather than replacing it (`src/server.rs:446`).
+  `PullInFlight` rather than replacing it (`src/server.rs:451`).
 - An ack that frees a spent pull answers that pull under the request id it arrived with
   (`src/server.rs:576`), so a multiplexed client never leaves a request unanswered.
 

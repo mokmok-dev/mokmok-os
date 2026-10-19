@@ -35,7 +35,7 @@ carries.[^crate]
 | `Db`, `Log`, `Entry`, `TurnRecord`, `ResultRecord` | `src/db.rs:276,103,45,89,96` | The appender over the event log and the folded view of one session |
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
-| `Relay`, `serve` | `src/serve.rs:52,138` | The outbox relay and the daemon loop |
+| `Relay`, `serve` | `src/serve.rs:51,145` | The outbox relay and the daemon loop |
 | `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,514,533` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
 | `skill::discover`, `Library` | `src/skill.rs:30,136` | Discovery of a root's immediate subdirectories into adverts, and the recorded-task library activation reads |
