@@ -666,7 +666,7 @@ mod tests {
             .frames
             .iter()
             .find_map(|frame| match &frame.sheet {
-                Some(Sheet::List { rows, .. }) => Some(rows.clone()),
+                Some(Sheet::List { entries, .. }) => Some(entries.clone()),
                 _ => None,
             })
             .expect("the listing is drawn");

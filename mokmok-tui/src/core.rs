@@ -12,7 +12,7 @@ use mokmok_protocol::{SessionID, TurnID};
 use mokmok_state_machine::{Attempt, Ending, Phase};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Update, View};
+use crate::port::{Engine, Entry, Event, Key, Line, Listing, Roster, Screen, Sheet, Update, View};
 use crate::{Error, Left, Outcome};
 
 /// One session this process holds: its engine, the line being typed in it, and how far back its
@@ -66,6 +66,8 @@ struct Manager<E> {
     listed: Vec<Listing>,
     pane: Option<Pane>,
     deferred: Vec<Event>,
+    /// Which frame of the spinner the screen shows while the focused session is moving.
+    phase: u8,
 }
 
 /// Whose turn it is. The one question the driver asks, and a pure function of the fold.
@@ -275,6 +277,7 @@ impl<E: Engine> Manager<E> {
             listed: Vec::new(),
             pane: None,
             deferred: Vec::new(),
+            phase: 0,
         }
     }
 
@@ -310,7 +313,8 @@ impl<E: Engine> Manager<E> {
         folds: &[Transcript],
     ) -> View {
         let held = &self.held[self.focus];
-        let mut shown = lines(&folds[self.focus]);
+        let fold = &folds[self.focus];
+        let mut shown = lines(fold);
         let streaming = held.streaming.borrow();
 
         if !streaming.is_empty() {
@@ -318,13 +322,58 @@ impl<E: Engine> Manager<E> {
         }
 
         View {
-            session: folds[self.focus].session.id(),
+            session: fold.session.id(),
+            goal: fold.task.as_ref().map(|task| task.goal.clone()),
+            checkout: fold.task.as_ref().map(|task| task.setting.checkout.clone()),
             lines: shown,
             input: held.input.clone(),
             status: self.status(folds),
+            hints: self.hints(folds),
+            placeholder: self.placeholder(folds),
             scroll: held.scroll,
             background: background(folds, self.focus),
             sheet: self.sheet(folds),
+            spinner: matches!(mode(fold), Mode::Working).then_some(self.phase),
+        }
+    }
+
+    fn hints(
+        &self,
+        folds: &[Transcript],
+    ) -> String {
+        match &self.pane {
+            Some(Pane::List { .. }) => "↑↓ choose  enter open  esc close".to_owned(),
+            Some(Pane::New { .. }) => "enter create  esc cancel".to_owned(),
+            None => match mode(&folds[self.focus]) {
+                Mode::Ended(_) => "tab next  ^O sessions  ^N new  ^C quit".to_owned(),
+                Mode::Waiting | Mode::Working => {
+                    "enter send  tab next  ^O sessions  ^N new  ^C quit".to_owned()
+                },
+            },
+        }
+    }
+
+    fn placeholder(
+        &self,
+        folds: &[Transcript],
+    ) -> String {
+        match &self.pane {
+            Some(Pane::List { .. }) => String::new(),
+            Some(Pane::New { .. }) => "what should this session do?".to_owned(),
+            None => match mode(&folds[self.focus]) {
+                Mode::Waiting => "Send a line to the agent…".to_owned(),
+                Mode::Working | Mode::Ended(_) => String::new(),
+            },
+        }
+    }
+
+    /// Advances the spinner, but only while the session on screen is the one moving.
+    fn advance(
+        &mut self,
+        folds: &[Transcript],
+    ) {
+        if matches!(mode(&folds[self.focus]), Mode::Working) {
+            self.phase = self.phase.wrapping_add(1);
         }
     }
 
@@ -333,13 +382,15 @@ impl<E: Engine> Manager<E> {
         folds: &[Transcript],
     ) -> String {
         match &self.pane {
-            Some(Pane::List { .. }) => format!(
-                "{} sessions; {HELD_LEGEND}; enter opens one, esc closes",
-                self.rows(folds).len(),
-            ),
-            Some(Pane::New { .. }) => {
-                "type a goal; enter creates a session, esc cancels".to_owned()
+            Some(Pane::List { .. }) => {
+                let count = self.entries(folds).len();
+
+                match count {
+                    1 => format!("1 session · {HELD_LEGEND}"),
+                    _ => format!("{count} sessions · {HELD_LEGEND}"),
+                }
             },
+            Some(Pane::New { .. }) => "a new session".to_owned(),
             None => status(&folds[self.focus], &self.held[self.focus].input),
         }
     }
@@ -351,22 +402,22 @@ impl<E: Engine> Manager<E> {
         match &self.pane {
             None => None,
             Some(Pane::List { cursor }) => Some(Sheet::List {
-                rows: self.rows(folds),
+                entries: self.entries(folds),
                 cursor: *cursor,
             }),
             Some(Pane::New { goal }) => Some(Sheet::New { goal: goal.clone() }),
         }
     }
 
-    fn rows(
+    fn entries(
         &self,
         folds: &[Transcript],
-    ) -> Vec<Row> {
-        let mut rows: Vec<Row> = self
+    ) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = self
             .held
             .iter()
             .enumerate()
-            .map(|(index, held)| Row {
+            .map(|(index, held)| Entry {
                 session: held.engine.session(),
                 goal: folds[index].task.as_ref().map(|task| task.goal.clone()),
                 status: status(&folds[index], &held.input),
@@ -375,11 +426,11 @@ impl<E: Engine> Manager<E> {
             })
             .collect();
 
-        rows.extend(
+        entries.extend(
             self.listed
                 .iter()
                 .filter(|listing| self.index_of(listing.session).is_none())
-                .map(|listing| Row {
+                .map(|listing| Entry {
                     session: listing.session,
                     goal: listing.goal.clone(),
                     status: listed_phrase(listing),
@@ -388,7 +439,7 @@ impl<E: Engine> Manager<E> {
                 }),
         );
 
-        rows
+        entries
     }
 
     fn index_of(
@@ -480,9 +531,9 @@ impl<E: Engine> Manager<E> {
     ) {
         let focused = self.held[self.focus].engine.session();
         let cursor = self
-            .rows(folds)
+            .entries(folds)
             .iter()
-            .position(|row| row.session == focused)
+            .position(|entry| entry.session == focused)
             .unwrap_or(0);
 
         self.pane = Some(Pane::List { cursor });
@@ -586,7 +637,7 @@ impl<E: Engine> Manager<E> {
         folds: &[Transcript],
     ) -> Reaction {
         // Read before the pane is borrowed, because a cursor that moves needs the rows to clamp to.
-        let rows = self.rows(folds);
+        let entries = self.entries(folds);
 
         match key {
             Key::Interrupt => Reaction::Quit,
@@ -600,7 +651,9 @@ impl<E: Engine> Manager<E> {
                     *cursor = if matches!(key, Key::Up) {
                         cursor.saturating_sub(1)
                     } else {
-                        cursor.saturating_add(1).min(rows.len().saturating_sub(1))
+                        cursor
+                            .saturating_add(1)
+                            .min(entries.len().saturating_sub(1))
                     };
                 }
 
@@ -610,7 +663,7 @@ impl<E: Engine> Manager<E> {
                 // A session the log holds no task for is not opened: the run would carry the command
                 // line's goal into it and the runtime would close it on the model's first answer, so
                 // the row says what it is and choosing it does nothing.
-                Some(Pane::List { cursor }) => rows
+                Some(Pane::List { cursor }) => entries
                     .get(*cursor)
                     .filter(|row| row.goal.is_some())
                     .map_or(Reaction::Idle, |row| Reaction::Adopt(row.session)),
@@ -715,6 +768,7 @@ impl<E: Engine> Manager<E> {
         let pending = Rc::clone(&self.held[index].streaming);
         let mut deferred = Vec::new();
         let mut failure = None;
+        let mut phase = self.phase;
 
         let result = {
             let Held {
@@ -736,6 +790,7 @@ impl<E: Engine> Manager<E> {
                 tokio::select! {
                     result = &mut stepping => break result,
                     _ = tick.tick(), if on_screen => {
+                        phase = phase.wrapping_add(1);
                         let changed =
                             type_during_stream(screen, input, scroll, &mut deferred, &mut failure);
                         let text = pending.borrow().clone();
@@ -743,7 +798,7 @@ impl<E: Engine> Manager<E> {
                         if (changed || text.len() > drawn)
                             && let Some(base) = &base
                         {
-                            draw_stream(screen, base, input, *scroll, &text, &mut failure);
+                            draw_stream(screen, base, input, *scroll, &text, phase, &mut failure);
                             drawn = text.len();
                         }
                     },
@@ -753,6 +808,7 @@ impl<E: Engine> Manager<E> {
 
         self.held[index].streaming.borrow_mut().clear();
         self.deferred.extend(deferred);
+        self.phase = phase;
 
         match result {
             // A replayed intent is a write that landed with no outcome after it: re-read the log,
@@ -829,6 +885,7 @@ fn draw_stream(
     input: &str,
     scroll: u16,
     pending: &str,
+    phase: u8,
     failure: &mut Option<Error>,
 ) {
     let mut view = base.clone();
@@ -838,6 +895,7 @@ fn draw_stream(
     view.lines.push(Line::Agent(pending.to_owned()));
     view.status.clear();
     view.status.push_str("the agent is answering");
+    view.spinner = Some(phase);
 
     if let Err(error) = screen.draw(&view) {
         failure.get_or_insert(error);
@@ -876,6 +934,7 @@ pub async fn run<R: Roster>(
         folds = manager.folds()?;
 
         screen.draw(&manager.view(&folds))?;
+        manager.advance(&folds);
 
         if settled(&folds) {
             return Ok(outcome(&folds));
@@ -929,7 +988,7 @@ mod tests {
         settled, status,
     };
     use crate::Error;
-    use crate::port::{Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, View};
+    use crate::port::{Engine, Entry, Event, Key, Line, Listing, Roster, Screen, Sheet, View};
     use crate::worker::Worker;
     use mokmok_agent_runtime::{
         Action, AnswerRecord, ArtifactRef, Budget, CallRecord, MAX_SPEECH_BYTES, Progress, Record,
@@ -2223,19 +2282,19 @@ mod tests {
         ]);
         manager.focus = 1;
 
-        let rows = manager.rows(&folds_of(&manager));
+        let rows = manager.entries(&folds_of(&manager));
 
         assert_eq!(
             rows,
             vec![
-                Row {
+                Entry {
                     session: session(),
                     goal: Some("hold a conversation".to_owned()),
                     status: "the agent is working".to_owned(),
                     held: true,
                     focused: false,
                 },
-                Row {
+                Entry {
                     session: session(),
                     goal: Some("hold a conversation".to_owned()),
                     status: "your turn".to_owned(),
@@ -2261,33 +2320,33 @@ mod tests {
             ),
         ];
 
-        let rows = manager.rows(&folds_of(&manager));
+        let rows = manager.entries(&folds_of(&manager));
 
         assert_eq!(
             rows,
             vec![
-                Row {
+                Entry {
                     session: session(),
                     goal: Some("hold a conversation".to_owned()),
                     status: "your turn".to_owned(),
                     held: true,
                     focused: true,
                 },
-                Row {
+                Entry {
                     session: others(2),
                     goal: None,
                     status: "not opened (no task recorded)".to_owned(),
                     held: false,
                     focused: false,
                 },
-                Row {
+                Entry {
                     session: others(3),
                     goal: Some("count the quokkas".to_owned()),
                     status: "open".to_owned(),
                     held: false,
                     focused: false,
                 },
-                Row {
+                Entry {
                     session: others(4),
                     goal: Some("the older one".to_owned()),
                     status: "closed (Cancelled)".to_owned(),
@@ -2384,7 +2443,7 @@ mod tests {
             "opening it would carry the command line's goal into a session that recorded none",
         );
         assert_eq!(
-            manager.rows(&folds_of(&manager))[1].status,
+            manager.entries(&folds_of(&manager))[1].status,
             "open (no task recorded)",
             "and the row says why before the human chooses it",
         );
@@ -2472,7 +2531,7 @@ mod tests {
         assert_eq!(manager.held.len(), 2);
         assert_eq!(manager.focus, 1, "the human is in the session he just made");
         assert_eq!(manager.pane, None);
-        let rows = manager.rows(&folds_of(&manager));
+        let rows = manager.entries(&folds_of(&manager));
         assert_eq!(
             rows[1].goal.as_deref(),
             Some(created),
@@ -2609,18 +2668,46 @@ mod tests {
         assert_eq!(manager.status(&folds), "your turn");
 
         manager.pane = Some(Pane::List { cursor: 0 });
-        assert_eq!(
-            manager.status(&folds),
-            "2 sessions; * is held; enter opens one, esc closes",
-        );
+        assert_eq!(manager.status(&folds), "2 sessions · * is held");
 
         manager.pane = Some(Pane::New {
             goal: String::new(),
         });
+        assert_eq!(manager.status(&folds), "a new session");
+    }
+
+    #[test]
+    fn the_spinner_advances_only_while_the_session_on_screen_works() {
+        let mut manager = holding(vec![
+            Fake::new(session(), &in_flight(turn_id(session(), 1))),
+            Fake::awaiting(),
+        ]);
+        manager.focus = 0;
+        let folds = folds_of(&manager);
+
+        assert_eq!(manager.view(&folds).spinner, Some(0));
+        manager.advance(&folds);
+        assert_eq!(manager.view(&folds).spinner, Some(1));
+
+        manager.focus = 1;
+        let folds = folds_of(&manager);
+        manager.advance(&folds);
+
         assert_eq!(
-            manager.status(&folds),
-            "type a goal; enter creates a session, esc cancels",
+            manager.phase, 1,
+            "a waiting session does not move the spinner"
         );
+        assert_eq!(manager.view(&folds).spinner, None);
+    }
+
+    #[test]
+    fn one_held_session_is_singular_in_the_listing_status() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        let folds = folds_of(&manager);
+
+        manager.pane = Some(Pane::List { cursor: 0 });
+
+        assert_eq!(manager.status(&folds), "1 session · * is held");
     }
 
     #[test]

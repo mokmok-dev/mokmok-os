@@ -12,12 +12,19 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::text::Line as TextLine;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line as TextLine, Span as TextSpan};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal as RtTerminal};
+use unicode_width::UnicodeWidthStr;
 
 use crate::Error;
-use crate::port::{Event, Key, Screen, View};
+use crate::port::{Event, Key, Row, Screen, Span, Tone, View};
+
+/// The frames of the braille spinner, in the order a working turn walks them.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+const RULE: char = '─';
 
 /// The real terminal: keys from crossterm, one frame to the alternate screen.
 pub struct Terminal {
@@ -151,7 +158,26 @@ fn mapped(key: &KeyEvent) -> Option<Key> {
     }
 }
 
-/// Lays out one frame: the header, the body, the line being typed, and the status line.
+/// The style a tone reads in.
+///
+/// The palette is the terminal's own, so a light and a dark theme both stay legible; only the
+/// accent and code reach for a named color.
+const fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Human | Tone::Strong | Tone::Command => Style::new().add_modifier(Modifier::BOLD),
+        Tone::Agent => Style::new(),
+        Tone::Observation | Tone::Muted => Style::new().add_modifier(Modifier::DIM),
+        Tone::Code => Style::new().fg(Color::Cyan),
+        Tone::Trouble => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Tone::Accent => Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    }
+}
+
+fn text_span(span: Span) -> TextSpan<'static> {
+    TextSpan::styled(span.text, tone_style(span.tone))
+}
+
+/// Lays out one frame: the header, an optional rule, the body, the composer, and the status row.
 ///
 /// The body is the pane the human opened when he opened one, and the transcript otherwise, so the
 /// renderer asks [`View::body`] which rows to draw and decides nothing about them.
@@ -159,50 +185,221 @@ fn render(
     frame: &mut Frame<'_>,
     view: &View,
 ) {
-    let width = usize::from(frame.area().width);
-    let typing = view.typing(width);
-    let typed_height = u16::try_from(typing.rows.len()).unwrap_or(u16::MAX);
-    let [header, body, input, status] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(typed_height),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let area = frame.area();
+    let height = area.height;
+    let typing = view.typing(usize::from(area.width));
+    let chrome = 1 + usize::from(height >= 10) + usize::from(height >= 5);
+    let max_composer = usize::from(height).saturating_sub(chrome + 1).max(1);
+    let composer_height = typing
+        .rows
+        .len()
+        .min(max_composer)
+        .max(1)
+        .try_into()
+        .unwrap_or(u16::MAX);
 
-    let heading = view.background.as_ref().map_or_else(
-        || format!("mokmok-tui  {}  {}", view.session.as_uuid(), view.status),
-        |background| {
-            format!(
-                "mokmok-tui  {}  {}  ({background})",
-                view.session.as_uuid(),
-                view.status,
-            )
-        },
+    let mut constraints = vec![Constraint::Length(1)];
+    if height >= 10 {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(1));
+    if height >= 3 {
+        constraints.push(Constraint::Length(composer_height));
+    }
+    if height >= 5 {
+        constraints.push(Constraint::Length(1));
+    }
+
+    let areas = Layout::vertical(constraints).split(area);
+    let mut next = 0;
+    let header = areas[next];
+    next += 1;
+    let rule = (height >= 10).then(|| {
+        let rule = areas[next];
+        next += 1;
+
+        rule
+    });
+    let body = areas[next];
+    next += 1;
+    let composer = (height >= 3).then(|| {
+        let composer = areas[next];
+        next += 1;
+
+        composer
+    });
+    let footer = (height >= 5).then(|| areas[next]);
+
+    frame.render_widget(
+        Paragraph::new(header_line(view, usize::from(header.width))),
+        header,
     );
-    frame.render_widget(Paragraph::new(TextLine::raw(heading)), header);
 
-    let lines: Vec<TextLine<'static>> = view
-        .body(width, usize::from(body.height))
+    if let Some(rule_area) = rule {
+        let rule_text = RULE.to_string().repeat(usize::from(rule_area.width));
+        frame.render_widget(
+            Paragraph::new(TextLine::styled(rule_text, tone_style(Tone::Muted))),
+            rule_area,
+        );
+    }
+
+    let rows: Vec<TextLine<'static>> = view
+        .body(usize::from(body.width), usize::from(body.height))
         .into_iter()
-        .map(TextLine::raw)
+        .map(|row| body_line(row, usize::from(body.width)))
         .collect();
-    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(Paragraph::new(rows), body);
 
-    let typed_rows: Vec<TextLine<'static>> = typing.rows.into_iter().map(TextLine::raw).collect();
-    frame.render_widget(Paragraph::new(typed_rows), input);
-    frame.render_widget(Paragraph::new(TextLine::raw(view.status.as_str())), status);
+    let cursor = composer.map_or(Position::new(0, 0), |composer| {
+        let first = typing
+            .rows
+            .len()
+            .saturating_sub(usize::from(composer.height));
+        let rows: Vec<TextLine<'static>> = typing.rows[first..]
+            .iter()
+            .cloned()
+            .map(|row| body_line(row, usize::from(composer.width)))
+            .collect();
+        frame.render_widget(Paragraph::new(rows), composer);
 
-    // `Screen::draw` hands over a `View` and nothing else, so the adapter cannot tell a waiting fold
-    // from a working one; parking the cursor on the input row is the one cursor the frame can place.
-    let column = u16::try_from(typing.column).unwrap_or(u16::MAX);
-    let row = u16::try_from(typing.row).unwrap_or(u16::MAX);
-    frame.set_cursor_position(Position::new(
-        input.x.saturating_add(column),
-        input.y.saturating_add(row),
-    ));
+        let row = typing.row.saturating_sub(first);
+        let column = typing
+            .column
+            .min(usize::from(composer.width).saturating_sub(1));
+
+        Position::new(
+            composer
+                .x
+                .saturating_add(u16::try_from(column).unwrap_or(u16::MAX)),
+            composer
+                .y
+                .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+        )
+    });
+
+    if let Some(footer) = footer {
+        frame.render_widget(Paragraph::new(footer_line(view, footer.width)), footer);
+    }
+
+    frame.set_cursor_position(cursor);
 }
 
+fn header_line(
+    view: &View,
+    width: usize,
+) -> TextLine<'static> {
+    let mut spans = vec![TextSpan::styled("mokmok", tone_style(Tone::Strong))];
+    let mut used = 6;
+    push_header_field(
+        &mut spans,
+        &mut used,
+        width,
+        &view.short_session(),
+        Tone::Muted,
+    );
+
+    if let Some(goal) = &view.goal {
+        push_header_field(&mut spans, &mut used, width, goal, Tone::Agent);
+    }
+    if let Some(background) = &view.background {
+        push_header_field(
+            &mut spans,
+            &mut used,
+            width,
+            &format!("· {background}"),
+            Tone::Muted,
+        );
+    }
+
+    TextLine::from(spans)
+}
+
+fn push_header_field(
+    spans: &mut Vec<TextSpan<'static>>,
+    used: &mut usize,
+    width: usize,
+    text: &str,
+    tone: Tone,
+) {
+    let room = width.saturating_sub(*used + 2);
+    if room == 0 {
+        return;
+    }
+
+    let text = clipped(text, room);
+    if text.is_empty() {
+        return;
+    }
+
+    spans.push(TextSpan::styled("  ", tone_style(Tone::Muted)));
+    *used += 2 + text.width();
+    spans.push(TextSpan::styled(text, tone_style(tone)));
+}
+
+fn body_line(
+    row: Row,
+    width: usize,
+) -> TextLine<'static> {
+    let selected = row.selected;
+    let mut spans: Vec<TextSpan<'static>> = row.spans.into_iter().map(text_span).collect();
+
+    if selected {
+        let used: usize = spans.iter().map(TextSpan::width).sum();
+        if used < width {
+            spans.push(TextSpan::styled(
+                " ".repeat(width - used),
+                Style::new().add_modifier(Modifier::REVERSED),
+            ));
+        }
+    }
+
+    let line = TextLine::from(spans);
+
+    if selected {
+        line.style(Style::new().add_modifier(Modifier::REVERSED))
+    } else {
+        line
+    }
+}
+
+fn footer_line(
+    view: &View,
+    width: u16,
+) -> TextLine<'static> {
+    let width = usize::from(width);
+    let mut spans = Vec::new();
+    let mut used = 0;
+
+    if let Some(phase) = view.spinner {
+        let glyph = SPINNER[usize::from(phase) % SPINNER.len()];
+        let spinner = format!("{glyph} ");
+        used += spinner.width();
+        spans.push(TextSpan::styled(spinner, tone_style(Tone::Accent)));
+    }
+
+    let status = clipped(&view.status, width.saturating_sub(used));
+    used += status.width();
+    spans.push(TextSpan::styled(status, tone_style(Tone::Muted)));
+
+    let hints = view.hints.width();
+    if !view.hints.is_empty() && used + 2 + hints <= width {
+        spans.push(TextSpan::raw(" ".repeat(width - used - hints)));
+        spans.push(TextSpan::styled(
+            view.hints.clone(),
+            tone_style(Tone::Muted),
+        ));
+    }
+
+    TextLine::from(spans)
+}
+
+/// Clips `text` to `width` columns, ending with an ellipsis when it does not fit.
+fn clipped(
+    text: &str,
+    width: usize,
+) -> String {
+    crate::port::clipped(text, width)
+}
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal as RtTerminal;
@@ -215,7 +412,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{both_are_terminals, classified, mapped, render};
-    use crate::port::{Event, Key, Line, Row, Sheet, View};
+    use crate::port::{Entry, Event, Key, Line, Sheet, View};
     use mokmok_protocol::SessionID;
 
     #[test]
@@ -357,17 +554,36 @@ mod tests {
     ) -> View {
         View {
             session: SessionID::from_uuid(Uuid::from_u128(1)),
+            goal: None,
+            checkout: None,
             lines,
             input: "hi".to_owned(),
             status: "your turn".to_owned(),
+            hints: String::new(),
+            placeholder: String::new(),
             scroll,
             background: None,
             sheet: None,
+            spinner: None,
         }
     }
 
+    fn draw(
+        view: &View,
+        width: u16,
+        height: u16,
+    ) -> RtTerminal<TestBackend> {
+        let mut terminal =
+            RtTerminal::new(TestBackend::new(width, height)).expect("the screen opens");
+        terminal
+            .draw(|frame| render(frame, view))
+            .expect("the frame draws");
+
+        terminal
+    }
+
     #[test]
-    fn the_frame_shows_the_header_the_transcript_the_input_and_the_status() {
+    fn the_frame_shows_the_header_the_rule_the_transcript_the_input_and_the_status() {
         let view = view(
             vec![
                 Line::Human("what is here".to_owned()),
@@ -379,21 +595,20 @@ mod tests {
             ],
             0,
         );
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+        let terminal = draw(&view, 80, 10);
         let buffer = terminal.backend().buffer();
 
+        assert_eq!(row(buffer, 0, 80), "mokmok  00000000");
         assert_eq!(
-            row(buffer, 0, 80),
-            format!("mokmok-tui  {}  your turn", view.session.as_uuid()),
+            row(buffer, 1, 80),
+            "─".repeat(80),
+            "the rule separates the heading from the conversation",
         );
-        assert_eq!(row(buffer, 1, 80), "you    what is here");
-        assert_eq!(row(buffer, 2, 80), "  $ ls");
-        assert_eq!(row(buffer, 3, 80), "    out.txt");
-        assert_eq!(row(buffer, 4, 80), "agent  an answer");
-        assert_eq!(row(buffer, 8, 80), "> hi");
+        assert_eq!(row(buffer, 2, 80), "› what is here");
+        assert_eq!(row(buffer, 3, 80), "  $ ls");
+        assert_eq!(row(buffer, 4, 80), "    out.txt");
+        assert_eq!(row(buffer, 5, 80), "• an answer");
+        assert_eq!(row(buffer, 8, 80), "› hi");
         assert_eq!(row(buffer, 9, 80), "your turn");
         assert_eq!(
             terminal.backend().cursor_position(),
@@ -412,15 +627,12 @@ mod tests {
             ],
             1,
         );
-        let mut terminal = RtTerminal::new(TestBackend::new(40, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+        let terminal = draw(&view, 40, 10);
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(row(buffer, 1, 40), "you    oldest");
-        assert_eq!(row(buffer, 2, 40), "agent  middle");
-        assert_eq!(row(buffer, 3, 40), "");
+        assert_eq!(row(buffer, 2, 40), "› oldest");
+        assert_eq!(row(buffer, 3, 40), "• middle");
+        assert_eq!(row(buffer, 4, 40), "");
         assert_eq!(
             terminal.backend().cursor_position(),
             Position::new(4, 8),
@@ -437,14 +649,10 @@ mod tests {
             }],
             0,
         );
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
-        let buffer = terminal.backend().buffer();
+        let terminal = draw(&view, 80, 10);
 
         assert_eq!(
-            row(buffer, 1, 80),
+            row(terminal.backend().buffer(), 2, 80),
             r"  $ printf '1\n1\n2\n3\n5\n'",
             "the drawn row escapes each newline instead of collapsing the command",
         );
@@ -452,8 +660,6 @@ mod tests {
 
     #[test]
     fn a_work_row_shows_the_command_and_its_outcome() {
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-
         let reported = view(
             vec![
                 Line::Work {
@@ -464,14 +670,12 @@ mod tests {
             ],
             0,
         );
-        terminal
-            .draw(|frame| render(frame, &reported))
-            .expect("the frame draws");
+        let terminal = draw(&reported, 80, 10);
         {
             let buffer = terminal.backend().buffer();
-            assert_eq!(row(buffer, 1, 80), "  $ ls");
-            assert_eq!(row(buffer, 2, 80), "    exit code 0");
-            assert_eq!(row(buffer, 3, 80), "agent  next");
+            assert_eq!(row(buffer, 2, 80), "  $ ls");
+            assert_eq!(row(buffer, 3, 80), "    exit code 0");
+            assert_eq!(row(buffer, 4, 80), "• next");
         }
 
         let silent = view(
@@ -484,14 +688,11 @@ mod tests {
             ],
             0,
         );
-        terminal
-            .draw(|frame| render(frame, &silent))
-            .expect("the frame draws");
-        {
-            let buffer = terminal.backend().buffer();
-            assert_eq!(row(buffer, 1, 80), "  $ ls");
-            assert_eq!(row(buffer, 2, 80), "agent  next");
-        }
+        let terminal = draw(&silent, 80, 10);
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(row(buffer, 2, 80), "  $ ls");
+        assert_eq!(row(buffer, 3, 80), "• next");
     }
 
     #[test]
@@ -506,15 +707,12 @@ mod tests {
             ],
             0,
         );
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+        let terminal = draw(&view, 80, 10);
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(row(buffer, 1, 80), "  ? quokka");
-        assert_eq!(row(buffer, 2, 80), "    indexed=2 hits=1");
-        assert_eq!(row(buffer, 3, 80), "agent  next");
+        assert_eq!(row(buffer, 2, 80), "  ⌕ quokka");
+        assert_eq!(row(buffer, 3, 80), "    indexed=2 hits=1");
+        assert_eq!(row(buffer, 4, 80), "• next");
     }
 
     #[test]
@@ -522,10 +720,6 @@ mod tests {
         let view = view(
             vec![
                 Line::Human("first".to_owned()),
-                Line::Work {
-                    command: "ls".to_owned(),
-                    observation: "out.txt".to_owned(),
-                },
                 Line::Agent("second".to_owned()),
                 Line::Human("third".to_owned()),
                 Line::Agent("fourth".to_owned()),
@@ -535,74 +729,25 @@ mod tests {
             ],
             0,
         );
-        let mut terminal = RtTerminal::new(TestBackend::new(40, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+        let terminal = draw(&view, 40, 10);
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(row(buffer, 1, 40), "    out.txt");
-        assert_eq!(row(buffer, 2, 40), "agent  second");
-        assert_eq!(row(buffer, 3, 40), "you    third");
-        assert_eq!(row(buffer, 4, 40), "agent  fourth");
-        assert_eq!(row(buffer, 5, 40), "you    fifth");
-        assert_eq!(row(buffer, 6, 40), "agent  sixth");
-        assert_eq!(row(buffer, 7, 40), "you    seventh");
-        assert_eq!(row(buffer, 8, 40), "> hi");
+        assert_eq!(row(buffer, 2, 40), "• second");
+        assert_eq!(row(buffer, 3, 40), "› third");
+        assert_eq!(row(buffer, 4, 40), "• fourth");
+        assert_eq!(row(buffer, 5, 40), "› fifth");
+        assert_eq!(row(buffer, 6, 40), "• sixth");
+        assert_eq!(row(buffer, 7, 40), "› seventh");
+        assert_eq!(row(buffer, 8, 40), "› hi");
     }
 
-    #[test]
-    fn a_row_count_that_counts_rows_and_not_lines() {
-        let lines = || {
-            vec![
-                Line::Human("first".to_owned()),
-                Line::Work {
-                    command: "ls".to_owned(),
-                    observation: "out.txt".to_owned(),
-                },
-                Line::Agent("last".to_owned()),
-            ]
-        };
-        let mut terminal = RtTerminal::new(TestBackend::new(40, 5)).expect("the screen opens");
-
-        let newest = view(lines(), 0);
-        terminal
-            .draw(|frame| render(frame, &newest))
-            .expect("the frame draws");
-        {
-            let buffer = terminal.backend().buffer();
-            assert_eq!(row(buffer, 1, 40), "    out.txt");
-            assert_eq!(row(buffer, 2, 40), "agent  last");
-        }
-
-        let one_back = view(lines(), 1);
-        terminal
-            .draw(|frame| render(frame, &one_back))
-            .expect("the frame draws");
-        {
-            let buffer = terminal.backend().buffer();
-            assert_eq!(row(buffer, 1, 40), "  $ ls");
-            assert_eq!(row(buffer, 2, 40), "    out.txt");
-        }
-    }
-
-    fn listing(
-        rows: Vec<Row>,
-        cursor: usize,
-    ) -> View {
-        View {
-            sheet: Some(Sheet::List { rows, cursor }),
-            ..view(Vec::new(), 0)
-        }
-    }
-
-    fn listed_row(
+    fn entry(
         seed: u128,
         goal: Option<&str>,
         held: bool,
-    ) -> Row {
-        Row {
-            session: SessionID::from_uuid(Uuid::from_u128(seed)),
+    ) -> Entry {
+        Entry {
+            session: SessionID::from_uuid(Uuid::from_u128(seed << 120)),
             goal: goal.map(str::to_owned),
             status: "your turn".to_owned(),
             held,
@@ -611,37 +756,35 @@ mod tests {
     }
 
     #[test]
-    fn the_listing_draws_its_rows_and_takes_the_input_row() {
-        let view = listing(
-            vec![
-                listed_row(1, Some("hold a conversation"), true),
-                listed_row(2, None, false),
-            ],
-            1,
-        );
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+    fn the_listing_draws_its_entries_and_takes_the_composer_row() {
+        let view = View {
+            sheet: Some(Sheet::List {
+                entries: vec![
+                    entry(1, Some("hold a conversation"), true),
+                    entry(2, None, false),
+                ],
+                cursor: 1,
+            }),
+            ..view(Vec::new(), 0)
+        };
+        let terminal = draw(&view, 80, 10);
         let buffer = terminal.backend().buffer();
 
+        assert_eq!(row(buffer, 1, 80), "─".repeat(80));
+        assert_eq!(row(buffer, 2, 80), "sessions");
         assert_eq!(
-            row(buffer, 1, 80),
-            "  * 00000000-0000-0000-0000-000000000001  your turn  hold a conversation",
+            row(buffer, 3, 80),
+            "  * 01000000  your turn  hold a conversation",
         );
         assert_eq!(
-            row(buffer, 2, 80),
-            ">   00000000-0000-0000-0000-000000000002  your turn  (no goal recorded)",
+            row(buffer, 4, 80),
+            "›   02000000  your turn  (no goal recorded)",
         );
-        assert_eq!(
-            row(buffer, 8, 80),
-            "",
-            "the listing takes the input row rather than sharing it with a line",
-        );
+        assert_eq!(row(buffer, 8, 80), "");
         assert_eq!(
             terminal.backend().cursor_position(),
             Position::new(0, 8),
-            "the cursor sits at the start of the blank input row",
+            "the cursor sits at the start of the blank composer row",
         );
     }
 
@@ -653,14 +796,10 @@ mod tests {
             }),
             ..view(vec![Line::Human("hello".to_owned())], 0)
         };
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
-        let buffer = terminal.backend().buffer();
+        let terminal = draw(&view, 80, 10);
 
-        assert_eq!(row(buffer, 1, 80), "you    hello");
-        assert_eq!(row(buffer, 8, 80), "goal> count");
+        assert_eq!(row(terminal.backend().buffer(), 2, 80), "› hello");
+        assert_eq!(row(terminal.backend().buffer(), 8, 80), "goal› count");
         assert_eq!(
             terminal.backend().cursor_position(),
             Position::new(11, 8),
@@ -669,15 +808,40 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_sits_past_the_columns_a_wide_character_takes() {
+    fn an_empty_input_shows_the_placeholder_and_parks_the_cursor_at_the_prompt() {
         let view = View {
-            input: "日本語".to_owned(),
-            ..view(vec![Line::Human("hello".to_owned())], 0)
+            input: String::new(),
+            placeholder: "Send a line to the agent…".to_owned(),
+            ..view(Vec::new(), 0)
         };
-        let mut terminal = RtTerminal::new(TestBackend::new(80, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+        let terminal = draw(&view, 80, 10);
+
+        assert_eq!(
+            row(terminal.backend().buffer(), 8, 80),
+            "› Send a line to the agent…",
+        );
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(2, 8),
+            "the cursor sits after the prompt, before the placeholder",
+        );
+    }
+
+    #[test]
+    fn the_cursor_counts_a_wide_character_as_two_columns() {
+        let two = View {
+            input: "日本".to_owned(),
+            ..view(Vec::new(), 0)
+        };
+        let terminal = draw(&two, 80, 10);
+
+        assert_eq!(terminal.backend().cursor_position(), Position::new(6, 8));
+
+        let three = View {
+            input: "日本語".to_owned(),
+            ..view(Vec::new(), 0)
+        };
+        let terminal = draw(&three, 80, 10);
 
         assert_eq!(
             terminal.backend().cursor_position(),
@@ -692,13 +856,10 @@ mod tests {
             input: "alpha bravo charlie".to_owned(),
             ..view(vec![Line::Human("hello".to_owned())], 0)
         };
-        let mut terminal = RtTerminal::new(TestBackend::new(20, 10)).expect("the screen opens");
-        terminal
-            .draw(|frame| render(frame, &view))
-            .expect("the frame draws");
+        let terminal = draw(&view, 20, 10);
         let buffer = terminal.backend().buffer();
 
-        assert_eq!(row(buffer, 7, 20), "> alpha bravo");
+        assert_eq!(row(buffer, 7, 20), "› alpha bravo");
         assert_eq!(row(buffer, 8, 20), "  charlie");
         assert_eq!(row(buffer, 9, 20), "your turn");
         assert_eq!(
@@ -715,26 +876,93 @@ mod tests {
             background: Some("1 other session working".to_owned()),
             ..quiet.clone()
         };
-        let mut terminal = RtTerminal::new(TestBackend::new(120, 10)).expect("the screen opens");
 
-        terminal
-            .draw(|frame| render(frame, &quiet))
-            .expect("the frame draws");
+        let terminal = draw(&quiet, 120, 10);
         assert_eq!(
             row(terminal.backend().buffer(), 0, 120),
-            format!("mokmok-tui  {}  your turn", quiet.session.as_uuid()),
+            "mokmok  00000000",
             "a frame with nothing moving elsewhere is the frame it was",
         );
 
-        terminal
-            .draw(|frame| render(frame, &busy))
-            .expect("the frame draws");
+        let terminal = draw(&busy, 120, 10);
         assert_eq!(
             row(terminal.backend().buffer(), 0, 120),
-            format!(
-                "mokmok-tui  {}  your turn  (1 other session working)",
-                busy.session.as_uuid(),
-            ),
+            "mokmok  00000000  · 1 other session working",
         );
+    }
+
+    #[test]
+    fn the_heading_keeps_the_goal_and_truncates_it_to_the_width() {
+        let view = View {
+            goal: Some("hold a conversation with the constrained agent".to_owned()),
+            ..view(vec![Line::Human("hello".to_owned())], 0)
+        };
+        let terminal = draw(&view, 30, 10);
+        let heading = row(terminal.backend().buffer(), 0, 30);
+
+        assert!(heading.starts_with("mokmok  00000000  hold"));
+        assert!(heading.ends_with('…'), "a clipped goal says it was clipped");
+        assert!(heading.chars().count() <= 30);
+    }
+
+    #[test]
+    fn the_footer_draws_the_spinner_while_the_session_is_working() {
+        let view = View {
+            status: "the agent is working".to_owned(),
+            hints: "enter send".to_owned(),
+            spinner: Some(3),
+            ..view(Vec::new(), 0)
+        };
+        let terminal = draw(&view, 60, 10);
+        let footer = row(terminal.backend().buffer(), 9, 60);
+
+        assert_eq!(
+            footer,
+            format!("⠸ the agent is working{}enter send", " ".repeat(28))
+        );
+    }
+
+    #[test]
+    fn the_footer_drops_the_hints_when_they_do_not_fit() {
+        let view = View {
+            status: "the agent is working".to_owned(),
+            hints: "enter send  tab next  ^O sessions  ^N new  ^C quit".to_owned(),
+            spinner: Some(0),
+            ..view(Vec::new(), 0)
+        };
+        let terminal = draw(&view, 20, 10);
+        let footer = row(terminal.backend().buffer(), 9, 20);
+
+        assert_eq!(footer, "⠋ the agent is work…");
+        assert!(!footer.contains("enter"), "a clipped hint is dropped whole");
+    }
+
+    #[test]
+    fn a_long_reply_wraps_inside_the_body() {
+        let view = view(
+            vec![Line::Agent(
+                "one two three four five six seven eight".to_owned(),
+            )],
+            0,
+        );
+        let terminal = draw(&view, 20, 10);
+        let buffer = terminal.backend().buffer();
+
+        for y in 2..8 {
+            let line = row(buffer, y, 20);
+            assert!(line.chars().count() <= 20, "row {y} fits: {line:?}");
+        }
+        assert!(row(buffer, 2, 20).starts_with('•'));
+    }
+
+    #[test]
+    fn a_short_screen_keeps_the_header_the_body_and_the_composer() {
+        let view = view(vec![Line::Human("hello".to_owned())], 0);
+        let terminal = draw(&view, 40, 4);
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(row(buffer, 0, 40), "mokmok  00000000");
+        assert_eq!(row(buffer, 1, 40), "› hello");
+        assert_eq!(row(buffer, 3, 40), "› hi");
     }
 }
