@@ -70,4 +70,8 @@ exclude_re = [
   # is the same empty vector. An engine that runs its step inline is the only one that reaches the
   # default, and an empty drain is its contract; the worker overrides the method.
   '^mokmok-tui/src/port\.rs:\d+:\d+: replace Engine::drain -> Vec<Update> with vec!\[\]$',
+  # `first_marker` asks `find_pair` for the first `**` and the first backtick. Two different
+  # markers cannot begin at the same byte, so the tie that `<=` and `>` would decide differently
+  # never happens.
+  '^mokmok-tui/src/markdown\.rs:\d+:\d+: replace <= with > in first_marker$',
 ]

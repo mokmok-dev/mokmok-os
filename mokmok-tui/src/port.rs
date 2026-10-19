@@ -1,5 +1,6 @@
 //! The ports: what the core needs from one session, from the log, and where a frame goes.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
 
@@ -9,6 +10,7 @@ use mokmok_state_machine::Phase;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::Error;
+use crate::markdown::Markdown;
 
 /// Everything the core needs from one session: its past, one human line, one bounded step.
 ///
@@ -253,139 +255,87 @@ pub enum Line {
     Trouble(String),
 }
 
-/// What the input row starts with, so the line being typed and the goal being named are told apart.
-const INPUT_PREFIX: &str = "> ";
+const HUMAN_PREFIX: &str = "› ";
 
-const GOAL_PREFIX: &str = "goal> ";
+const AGENT_PREFIX: &str = "• ";
 
-const HUMAN_GUTTER: &str = "you    ";
+const TROUBLE_PREFIX: &str = "! ";
 
-const AGENT_GUTTER: &str = "agent  ";
+const WORK_PREFIX: &str = "  $ ";
 
-const TROUBLE_GUTTER: &str = "!      ";
-
-// Seven columns, so a continuation row aligns under the first row's text.
-const CONTINUATION_PREFIX: &str = "       ";
-
-const COMMAND_PREFIX: &str = "  $ ";
-
-const QUERY_PREFIX: &str = "  ? ";
+const FIND_PREFIX: &str = "  ⌕ ";
 
 const EDIT_PREFIX: &str = "  ✎ ";
 
 const DELEGATE_PREFIX: &str = "  ⤷ ";
 
-const OBSERVATION_PREFIX: &str = "    ";
+const CODE_PREFIX: &str = "  │ ";
+
+const DETAIL_PREFIX: &str = "    ";
+
+const CONTINUATION: &str = "  ";
+
+/// What the input row starts with, so the line being typed and the goal being named are told apart.
+const INPUT_PREFIX: &str = "› ";
+
+const GOAL_PREFIX: &str = "goal› ";
 
 impl std::fmt::Display for Line {
     fn fmt(
         &self,
         formatter: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        let rows: Vec<String> = match self {
-            // The replay is plain text written after the terminal is handed back, with no row limit,
-            // and it is the record the human takes away, so it carries every observation row the
-            // frame trims to its four-row budget.
-            Self::Work {
-                command,
-                observation,
-            } => {
-                let mut rows = command_row(command, usize::MAX);
-                rows.extend(
-                    observation
-                        .lines()
-                        .flat_map(|line| observation_row(line, usize::MAX)),
-                );
-                rows
-            },
-            Self::Find { query, observation } => {
-                let mut rows = query_row(query, usize::MAX);
-                rows.extend(
-                    observation
-                        .lines()
-                        .flat_map(|line| observation_row(line, usize::MAX)),
-                );
-                rows
-            },
-            Self::Edit { observation } => {
-                let mut rows = edit_row(observation, usize::MAX);
-                rows.extend(
-                    observation
-                        .lines()
-                        .skip(1)
-                        .flat_map(|line| observation_row(line, usize::MAX)),
-                );
-                rows
-            },
-            Self::Delegate {
-                child_session,
-                goal,
-                reply,
-            } => {
-                let mut rows = delegate_row(goal, usize::MAX);
-                rows.extend(observation_row(
-                    &format!("child: {}", child_session.as_uuid()),
-                    usize::MAX,
-                ));
-                rows.extend(
-                    reply
-                        .lines()
-                        .flat_map(|line| observation_row(line, usize::MAX)),
-                );
-                rows
-            },
-            other => rows_of(other, usize::MAX),
-        };
-
+        let rows = replay(self);
         formatter.write_str(&rows.join("\n"))
     }
 }
 
-fn rows_of(
-    line: &Line,
-    columns: usize,
-) -> Vec<String> {
+/// The line as plain rows, with every observation row the frame trims.
+///
+/// This is the record the human takes away after the alternate screen is handed back, so it keeps
+/// the source text and drops only the markdown markers' styling, never their bytes.
+fn replay(line: &Line) -> Vec<String> {
     match line {
-        Line::Human(text) => prose_rows(HUMAN_GUTTER, text, columns),
-        Line::Agent(text) => prose_rows(AGENT_GUTTER, text, columns),
-        Line::Trouble(text) => prose_rows(TROUBLE_GUTTER, text, columns),
+        Line::Human(text) => prose_replay(HUMAN_PREFIX, text),
+        Line::Agent(text) => prose_replay(AGENT_PREFIX, text),
+        Line::Trouble(text) => prose_replay(TROUBLE_PREFIX, text),
         Line::Work {
             command,
             observation,
         } => {
-            let mut rows = command_row(command, columns);
-
-            // Four fixed rows is the frame's whole budget, so the first observation line is all it
-            // can spare for the reason a command failed.
-            if let Some(outcome) = observation.lines().next().filter(|first| !first.is_empty()) {
-                rows.extend(observation_row(outcome, columns));
-            }
-
+            let mut rows = vec![format!("{WORK_PREFIX}{}", escaped(command))];
+            rows.extend(
+                observation
+                    .lines()
+                    .map(|line| format!("{DETAIL_PREFIX}{}", escaped(line))),
+            );
             rows
         },
         Line::Find { query, observation } => {
-            let mut rows = query_row(query, columns);
-
-            if let Some(outcome) = observation.lines().next().filter(|first| !first.is_empty()) {
-                rows.extend(observation_row(outcome, columns));
-            }
-
+            let mut rows = vec![format!("{FIND_PREFIX}{}", escaped(query))];
+            rows.extend(
+                observation
+                    .lines()
+                    .map(|line| format!("{DETAIL_PREFIX}{}", escaped(line))),
+            );
             rows
         },
         Line::Edit { observation } => {
             let mut rows = Vec::new();
-
-            if let Some(first) = observation.lines().next().filter(|first| !first.is_empty()) {
-                rows.extend(edit_row(first, columns));
-            }
-            if let Some(outcome) = observation
+            let lines: Vec<&str> = observation
                 .lines()
-                .nth(1)
-                .filter(|second| !second.is_empty())
-            {
-                rows.extend(observation_row(outcome, columns));
-            }
+                .filter(|line| !line.is_empty())
+                .collect();
 
+            if let Some(first) = lines.first() {
+                rows.push(format!("{EDIT_PREFIX}{}", escaped(first)));
+            }
+            rows.extend(
+                lines
+                    .iter()
+                    .skip(1)
+                    .map(|line| format!("{DETAIL_PREFIX}{}", escaped(line))),
+            );
             rows
         },
         Line::Delegate {
@@ -393,156 +343,963 @@ fn rows_of(
             goal,
             reply,
         } => {
-            let mut rows = delegate_row(goal, columns);
-            rows.extend(observation_row(
-                &format!("child: {}", child_session.as_uuid()),
-                columns,
-            ));
-            if let Some(first) = reply.lines().next().filter(|first| !first.is_empty()) {
-                rows.extend(observation_row(first, columns));
-            }
-
+            let mut rows = vec![format!("{DELEGATE_PREFIX}delegate: {}", escaped(goal))];
+            rows.push(format!("{DETAIL_PREFIX}child: {}", child_session.as_uuid()));
+            rows.extend(
+                reply
+                    .lines()
+                    .map(|line| format!("{DETAIL_PREFIX}{}", escaped(line))),
+            );
             rows
         },
     }
 }
 
-fn command_row(
-    command: &str,
-    columns: usize,
-) -> Vec<String> {
-    prefixed(COMMAND_PREFIX, &escaped(command), columns)
-}
-
-fn query_row(
-    query: &str,
-    columns: usize,
-) -> Vec<String> {
-    prefixed(QUERY_PREFIX, &escaped(query), columns)
-}
-
-fn edit_row(
-    observation: &str,
-    columns: usize,
-) -> Vec<String> {
-    prefixed(EDIT_PREFIX, &escaped(observation), columns)
-}
-
-fn observation_row(
-    line: &str,
-    columns: usize,
-) -> Vec<String> {
-    prefixed(OBSERVATION_PREFIX, &escaped(line), columns)
-}
-
-fn delegate_row(
-    goal: &str,
-    columns: usize,
-) -> Vec<String> {
-    prefixed(
-        DELEGATE_PREFIX,
-        &format!("delegate: {}", escaped(goal)),
-        columns,
-    )
-}
-
-/// One speaker's text as rows: the gutter leads the first line, seven spaces each later one.
-///
-/// A single trailing line break ends the last line rather than opening an empty one, so it draws
-/// no blank row.
-fn prose_rows(
-    gutter: &str,
+fn prose_replay(
+    prefix: &str,
     text: &str,
-    columns: usize,
 ) -> Vec<String> {
     let body = text.strip_suffix('\n').unwrap_or(text);
+    let continuation = " ".repeat(prefix.width());
 
     body.split('\n')
         .enumerate()
-        .flat_map(|(index, line)| {
-            let prefix = if index == 0 {
-                gutter
-            } else {
-                CONTINUATION_PREFIX
-            };
-            // A carriage return before a line break is part of the break, not a character to draw.
+        .map(|(index, line)| {
             let line = line.strip_suffix('\r').unwrap_or(line);
+            let lead = if index == 0 {
+                prefix.to_owned()
+            } else {
+                continuation.clone()
+            };
 
-            prefixed(prefix, &escaped(line), columns)
+            format!("{lead}{}", escaped(line))
         })
         .collect()
 }
 
-/// `text` behind `prefix`, with every later row indented past the prefix so it stays under the text
-/// it continues.
-fn prefixed(
-    prefix: &str,
-    text: &str,
-    columns: usize,
-) -> Vec<String> {
-    let hanging = prefix.width();
-    let content = columns.saturating_sub(hanging).max(1);
-    let indent = " ".repeat(hanging);
-
-    wrapped(text, content)
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let lead = if index == 0 { prefix } else { indent.as_str() };
-
-            format!("{lead}{row}")
-        })
-        .collect()
+/// How a drawn span reads. The adapter maps a tone to a style and decides nothing else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Tone {
+    /// What the human said.
+    Human,
+    /// What the agent said.
+    Agent,
+    /// A command or a finder's query.
+    Command,
+    /// What a command, a finder, or an edit produced.
+    Observation,
+    /// Code, inline or in a fenced block.
+    Code,
+    /// A heading or bold prose.
+    Strong,
+    /// A turn that could not finish.
+    Trouble,
+    /// Metadata: a prefix, a hint, a label.
+    Muted,
+    /// A marker that belongs to the human's own surface.
+    Accent,
 }
 
-/// `text` broken into rows of at most `columns`, measured as the terminal draws them: a wide
-/// character takes two columns and a combining one none.
-fn wrapped(
-    text: &str,
-    columns: usize,
-) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
+/// One piece of a drawn row, with the tone it reads in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Span {
+    /// The text to place. It holds no control character.
+    pub text: String,
+    /// How it reads.
+    pub tone: Tone,
+}
+
+impl Span {
+    fn new(
+        text: impl Into<String>,
+        tone: Tone,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+        }
+    }
+}
+
+/// One drawn row: the spans to place, and whether the listing's cursor is on it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Row {
+    /// The spans, left to right.
+    pub spans: Vec<Span>,
+    /// Whether the listing's cursor is on this row, so the adapter may highlight it.
+    pub selected: bool,
+}
+
+impl Row {
+    /// The display width of the row, in terminal columns.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(|span| span.text.width()).sum()
     }
 
+    /// The row's text with every span joined.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    const fn plain(
+        spans: Vec<Span>,
+        selected: bool,
+    ) -> Self {
+        Self { spans, selected }
+    }
+}
+
+/// One frame, as data: the renderer lays it out and decides nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct View {
+    /// The session's name, so the human can read the conversation back with `mokmokd status`.
+    pub session: SessionID,
+    /// The goal the session's task recorded, when it recorded one.
+    pub goal: Option<String>,
+    /// The checkout the session's task recorded, when it recorded one.
+    pub checkout: Option<PathBuf>,
+    /// Every line of the conversation, oldest first.
+    pub lines: Vec<Line>,
+    /// The line being typed.
+    pub input: String,
+    /// One phrase for the session's state and whose turn it is.
+    pub status: String,
+    /// The key hints for the open pane, or the conversation's own.
+    pub hints: String,
+    /// The composer's placeholder, empty when there is nothing to type.
+    pub placeholder: String,
+    /// How many lines back from the newest the transcript is scrolled.
+    pub scroll: u16,
+    /// One phrase for the sessions whose turn it is besides the one on screen, when any are.
+    ///
+    /// `None` when nothing else is moving, so the frame of a single session is the frame it was.
+    pub background: Option<String>,
+    /// The pane that replaces the transcript, when the human opened one.
+    pub sheet: Option<Sheet>,
+    /// `Some(phase)` while the focused session's turn is moving, so the adapter draws a spinner.
+    pub spinner: Option<u8>,
+}
+
+/// The line being typed, laid out for a pane `width` columns wide.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Typing {
+    /// The rows to draw, the first behind the prompt and the rest indented past it.
+    pub rows: Vec<Row>,
+    /// Which row holds the cursor.
+    pub row: usize,
+    /// The column the next character takes.
+    pub column: usize,
+}
+
+/// A pane the human opened over the conversation.
+///
+/// The cases are the two things he can be doing besides typing a line — choosing a session, and
+/// naming one that does not exist yet — so the screen cannot invent a third.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Sheet {
+    /// The sessions this process holds and the ones the log holds, with the cursor on one entry.
+    List {
+        /// The entries, in the order they are drawn.
+        entries: Vec<Entry>,
+        /// Which entry the cursor is on.
+        cursor: usize,
+    },
+    /// The goal of a session that does not exist yet, as it is being typed.
+    New {
+        /// The goal so far.
+        goal: String,
+    },
+}
+
+/// One entry of the listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Entry {
+    /// The session the entry names.
+    pub session: SessionID,
+    /// The goal the session recorded, when it recorded one.
+    pub goal: Option<String>,
+    /// One phrase for the session's state, the same one the header shows for the session on screen.
+    pub status: String,
+    /// Whether this process holds the session's engine.
+    pub held: bool,
+    /// Whether it is the session the human is in.
+    pub focused: bool,
+}
+
+const NO_GOAL: &str = "(no goal recorded)";
+
+const LIST_ID_WIDTH: usize = 8;
+
+const LIST_STATUS_CAP: usize = 22;
+
+const LIST_GAP: &str = "  ";
+
+/// A logical row before wrapping: its first prefix, its continuation prefix, and its content.
+struct Logical {
+    prefix: Vec<Span>,
+    continuation: Vec<Span>,
+    content: Vec<Span>,
+    preformatted: bool,
+}
+
+impl Logical {
+    fn prefixed(
+        prefix: &str,
+        content: Vec<Span>,
+    ) -> Self {
+        Self {
+            prefix: vec![Span::new(prefix, Tone::Muted)],
+            continuation: vec![Span::new(" ".repeat(prefix.width()), Tone::Muted)],
+            content,
+            preformatted: false,
+        }
+    }
+
+    fn detail(content: Vec<Span>) -> Self {
+        Self::prefixed(DETAIL_PREFIX, content)
+    }
+
+    const fn plain(content: Vec<Span>) -> Self {
+        Self {
+            prefix: Vec::new(),
+            continuation: Vec::new(),
+            content,
+            preformatted: false,
+        }
+    }
+
+    fn field(
+        label: &str,
+        value: &str,
+        tone: Tone,
+    ) -> Self {
+        let prefix = format!("{label:<10}");
+
+        Self {
+            prefix: vec![Span::new(prefix.clone(), Tone::Muted)],
+            continuation: vec![Span::new(" ".repeat(prefix.width()), Tone::Muted)],
+            content: vec![Span::new(escaped(value), tone)],
+            preformatted: false,
+        }
+    }
+}
+
+fn prose_lines(
+    prefix: &str,
+    prefix_tone: Tone,
+    tone: Tone,
+    text: &str,
+) -> Vec<Logical> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let continuation = " ".repeat(prefix.width());
+
+    body.split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let held = if index == 0 {
+                prefix
+            } else {
+                continuation.as_str()
+            };
+
+            Logical {
+                prefix: vec![Span::new(
+                    held,
+                    if index == 0 { prefix_tone } else { Tone::Muted },
+                )],
+                continuation: vec![Span::new(continuation.clone(), Tone::Muted)],
+                content: vec![Span::new(escaped(line), tone)],
+                preformatted: false,
+            }
+        })
+        .collect()
+}
+
+fn agent_lines(text: &str) -> Vec<Logical> {
+    let mut markdown = Markdown::new();
+    let body = text.strip_suffix('\n').unwrap_or(text);
     let mut rows = Vec::new();
-    let mut rest = text;
+    let mut first = true;
 
-    while let Some(first) = rest.chars().next() {
-        // The row's first character is taken whatever its width, so a row always advances the text
-        // and a wide character in a one-column row still leaves the rest for the next row.
-        let mut row = String::new();
-        let mut used = first.width().unwrap_or(0);
-        let mut space = None;
-        row.push(first);
+    for line in body.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some(prose) = markdown.line(line) else {
+            continue;
+        };
+        let content: Vec<Span> = prose
+            .spans
+            .into_iter()
+            .map(|(text, tone)| Span::new(text, tone))
+            .collect();
 
-        for character in rest[first.len_utf8()..].chars() {
-            let width = character.width().unwrap_or(0);
-
-            if used + width > columns {
-                break;
-            }
-
-            used += width;
-            row.push(character);
-
-            if character == ' ' {
-                space = Some(row.len());
-            }
+        if prose.code {
+            rows.push(Logical {
+                prefix: vec![Span::new(CODE_PREFIX, Tone::Muted)],
+                continuation: vec![Span::new(CODE_PREFIX, Tone::Muted)],
+                content,
+                preformatted: true,
+            });
+        } else {
+            let held = if first { AGENT_PREFIX } else { CONTINUATION };
+            first = false;
+            rows.push(Logical {
+                prefix: vec![Span::new(held, Tone::Muted)],
+                continuation: vec![Span::new(CONTINUATION, Tone::Muted)],
+                content,
+                preformatted: false,
+            });
         }
-
-        if row.len() == rest.len() {
-            rows.push(rest.to_owned());
-            break;
-        }
-
-        let at = space.unwrap_or(row.len());
-
-        rows.push(row[..at].trim_end_matches(' ').to_owned());
-        rest = &rest[at..];
     }
 
     rows
+}
+
+fn work_lines(
+    command: &str,
+    observation: &str,
+) -> Vec<Logical> {
+    let mut rows = vec![Logical::prefixed(
+        WORK_PREFIX,
+        vec![Span::new(escaped(command), Tone::Command)],
+    )];
+
+    if let Some(first) = observation.lines().next().filter(|line| !line.is_empty()) {
+        rows.push(Logical::detail(vec![Span::new(
+            escaped(first.strip_suffix('\r').unwrap_or(first)),
+            Tone::Observation,
+        )]));
+    }
+
+    rows
+}
+
+fn find_lines(
+    query: &str,
+    observation: &str,
+) -> Vec<Logical> {
+    let mut rows = vec![Logical::prefixed(
+        FIND_PREFIX,
+        vec![Span::new(escaped(query), Tone::Command)],
+    )];
+
+    if let Some(first) = observation.lines().next().filter(|line| !line.is_empty()) {
+        rows.push(Logical::detail(vec![Span::new(
+            escaped(first.strip_suffix('\r').unwrap_or(first)),
+            Tone::Observation,
+        )]));
+    }
+
+    rows
+}
+
+fn edit_lines(observation: &str) -> Vec<Logical> {
+    let lines: Vec<&str> = observation
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut rows = Vec::new();
+
+    if let Some(first) = lines.first() {
+        rows.push(Logical::prefixed(
+            EDIT_PREFIX,
+            vec![Span::new(escaped(first), Tone::Command)],
+        ));
+    }
+    if let Some(second) = lines.get(1) {
+        rows.push(Logical::detail(vec![Span::new(
+            escaped(second),
+            Tone::Observation,
+        )]));
+    }
+
+    rows
+}
+
+fn delegate_lines(
+    child_session: SessionID,
+    goal: &str,
+    reply: &str,
+) -> Vec<Logical> {
+    let mut rows = vec![Logical::prefixed(
+        DELEGATE_PREFIX,
+        vec![
+            Span::new("delegate: ", Tone::Muted),
+            Span::new(escaped(goal), Tone::Strong),
+        ],
+    )];
+    rows.push(Logical::detail(vec![
+        Span::new("child: ", Tone::Muted),
+        Span::new(child_session.as_uuid().to_string(), Tone::Observation),
+    ]));
+
+    if let Some(first) = reply.lines().next().filter(|line| !line.is_empty()) {
+        rows.push(Logical::detail(vec![Span::new(
+            escaped(first),
+            Tone::Observation,
+        )]));
+    }
+
+    rows
+}
+
+fn line_rows(line: &Line) -> Vec<Logical> {
+    match line {
+        Line::Human(text) => prose_lines(HUMAN_PREFIX, Tone::Accent, Tone::Human, text),
+        Line::Agent(text) => agent_lines(text),
+        Line::Work {
+            command,
+            observation,
+        } => work_lines(command, observation),
+        Line::Find { query, observation } => find_lines(query, observation),
+        Line::Edit { observation } => edit_lines(observation),
+        Line::Delegate {
+            child_session,
+            goal,
+            reply,
+        } => delegate_lines(*child_session, goal, reply),
+        Line::Trouble(text) => prose_lines(TROUBLE_PREFIX, Tone::Trouble, Tone::Trouble, text),
+    }
+}
+
+/// Wraps every logical row and turns it into drawn rows.
+fn draw(
+    logicals: Vec<Logical>,
+    width: usize,
+) -> Vec<Row> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+
+    for logical in logicals {
+        let prefix_width: usize = logical.prefix.iter().map(|span| span.text.width()).sum();
+        let available = width.saturating_sub(prefix_width).max(1);
+        let chunks = if logical.preformatted {
+            wrap_preformatted(&logical.content, available)
+        } else {
+            wrap_spans(&logical.content, available)
+        };
+
+        if chunks.is_empty() {
+            rows.push(Row::plain(logical.prefix, false));
+            continue;
+        }
+
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let mut spans = if index == 0 {
+                logical.prefix.clone()
+            } else {
+                logical.continuation.clone()
+            };
+            spans.extend(chunk);
+            rows.push(Row::plain(spans, false));
+        }
+    }
+
+    rows
+}
+
+struct Token {
+    text: String,
+    tone: Tone,
+    space: bool,
+}
+
+fn tokens(spans: &[Span]) -> Vec<Token> {
+    let mut tokens = Vec::new();
+
+    for span in spans {
+        let mut word = String::new();
+
+        for character in span.text.chars() {
+            if character == ' ' {
+                if !word.is_empty() {
+                    tokens.push(Token {
+                        text: std::mem::take(&mut word),
+                        tone: span.tone,
+                        space: false,
+                    });
+                }
+                tokens.push(Token {
+                    text: " ".to_owned(),
+                    tone: span.tone,
+                    space: true,
+                });
+            } else {
+                word.push(character);
+            }
+        }
+
+        if !word.is_empty() {
+            tokens.push(Token {
+                text: word,
+                tone: span.tone,
+                space: false,
+            });
+        }
+    }
+
+    tokens
+}
+
+fn wrap_spans(
+    spans: &[Span],
+    width: usize,
+) -> Vec<Vec<Span>> {
+    let mut tokens: VecDeque<Token> = tokens(spans).into();
+    let mut rows = Vec::new();
+    let mut current: Vec<Span> = Vec::new();
+    let mut used = 0;
+
+    while let Some(token) = tokens.pop_front() {
+        if token.space {
+            if used == 0 {
+                continue;
+            }
+
+            let Some(next) = tokens.iter().find(|token| !token.space) else {
+                continue;
+            };
+
+            if used + 1 + next.text.width() <= width {
+                push_text(&mut current, " ", token.tone);
+                used += 1;
+            } else {
+                rows.push(std::mem::take(&mut current));
+                used = 0;
+                while tokens.front().is_some_and(|token| token.space) {
+                    tokens.pop_front();
+                }
+            }
+            continue;
+        }
+
+        let word_width = token.text.width();
+
+        if used + word_width <= width {
+            push_text(&mut current, &token.text, token.tone);
+            used += word_width;
+        } else {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                used = 0;
+            }
+
+            if word_width <= width {
+                push_text(&mut current, &token.text, token.tone);
+                used = word_width;
+            } else {
+                let mut rest = token.text.as_str();
+
+                while !rest.is_empty() {
+                    let cut = char_boundary(rest, width);
+                    if cut == 0 {
+                        break;
+                    }
+                    let (head, tail) = rest.split_at(cut);
+
+                    if tail.is_empty() {
+                        push_text(&mut current, head, token.tone);
+                        used = head.width();
+                        break;
+                    }
+
+                    rows.push(vec![Span::new(head, token.tone)]);
+                    rest = tail;
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        rows.push(current);
+    }
+
+    rows
+}
+
+fn wrap_preformatted(
+    spans: &[Span],
+    width: usize,
+) -> Vec<Vec<Span>> {
+    let mut rows = Vec::new();
+    let mut current: Vec<Span> = Vec::new();
+    let mut used = 0;
+
+    for span in spans {
+        let mut rest = span.text.as_str();
+
+        while !rest.is_empty() {
+            let cut = char_boundary(rest, width.saturating_sub(used).max(1));
+            if cut == 0 {
+                break;
+            }
+            let (head, tail) = rest.split_at(cut);
+            push_text(&mut current, head, span.tone);
+            used += head.width();
+            rest = tail;
+
+            if used >= width {
+                rows.push(std::mem::take(&mut current));
+                used = 0;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        rows.push(current);
+    }
+
+    rows
+}
+
+/// The byte index after the longest prefix whose display width is at most `width`.
+///
+/// A single character wider than `width` is returned whole, so a caller always makes progress.
+fn char_boundary(
+    text: &str,
+    width: usize,
+) -> usize {
+    let mut used = 0;
+    let mut end = 0;
+
+    for (index, character) in text.char_indices() {
+        let character_width = character.width().unwrap_or(0);
+
+        if used + character_width > width {
+            if index == 0 {
+                return character.len_utf8();
+            }
+            break;
+        }
+
+        used += character_width;
+        end = index + character.len_utf8();
+    }
+
+    end
+}
+
+fn push_text(
+    spans: &mut Vec<Span>,
+    text: &str,
+    tone: Tone,
+) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = spans.last_mut()
+        && last.tone == tone
+    {
+        last.text.push_str(text);
+
+        return;
+    }
+
+    spans.push(Span::new(text, tone));
+}
+
+fn short_id(session: SessionID) -> String {
+    session
+        .as_uuid()
+        .to_string()
+        .chars()
+        .take(LIST_ID_WIDTH)
+        .collect()
+}
+
+/// Clips `text` to `width` columns, ending with an ellipsis when it does not fit.
+#[must_use]
+pub fn clipped(
+    text: &str,
+    width: usize,
+) -> String {
+    let text = escaped(text);
+
+    if text.width() <= width {
+        return text;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+
+    let mut clipped = String::new();
+    let mut used = 0;
+
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+
+        if used + character_width > width - 1 {
+            break;
+        }
+
+        clipped.push(character);
+        used += character_width;
+    }
+
+    clipped.push('…');
+
+    clipped
+}
+
+fn window(
+    rows: &[Row],
+    cursor: usize,
+    height: usize,
+) -> Vec<Row> {
+    let start = cursor
+        .saturating_sub(height / 2)
+        .min(rows.len().saturating_sub(height));
+
+    rows[start..].iter().take(height).cloned().collect()
+}
+
+impl View {
+    /// The first eight characters of the session's identity, which is what a row can spare.
+    #[must_use]
+    pub fn short_session(&self) -> String {
+        short_id(self.session)
+    }
+
+    /// The rows a transcript `height` rows tall shows, newest last, wrapped to `width` columns.
+    ///
+    /// A pure function of the view and the two things the adapter knows, so which rows are on
+    /// screen is decided here and tested without a terminal.
+    #[must_use]
+    pub fn visible(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Vec<Row> {
+        let rows: Vec<Row> = self
+            .lines
+            .iter()
+            .flat_map(|line| draw(line_rows(line), width))
+            .collect();
+        let end = rows.len().saturating_sub(usize::from(self.scroll));
+        let start = end.saturating_sub(height);
+
+        rows[start..end].to_vec()
+    }
+
+    /// The rows the body shows: the listing when the human opened it, and the transcript otherwise.
+    ///
+    /// Naming a session's goal leaves the conversation behind the pane, because the goal is usually
+    /// a reading of what is already on screen.
+    #[must_use]
+    pub fn body(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Vec<Row> {
+        match &self.sheet {
+            Some(Sheet::List { entries, cursor }) => Self::listing(entries, *cursor, width, height),
+            _ if self.lines.is_empty() => self.welcome(width, height),
+            _ => self.visible(width, height),
+        }
+    }
+
+    /// The line being typed, laid out and placed for a pane `width` columns wide.
+    ///
+    /// A character that fills the last column leaves the cursor on a fresh row, which is where the
+    /// terminal puts it. A pane narrower than the prompt keeps the cursor on its last column.
+    #[must_use]
+    pub fn typing(
+        &self,
+        width: usize,
+    ) -> Typing {
+        let prompt = match &self.sheet {
+            Some(Sheet::List { .. }) => {
+                return Typing {
+                    rows: vec![Row::plain(Vec::new(), false)],
+                    row: 0,
+                    column: 0,
+                };
+            },
+            Some(Sheet::New { .. }) => GOAL_PREFIX,
+            None => INPUT_PREFIX,
+        };
+        let prefix_width = prompt.width();
+        let available = width.saturating_sub(prefix_width).max(1);
+        let text = match &self.sheet {
+            Some(Sheet::New { goal }) => goal.as_str(),
+            Some(Sheet::List { .. }) => "",
+            None => self.input.as_str(),
+        };
+
+        if text.is_empty() {
+            let mut spans = vec![Span::new(prompt, Tone::Accent)];
+
+            if !self.placeholder.is_empty() {
+                spans.push(Span::new(
+                    clipped(&self.placeholder, available),
+                    Tone::Muted,
+                ));
+            }
+
+            return Typing {
+                rows: vec![Row::plain(spans, false)],
+                row: 0,
+                column: prefix_width.min(width.saturating_sub(1)),
+            };
+        }
+
+        let content = vec![Span::new(escaped(text), Tone::Agent)];
+        let chunks = wrap_spans(&content, available);
+        let mut rows = Vec::new();
+
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let mut spans = if index == 0 {
+                vec![Span::new(prompt, Tone::Accent)]
+            } else {
+                vec![Span::new(" ".repeat(prefix_width), Tone::Muted)]
+            };
+            spans.extend(chunk);
+            rows.push(Row::plain(spans, false));
+        }
+
+        let mut row = rows.len() - 1;
+        let mut column = rows[row].width();
+
+        if column >= width {
+            rows.push(Row::plain(
+                vec![Span::new(" ".repeat(prefix_width), Tone::Muted)],
+                false,
+            ));
+            row += 1;
+            column = prefix_width;
+        }
+
+        Typing {
+            rows,
+            row,
+            column: column.min(width.saturating_sub(1)),
+        }
+    }
+
+    fn welcome(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Vec<Row> {
+        let mut logicals = vec![
+            Logical::plain(vec![Span::new(
+                "A conversation with the constrained agent. Type a line and press enter.",
+                Tone::Muted,
+            )]),
+            Logical::plain(Vec::new()),
+        ];
+
+        if let Some(goal) = &self.goal {
+            logicals.push(Logical::field("goal", goal, Tone::Agent));
+        }
+        if let Some(checkout) = &self.checkout {
+            logicals.push(Logical::field(
+                "checkout",
+                &checkout.display().to_string(),
+                Tone::Observation,
+            ));
+        }
+
+        logicals.push(Logical::plain(Vec::new()));
+        logicals.push(Logical::plain(vec![Span::new(
+            "^O lists every session this log holds.",
+            Tone::Muted,
+        )]));
+
+        draw(logicals, width).into_iter().take(height).collect()
+    }
+
+    fn listing(
+        entries: &[Entry],
+        cursor: usize,
+        width: usize,
+        height: usize,
+    ) -> Vec<Row> {
+        let mut rows = Vec::new();
+
+        // A header is worth a row only when the pane can spare one beside a list worth scanning.
+        if height >= 4 {
+            rows.push(Row::plain(vec![Span::new("sessions", Tone::Muted)], false));
+        }
+
+        let room = height - rows.len();
+
+        if entries.is_empty() {
+            rows.push(Row::plain(
+                vec![Span::new(
+                    "no session is written in this log yet",
+                    Tone::Muted,
+                )],
+                false,
+            ));
+
+            return rows.into_iter().take(height).collect();
+        }
+
+        let status_width = entries
+            .iter()
+            .map(|entry| clipped(&entry.status, LIST_STATUS_CAP).width())
+            .max()
+            .unwrap_or(0);
+        let drawn: Vec<Row> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| Self::entry_row(entry, index == cursor, status_width, width))
+            .collect();
+
+        rows.extend(window(&drawn, cursor, room));
+
+        rows
+    }
+
+    fn entry_row(
+        entry: &Entry,
+        selected: bool,
+        status_width: usize,
+        width: usize,
+    ) -> Row {
+        let mut spans = Vec::new();
+
+        push_text(&mut spans, if selected { "› " } else { "  " }, Tone::Accent);
+        push_text(
+            &mut spans,
+            if entry.held { "* " } else { "  " },
+            Tone::Command,
+        );
+        push_text(&mut spans, &short_id(entry.session), Tone::Observation);
+        push_text(&mut spans, LIST_GAP, Tone::Muted);
+
+        let status = clipped(&entry.status, status_width);
+        let padding = status_width.saturating_sub(status.width());
+        push_text(&mut spans, &status, Tone::Agent);
+        push_text(&mut spans, &" ".repeat(padding), Tone::Muted);
+        push_text(&mut spans, LIST_GAP, Tone::Muted);
+
+        let used: usize = spans.iter().map(|span| span.text.width()).sum();
+        let room = width.saturating_sub(used);
+        let goal = entry.goal.as_deref().unwrap_or(NO_GOAL);
+
+        push_text(
+            &mut spans,
+            &clipped(goal, room),
+            if entry.goal.is_some() {
+                Tone::Agent
+            } else {
+                Tone::Muted
+            },
+        );
+
+        Row::plain(spans, selected)
+    }
 }
 
 /// Replaces every control character so a drawn row holds the text the shell received.
@@ -565,205 +1322,12 @@ fn escaped(text: &str) -> String {
     escaped
 }
 
-/// One frame, as data: the renderer lays it out and decides nothing.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct View {
-    /// The session's name, so the human can read the conversation back with `mokmokd status`.
-    pub session: SessionID,
-    /// Every line of the conversation, oldest first.
-    pub lines: Vec<Line>,
-    /// The line being typed.
-    pub input: String,
-    /// One phrase for the session's state and whose turn it is.
-    pub status: String,
-    /// How many drawn rows back from the newest the transcript is scrolled.
-    pub scroll: u16,
-    /// One phrase for the sessions whose turn it is besides the one on screen, when any are.
-    ///
-    /// `None` when nothing else is moving, so the frame of a single session is the frame it was.
-    pub background: Option<String>,
-    /// The pane that replaces the transcript, when the human opened one.
-    pub sheet: Option<Sheet>,
-}
-
-/// A pane the human opened over the conversation.
-///
-/// The cases are the two things he can be doing besides typing a line — choosing a session, and
-/// naming one that does not exist yet — so the screen cannot invent a third.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Sheet {
-    /// The sessions this process holds and the ones the log holds, with the cursor on one row.
-    List {
-        /// The rows, in the order they are drawn.
-        rows: Vec<Row>,
-        /// Which row the cursor is on.
-        cursor: usize,
-    },
-    /// The goal of a session that does not exist yet, as it is being typed.
-    New {
-        /// The goal so far.
-        goal: String,
-    },
-}
-
-/// One row of the listing.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Row {
-    /// The session the row names.
-    pub session: SessionID,
-    /// The goal the session recorded, when it recorded one.
-    pub goal: Option<String>,
-    /// One phrase for the session's state, the same one the header shows for the session on screen.
-    pub status: String,
-    /// Whether this process holds the session's engine.
-    pub held: bool,
-    /// Whether it is the session the human is in.
-    pub focused: bool,
-}
-
-const NO_GOAL: &str = "(no goal recorded)";
-
-// Two columns, so the cursor's row and the session the human is in can be told apart at a glance.
-const CURSOR_MARK: &str = "> ";
-
-const NO_CURSOR_MARK: &str = "  ";
-
-const HELD_MARK: &str = "* ";
-
-const NO_HELD_MARK: &str = "  ";
-
-const COLUMN_GAP: &str = "  ";
-
-fn drawn_row(
-    cursor: bool,
-    row: &Row,
-) -> String {
-    let cursor = if cursor { CURSOR_MARK } else { NO_CURSOR_MARK };
-    let held = if row.held { HELD_MARK } else { NO_HELD_MARK };
-    let goal = row.goal.as_deref().unwrap_or(NO_GOAL);
-
-    format!(
-        "{cursor}{held}{}{COLUMN_GAP}{}{COLUMN_GAP}{goal}",
-        row.session.as_uuid(),
-        row.status,
-    )
-}
-
-/// The line being typed, laid out in a pane `width` columns wide.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Typing {
-    /// The rows to draw, the first behind the prompt and the rest indented past it.
-    pub rows: Vec<String>,
-    /// Which of the rows holds the cursor.
-    pub row: usize,
-    /// The column the next character takes.
-    pub column: usize,
-}
-
-impl View {
-    /// The rows a transcript `width` columns wide and `height` rows tall shows, newest last.
-    ///
-    /// A pure function of the view and the two things the adapter knows, so which rows are on screen
-    /// and where each one breaks are decided here and tested without a terminal. Rows are counted
-    /// after they are wrapped, so the scroll and the window move by drawn rows.
-    #[must_use]
-    pub fn visible(
-        &self,
-        width: usize,
-        height: usize,
-    ) -> Vec<String> {
-        let rows: Vec<String> = self
-            .lines
-            .iter()
-            .flat_map(|line| rows_of(line, width))
-            .collect();
-        let end = rows.len().saturating_sub(usize::from(self.scroll));
-        let start = end.saturating_sub(height);
-
-        rows[start..end].to_vec()
-    }
-
-    /// The rows the body shows: the listing when the human opened it, and the transcript otherwise.
-    ///
-    /// Naming a session's goal leaves the conversation behind the pane, because the goal is usually a
-    /// reading of what is already on screen. The listing's columns are a table rather than prose, so
-    /// its rows are left to the renderer to truncate.
-    #[must_use]
-    pub fn body(
-        &self,
-        width: usize,
-        height: usize,
-    ) -> Vec<String> {
-        match &self.sheet {
-            Some(Sheet::List { rows, cursor }) => {
-                let drawn: Vec<String> = rows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| drawn_row(index == *cursor, row))
-                    .collect();
-
-                window(&drawn, *cursor, height)
-            },
-            _ => self.visible(width, height),
-        }
-    }
-
-    /// The line being typed, laid out and placed for a pane `width` columns wide.
-    ///
-    /// A character that fills the last column leaves the cursor on a fresh row, which is where the
-    /// terminal puts it. A pane narrower than the prompt keeps the cursor on its last column.
-    #[must_use]
-    pub fn typing(
-        &self,
-        width: usize,
-    ) -> Typing {
-        let (prompt, text) = match &self.sheet {
-            Some(Sheet::List { .. }) => {
-                return Typing {
-                    rows: vec![String::new()],
-                    row: 0,
-                    column: 0,
-                };
-            },
-            Some(Sheet::New { goal }) => (GOAL_PREFIX, goal.as_str()),
-            None => (INPUT_PREFIX, self.input.as_str()),
-        };
-
-        let hanging = prompt.width();
-        let mut rows = prefixed(prompt, text, width);
-        let mut row = rows.len() - 1;
-        let mut column = rows[row].width();
-
-        if column >= width {
-            rows.push(" ".repeat(hanging));
-            row += 1;
-            column = hanging;
-        }
-
-        column = column.min(width.saturating_sub(1));
-
-        Typing { rows, row, column }
-    }
-}
-
-fn window(
-    rows: &[String],
-    cursor: usize,
-    height: usize,
-) -> Vec<String> {
-    let start = cursor
-        .saturating_sub(height / 2)
-        .min(rows.len().saturating_sub(height));
-
-    rows[start..].iter().take(height).cloned().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
     use uuid::Uuid;
 
-    use super::{Line, Row, Sheet, Typing, View, edit_row};
+    use super::{Entry, Line, Row, Sheet, Tone, Typing, View};
     use mokmok_protocol::SessionID;
 
     fn view(
@@ -772,25 +1336,30 @@ mod tests {
     ) -> View {
         View {
             session: SessionID::from_uuid(Uuid::from_u128(1)),
+            goal: None,
+            checkout: None,
             lines,
             input: String::new(),
             status: String::new(),
+            hints: String::new(),
+            placeholder: String::new(),
             scroll,
             background: None,
             sheet: None,
+            spinner: None,
         }
     }
 
     fn named(seed: u128) -> SessionID {
-        SessionID::from_uuid(Uuid::from_u128(seed))
+        SessionID::from_uuid(Uuid::from_u128(seed << 120))
     }
 
-    fn row(
+    fn entry(
         session: SessionID,
         goal: Option<&str>,
         held: bool,
-    ) -> Row {
-        Row {
+    ) -> Entry {
+        Entry {
             session,
             goal: goal.map(str::to_owned),
             status: "your turn".to_owned(),
@@ -804,9 +1373,9 @@ mod tests {
         cursor: usize,
         goals: &[Option<&str>],
     ) -> View {
-        let rows = (0..count)
+        let entries = (0..count)
             .map(|index| {
-                row(
+                entry(
                     named(u128::try_from(index).unwrap() + 1),
                     goals.get(index).copied().flatten(),
                     index == 0,
@@ -815,94 +1384,387 @@ mod tests {
             .collect();
 
         View {
-            sheet: Some(Sheet::List { rows, cursor }),
+            sheet: Some(Sheet::List { entries, cursor }),
             ..view(Vec::new(), 0)
         }
+    }
+
+    fn texts(rows: &[Row]) -> Vec<String> {
+        rows.iter().map(Row::text).collect()
+    }
+
+    fn content(rows: &[Row]) -> String {
+        rows.iter()
+            .map(|row| row.text().chars().skip(2).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn a_human_and_an_agent_turn_carry_their_own_markers() {
+        let view = view(
+            vec![
+                Line::Human("hello".to_owned()),
+                Line::Agent("bye".to_owned()),
+            ],
+            0,
+        );
+
+        assert_eq!(texts(&view.visible(20, 10)), vec!["› hello", "• bye"]);
+    }
+
+    #[test]
+    fn a_work_row_shows_the_command_and_its_first_outcome() {
+        let view = view(
+            vec![Line::Work {
+                command: "ls".to_owned(),
+                observation: "out.txt\nmore\n".to_owned(),
+            }],
+            0,
+        );
+        let rows = view.visible(30, 10);
+
+        assert_eq!(texts(&rows), vec!["  $ ls", "    out.txt"]);
+        assert_eq!(rows[0].spans[1].tone, Tone::Command);
+        assert_eq!(rows[1].spans[1].tone, Tone::Observation);
+    }
+
+    #[test]
+    fn a_work_row_with_no_outcome_is_the_command_alone() {
+        let view = view(
+            vec![Line::Work {
+                command: "ls".to_owned(),
+                observation: String::new(),
+            }],
+            0,
+        );
+
+        assert_eq!(texts(&view.visible(30, 10)), vec!["  $ ls"]);
+    }
+
+    #[test]
+    fn a_find_row_is_not_a_command() {
+        let view = view(
+            vec![Line::Find {
+                query: "quokka".to_owned(),
+                observation: "indexed=2 hits=1\n1.500  notes.txt\n".to_owned(),
+            }],
+            0,
+        );
+
+        assert_eq!(
+            texts(&view.visible(40, 10)),
+            vec!["  ⌕ quokka", "    indexed=2 hits=1"],
+        );
+    }
+
+    #[test]
+    fn an_edit_row_shows_its_first_two_lines() {
+        let view = view(
+            vec![Line::Edit {
+                observation: "edit applied to src/x.rs\n1 bytes became 1 bytes\n".to_owned(),
+            }],
+            0,
+        );
+
+        assert_eq!(
+            texts(&view.visible(50, 10)),
+            vec!["  ✎ edit applied to src/x.rs", "    1 bytes became 1 bytes",],
+        );
+    }
+
+    #[test]
+    fn an_edit_skips_a_blank_line_between_its_rows() {
+        let line = Line::Edit {
+            observation: "first\n\nsecond\n".to_owned(),
+        };
+        let view = view(vec![line.clone()], 0);
+
+        assert_eq!(
+            texts(&view.visible(40, 10)),
+            vec!["  ✎ first", "    second"],
+        );
+        assert_eq!(format!("{line}"), "  ✎ first\n    second");
+    }
+
+    #[test]
+    fn a_delegate_row_shows_the_goal_the_child_and_the_reply() {
+        let session = named(2);
+        let view = view(
+            vec![Line::Delegate {
+                child_session: session,
+                goal: "find the license".to_owned(),
+                reply: "MIT license\nsummary here".to_owned(),
+            }],
+            0,
+        );
+
+        assert_eq!(
+            texts(&view.visible(60, 10)),
+            vec![
+                "  ⤷ delegate: find the license".to_owned(),
+                format!("    child: {}", session.as_uuid()),
+                "    MIT license".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_trouble_row_carries_its_reason() {
+        let view = view(
+            vec![Line::Trouble(
+                "the model did not answer\nno attempt was usable".to_owned(),
+            )],
+            0,
+        );
+
+        assert_eq!(
+            texts(&view.visible(50, 10)),
+            vec!["! the model did not answer", "  no attempt was usable",],
+        );
+    }
+
+    #[test]
+    fn a_reply_wraps_with_a_hanging_indent_under_its_marker() {
+        let view = view(
+            vec![Line::Agent("one two three four five six seven".to_owned())],
+            0,
+        );
+        let rows = view.visible(16, 10);
+
+        assert!(rows.len() > 2, "the reply wraps: {rows:?}");
+        assert_eq!(rows[0].text().chars().next(), Some('•'));
+
+        for row in rows.iter().skip(1) {
+            assert!(
+                row.text().starts_with("  "),
+                "a continuation starts under the marker: {row:?}",
+            );
+        }
+        for row in &rows {
+            assert!(
+                row.width() <= 16,
+                "a wrapped row fits the width: {:?}",
+                row.text(),
+            );
+        }
+        assert_eq!(
+            content(&rows),
+            "one two three four five six seven",
+            "wrapping drops no word and no space between words",
+        );
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_split() {
+        let view = view(vec![Line::Agent("abcdefghij".to_owned())], 0);
+
+        assert_eq!(
+            texts(&view.visible(6, 10)),
+            vec!["• abcd", "  efgh", "  ij"],
+        );
+    }
+
+    #[test]
+    fn a_wide_character_is_counted_by_columns() {
+        let view = view(vec![Line::Agent("日本語".to_owned())], 0);
+
+        assert_eq!(texts(&view.visible(8, 10)), vec!["• 日本語"]);
+        assert_eq!(
+            texts(&view.visible(7, 10)),
+            vec!["• 日本", "  語"],
+            "a wide character moves as one column pair",
+        );
+    }
+
+    #[test]
+    fn a_code_fence_draws_with_a_bar_and_no_markers() {
+        let view = view(
+            vec![Line::Agent(
+                "# Title\n```\nlet x = 1;\n```\nplain".to_owned(),
+            )],
+            0,
+        );
+        let rows = view.visible(40, 20);
+
+        assert_eq!(texts(&rows), vec!["• Title", "  │ let x = 1;", "  plain"],);
+        assert_eq!(rows[0].spans[1].tone, Tone::Strong);
+        assert_eq!(rows[1].spans[1].tone, Tone::Code);
+    }
+
+    #[test]
+    fn a_code_line_wider_than_the_pane_is_hard_wrapped() {
+        let view = view(vec![Line::Agent("```\nabcdefghij\n```".to_owned())], 0);
+
+        assert_eq!(
+            texts(&view.visible(6, 10)),
+            vec!["  │ ab", "  │ cd", "  │ ef", "  │ gh", "  │ ij"],
+        );
+    }
+
+    #[test]
+    fn an_inline_marker_produces_its_own_tone() {
+        let view = view(vec![Line::Agent("use `x` now".to_owned())], 0);
+        let rows = view.visible(30, 10);
+
+        assert_eq!(rows[0].text(), "• use x now");
+        assert_eq!(
+            rows[0]
+                .spans
+                .iter()
+                .map(|span| span.tone)
+                .collect::<Vec<_>>(),
+            vec![Tone::Muted, Tone::Agent, Tone::Code, Tone::Agent],
+        );
+    }
+
+    #[test]
+    fn scrolling_counts_wrapped_rows() {
+        let base = view(vec![Line::Agent("one two three four five".to_owned())], 0);
+        let all = base.visible(12, 10);
+
+        assert!(all.len() >= 2, "the reply wraps: {all:?}");
+
+        let one_back = View { scroll: 1, ..base }.visible(12, all.len() - 1);
+        assert_eq!(
+            one_back.last().map(Row::text),
+            all.get(all.len() - 2).map(Row::text),
+            "one row back drops the newest wrapped row",
+        );
+    }
+
+    #[test]
+    fn the_newest_rows_survive_a_transcript_taller_than_the_pane() {
+        let view = view(
+            vec![
+                Line::Human("first".to_owned()),
+                Line::Agent("second".to_owned()),
+                Line::Human("third".to_owned()),
+                Line::Agent("fourth".to_owned()),
+            ],
+            0,
+        );
+
+        assert_eq!(texts(&view.visible(20, 2)), vec!["› third", "• fourth"],);
+    }
+
+    #[test]
+    fn a_zero_width_draws_nothing() {
+        let view = view(vec![Line::Human("hello".to_owned())], 0);
+
+        assert_eq!(view.visible(0, 10), Vec::new());
+        assert_eq!(view.visible(10, 0), Vec::new());
     }
 
     #[test]
     fn the_listing_draws_the_cursor_the_held_mark_and_the_goal() {
         let view = listing(
             2,
-            1,
+            0,
             &[Some("hold a conversation"), Some("count the quokkas")],
         );
 
         assert_eq!(
-            view.body(usize::MAX, 10),
+            texts(&view.body(60, 10)),
             vec![
-                "  * 00000000-0000-0000-0000-000000000001  your turn  hold a conversation"
-                    .to_owned(),
-                ">   00000000-0000-0000-0000-000000000002  your turn  count the quokkas".to_owned(),
+                "sessions",
+                "› * 01000000  your turn  hold a conversation",
+                "    02000000  your turn  count the quokkas",
             ],
             "the cursor row, the held row, and each goal are drawn",
         );
+        assert!(view.body(60, 10)[1].selected);
     }
 
     #[test]
-    fn a_session_that_recorded_no_goal_says_so_in_its_row() {
+    fn a_session_that_recorded_no_goal_says_so_in_its_entry() {
         let view = listing(1, 0, &[None]);
 
         assert!(
-            view.body(usize::MAX, 1)[0].ends_with("(no goal recorded)"),
-            "a row with no goal says there is none: {:?}",
-            view.body(usize::MAX, 1),
+            view.body(60, 10)[1].text().ends_with("(no goal recorded)"),
+            "an entry with no goal says there is none: {:?}",
+            texts(&view.body(60, 10)),
         );
     }
 
     #[test]
-    fn the_listing_holds_the_cursor_row_in_a_pane_shorter_than_the_rows() {
+    fn the_listing_holds_the_cursor_entry_in_a_pane_shorter_than_the_entries() {
         let goals = [None; 5];
         let rows = |cursor| {
             listing(5, cursor, &goals)
-                .body(usize::MAX, 3)
+                .body(30, 3)
                 .iter()
-                .map(|row| row.chars().next().unwrap())
+                .map(|row| row.text().chars().next().unwrap())
                 .collect::<Vec<_>>()
         };
 
         assert_eq!(
             rows(0),
-            vec!['>', ' ', ' '],
+            vec!['›', ' ', ' '],
             "the cursor at the top stays there"
         );
         assert_eq!(
             rows(4),
-            vec![' ', ' ', '>'],
+            vec![' ', ' ', '›'],
             "the cursor at the bottom stays there",
         );
         assert_eq!(
             rows(2),
-            vec![' ', '>', ' '],
+            vec![' ', '›', ' '],
             "the cursor in the middle is centred"
         );
         assert_eq!(
-            listing(5, 0, &goals).body(usize::MAX, 5).len(),
+            listing(5, 0, &goals).body(30, 5).len(),
             5,
-            "a pane that fits shows every row"
+            "a pane that fits shows every entry",
         );
-        assert!(
-            listing(5, 0, &goals).body(usize::MAX, 0).is_empty(),
-            "a pane with no room shows no row",
-        );
+    }
 
-        // An even pane height, where the rows kept above the cursor are not the rows between the top
-        // of the window and the cursor.
-        let even = listing(6, 3, &[None; 6]).body(usize::MAX, 4);
+    #[test]
+    fn a_two_row_listing_keeps_the_cursor_on_the_second_row() {
+        let goals = [None; 5];
+        let rows = listing(5, 2, &goals).body(30, 2);
 
-        assert_eq!(even.len(), 4);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].text().starts_with(' '));
+        assert!(rows[1].text().starts_with('›'));
+    }
+
+    #[test]
+    fn an_empty_listing_says_so() {
+        let view = listing(0, 0, &[]);
+
         assert_eq!(
-            even.iter()
-                .map(|row| row.chars().next().expect("a marker"))
-                .collect::<Vec<_>>(),
-            vec![' ', ' ', '>', ' '],
-            "a pane four rows tall keeps two rows above the cursor",
+            texts(&view.body(40, 5)),
+            vec!["sessions", "no session is written in this log yet"],
         );
-        assert!(
-            even[0].contains("00000000-0000-0000-0000-000000000002"),
-            "the window starts two rows above the cursor's own row: {:?}",
-            even[0],
-        );
+    }
+
+    #[test]
+    fn the_welcome_names_the_goal_and_the_checkout() {
+        let view = View {
+            goal: Some("hold a conversation".to_owned()),
+            checkout: Some("/checkout".into()),
+            ..view(Vec::new(), 0)
+        };
+        let shown = texts(&view.body(60, 10)).join("\n");
+
+        assert!(shown.contains("A conversation with the constrained agent"));
+        assert!(shown.contains("goal"), "the welcome labels the goal");
+        assert!(shown.contains("hold a conversation"));
+        assert!(shown.contains("checkout"));
+        assert!(shown.contains("/checkout"));
+    }
+
+    #[test]
+    fn the_welcome_keeps_only_the_rows_that_fit() {
+        let view = View {
+            goal: Some("hold a conversation".to_owned()),
+            ..view(Vec::new(), 0)
+        };
+
+        assert_eq!(view.body(60, 2).len(), 2);
+        assert_eq!(view.body(60, 0), Vec::new());
     }
 
     #[test]
@@ -916,259 +1778,9 @@ mod tests {
         };
 
         assert_eq!(
-            naming.body(usize::MAX, 10),
-            conversation.body(usize::MAX, 10),
+            naming.body(40, 10),
+            conversation.body(40, 10),
             "the pane that names a goal draws the conversation it is about",
-        );
-    }
-
-    #[test]
-    fn visible_draws_the_gutter_and_the_work_outcome() {
-        let view = view(
-            vec![
-                Line::Human("hello".to_owned()),
-                Line::Work {
-                    command: "ls".to_owned(),
-                    observation: "out.txt\nmore\n".to_owned(),
-                },
-                Line::Agent("bye".to_owned()),
-            ],
-            0,
-        );
-
-        assert_eq!(
-            view.visible(usize::MAX, 10),
-            vec![
-                "you    hello".to_owned(),
-                "  $ ls".to_owned(),
-                "    out.txt".to_owned(),
-                "agent  bye".to_owned(),
-            ],
-        );
-        assert_eq!(view.visible(usize::MAX, 0), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_find_draws_its_query_and_its_outcome_under_a_gutter_of_its_own() {
-        let view = view(
-            vec![
-                Line::Find {
-                    query: "quokka".to_owned(),
-                    observation: "indexed=2 hits=1\n1.500  /checkout/notes.txt\n".to_owned(),
-                },
-                Line::Agent("found it".to_owned()),
-            ],
-            0,
-        );
-
-        assert_eq!(
-            view.visible(usize::MAX, 10),
-            vec![
-                "  ? quokka".to_owned(),
-                "    indexed=2 hits=1".to_owned(),
-                "agent  found it".to_owned(),
-            ],
-            "a find must not draw the command's gutter",
-        );
-    }
-
-    #[test]
-    fn an_edit_draws_its_first_two_lines_with_the_edit_gutter() {
-        let line = Line::Edit {
-            observation: "edit applied to src/x.rs\n1 bytes became 1 bytes\n".to_owned(),
-        };
-
-        assert_eq!(
-            view(vec![line.clone()], 0).visible(usize::MAX, 2),
-            vec![
-                "  ✎ edit applied to src/x.rs".to_owned(),
-                "    1 bytes became 1 bytes".to_owned(),
-            ],
-            "an edit's first two non-empty lines appear in the frame",
-        );
-
-        let replayed = format!("{line}");
-        assert!(
-            replayed.contains("edit applied to src/x.rs")
-                && replayed.contains("1 bytes became 1 bytes"),
-            "the replay carries every line of the edit: {replayed:?}"
-        );
-    }
-
-    #[test]
-    fn edit_row_renders_the_exact_gutter() {
-        assert_eq!(
-            edit_row("applied to src/x.rs", usize::MAX),
-            vec!["  ✎ applied to src/x.rs".to_owned()],
-        );
-    }
-
-    #[test]
-    fn a_delegate_line_renders_its_goal_child_and_reply() {
-        let session = SessionID::from_uuid(Uuid::from_u128(2));
-        let line = Line::Delegate {
-            child_session: session,
-            goal: "find the license".to_owned(),
-            reply: "MIT license\nsummary here".to_owned(),
-        };
-
-        assert_eq!(
-            view(vec![line.clone()], 0).visible(usize::MAX, 3),
-            vec![
-                "  ⤷ delegate: find the license".to_owned(),
-                format!("    child: {}", session.as_uuid()),
-                "    MIT license".to_owned(),
-            ],
-            "the frame shows the goal, the child session, and the first reply line",
-        );
-
-        let replayed = format!("{line}");
-        assert!(
-            replayed.contains("delegate: find the license")
-                && replayed.contains(&session.as_uuid().to_string())
-                && replayed.contains("summary here"),
-            "the replay carries every line: {replayed:?}",
-        );
-    }
-
-    #[test]
-    fn the_replay_carries_every_find_row_and_the_frame_carries_the_first() {
-        let line = Line::Find {
-            query: "quokka".to_owned(),
-            observation: "indexed=2 hits=1\n1.500  /checkout/notes.txt\n".to_owned(),
-        };
-
-        let replayed = format!("{line}");
-        assert!(
-            replayed.contains("notes.txt"),
-            "the replay must carry every row of the find's answer: {replayed:?}",
-        );
-        assert_eq!(
-            view(vec![line], 0).visible(usize::MAX, 2),
-            vec!["  ? quokka".to_owned(), "    indexed=2 hits=1".to_owned()],
-        );
-    }
-
-    #[test]
-    fn a_reply_with_line_breaks_draws_one_row_per_line() {
-        let view = view(
-            vec![Line::Agent(
-                "fib.txt holds:\n1, 1, 2, 3, 5\nAnything else?".to_owned(),
-            )],
-            0,
-        );
-
-        assert_eq!(
-            view.visible(usize::MAX, 3),
-            vec![
-                "agent  fib.txt holds:".to_owned(),
-                "       1, 1, 2, 3, 5".to_owned(),
-                "       Anything else?".to_owned(),
-            ],
-            "each line of the reply is its own row, the later rows aligned under the gutter",
-        );
-        assert_eq!(
-            view.visible(usize::MAX, 2),
-            vec![
-                "       1, 1, 2, 3, 5".to_owned(),
-                "       Anything else?".to_owned(),
-            ],
-            "the window arithmetic counts the reply's three rows, not its one line",
-        );
-    }
-
-    #[test]
-    fn a_reply_of_one_line_stays_one_row() {
-        let one = view(vec![Line::Agent("one line".to_owned())], 0);
-
-        assert_eq!(
-            one.visible(usize::MAX, 1),
-            vec!["agent  one line".to_owned()]
-        );
-
-        let ended = view(vec![Line::Agent("one line\n".to_owned())], 0);
-
-        assert_eq!(
-            ended.visible(usize::MAX, 2),
-            vec!["agent  one line".to_owned()],
-            "the trailing line break ends the line instead of drawing a blank row after it",
-        );
-    }
-
-    #[test]
-    fn a_row_wider_than_the_pane_breaks_at_a_space_and_indents_the_next_row() {
-        let view = view(vec![Line::Agent("alpha bravo charlie".to_owned())], 0);
-
-        assert_eq!(
-            view.visible(16, 3),
-            vec![
-                "agent  alpha".to_owned(),
-                "       bravo".to_owned(),
-                "       charlie".to_owned(),
-            ],
-            "a word that does not fit moves whole to the next row",
-        );
-        assert_eq!(
-            view.visible(16, 2),
-            vec!["       bravo".to_owned(), "       charlie".to_owned()],
-            "the window counts the rows a line was wrapped over",
-        );
-    }
-
-    #[test]
-    fn a_word_wider_than_the_pane_breaks_inside_it() {
-        let view = view(vec![Line::Agent("abcdefghij".to_owned())], 0);
-
-        assert_eq!(
-            view.visible(11, 3),
-            vec![
-                "agent  abcd".to_owned(),
-                "       efgh".to_owned(),
-                "       ij".to_owned(),
-            ],
-        );
-    }
-
-    #[test]
-    fn a_wide_character_takes_two_columns_and_is_never_split() {
-        let view = view(vec![Line::Agent("あああ".to_owned())], 0);
-
-        assert_eq!(
-            view.visible(11, 2),
-            vec!["agent  ああ".to_owned(), "       あ".to_owned()],
-            "two wide characters fill the four columns left beside the gutter",
-        );
-    }
-
-    #[test]
-    fn a_wide_character_alone_in_a_one_column_row_is_drawn_whole() {
-        let view = view(vec![Line::Agent("ああ".to_owned())], 0);
-
-        assert_eq!(
-            view.visible(8, 2),
-            vec!["agent  あ".to_owned(), "       あ".to_owned()],
-            "a row narrower than the character takes it whole rather than nothing",
-        );
-    }
-
-    #[test]
-    fn a_work_outcome_wraps_its_first_line_under_its_own_gutter() {
-        let view = view(
-            vec![Line::Work {
-                command: "ls".to_owned(),
-                observation: "alpha bravo charlie".to_owned(),
-            }],
-            0,
-        );
-
-        assert_eq!(
-            view.visible(16, 3),
-            vec![
-                "  $ ls".to_owned(),
-                "    alpha bravo".to_owned(),
-                "    charlie".to_owned(),
-            ],
-            "the frame keeps the command row and wraps the observation's first line",
         );
     }
 
@@ -1182,7 +1794,22 @@ mod tests {
         assert_eq!(
             view.typing(10),
             Typing {
-                rows: vec!["> abcdefgh".to_owned(), "  ij".to_owned()],
+                rows: vec![
+                    Row::plain(
+                        vec![
+                            super::Span::new("› ", Tone::Accent),
+                            super::Span::new("abcdefgh", Tone::Agent)
+                        ],
+                        false
+                    ),
+                    Row::plain(
+                        vec![
+                            super::Span::new("  ", Tone::Muted),
+                            super::Span::new("ij", Tone::Agent)
+                        ],
+                        false
+                    ),
+                ],
                 row: 1,
                 column: 4,
             },
@@ -1195,16 +1822,10 @@ mod tests {
             input: "abcdefgh".to_owned(),
             ..view(Vec::new(), 0)
         };
+        let typing = view.typing(10);
 
-        assert_eq!(
-            view.typing(10),
-            Typing {
-                rows: vec!["> abcdefgh".to_owned(), "  ".to_owned()],
-                row: 1,
-                column: 2,
-            },
-            "a cursor at the pane's own width would be off the screen",
-        );
+        assert_eq!(texts(&typing.rows), vec!["› abcdefgh", "  "]);
+        assert_eq!((typing.row, typing.column), (1, 2));
     }
 
     #[test]
@@ -1213,22 +1834,14 @@ mod tests {
             input: "日本語".to_owned(),
             ..view(Vec::new(), 0)
         };
+        let typing = wide.typing(80);
 
-        assert_eq!(
-            wide.typing(80),
-            Typing {
-                rows: vec!["> 日本語".to_owned()],
-                row: 0,
-                column: 8,
-            },
-        );
+        assert_eq!(texts(&typing.rows), vec!["› 日本語"]);
+        assert_eq!((typing.row, typing.column), (0, 8));
 
         let empty = view(Vec::new(), 0).typing(80);
-        assert_eq!(
-            (empty.row, empty.column),
-            (0, 2),
-            "an empty line leaves the cursor past the prompt",
-        );
+
+        assert_eq!((empty.row, empty.column), (0, 2));
     }
 
     #[test]
@@ -1239,28 +1852,18 @@ mod tests {
             }),
             ..view(Vec::new(), 0)
         };
+        let wide = naming.typing(80);
+
+        assert_eq!(texts(&wide.rows), vec!["goal› count the quokkas"]);
+        assert_eq!((wide.row, wide.column), (0, 23));
+
+        let narrow = naming.typing(14);
 
         assert_eq!(
-            naming.typing(80),
-            Typing {
-                rows: vec!["goal> count the quokkas".to_owned()],
-                row: 0,
-                column: 23,
-            },
+            texts(&narrow.rows),
+            vec!["goal› count", "      the", "      quokkas"],
         );
-
-        assert_eq!(
-            naming.typing(14),
-            Typing {
-                rows: vec![
-                    "goal> count".to_owned(),
-                    "      the".to_owned(),
-                    "      quokkas".to_owned(),
-                ],
-                row: 2,
-                column: 13,
-            },
-        );
+        assert_eq!((narrow.row, narrow.column), (2, 13));
     }
 
     #[test]
@@ -1271,20 +1874,13 @@ mod tests {
             }),
             ..view(Vec::new(), 0)
         };
+        let typing = naming.typing(1);
 
         assert_eq!(
-            naming.typing(1),
-            Typing {
-                rows: vec![
-                    "goal> a".to_owned(),
-                    "      b".to_owned(),
-                    "      c".to_owned(),
-                    "      ".to_owned(),
-                ],
-                row: 3,
-                column: 0,
-            },
+            texts(&typing.rows),
+            vec!["goal› a", "      b", "      c", "      "],
         );
+        assert_eq!((typing.row, typing.column), (3, 0));
     }
 
     #[test]
@@ -1294,7 +1890,7 @@ mod tests {
         assert_eq!(
             view.typing(80),
             Typing {
-                rows: vec![String::new()],
+                rows: vec![Row::plain(Vec::new(), false)],
                 row: 0,
                 column: 0,
             },
@@ -1302,149 +1898,55 @@ mod tests {
     }
 
     #[test]
-    fn a_human_line_with_line_breaks_is_drawn_the_same_way() {
-        let view = view(
-            vec![Line::Human(
-                "fib.txt holds:\n1, 1, 2, 3, 5\nAnything else?".to_owned(),
-            )],
-            0,
-        );
+    fn an_empty_input_leaves_the_cursor_past_the_prompt_and_shows_the_placeholder() {
+        let view = View {
+            placeholder: "Send a line to the agent…".to_owned(),
+            ..view(Vec::new(), 0)
+        };
+        let typing = view.typing(80);
 
-        assert_eq!(
-            view.visible(usize::MAX, 3),
-            vec![
-                "you    fib.txt holds:".to_owned(),
-                "       1, 1, 2, 3, 5".to_owned(),
-                "       Anything else?".to_owned(),
-            ],
-        );
+        assert_eq!(texts(&typing.rows), vec!["› Send a line to the agent…"]);
+        assert_eq!((typing.row, typing.column), (0, 2));
     }
 
     #[test]
-    fn visible_keeps_the_newest_rows_and_windows_by_rows() {
-        let view = view(
-            vec![
-                Line::Human("first".to_owned()),
-                Line::Work {
-                    command: "ls".to_owned(),
-                    observation: "out.txt".to_owned(),
-                },
-                Line::Agent("one\ntwo\nthree".to_owned()),
-            ],
-            0,
-        );
-
-        assert_eq!(
-            view.visible(usize::MAX, 4),
-            vec![
-                "    out.txt".to_owned(),
-                "agent  one".to_owned(),
-                "       two".to_owned(),
-                "       three".to_owned(),
-            ],
-            "a reply's continuation rows count toward a window shorter than the transcript",
-        );
-        assert_eq!(
-            view.visible(usize::MAX, 2),
-            vec!["       two".to_owned(), "       three".to_owned()],
-        );
-    }
-
-    #[test]
-    fn the_replay_carries_the_whole_observation_and_the_frame_carries_the_first_line() {
+    fn the_replay_carries_every_observation_row() {
         let line = Line::Work {
             command: "cat /etc/passwd".to_owned(),
             observation: "exit code 1\nstderr: denied\n".to_owned(),
         };
-
         let replayed = format!("{line}");
-        assert!(
-            replayed.contains("exit code 1") && replayed.contains("stderr: denied"),
-            "the replay must carry every line of the observation: {replayed:?}",
-        );
 
         assert_eq!(
-            view(vec![line], 0).visible(usize::MAX, 2),
-            vec![
-                "  $ cat /etc/passwd".to_owned(),
-                "    exit code 1".to_owned(),
-            ],
-            "the frame must keep the command row and the observation's first line",
+            replayed,
+            "  $ cat /etc/passwd\n    exit code 1\n    stderr: denied",
         );
     }
 
     #[test]
-    fn the_frame_and_the_replay_use_the_same_gutters() {
-        for (line, gutter) in [
-            (Line::Human("first\nsecond".to_owned()), "you    "),
-            (Line::Agent("first\nsecond".to_owned()), "agent  "),
-        ] {
-            let drawn = view(vec![line.clone()], 0).visible(usize::MAX, 2);
-            let replayed: Vec<String> = format!("{line}").lines().map(str::to_owned).collect();
+    fn the_replay_carries_every_reply_row() {
+        let line = Line::Agent("# Title\nbody".to_owned());
+        let replayed = format!("{line}");
 
-            assert_eq!(drawn.len(), 2, "a two-line {line:?} must draw two rows");
-            assert!(
-                drawn[0].starts_with(gutter),
-                "the drawn first row {drawn:?} must carry the gutter {gutter:?}",
-            );
-            assert!(
-                replayed[0].starts_with(gutter),
-                "the replayed first row {replayed:?} must carry the same gutter {gutter:?}",
-            );
-            assert!(
-                drawn[1].starts_with("       "),
-                "the drawn continuation row {drawn:?} must carry the seven-space prefix",
-            );
-            assert!(
-                replayed[1].starts_with("       "),
-                "the replayed continuation row {replayed:?} must carry the seven-space prefix",
-            );
-        }
-    }
-
-    #[test]
-    fn a_trouble_row_carries_its_gutter_and_the_replay_carries_the_same_text() {
-        let line = Line::Trouble(
-            "the model did not answer in 3 attempts\nthe turn stopped at that".to_owned(),
-        );
-
-        let drawn = vec![
-            "!      the model did not answer in 3 attempts".to_owned(),
-            "       the turn stopped at that".to_owned(),
-        ];
-
-        assert_eq!(view(vec![line.clone()], 0).visible(usize::MAX, 2), drawn);
-        assert_eq!(format!("{line}"), drawn.join("\n"));
+        assert_eq!(replayed, "• # Title\n  body");
     }
 
     #[test]
     fn a_carriage_return_before_a_line_break_is_one_break() {
-        let crlf = view(vec![Line::Agent("one\r\ntwo".to_owned())], 0);
+        let view = view(vec![Line::Agent("one\r\ntwo".to_owned())], 0);
 
-        assert_eq!(
-            crlf.visible(usize::MAX, 2),
-            vec!["agent  one".to_owned(), "       two".to_owned()],
-            "a carriage return before a line break is part of the break, not a drawn character",
-        );
-
-        let lone = view(vec![Line::Agent("a\rb".to_owned())], 0);
-
-        assert_eq!(
-            lone.visible(usize::MAX, 1),
-            vec!["agent  a\\rb".to_owned()],
-            "a carriage return inside a line is still shown as the escape",
-        );
+        assert_eq!(texts(&view.visible(20, 10)), vec!["• one", "  two"]);
     }
 
     #[test]
     fn a_control_character_that_is_not_a_break_is_drawn_as_a_question_mark() {
-        let line = Line::Agent("bell\u{7}here".to_owned());
+        let view = view(vec![Line::Agent("bell\u{7}here".to_owned())], 0);
 
+        assert_eq!(texts(&view.visible(20, 10)), vec!["• bell?here"]);
         assert_eq!(
-            view(vec![line.clone()], 0).visible(usize::MAX, 1),
-            vec!["agent  bell?here".to_owned()],
+            format!("{}", Line::Agent("bell\u{7}here".to_owned())),
+            "• bell?here"
         );
-        assert_eq!(format!("{line}"), "agent  bell?here");
     }
 
     /// Any text a line can hold, its line breaks and control characters among the choices.
@@ -1463,7 +1965,10 @@ mod tests {
 
     proptest! {
         #[test]
-        fn a_drawn_row_holds_no_control_character_and_matches_the_replay(text in any_text()) {
+        fn a_drawn_row_holds_no_control_character_and_fits_the_width(
+            text in any_text(),
+            width in 7usize..40,
+        ) {
             let lines = [
                 Line::Human(text.clone()),
                 Line::Agent(text.clone()),
@@ -1472,25 +1977,27 @@ mod tests {
                     command: text.clone(),
                     observation: text.clone(),
                 },
+                Line::Find {
+                    query: text.clone(),
+                    observation: text.clone(),
+                },
             ];
 
             for line in &lines {
-                for row in view(vec![line.clone()], 0).visible(usize::MAX, usize::MAX) {
+                for row in view(vec![line.clone()], 0).visible(width, usize::MAX) {
                     prop_assert!(
-                        !row.chars().any(char::is_control),
-                        "the drawn row {row:?} of {text:?} holds a control character",
+                        !row.text().chars().any(char::is_control),
+                        "the drawn row {:?} of {:?} holds a control character",
+                        row.text(),
+                        text,
+                    );
+                    prop_assert!(
+                        row.width() <= width,
+                        "the drawn row {:?} of {:?} is wider than {width}",
+                        row.text(),
+                        text,
                     );
                 }
-            }
-
-            for line in &lines[..3] {
-                let replayed: Vec<String> =
-                    format!("{line}").split('\n').map(str::to_owned).collect();
-                prop_assert_eq!(
-                    view(vec![line.clone()], 0).visible(usize::MAX, replayed.len()),
-                    replayed,
-                    "the frame and the replay of {:?} differ", text,
-                );
             }
         }
     }

@@ -11,6 +11,7 @@
 //! [`Transcript`]: mokmok_agent_runtime::Transcript
 
 mod core;
+mod markdown;
 mod port;
 mod session;
 mod terminal;
@@ -21,7 +22,7 @@ use mokmok_state_machine::Ending;
 
 pub use crate::core::run;
 pub use crate::port::{
-    Engine, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Typing, Update, View,
+    Engine, Entry, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Span, Tone, Update, View,
 };
 pub use crate::session::{Session, Sessions};
 pub use crate::terminal::Terminal;

@@ -31,36 +31,61 @@ the turn settles.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `run` | `src/core.rs:857` | The driver loop over every session the process holds |
-| `Engine` | `src/port.rs:17` | One session's world: `session`, `fold`, `speak`, `step`, `step_watched`, `reopen`, `busy`, `drain` |
-| `Update` | `src/port.rs:98` | What a step working elsewhere reported: a fragment, its result, or a failure |
-| `Roster` | `src/port.rs:125` | The log's sessions: `listed`, `resume`, `create` |
-| `Screen` | `src/port.rs:161` | `poll`, `event`, `draw` |
-| `Listing`, `Key`, `Event`, `Line` | `src/port.rs:113,189,214,227` | What the log holds of one session, the keys, and the seven line kinds, including a delegation's child, goal, and reply |
-| `View`, `Sheet`, `Row`, `Typing` | `src/port.rs:570,594,611,654` | The frame, the pane over the transcript, one row of the listing, and the typed line laid out for a width |
+| `run` | `src/core.rs:915` | The driver loop over every session the process holds |
+| `Engine` | `src/port.rs:19` | One session's world: `session`, `fold`, `speak`, `step`, `step_watched`, `reopen`, `busy`, `drain` |
+| `Update` | `src/port.rs:99` | What a step working elsewhere reported: a fragment, its result, or a failure |
+| `Roster` | `src/port.rs:126` | The log's sessions: `listed`, `resume`, `create` |
+| `Screen` | `src/port.rs:162` | `poll`, `event`, `draw` |
+| `Listing`, `Key`, `Event`, `Line` | `src/port.rs:114,190,215,228` | What the log holds of one session, the keys, and the seven line kinds, including a delegation's child, goal, and reply |
+| `Tone`, `Span`, `Row` | `src/port.rs:381,404,425` | How one drawn span reads, one span, and one drawn row with its spans and selection |
+| `View`, `Typing`, `Sheet`, `Entry` | `src/port.rs:455,486,500,517` | The frame, the typed line laid out for a width, the pane over the transcript, and one entry of the listing |
+| `clipped` | `src/port.rs:1018` | The display-width clip a heading, a status, and a goal share |
 | `Session` | `src/session.rs:16` | The kernel-backed engine |
 | `Sessions` | `src/session.rs:84` | The kernel-backed roster, which opens every session on a worker |
 | `Worker` | `src/worker.rs:32` | The thread one session's world runs on, and the cached fold it reports |
-| `Terminal` | `src/terminal.rs:28` | The terminal mode, its restoration, and the key reader |
-| `Outcome`, `Left` | `src/lib.rs:32,39` | What each held session left behind, and how it stands |
+| `Terminal` | `src/terminal.rs:35` | The terminal mode, its restoration, and the key reader |
+| `Outcome`, `Left` | `src/lib.rs:33,40` | What each held session left behind, and how it stands |
 
 # Owned state
 
 Per session, the engine that runs it, the line being typed in it, how far back its transcript is
 scrolled, and the prose its step has streamed (`src/core.rs:23-29`). Per process, which session the
-human is in, the log's own listing as it was when he opened the pane, at most one open pane, and the
-keys typed while an engine run on this thread held the loop (`src/core.rs:63-71`). A worker owns the
+human is in, the log's own listing as it was when he opened the pane, at most one open pane, the
+keys typed while an engine run on this thread held the loop, and the spinner phase
+(`src/core.rs:60-72`). A worker owns the
 command and message channels, the last fold the engine reported, and whether a command is in flight
 (`src/worker.rs:32-47`). `Terminal` also owns the terminal mode it entered, raw mode and the alternate
-screen, and restores both in its `Drop` (`src/terminal.rs:61-66`). The crate holds no durable file,
+screen, and restores both in its `Drop` (`src/terminal.rs:66-71`). The crate holds no durable file,
 directory, or database of its own. The log, the artifact store, the sandbox, and the provider belong
 to the kernel.
 
 # Invariants
 
 - `Terminal::open` refuses when standard input or standard output is not a terminal, so a run in a
-  pipe leaves the screen alone (`src/terminal.rs:40-44`).
-- Raw mode and the alternate screen are left even on an early return (`src/terminal.rs:57-61`).
+  pipe leaves the screen alone (`src/terminal.rs:47-51`).
+- Raw mode and the alternate screen are left even on an early return.
+- Every drawn row is wrapped to the pane's width before it is windowed, and the width is display
+  width, so a wide character counts as two columns (`src/port.rs:1076-1099`). A break takes the last
+  space that fits and falls inside a word wider than a row.
+- The typed line wraps the same way and the input area takes the rows it occupies. The cursor is
+  placed after the last character, or at the start of a fresh row when that character fills the last
+  column, so it never leaves the pane (`src/port.rs:1118-1185`).
+- A line kind carries a prefix, a continuation prefix of the same width, and a semantic tone; the
+  adapter maps a tone to a style and chooses no wording or count (`src/port.rs:381-429`).
+- The port draws only inline code, bold, headings, and fenced blocks from agent prose; a fence line
+  itself draws nothing and a block line draws behind a bar (`src/markdown.rs:17-60`).
+- The frame is a heading, a rule, the body, a composer, and a status row; the rule disappears below
+  ten rows and the status row below five (`src/terminal.rs:191-240`).
+- The status row prefixes a braille spinner exactly when `View::spinner` is `Some`, and the phase
+  advances only while the session on screen is the one moving (`src/core.rs:364-373`).
+- The hints and the placeholder are chosen by the core for the open pane and the mode, so the
+  adapter cannot invent a key or a phrase.
+- An empty transcript draws a welcome naming the goal and the checkout, and drops rows from the
+  bottom when the pane is short (`src/port.rs:1098-1131`).
+- The listing drops the full identity for eight characters, pads its status column, marks the
+  cursor's entry selected, and says how many sessions the process holds (`src/port.rs:1135-1230`).
+- The status row drops its hints whole when they do not fit beside the phrase, rather than showing
+  half a shortcut (`src/terminal.rs:398-419`).
 - A control or alt chord other than `Ctrl-C`, `Ctrl-N`, and `Ctrl-O` is dropped instead of being
   typed as its letter (`src/terminal.rs:129-151`).
 - Only a key press is one of the conversation's keys; a release and a repeat are dropped
@@ -97,14 +122,7 @@ to the kernel.
   (`src/core.rs:86-166`) naming the reason its highest attempt answered with, or the attempts it
   spent without answering.
 - The trouble row renders through `prose_rows` with the gutter `TROUBLE_GUTTER`
-  (`src/port.rs:453,265`), so the frame and the plain replay show the same text.
-- Every transcript row is wrapped to the pane's width before the window is taken, so a row wider
-  than the pane continues on the next one under the same gutter instead of being truncated
-  (`src/port.rs:670`). A break takes the last space that fits and falls inside a word wider than a
-  row. A row is measured in display columns, so a wide character takes two and a combining one none.
-- The typed line wraps the same way and the input area takes the rows it occupies. The cursor is
-  placed after the last character, or at the start of a fresh row when that character fills the last
-  column, so it never leaves the pane (`src/port.rs:716`).
+  (`src/port.rs:368,254`), so the frame and the plain replay show the same text.
 - The listing draws the sessions this process holds first and the ones only the log holds after them,
   and a row's status is the phrase the header shows when the process holds that session and a phrase
   for its folded phase when it does not (`src/core.rs:320-379`).
@@ -132,10 +150,11 @@ to the kernel.
 # Dependencies
 
 `clap`, `mokmok-agent-runtime`, `mokmok-kernel`, `mokmok-protocol`, `mokmok-state-machine`,
-`ratatui`, `thiserror`, `tokio` with `macros`, `rt-multi-thread`, and `time`, and `unicode-width`.
-Development adds `mokmok-artifact`, `nix`, `proptest`, `serde_json`, and `uuid`. The crate declares
-no rusqlite and no axum dependency, and it reaches the log through `mokmok-kernel`'s `sessions`
-rather than by opening the file itself.
+`ratatui`, `thiserror`, `tokio` with `macros`, `rt-multi-thread`, and `time`, and `unicode-width`,
+which measures every row and the composer's cursor. Development adds
+`mokmok-artifact`, `nix`, `proptest`, `serde_json`, and `uuid`. The crate declares no rusqlite and no
+axum dependency, and it reaches the log through `mokmok-kernel`'s `sessions` rather than by opening
+the file itself.
 
 # Reconciliation
 
@@ -163,7 +182,7 @@ already covers.
 
 # Tests
 
-127 cases: 14 in `tests/` and 113 across six `#[cfg(test)]` modules, two of them property cases.
+150 cases: 14 in `tests/` and 136 across seven `#[cfg(test)]` modules, two of them property cases.
 
 Six of the fourteen cases in `tests/` are asynchronous conversation cases.
 One asserts that a conversation shows the line it answers and survives two exchanges.
@@ -176,14 +195,15 @@ One asserts that the listing shows a session only the log holds and that choosin
 (`tests/conversation.rs:623`).
 Eight are binary cases: one asserts that a pipe on each standard stream refuses the run and says why,
 one drives a conversation on a pseudo-terminal through a frame and back to the shell, one submits a
-line wider than the pane and asserts that its tail reaches the screen, one types three wide
-characters and asserts that the cursor sits past the six columns they occupy, one asserts
+line wider than the pane and asserts that its tail reaches the screen
+(`tests/binary.rs:413`), one types three wide characters and asserts that the cursor sits past the
+six columns they occupy (`tests/binary.rs:455`), one asserts
 that a frame drawn while a turn is in flight, the listing, and the prompt that names a goal all reach
-a real terminal (`tests/binary.rs:398`), one serves a held server-sent stream and asserts that the
+a real terminal (`tests/binary.rs:492`), one serves a held server-sent stream and asserts that the
 first fragment is drawn before the second is sent, that a key typed during the stream echoes, and
-that the rest of the answer follows in order (`tests/binary.rs:629`), one runs a command that sleeps
+that the rest of the answer follows in order (`tests/binary.rs:806`), one runs a command that sleeps
 and asserts that a key typed while it runs is drawn before the answer
-(`tests/binary.rs:564`), and one starts with no session, goal, checkout, grant, search root, or skill
+(`tests/binary.rs:741`), and one starts with no session, goal, checkout, grant, search root, or skill
 root and asserts that the current checkout, the configured skill, and the reply all reach the
 replay. The command case returns early when the sandbox's confiner is absent, which is the shape of a
 package-scoped build.
@@ -191,27 +211,31 @@ package-scoped build.
 Six modules hold the rest. The binary holds 4 cases for a bare start's minted session and anchored
 paths, an explicit flag surviving the defaults, the path guards skipping a directory the working
 directory already covers, and the shell rule.
-One holds 49 cases and one property case for the trouble row, the work row, a dispatched command with
+One holds 51 cases and one property case for the trouble row, the work row, a dispatched command with
 no call record, the empty-line guard, the byte ceiling of the typed line and of a named goal, the
-status phrase of each mode, the rotation and its order, the listing's rows and cursor, adopting and
-creating a session, each pane's keys, the frame the manager builds, a streamed fragment being drawn
-before the next arrives, a stream drawing once per fragment, a key typed during a stream reaching the
-line, a deferred key waiting for the step and being answered in order, a background stream drawing
-nothing, a pane covering the session keeping the stream off the screen, a terminal that fails while a
-stream is read or drawn, a key drawn while a worker's step is parked, and an interrupt answered while
-a session can move leaving (`src/core.rs:914`).
-One holds 30 cases and one property case for gutters, multi-row replies, row-wise windowing, the
-trouble row, a find row, an edit row, a delegated row, escaped control characters, the replay,
-wrapping at a space and inside a long word, a wide character's two columns, the input row's own
-wrapping and cursor, a pane narrower than its prompt, and the rows of the listing
-(`src/port.rs:762`).
+status phrase of each mode, the one-session phrase, the hints and placeholder of each pane, the
+spinner phase advancing only while the session on screen works, the rotation and its order, the
+listing's entries and cursor, adopting and creating a session, each pane's keys, the frame the
+manager builds, a streamed fragment being drawn before the next arrives, a stream drawing once per
+fragment, a key typed during a stream reaching the line, a deferred key waiting for the step and
+being answered in order, a background stream drawing nothing, a pane covering the session keeping the
+stream off the screen, a terminal that fails while a stream is read or drawn, a key drawn while a
+worker's step is parked, and an interrupt answered while a session can move leaving
+(`src/core.rs:975`).
+One holds 37 cases and one property case for wrapping at display width, a wide character, a word
+wider than the line, the gutters and tones of each line kind, the markdown spans and fences, row-wise
+windowing, the welcome, the listing's entries and cursor, the typed line's own wrapping and cursor,
+escaped control characters, and the replay (`src/port.rs:1326`).
+One holds 7 cases for plain prose, bold, inline code, an unclosed marker, an escaped
+marker, a heading, and a fenced block (`src/markdown.rs:173`).
 One holds 7 cases for a step another writer committed becoming visible after the engine reopens the
 ledger, the goal and the checkout the log holds being the ones a resumed session runs under, a
 session with no task being refused, a created session running under the goal the human typed, and the
-listing mapping onto what the kernel holds (`src/session.rs:202`).
-One holds 18 cases for the layout, scrollback, the key map, the press rule, the event
-classification, the terminal check, a find row, the two panes, a wrapped input row with its cursor,
-and a wide character's cursor (`src/terminal.rs:208`).
+listing mapping onto what the kernel holds (`src/session.rs:203`).
+One holds 26 cases for the layout, the rule, the heading and its truncation, a wrapped body,
+scrollback, the composer.s rows, prompt, placeholder, wrapped input, and cursor, the selected row.s
+fill, the spinner, the hint boundary, the key map, the press rule, the event classification, the
+terminal check, a find row, and the two panes (`src/terminal.rs:411`).
 One holds 4 cases for a step's fragments and result, a parked step leaving the screen thread free, a
 spoken line's fold ending its flight, and a reopen reaching the engine (`src/worker.rs:213`).
 
@@ -222,4 +246,4 @@ MUTANTS_PACKAGE=mokmok-tui ./scripts/mutants.sh --jobs 8
 
 [^architecture]: `mokmok-os-architecture.md` carries no `mokmok-tui` section, so the only claim
     taken from it is the exclusion in section 8.
-[^crate]: The re-export list is `mokmok-tui/src/lib.rs:22-28`.
+[^crate]: The re-export list is `mokmok-tui/src/lib.rs:24-26`.

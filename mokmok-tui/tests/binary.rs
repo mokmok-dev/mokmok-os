@@ -29,19 +29,25 @@ mod tests {
     const POLL: Duration = Duration::from_millis(5);
 
     /// What the adapter puts on the master for the first frame of an 80x10 screen, before any key:
-    /// the alternate screen, the heading on row 1, the empty input line on row 9, the status on row
-    /// 10, and the cursor one column past the `> ` the line starts with.
+    /// the alternate screen, the heading on row 1, the rule on row 2, the welcome on rows 3 to 8,
+    /// the empty composer on row 9, the status on row 10, and the cursor one column past the `› `.
     ///
     /// Each run of words arrives behind its own move rather than as one line, because the backend
-    /// writes only the cells a screen of spaces did not already hold.
+    /// writes only the cells a screen of spaces did not already hold. The checkout row names a
+    /// scratch directory, so it is asserted by its label rather than by its path. The style bytes
+    /// are left out because the color level a terminal reports differs between a developer's pty
+    /// and the build sandbox; the row positions and the words are what this case proves.
     const FRAME: &[&[u8]] = &[
         b"\x1b[?1049h",
-        b"\x1b[1;1Hmokmok-tui",
-        b"\x1b[1;13H018f2f1e-0000-7000-8000-000000000000",
-        b"\x1b[1;51Hyour\x1b[1;56Hturn",
-        b"\x1b[9;1H>",
-        b"\x1b[10;1Hyour\x1b[10;6Hturn",
-        b"\x1b[9;3H",
+        b"\x1b[1;1H",
+        b"mokmok",
+        b"\x1b[2;1H",
+        b"\xe2\x94\x80\xe2\x94\x80",
+        b"A conversation with the constrained agent. Type a line and press enter.",
+        b"\x1b[9;1H",
+        b"Send a line to the agent\xe2\x80\xa6",
+        b"\x1b[10;1Hyour turn\x1b[10;31Henter send  tab next  ^O sessions  ^N new  ^C quit",
+        b"\x1b[?25h\x1b[9;3H",
     ];
 
     /// The same screen once `hi` is typed: the first character on the input row, and the cursor two
@@ -415,7 +421,7 @@ mod tests {
         let mut transcript = Vec::new();
 
         assert!(
-            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            await_bytes(&master, &mut transcript, &[b"mokmok"], deadline),
             "the conversation's own screen is up: {}",
             transcript.escape_ascii(),
         );
@@ -456,7 +462,7 @@ mod tests {
         let mut transcript = Vec::new();
 
         assert!(
-            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            await_bytes(&master, &mut transcript, &[b"mokmok"], deadline),
             "the conversation's own screen is up: {}",
             transcript.escape_ascii(),
         );
@@ -496,7 +502,7 @@ mod tests {
         // A key typed before the child has the terminal in raw mode is read by the line discipline,
         // so the first frame is what says the screen is the conversation's own.
         assert!(
-            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            await_bytes(&master, &mut transcript, &[b"mokmok"], deadline),
             "the conversation's own screen is up: {}",
             transcript.escape_ascii(),
         );
@@ -544,7 +550,7 @@ mod tests {
                 &mut transcript,
                 // The backend writes only the cells that changed, so the status row arrives as its
                 // words rather than as one run.
-                &[b"held;", b"opens", b"closes"],
+                &[b"sessions", b"is held", b"esc close"],
                 deadline,
             ),
             "the listing is drawn on the real terminal: {}",
@@ -558,7 +564,7 @@ mod tests {
             .write_all(CTRL_N)
             .expect("a new session is asked for");
         assert!(
-            await_bytes(&master, &mut transcript, &[b"goal>"], deadline),
+            await_bytes(&master, &mut transcript, &[b"goal\xe2\x80\xba"], deadline),
             "the prompt that names a goal is drawn: {}",
             transcript.escape_ascii(),
         );
@@ -619,7 +625,7 @@ mod tests {
         let mut transcript = Vec::new();
 
         assert!(
-            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            await_bytes(&master, &mut transcript, &[b"mokmok"], deadline),
             "the conversation's own screen is up: {}",
             transcript.escape_ascii(),
         );
@@ -650,7 +656,7 @@ mod tests {
             )
         });
         for wanted in [
-            b"you    hi".as_slice(),
+            b"\xe2\x80\xba hi".as_slice(),
             b"loaded skill demo",
             b"the bare start replied",
         ] {
@@ -756,7 +762,7 @@ mod tests {
         let mut transcript = Vec::new();
 
         assert!(
-            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            await_bytes(&master, &mut transcript, &[b"mokmok"], deadline),
             "the conversation's own screen is up: {}",
             transcript.escape_ascii(),
         );
@@ -806,7 +812,7 @@ mod tests {
         let mut transcript = Vec::new();
 
         assert!(
-            await_bytes(&master, &mut transcript, &[b"mokmok-tui"], deadline),
+            await_bytes(&master, &mut transcript, &[b"mokmok"], deadline),
             "the conversation's own screen is up: {}",
             transcript.escape_ascii(),
         );
