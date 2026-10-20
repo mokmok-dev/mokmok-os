@@ -59,6 +59,10 @@ pub enum Command {
         request: CommandID,
         session: SessionID,
     },
+    Cancel {
+        request: CommandID,
+        session: SessionID,
+    },
 }
 
 impl Command {
@@ -71,7 +75,8 @@ impl Command {
             | Self::Create { request, .. }
             | Self::Open { request, .. }
             | Self::Speak { request, .. }
-            | Self::History { request, .. } => *request,
+            | Self::History { request, .. }
+            | Self::Cancel { request, .. } => *request,
         }
     }
 }
@@ -306,6 +311,10 @@ mod tests {
                 request: request(),
                 session: session(),
             },
+            Command::Cancel {
+                request: request(),
+                session: session(),
+            },
         ] {
             assert_eq!(round_trip(&command), command);
         }
@@ -313,13 +322,19 @@ mod tests {
 
     #[test]
     fn a_command_names_the_request_a_retry_reuses() {
-        let command = Command::Speak {
-            request: request(),
-            session: session(),
-            line: "hello".to_owned(),
-        };
-
-        assert_eq!(command.request(), request());
+        for command in [
+            Command::Speak {
+                request: request(),
+                session: session(),
+                line: "hello".to_owned(),
+            },
+            Command::Cancel {
+                request: request(),
+                session: session(),
+            },
+        ] {
+            assert_eq!(command.request(), request());
+        }
     }
 
     #[test]
