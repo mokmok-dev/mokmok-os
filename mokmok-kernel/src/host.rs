@@ -6,6 +6,7 @@
 //! durable, so a crash between the write and the ack replays the command instead of losing it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mokmok_agent_runtime::{MAX_SPEECH_BYTES, Record, Task, Transcript};
 use mokmok_event_bus::{Client, Cursor, Payload, Subscription};
@@ -17,6 +18,7 @@ use mokmok_session_wire::{
 use mokmok_state_machine::Phase;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::clock::Clock;
 use crate::config::{Config, SessionDefaults};
 use crate::db::Db;
 use crate::error::Error;
@@ -44,7 +46,7 @@ struct State {
 pub struct Host {
     config: Config,
     defaults: SessionDefaults,
-    at: Moment,
+    clock: Arc<dyn Clock>,
     daemon: AgentID,
     client: Client,
     commands: mpsc::UnboundedReceiver<Incoming>,
@@ -66,7 +68,7 @@ impl Host {
     pub async fn start(
         config: Config,
         defaults: SessionDefaults,
-        at: Moment,
+        clock: Arc<dyn Clock>,
         daemon: AgentID,
         client: Client,
     ) -> Result<Self, Error> {
@@ -81,7 +83,7 @@ impl Host {
         Ok(Self {
             config,
             defaults,
-            at,
+            clock,
             daemon,
             client,
             commands,
@@ -123,6 +125,8 @@ impl Host {
         &mut self,
         command: Command,
     ) -> Result<(), Error> {
+        let at = self.clock.now();
+
         match command {
             Command::Hello { request, protocol } => self.hello(request, protocol).await,
             Command::List { .. } => {
@@ -140,7 +144,7 @@ impl Host {
                 request,
                 session,
                 line,
-            } => self.speak(request, session, line).await,
+            } => self.speak(request, session, line, at).await,
             Command::History { request, session } => self.history(request, session).await,
         }
     }
@@ -285,6 +289,7 @@ impl Host {
         request: CommandID,
         session: SessionID,
         line: String,
+        at: Moment,
     ) -> Result<(), Error> {
         if line.trim().is_empty() {
             return self
@@ -330,6 +335,7 @@ impl Host {
             .send(SlotCommand::Speak {
                 request,
                 line,
+                at,
                 reply,
             })
             .is_err()
@@ -426,12 +432,15 @@ impl Host {
         let run = self
             .defaults
             .run(session.as_uuid().to_string(), goal, checkout);
-        let handle =
-            spawn(self.config.clone(), session, self.at, self.events.clone()).map_err(|error| {
-                Refusal::Unavailable {
-                    detail: error.to_string(),
-                }
-            })?;
+        let handle = spawn(
+            self.config.clone(),
+            session,
+            Arc::clone(&self.clock),
+            self.events.clone(),
+        )
+        .map_err(|error| Refusal::Unavailable {
+            detail: error.to_string(),
+        })?;
         let (reply, opened) = oneshot::channel();
         if handle
             .commands
@@ -729,7 +738,7 @@ mod tests {
     use mokmok_protocol::{AgentID, CommandID, Moment, SessionID};
     use mokmok_session_wire::{
         Command, DaemonEvent, Outcome, PROTOCOL, Refusal, Reply, RosterChunk, RosterEntry,
-        SessionEvent, command_topic, daemon_topic, session_topic,
+        SessionCommit, SessionEvent, command_topic, daemon_topic, session_topic,
     };
     use mokmok_state_machine::{Fact, Phase};
     use serde_json::json;
@@ -908,6 +917,7 @@ mod tests {
         socket: PathBuf,
         client: Client,
         daemon: AgentID,
+        clock: std::sync::Arc<crate::FixedClock>,
         commands: Subscription,
         host: tokio::task::JoinHandle<Result<(), Error>>,
         bus: tokio::task::JoinHandle<Result<(), mokmok_event_bus::ServeError>>,
@@ -940,10 +950,11 @@ mod tests {
 
             let client = Client::connect(&socket).await.unwrap();
             let daemon = AgentID::from_uuid(Uuid::from_u128(0xda_e0));
+            let clock = std::sync::Arc::new(crate::FixedClock::new(Moment::from_millis(0)));
             let host = Host::start(
                 config.clone(),
                 defaults(),
-                Moment::from_millis(0),
+                std::sync::Arc::clone(&clock) as std::sync::Arc<dyn crate::Clock>,
                 daemon,
                 client.clone(),
             )
@@ -961,6 +972,7 @@ mod tests {
                 socket,
                 client,
                 daemon,
+                clock,
                 commands,
                 host,
                 bus,
@@ -1093,6 +1105,26 @@ mod tests {
             }
 
             latest.expect("a roster the bus holds")
+        }
+
+        /// The next speech commit on `session`'s topic, skipping one stamped `not_at`.
+        async fn speech_commit(
+            &self,
+            session: SessionID,
+            not_at: Option<Moment>,
+        ) -> SessionCommit {
+            let event = self
+                .session_event(session_topic(session), |event| {
+                    matches!(event, SessionEvent::Commit(commit)
+                        if commit.records.iter().any(|record| matches!(record, Record::Speech(_)))
+                            && not_at.is_none_or(|at| commit.notice.at != at))
+                })
+                .await;
+            let SessionEvent::Commit(commit) = event else {
+                unreachable!("the predicate selected a commit");
+            };
+
+            commit
         }
 
         async fn roster_turns(
@@ -1653,6 +1685,136 @@ mod tests {
             "each line is its own speech record: {:?}",
             log.ordered,
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_line_carries_the_moment_it_spoke_at() {
+        let mut bench = Bench::start(
+            "clock-line",
+            Some(&[
+                json!({"action": "final", "say": "one"}),
+                json!({"action": "final", "say": "two"}),
+            ]),
+        )
+        .await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "first".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+        bench.roster_turns(session, 1).await;
+        bench.publish_pending().await;
+
+        let first = bench.speech_commit(session, None).await;
+        let spoke_at = first.notice.at;
+        let advance = Duration::from_secs(11);
+        bench.clock.advance(advance);
+
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(3),
+                    session,
+                    line: "second".to_owned(),
+                })
+                .await,
+            accepted(request(3), session),
+        );
+        bench.roster_turns(session, 2).await;
+        bench.publish_pending().await;
+
+        let second = bench.speech_commit(session, Some(spoke_at)).await;
+        assert_eq!(
+            second.notice.at,
+            spoke_at.saturating_add(advance),
+            "the second line is stamped with the clock its command read",
+        );
+        assert_ne!(
+            second.notice.at, first.notice.at,
+            "the daemon does not reuse its startup instant",
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sessions_spoken_at_different_clock_values_record_different_moments() {
+        let mut bench = Bench::start(
+            "clock-sessions",
+            Some(&[
+                json!({"action": "final", "say": "one"}),
+                json!({"action": "final", "say": "two"}),
+            ]),
+        )
+        .await;
+        let first_session = session_of(1);
+        let second_session = session_of(2);
+        let checkout = bench.scratch.checkout();
+
+        for (seed, session) in [(1, first_session), (2, second_session)] {
+            assert_eq!(
+                bench
+                    .asked(&Command::Create {
+                        request: request(seed),
+                        session,
+                        goal: GOAL.to_owned(),
+                        checkout: checkout.clone(),
+                    })
+                    .await,
+                accepted(request(seed), session),
+            );
+        }
+
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(3),
+                    session: first_session,
+                    line: "first".to_owned(),
+                })
+                .await,
+            accepted(request(3), first_session),
+        );
+        bench.roster_turns(first_session, 1).await;
+        bench.publish_pending().await;
+        let first = bench.speech_commit(first_session, None).await;
+
+        let advance = Duration::from_secs(23);
+        bench.clock.advance(advance);
+
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(4),
+                    session: second_session,
+                    line: "second".to_owned(),
+                })
+                .await,
+            accepted(request(4), second_session),
+        );
+        bench.roster_turns(second_session, 1).await;
+        bench.publish_pending().await;
+        let second = bench.speech_commit(second_session, None).await;
+
+        assert_ne!(first.notice.at, second.notice.at);
+        assert_eq!(second.notice.at, first.notice.at.saturating_add(advance));
     }
 
     #[tokio::test]

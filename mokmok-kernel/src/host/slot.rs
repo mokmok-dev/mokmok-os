@@ -1,6 +1,7 @@
 //! One session's world on a thread of its own, driven without a client waiting on it.
 
 use std::mem;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::Driver;
+use crate::clock::Clock;
 use crate::config::{Config, Run};
 
 /// How much streamed prose is held before it is sent to the daemon's publisher.
@@ -30,6 +32,8 @@ pub enum Command {
     Speak {
         request: CommandID,
         line: String,
+        /// The instant the line's speech record is stamped with, read where the host accepted it.
+        at: Moment,
         reply: oneshot::Sender<Result<Receipt, Refusal>>,
     },
 }
@@ -71,7 +75,7 @@ pub struct Handle {
 pub fn spawn(
     config: Config,
     session: SessionID,
-    at: Moment,
+    clock: Arc<dyn Clock>,
     events: mpsc::UnboundedSender<Event>,
 ) -> std::io::Result<Handle> {
     let (commands, command) = std::sync::mpsc::channel();
@@ -90,7 +94,7 @@ pub fn spawn(
 
             return;
         };
-        serve(&config, session, at, &command, &events, &runtime);
+        serve(&config, session, &clock, &command, &events, &runtime);
         let _ = events.send(Event::Stopped { session });
     })?;
 
@@ -100,7 +104,7 @@ pub fn spawn(
 fn serve(
     config: &Config,
     session: SessionID,
-    at: Moment,
+    clock: &Arc<dyn Clock>,
     commands: &Receiver<Command>,
     events: &mpsc::UnboundedSender<Event>,
     runtime: &Runtime,
@@ -115,7 +119,7 @@ fn serve(
                     continue;
                 }
 
-                match Driver::open(config, &run, at) {
+                match Driver::open(config, &run, clock.now(), Arc::clone(clock)) {
                     Ok(opened) => {
                         report(&opened, session, events);
                         let _ = reply.send(Ok(()));
@@ -131,6 +135,7 @@ fn serve(
             Command::Speak {
                 request,
                 line,
+                at,
                 reply,
             } => {
                 let Some(held) = driver.as_mut() else {
@@ -138,10 +143,10 @@ fn serve(
                     continue;
                 };
 
-                match held.speak_as(&line, request) {
+                match held.speak_as(&line, request, at) {
                     Ok(receipt) => {
                         let _ = reply.send(Ok(receipt));
-                        run_turn(held, session, events, runtime);
+                        run_turn(held, session, events, runtime, clock);
                         report(held, session, events);
                     },
                     Err(error) => {
@@ -163,6 +168,7 @@ fn run_turn(
     session: SessionID,
     events: &mpsc::UnboundedSender<Event>,
     runtime: &Runtime,
+    clock: &Arc<dyn Clock>,
 ) {
     let mut prose = Prose::new(session, events);
 
@@ -182,12 +188,13 @@ fn run_turn(
             break;
         }
 
-        let result = runtime.block_on(driver.step_watched(&mut |text| prose.observe(text)));
+        let at = clock.now();
+        let result = runtime.block_on(driver.step_watched(&mut |text| prose.observe(text), at));
         prose.flush();
 
         match result {
             Ok(Progress::Yielded | Progress::Advanced(Move::Halt(Halt::Draining))) => {
-                if let Err(error) = driver.reopen() {
+                if let Err(error) = driver.reopen(clock.now()) {
                     let _ = events.send(Event::Trouble {
                         session,
                         detail: error.to_string(),

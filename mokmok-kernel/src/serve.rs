@@ -8,6 +8,7 @@
 //! rather than a lost event.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mokmok_event_bus::{
@@ -19,6 +20,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::clock::Clock;
 use crate::config::{Config, SessionDefaults};
 use crate::db::Db;
 use crate::error::Error;
@@ -135,8 +137,9 @@ impl Relay {
 /// unsettled, then serves until the process is told to stop, reporting readiness once the bus
 /// answers and the outbox has drained, and returning the notices acknowledged over the run.
 ///
-/// `at` is the instant recovery stamps its notices with. Only the daemon path uses it: `--once`
-/// neither recovers nor reports readiness.
+/// `at` is the startup instant recovery stamps its notices with. Every later command reads
+/// `clock` at its own boundary. Only the daemon path uses either: `--once` neither recovers nor
+/// reports readiness.
 ///
 /// # Errors
 ///
@@ -149,6 +152,7 @@ pub async fn serve(
     socket: &Path,
     once: bool,
     at: Moment,
+    clock: Arc<dyn Clock>,
 ) -> Result<usize, Error> {
     let bus = BusConfig {
         path: socket.to_path_buf(),
@@ -168,7 +172,7 @@ pub async fn serve(
         return relay.once(&mut db).await;
     }
 
-    serve_until_stopped(config, defaults, bus, at).await
+    serve_until_stopped(config, defaults, bus, at, clock).await
 }
 
 async fn serve_until_stopped(
@@ -176,6 +180,7 @@ async fn serve_until_stopped(
     defaults: &SessionDefaults,
     bus: BusConfig,
     at: Moment,
+    clock: Arc<dyn Clock>,
 ) -> Result<usize, Error> {
     // Failing to install is reported and then ignored, because a process that cannot log still
     // has to serve.
@@ -224,7 +229,7 @@ async fn serve_until_stopped(
         .await
         .map_err(Error::Bus)?;
     let mut host = tokio::spawn(
-        Host::start(config.clone(), defaults.clone(), at, daemon, client)
+        Host::start(config.clone(), defaults.clone(), clock, daemon, client)
             .await?
             .run(),
     );

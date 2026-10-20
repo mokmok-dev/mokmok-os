@@ -12,6 +12,7 @@
 
 pub mod agent;
 mod authority;
+mod clock;
 mod config;
 mod db;
 mod editor;
@@ -28,6 +29,7 @@ mod skill;
 mod slice;
 
 pub use authority::{AGENT, Authority};
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use config::{
     Agent, Args, Command, Config, ConfigError, CrashPoint, Global, ProcessEnvironment,
     ProviderKind, ProviderLayer, ProviderSettings, Run, Submit, config_path, relative_path,
