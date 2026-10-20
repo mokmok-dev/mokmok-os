@@ -29,6 +29,7 @@ use mokmok_sandbox::{Confined, Environment};
 use mokmok_state_machine::{Attempt, Ending, Fact, Resolution, Turn, TurnNumber};
 
 use crate::authority::Authority;
+use crate::clock::Clock;
 use crate::config::{Config, ConfigError, CrashPoint, ProviderKind, Run};
 use crate::db::{Db, Entry, Log};
 use crate::editor::Editor;
@@ -90,6 +91,7 @@ impl Run {
 pub struct Ledger {
     /// The task a caller named, handed to the fold before its record commits.
     seed: Option<Task>,
+    /// The instant the next append stamps its notice with, refreshed at each commit boundary.
     at: Moment,
     db: Db,
     store: BlobStore,
@@ -98,6 +100,8 @@ pub struct Ledger {
 
 impl Ledger {
     /// Opens the session's history, recovering what a crash left in flight.
+    ///
+    /// `at` is the instant the recovery pass stamps its notices with.
     ///
     /// # Errors
     ///
@@ -123,6 +127,17 @@ impl Ledger {
             store: BlobStore::open(&config.artifacts)?,
             log,
         })
+    }
+
+    /// Stamps the next append with `at`.
+    ///
+    /// The runtime's [`Journal::append`] hands the step straight to this ledger, so the instant
+    /// travels beside the step rather than inside it and the runtime stays clock-free.
+    pub const fn stamp(
+        &mut self,
+        at: Moment,
+    ) {
+        self.at = at;
     }
 
     /// The commit one step carries, taken from the records it wrote.
@@ -309,7 +324,7 @@ pub struct Shell {
     config: Config,
     program: PathBuf,
     store: BlobStore,
-    at: Moment,
+    clock: Arc<dyn Clock>,
 }
 
 impl Shell {
@@ -321,13 +336,13 @@ impl Shell {
     pub fn new(
         config: &Config,
         program: PathBuf,
-        at: Moment,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, Error> {
         Ok(Self {
             store: BlobStore::open(&config.artifacts)?,
             config: config.clone(),
             program,
-            at,
+            clock,
         })
     }
 
@@ -339,6 +354,7 @@ impl Shell {
         // for recovery to settle.
         crate::config::crash(&self.config, CrashPoint::BeforeDispatch);
 
+        let at = self.clock.now();
         let plan = Plan {
             execution: call.execution,
             program: self.program.clone(),
@@ -354,9 +370,9 @@ impl Shell {
             confiner: self.config.confiner.clone(),
             ..mokmok_sandbox::Config::default()
         })?;
-        let authority = Authority::new(&self.config, self.at)?;
+        let authority = Authority::new(&self.config, at)?;
 
-        match execution::run(&self.config, &sandbox, &authority, &plan, self.at).await? {
+        match execution::run(&self.config, &sandbox, &authority, &plan, at).await? {
             Ran::Settled { resolution, result } => {
                 let stdout = self.read(&result.stdout)?;
                 let stderr = self.read(&result.stderr)?;
@@ -642,7 +658,7 @@ struct ChildRunner {
     config: Config,
     parent: Task,
     provider: Arc<Model>,
-    at: Moment,
+    clock: Arc<dyn Clock>,
 }
 
 impl ChildRunner {
@@ -650,13 +666,13 @@ impl ChildRunner {
         config: &Config,
         parent: Task,
         provider: Arc<Model>,
-        at: Moment,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             config: config.clone(),
             parent,
             provider,
-            at,
+            clock,
         }
     }
 }
@@ -670,7 +686,7 @@ impl Subagents for ChildRunner {
         let config = self.config.clone();
         let parent = self.parent.clone();
         let provider = Arc::clone(&self.provider);
-        let at = self.at;
+        let clock = Arc::clone(&self.clock);
         let call = call.clone();
 
         Box::pin(async move {
@@ -690,11 +706,18 @@ impl Subagents for ChildRunner {
                 steps: 64,
             };
 
-            let mut driver = Driver::open_with(&config, &run, at, child_task, provider)
-                .map_err(|error| AgentError::Subagent(Box::new(error)))?;
+            let mut driver = Driver::open_with(
+                &config,
+                &run,
+                clock.now(),
+                child_task,
+                provider,
+                Arc::clone(&clock),
+            )
+            .map_err(|error| AgentError::Subagent(Box::new(error)))?;
 
             for _ in 0..run.steps {
-                match driver.step().await {
+                match driver.step(clock.now()).await {
                     Ok(
                         Progress::Terminal(_)
                         | Progress::Awaiting
@@ -777,12 +800,14 @@ pub struct Driver {
     config: Config,
     session: SessionID,
     task: Task,
-    at: Moment,
 }
 
 impl Driver {
     /// Opens the session's world: its ledger, its tool, its finder, and the provider the
     /// configuration named.
+    ///
+    /// `at` is the instant recovery stamps its notices with. Every later commit takes the instant
+    /// its own boundary read from `clock`.
     ///
     /// # Errors
     ///
@@ -792,11 +817,12 @@ impl Driver {
         config: &Config,
         run: &Run,
         at: Moment,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, Error> {
         let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
         let task = run.task(config)?;
         let provider = Arc::new(model(config, session)?);
-        Self::open_with(config, run, at, task, provider)
+        Self::open_with(config, run, at, task, provider, clock)
     }
 
     fn open_with(
@@ -805,9 +831,10 @@ impl Driver {
         at: Moment,
         task: Task,
         provider: Arc<Model>,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, Error> {
         let session = SessionID::from_uuid(crate::config::uuid_of(&run.session, "session")?);
-        let shell = Shell::new(config, task.setting.program.clone(), at)?;
+        let shell = Shell::new(config, task.setting.program.clone(), Arc::clone(&clock))?;
         let ledger = Ledger::open(config, session, Some(task.clone()), at)?;
         // The task the fold holds, not the one this invocation built: the prompt the model was
         // handed, the tools the provider was given, and the roots the finder opened must all come
@@ -818,14 +845,14 @@ impl Driver {
             .map_err(Error::Agent)?
             .task
             .unwrap_or(task);
-        let editor = Editor::new(config, &task.setting.checkout, at)?;
+        let editor = Editor::new(config, &task.setting.checkout, Arc::clone(&clock))?;
         let index = if task.setting.search.is_empty() {
             Index::none()
         } else {
             Index::open(&task.setting.search, &config.search_index)?
         };
         let skills = Library::open(&task.setting.skills);
-        let delegates = ChildRunner::new(config, task.clone(), Arc::clone(&provider), at);
+        let delegates = ChildRunner::new(config, task.clone(), Arc::clone(&provider), clock);
 
         Ok(Self {
             ledger,
@@ -838,7 +865,6 @@ impl Driver {
             config: config.clone(),
             session,
             task,
-            at,
         })
     }
 
@@ -857,7 +883,7 @@ impl Driver {
         self.ledger.transcript(self.session)
     }
 
-    /// Commits one human line as the input of the session's next turn.
+    /// Commits one human line as the input of the session's next turn, stamped with `at`.
     ///
     /// # Errors
     ///
@@ -866,7 +892,9 @@ impl Driver {
     pub fn speak(
         &mut self,
         line: &str,
+        at: Moment,
     ) -> Result<Receipt, AgentError> {
+        self.ledger.stamp(at);
         mokmok_agent_runtime::speak(&mut self.ledger, self.session, line)
     }
 
@@ -882,7 +910,9 @@ impl Driver {
         &mut self,
         line: &str,
         request: CommandID,
+        at: Moment,
     ) -> Result<Receipt, AgentError> {
+        self.ledger.stamp(at);
         mokmok_agent_runtime::speak_as(&mut self.ledger, self.session, line, request)
     }
 
@@ -895,12 +925,17 @@ impl Driver {
         Ok(self.ledger.records().to_vec())
     }
 
-    /// Performs at most one bounded step of the same [`advance`] `agent run` calls.
+    /// Performs at most one bounded step of the same [`advance`] `agent run` calls, stamping what
+    /// it commits with `at`.
     ///
     /// # Errors
     ///
     /// Returns the runtime's own failures.
-    pub async fn step(&mut self) -> Result<Progress, AgentError> {
+    pub async fn step(
+        &mut self,
+        at: Moment,
+    ) -> Result<Progress, AgentError> {
+        self.ledger.stamp(at);
         advance(
             &mut self.ledger,
             &*self.provider,
@@ -910,7 +945,7 @@ impl Driver {
             &self.skills,
             &self.delegates,
             self.session,
-            self.at,
+            at,
         )
         .await
     }
@@ -925,7 +960,9 @@ impl Driver {
     pub async fn step_watched(
         &mut self,
         watch: &mut dyn FnMut(&str),
+        at: Moment,
     ) -> Result<Progress, AgentError> {
+        self.ledger.stamp(at);
         advance_watched(
             &mut self.ledger,
             &*self.provider,
@@ -935,7 +972,7 @@ impl Driver {
             &self.skills,
             &self.delegates,
             self.session,
-            self.at,
+            at,
             watch,
         )
         .await
@@ -947,8 +984,11 @@ impl Driver {
     /// # Errors
     ///
     /// Returns the errors of [`Ledger::open`].
-    pub fn reopen(&mut self) -> Result<(), Error> {
-        self.ledger = Ledger::open(&self.config, self.session, Some(self.task.clone()), self.at)?;
+    pub fn reopen(
+        &mut self,
+        at: Moment,
+    ) -> Result<(), Error> {
+        self.ledger = Ledger::open(&self.config, self.session, Some(self.task.clone()), at)?;
 
         Ok(())
     }
@@ -963,8 +1003,9 @@ pub async fn run(
     config: &Config,
     run: &Run,
     at: Moment,
+    clock: Arc<dyn Clock>,
 ) -> Result<Report, Error> {
-    let mut driver = Driver::open(config, run, at)?;
+    let mut driver = Driver::open(config, run, at, clock.clone())?;
     let mut report = Report {
         session: driver.session(),
         ending: None,
@@ -973,7 +1014,7 @@ pub async fn run(
     };
 
     for _ in 0..run.steps {
-        match driver.step().await? {
+        match driver.step(clock.now()).await? {
             Progress::Terminal(ending) => {
                 report.ending = Some(ending);
                 report

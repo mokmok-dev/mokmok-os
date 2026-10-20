@@ -1,14 +1,16 @@
 //! The kernel's thin binary: read the command line, run the kernel, report what it did.
 //!
-//! The clock is read here and nowhere else. Everything below takes the instant it was handed, which
-//! is what makes a rule over instants reproducible in a test and on replay.
+//! One-shot commands read the clock once for the whole invocation. The daemon reads it once for
+//! the startup instant recovery uses and then hands the kernel a clock, which the kernel reads at
+//! each command and step boundary. Everything below the kernel takes the instant it was handed,
+//! which is what makes a rule over instants reproducible in a test and on replay.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 use clap::Parser as _;
 use mokmok_kernel::{
-    Agent, Args, Command, Config, Error, ExecutionResult, Report, Submitted, agent, reconcile,
-    serve, status, submit,
+    Agent, Args, Clock, Command, Config, Error, ExecutionResult, Report, Submitted, SystemClock,
+    agent, reconcile, serve, status, submit,
 };
 use mokmok_protocol::{Moment, SessionID};
 
@@ -53,10 +55,13 @@ async fn run(args: Args) -> Result<(), Error> {
             defaults,
         } => {
             let socket = socket.clone().unwrap_or_else(|| config.socket());
-            let published = serve(&config, defaults, &socket, *once, at).await?;
+            let published =
+                serve(&config, defaults, &socket, *once, at, Arc::new(SystemClock)).await?;
             println!("published={published} socket={}", socket.display());
         },
-        Command::Agent(Agent::Run(run)) => print_agent(&agent::run(&config, run, at).await?),
+        Command::Agent(Agent::Run(run)) => {
+            print_agent(&agent::run(&config, run, at, Arc::new(SystemClock)).await?);
+        },
         Command::Agent(Agent::Cancel { session }) => {
             let session = session_id(session)?;
             agent::cancel(&config, session, at)?;
@@ -81,15 +86,10 @@ fn print_agent(report: &agent::Report) {
     }
 }
 
-/// The one clock reading in the workspace.
+/// The instant one invocation reads once; the daemon uses it for recovery and then hands the
+/// kernel a clock.
 fn now() -> Moment {
-    Moment::from_millis(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| {
-                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-            }),
-    )
+    SystemClock.now()
 }
 
 fn session_id(value: &str) -> Result<SessionID, Error> {

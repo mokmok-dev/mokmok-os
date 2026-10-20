@@ -20,7 +20,7 @@ mod tests {
     };
     use mokmok_artifact::{BlobStore, ContentHash};
     use mokmok_kernel::agent::{Driver, Ledger};
-    use mokmok_kernel::{Config, Db, ProcessEnvironment, Run, uuid_of};
+    use mokmok_kernel::{Clock, Config, Db, FixedClock, ProcessEnvironment, Run, uuid_of};
     use mokmok_protocol::{Moment, SessionID};
     use mokmok_state_machine::{Phase, TurnOutcome};
     use serde_json::json;
@@ -852,9 +852,12 @@ mod tests {
     /// Steps `driver` until it waits for the human or closes, and says which happened. A bound is
     /// what keeps a driver that never advances from spinning here forever: a test that hangs
     /// reports neither what it expected nor what it saw.
-    async fn settled(driver: &mut Driver) -> bool {
+    async fn settled(
+        driver: &mut Driver,
+        clock: &FixedClock,
+    ) -> bool {
         for _ in 0..20 {
-            match driver.step().await.expect("the step runs") {
+            match driver.step(clock.now()).await.expect("the step runs") {
                 Progress::Awaiting => return true,
                 Progress::Terminal(_) => return false,
                 Progress::Yielded | Progress::Advanced(_) => {},
@@ -900,12 +903,14 @@ mod tests {
         script(&path, &[json!({"action": "final", "say": "hi there"})]);
         let (config, run) = driver_config(&scratch, &path);
         let at = Moment::from_millis(0);
-        let mut driver = Driver::open(&config, &run, at).expect("the driver opens");
+        let clock = Arc::new(FixedClock::new(at));
+        let mut driver = Driver::open(&config, &run, at, Arc::clone(&clock) as Arc<dyn Clock>)
+            .expect("the driver opens");
         let session = driver.session();
 
-        driver.speak("hello").expect("the line opens turn 1");
+        driver.speak("hello", at).expect("the line opens turn 1");
 
-        let awaiting = settled(&mut driver).await;
+        let awaiting = settled(&mut driver, &clock).await;
         assert!(awaiting, "the driver waits for the human's next line");
 
         let transcript = driver.transcript().expect("the fold reads");
@@ -919,7 +924,7 @@ mod tests {
         );
 
         driver
-            .speak("again")
+            .speak("again", at)
             .expect("the line extends the conversation");
         let extended = driver.transcript().expect("the fold reads");
         assert_eq!(
@@ -936,16 +941,18 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "final", "say": "hi there"})]);
         let (config, run) = driver_config(&scratch, &path);
-        let mut driver =
-            Driver::open(&config, &run, Moment::from_millis(0)).expect("the driver opens");
+        let at = Moment::from_millis(0);
+        let clock = Arc::new(FixedClock::new(at));
+        let mut driver = Driver::open(&config, &run, at, Arc::clone(&clock) as Arc<dyn Clock>)
+            .expect("the driver opens");
 
         assert!(
             driver.records().expect("the ledger reads").is_empty(),
             "a driver that opened an empty log reports no records",
         );
 
-        driver.speak("hello").expect("the line opens turn 1");
-        assert!(settled(&mut driver).await, "the turn settled");
+        driver.speak("hello", at).expect("the line opens turn 1");
+        assert!(settled(&mut driver, &clock).await, "the turn settled");
 
         let records = driver.records().expect("the ledger reads");
         assert!(
@@ -975,12 +982,14 @@ mod tests {
             ],
         );
         let (config, run) = driver_config(&scratch, &path);
-        let mut driver =
-            Driver::open(&config, &run, Moment::from_millis(0)).expect("the driver opens");
+        let at = Moment::from_millis(0);
+        let clock = Arc::new(FixedClock::new(at));
+        let mut driver = Driver::open(&config, &run, at, Arc::clone(&clock) as Arc<dyn Clock>)
+            .expect("the driver opens");
 
-        driver.speak("hello").expect("the line opens turn 1");
+        driver.speak("hello", at).expect("the line opens turn 1");
 
-        let awaiting = settled(&mut driver).await;
+        let awaiting = settled(&mut driver, &clock).await;
         assert!(awaiting, "a spent ceiling waits rather than closing");
 
         let transcript = driver.transcript().expect("the fold reads");
@@ -1421,12 +1430,14 @@ mod tests {
         let path = scratch.0.join("script.json");
         script(&path, &[json!({"action": "final", "say": "hi there"})]);
         let (config, run) = driver_config(&scratch, &path);
-        let mut driver =
-            Driver::open(&config, &run, Moment::from_millis(0)).expect("the driver opens");
+        let at = Moment::from_millis(0);
+        let clock = Arc::new(FixedClock::new(at));
+        let mut driver = Driver::open(&config, &run, at, Arc::clone(&clock) as Arc<dyn Clock>)
+            .expect("the driver opens");
         let session = driver.session();
 
-        driver.speak("hello").expect("the line opens turn 1");
-        assert!(settled(&mut driver).await, "the first line settled");
+        driver.speak("hello", at).expect("the line opens turn 1");
+        assert!(settled(&mut driver, &clock).await, "the first line settled");
 
         let mut other =
             Ledger::open(&config, session, None, Moment::from_millis(0)).expect("the ledger opens");
@@ -1441,7 +1452,7 @@ mod tests {
             "a driver that opened before the write does not see it",
         );
 
-        driver.reopen().expect("the ledger re-opens");
+        driver.reopen(at).expect("the ledger re-opens");
 
         assert_eq!(
             driver

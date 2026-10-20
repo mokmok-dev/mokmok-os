@@ -11,17 +11,18 @@ use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mokmok_agent_runtime::{
     ArtifactRef, EditCall, EditOutcome, EditReport, Editor as EditorPort, Plan, Ready, edit,
 };
 use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_patch::{ApplyError, Label, ParseError, Patch, Placed};
-use mokmok_protocol::Moment;
 use nix::fcntl::{AtFlags, OFlag, openat};
 use nix::sys::stat::Mode;
 
 use crate::authority::Authority;
+use crate::clock::Clock;
 use crate::config::{Config, CrashPoint};
 use crate::error::Error;
 
@@ -39,11 +40,11 @@ pub struct Editor {
     /// by the grant that names that symlink.
     checkout_literal: PathBuf,
     store: BlobStore,
-    at: Moment,
+    clock: Arc<dyn Clock>,
 }
 
 impl Editor {
-    /// Opens the editor for one checkout and moment.
+    /// Opens the editor for one checkout and clock.
     ///
     /// # Errors
     ///
@@ -52,14 +53,14 @@ impl Editor {
     pub fn new(
         config: &Config,
         checkout: &Path,
-        at: Moment,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, Error> {
         Ok(Self {
             config: config.clone(),
             checkout: mokmok_sandbox::resolve(checkout)?,
             checkout_literal: checkout.to_path_buf(),
             store: BlobStore::open(&config.artifacts)?,
-            at,
+            clock,
         })
     }
 
@@ -129,7 +130,8 @@ impl EditorPort for Editor {
         &self,
         call: &EditCall,
     ) -> Result<Plan, mokmok_agent_runtime::Error> {
-        let authority = Authority::new(&self.config, self.at)?;
+        let at = self.clock.now();
+        let authority = Authority::new(&self.config, at)?;
         let parsed = match Patch::parse(&call.patch) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -186,8 +188,7 @@ impl EditorPort for Editor {
 
         // The authority answers for the path the operator wrote, because `--allow-write` is
         // compared literally; every open below uses the resolved one.
-        if let Err(denial) = authority.may_write_at(&self.checkout_literal.join(&relative), self.at)
-        {
+        if let Err(denial) = authority.may_write_at(&self.checkout_literal.join(&relative), at) {
             return Ok(Plan::Refused(format!(
                 "{relative} is not under a directory the operator granted for writing, so nothing \
                  was written: {denial}"
@@ -615,8 +616,12 @@ mod tests {
     }
 
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use mokmok_protocol::Moment;
 
     use super::Config;
+    use crate::FixedClock;
 
     struct Scratch(PathBuf);
 
@@ -686,7 +691,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "one\ntwo\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -708,7 +714,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "x\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -730,7 +737,8 @@ mod tests {
         let scratch = Scratch::new("delete");
         let checkout = checkout(&scratch);
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -749,7 +757,8 @@ mod tests {
         let scratch = Scratch::new("create");
         let checkout = checkout(&scratch);
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -770,7 +779,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "exists\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -793,7 +803,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
         call.expect = Some("0".repeat(64));
@@ -811,7 +822,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), [0xff, 0xfe]).unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -831,7 +843,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -858,7 +871,7 @@ mod tests {
         std::os::unix::fs::symlink(&checkout, &link).unwrap();
         // The grant names the symlink, which is the path `--allow-write` was handed.
         let config = config(&scratch.0, std::slice::from_ref(&link), &[]);
-        let editor = Editor::new(&config, &link, Moment::EPOCH).unwrap();
+        let editor = Editor::new(&config, &link, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -875,7 +888,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
         // 64 characters, one of them not hexadecimal.
@@ -896,7 +910,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let mut call = edit_call("--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-one\n+two\n");
         call.expect = Some(ContentHash::of(b"one\n").to_string().to_uppercase());
@@ -911,7 +926,8 @@ mod tests {
         std::fs::write(checkout.join("real.rs"), "one\n").unwrap();
         std::os::unix::fs::symlink(checkout.join("real.rs"), checkout.join("x.rs")).unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -931,7 +947,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "x".repeat(MAX_EDIT_FILE_BYTES + 1)).unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -952,7 +969,8 @@ mod tests {
         // One line per byte-pair keeps the hunk matching at the exact ceiling.
         std::fs::write(checkout.join("x.rs"), "x\n".repeat(MAX_EDIT_FILE_BYTES / 2)).unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -1010,7 +1028,8 @@ mod tests {
         let checkout = checkout(&scratch);
         std::fs::write(checkout.join("x.rs"), "one\n").unwrap();
         let config = config(&scratch.0, &[], std::slice::from_ref(&checkout));
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -1032,7 +1051,8 @@ mod tests {
         std::fs::write(&target, "one\ntwo\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -1061,7 +1081,8 @@ mod tests {
         let target = checkout.join("x.rs");
         std::fs::write(&target, "one\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -1085,7 +1106,8 @@ mod tests {
         let target = checkout.join("x.rs");
         std::fs::write(&target, "one\n").unwrap();
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
@@ -1114,7 +1136,8 @@ mod tests {
         let scratch = Scratch::new("create-commits");
         let checkout = checkout(&scratch);
         let config = config(&scratch.0, std::slice::from_ref(&checkout), &[]);
-        let editor = Editor::new(&config, &checkout, Moment::EPOCH).unwrap();
+        let editor =
+            Editor::new(&config, &checkout, Arc::new(FixedClock::new(Moment::EPOCH))).unwrap();
 
         let plan = editor
             .plan(&edit_call(
