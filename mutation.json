@@ -1,17 +1,17 @@
 {
-  "harness": "a504206f1e443cb4d7c4441ae0e0dd6b7c53282ed1ac6cdf1806e3b03a5a79e6",
-  "generated": "2026-10-18T16:46:07Z",
+  "harness": "e1d245d40dd46ce011f1d49b3a15eb0ceca0e176135bc7bd75dc0dc8ebe6fecb",
+  "generated": "2026-10-20T04:43:54Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
       "score": 100.0,
       "target": 100.0,
-      "tested": 210,
-      "caught": 210,
+      "tested": 211,
+      "caught": 211,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "fabea0f75ba4e0ec9a3817363401ef11eca8975ce2a93392929f74e0d4b09b04"
+      "digest": "3048ee6e36b5d5566428efb057d1a5fab7d7c31f6ebaeb78b773ee5f4f67e61f"
     },
     {
       "name": "mokmok-artifact",
@@ -50,34 +50,34 @@
       "name": "mokmok-event-bus",
       "score": 100.0,
       "target": 100.0,
-      "tested": 185,
-      "caught": 185,
+      "tested": 210,
+      "caught": 210,
       "missed": [],
       "timeout": 0,
-      "digest": "a10d8bb335582fc2567e44f466b263984deac67fa4dc87935e01c1e66a354930",
-      "timed_out": []
+      "timed_out": [],
+      "digest": "10cbe09603ae4ca85bf2e857122a05a62df84e3a225553f61cfb09b4303880e2"
     },
     {
       "name": "mokmok-event-store",
       "score": 100.0,
       "target": 100.0,
-      "tested": 87,
-      "caught": 87,
+      "tested": 91,
+      "caught": 91,
       "missed": [],
       "timeout": 0,
-      "digest": "5c59701335469051712301c67034949e6864745b3868fdcd70d86015faee7484",
-      "timed_out": []
+      "timed_out": [],
+      "digest": "dfa5afa5e8aa4463cd8de3bd598282599f3db4b859a95db9bb993746b405a8cd"
     },
     {
       "name": "mokmok-kernel",
       "score": 100.0,
       "target": 100.0,
-      "tested": 349,
-      "caught": 349,
+      "tested": 409,
+      "caught": 409,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "893c60c317a5316fd8cbe214284c0c8c260114180a52d194eb31f1a3e5fc4809"
+      "digest": "a220096379d67dbb0cbfc7890e9e1cd159debad4741fb3d1e769de116dbd6845"
     },
     {
       "name": "mokmok-observability",
@@ -105,12 +105,12 @@
       "name": "mokmok-protocol",
       "score": 100.0,
       "target": 100.0,
-      "tested": 73,
-      "caught": 73,
+      "tested": 79,
+      "caught": 79,
       "missed": [],
       "timeout": 0,
-      "digest": "bf9ff6b785352c5c14f360467515b92908baf3ce645c75a868da1ea7511077f8",
-      "timed_out": []
+      "timed_out": [],
+      "digest": "1f70a4db2c9f82a1a51f5bc626942875abfbe349da8ea7cdd45cf11c1f24f528"
     },
     {
       "name": "mokmok-sandbox",
@@ -146,6 +146,17 @@
       "timed_out": []
     },
     {
+      "name": "mokmok-session-wire",
+      "score": 100.0,
+      "target": 100.0,
+      "tested": 37,
+      "caught": 37,
+      "missed": [],
+      "timeout": 0,
+      "timed_out": [],
+      "digest": "2843a8e970f1792f36771447110180d22153591a26d547306c80f29fc5a09d60"
+    },
+    {
       "name": "mokmok-skill",
       "score": 100.0,
       "target": 100.0,
@@ -165,18 +176,18 @@
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "fee44c24c4575987fdd361add746fa200d1c0583972a2a43b700b563c75f6f37"
+      "digest": "b767e23f13fdc75a209ffaeea8e37a8c4d9027218703902fd56f6f0c9825f3a8"
     },
     {
       "name": "mokmok-tui",
       "score": 100.0,
       "target": 100.0,
-      "tested": 183,
-      "caught": 183,
+      "tested": 382,
+      "caught": 382,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "56b9112903a49421a46550daee41ace2c00887614fb0a52b34cf39b26e3d5586"
+      "digest": "e9dd6a531a6eb9922ca3800e4ea6e1e7f9482812e3d32e91a3bc919f09f1afd6"
     }
   ]
 }
