@@ -653,16 +653,18 @@ mod tests {
         let scratch = Scratch::new("first-pass");
         seed(&scratch.data(), 0xd1, 1);
 
-        let started = Instant::now();
         let daemon = Daemon::start(&scratch, &[]);
         wait_for_socket(&scratch.socket(), Duration::from_secs(5));
+        // The interval is scheduled once the bus is bound, so the measurement starts there. Timing
+        // it from the spawn would let a start slower than the interval read as a pass that waited.
+        let bound = Instant::now();
         let notices = collect(
             &scratch.socket(),
             Topic::Session(session()),
             SubscriberId::new(),
             1,
         );
-        let elapsed = started.elapsed();
+        let elapsed = bound.elapsed();
 
         assert_eq!(
             notices.len(),
