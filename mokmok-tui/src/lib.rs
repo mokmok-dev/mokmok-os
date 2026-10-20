@@ -10,23 +10,22 @@
 //!
 //! [`Transcript`]: mokmok_agent_runtime::Transcript
 
+mod bus;
 mod core;
 mod markdown;
 mod port;
-mod session;
 mod terminal;
-mod worker;
 
 use mokmok_protocol::SessionID;
 use mokmok_state_machine::Ending;
 
+pub use crate::bus::BusRoster;
 pub use crate::core::run;
 pub use crate::port::{
-    Engine, Entry, Event, Key, Line, Listing, Roster, Row, Screen, Sheet, Span, Tone, Update, View,
+    Engine, Entry, Event, Key, Line, Link, Listing, Roster, Row, Screen, Sheet, Span, Tone, Update,
+    View,
 };
-pub use crate::session::{Session, Sessions};
 pub use crate::terminal::Terminal;
-pub use crate::worker::Worker;
 
 /// What the process left behind: every session it held, and how each one stands.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +56,9 @@ pub enum Error {
     /// The working directory could not be read, so a bare start has no checkout to offer.
     #[error("the working directory could not be read")]
     Directory(#[source] std::io::Error),
+    /// `--session` is not a UUID.
+    #[error("{0} is not a session UUID")]
+    InvalidSession(String),
     /// The log holds a history for the session and no task in it.
     #[error(
         "the session {} recorded no task, and a session runs under the task its log holds; read it \
@@ -65,19 +67,22 @@ pub enum Error {
         .0.as_uuid()
     )]
     Untasked(SessionID),
-    /// The configuration was refused: a grant, a program, a credential, a script.
+    /// The bus could not be reached, or stopped answering.
+    #[error("the bus failed: {0}")]
+    Bus(#[from] mokmok_event_bus::Error),
+    /// A payload was not the message this client reads.
+    #[error("a bus payload could not be read: {0}")]
+    BusPayload(#[from] mokmok_event_bus::PayloadError),
+    /// The daemon refused the command at its boundary.
     #[error("{0}")]
-    Config(#[from] mokmok_kernel::ConfigError),
-    /// The kernel could not open the log, the artifact store, the sandbox, or the provider.
-    #[error("{0}")]
-    Kernel(#[from] mokmok_kernel::Error),
+    Refused(#[from] mokmok_session_wire::Refusal),
     /// The agent loop failed: the journal, the provider, or the tools.
     #[error("{0}")]
     Agent(#[from] mokmok_agent_runtime::Error),
-    /// The thread a session stepped on stopped answering.
-    #[error("the session worker stopped; its log holds everything it committed")]
-    Worker,
-    /// The thread a session would have stepped on could not be started.
-    #[error("the session worker could not start")]
-    WorkerStart(#[source] std::io::Error),
+    /// The recorded history is not one this build can fold.
+    #[error("the session history is not one this build can fold: {0}")]
+    Fold(#[from] mokmok_agent_runtime::Refusal),
+    /// The bus thread stopped answering, or never started.
+    #[error("the bus thread stopped; the daemon still holds the session")]
+    BusThread,
 }

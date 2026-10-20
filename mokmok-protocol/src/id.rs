@@ -1,5 +1,7 @@
 mod marker;
 
+use crate::moment::Moment;
+
 pub use marker::*;
 
 mod private {
@@ -41,12 +43,35 @@ impl<M: private::Sealed> ID<M> {
     }
 }
 
+impl ID<Session> {
+    /// Mints one session identity from a caller's clock reading.
+    ///
+    /// The clock is the caller's because no crate below a binary reads one here. Two identities
+    /// minted from the same reading differ in their random bits, so a caller cannot collide with
+    /// itself by minting twice before its clock moves.
+    #[must_use]
+    pub fn mint(at: Moment) -> Self {
+        // `Timestamp::from_unix_time` takes whole seconds and a sub-second nanosecond count, which
+        // is why the milliseconds are split rather than converted as one number.
+        let millis = at.as_millis();
+        let timestamp = uuid::Timestamp::from_unix_time(
+            millis / 1_000,
+            u32::try_from((millis % 1_000) * 1_000_000).unwrap_or(0),
+            0,
+            0,
+        );
+
+        Self::new(timestamp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AgentID, EventID, ID};
+    use super::{AgentID, EventID, ID, Session};
+    use crate::moment::Moment;
     use core::marker::PhantomData;
     use proptest::prelude::*;
-    use uuid::{Uuid, timestamp::Timestamp};
+    use uuid::{Uuid, Variant, timestamp::Timestamp};
 
     const _: () = {
         const fn assert_value_type<
@@ -142,5 +167,30 @@ mod tests {
             prop_assert_eq!(decoded.value, id.value);
             prop_assert_eq!(encoded, serde_json::to_string(&id.value).unwrap());
         }
+    }
+
+    #[test]
+    fn mint_places_the_seconds_and_sub_second_millis_in_a_version_7_uuid() {
+        let at = Moment::from_millis(1_700_000_123_456);
+
+        let id = ID::<Session>::mint(at);
+
+        assert_eq!(id.as_uuid().get_version_num(), 7);
+        assert_eq!(id.as_uuid().get_variant(), Variant::RFC4122);
+        let (seconds, nanos) = id.as_uuid().get_timestamp().unwrap().to_unix();
+        assert_eq!(seconds, 1_700_000_123);
+        assert_eq!(nanos, 456_000_000);
+    }
+
+    #[test]
+    fn mint_gives_each_reading_a_distinct_identity() {
+        let reading = Moment::from_millis(1_700_000_000_000);
+
+        let first = ID::<Session>::mint(reading);
+        let later = ID::<Session>::mint(Moment::from_millis(1_700_000_000_001));
+        let again = ID::<Session>::mint(reading);
+
+        assert_ne!(first, later);
+        assert_ne!(first, again);
     }
 }

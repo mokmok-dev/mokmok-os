@@ -14,14 +14,15 @@ use mokmok_event_bus::{
     Config as BusConfig, Error as BusError, Payload, Topic, serve as serve_bus, signals,
 };
 use mokmok_observability::{Config as LogConfig, Redaction, init};
-use mokmok_protocol::Moment;
+use mokmok_protocol::{AgentID, Moment};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, SessionDefaults};
 use crate::db::Db;
 use crate::error::Error;
+use crate::host::Host;
 use crate::notify::{Cadence, Message, Notifier};
 use crate::recovery;
 
@@ -144,6 +145,7 @@ impl Relay {
 /// it.
 pub async fn serve(
     config: &Config,
+    defaults: &SessionDefaults,
     socket: &Path,
     once: bool,
     at: Moment,
@@ -166,11 +168,12 @@ pub async fn serve(
         return relay.once(&mut db).await;
     }
 
-    serve_until_stopped(config, bus, at).await
+    serve_until_stopped(config, defaults, bus, at).await
 }
 
 async fn serve_until_stopped(
     config: &Config,
+    defaults: &SessionDefaults,
     bus: BusConfig,
     at: Moment,
 ) -> Result<usize, Error> {
@@ -212,6 +215,20 @@ async fn serve_until_stopped(
         let _ = stopped.await;
     }));
 
+    // The host needs a bound socket to subscribe. The bus task binds it; waiting here is the same
+    // bounded probe readiness uses later, and it keeps a slow bind from looking like a refused
+    // daemon.
+    waited_for_bus(&socket, &mut bus).await?;
+    let daemon = AgentID::from_uuid(uuid::Uuid::new_v4());
+    let client = mokmok_event_bus::Client::connect(&socket)
+        .await
+        .map_err(Error::Bus)?;
+    let mut host = tokio::spawn(
+        Host::start(config.clone(), defaults.clone(), at, daemon, client)
+            .await?
+            .run(),
+    );
+
     let mut relay = Relay::new(&socket);
     let notifier = Notifier::from_env()?;
     // The first tick waits a whole interval, so the bus has bound before the first pass rather
@@ -229,6 +246,7 @@ async fn serve_until_stopped(
             // toss.
             biased;
             result = &mut bus => return Err(bus_ended(result)),
+            result = &mut host => return Err(host_ended(result)),
             () = &mut shutdown => break,
             // A stop that arrives while a pass runs is honoured after it. That is the drain: the
             // pass is the unit of durable progress, and a cancelled one would only cost a
@@ -264,7 +282,7 @@ async fn serve_until_stopped(
             // Readiness is a bus that answers a session and an outbox that drained, because that is
             // what a dependent connecting now finds. A socket file is neither of those things: a
             // process killed with SIGKILL leaves one behind.
-            wait_for_bus(&socket).await?;
+            waited_for_bus(&socket, &mut bus).await?;
             report(&notifier, Message::Ready);
             ready = Some(Cadence::new(notifier.ping(), Instant::now()));
         } else if let Some(cadence) = &mut ready {
@@ -283,6 +301,9 @@ async fn serve_until_stopped(
     // The bus unlinks its socket on the way out, so it is awaited before the process ends: a
     // restart must not meet a socket this instance left behind.
     report(&notifier, Message::Stopping);
+    // A session thread in a step is left to finish; the log already covers a step cut off by the
+    // process leaving.
+    host.abort();
     let _ = stop.send(());
     if let Ok(ended) = bus.await {
         ended?;
@@ -315,6 +336,20 @@ async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
     }
 }
 
+/// Waits for the bus this process spawned, and answers its bind failure before the probe's timeout.
+///
+/// A peer that holds the socket and accepts without answering keeps every probe waiting, so the
+/// probe alone reports a silent peer where the bus already named the live one.
+async fn waited_for_bus(
+    socket: &Path,
+    bus: &mut tokio::task::JoinHandle<Result<(), mokmok_event_bus::ServeError>>,
+) -> Result<(), Error> {
+    tokio::select! {
+        result = bus => Err(bus_ended(result)),
+        result = wait_for_bus(socket) => result,
+    }
+}
+
 /// A socket file is not a bus: a process killed with SIGKILL leaves one behind, and the bus that
 /// replaces it unlinks and rebinds, so the file says nothing until a peer answers. A WebSocket
 /// upgrade is that answer: it needs the live server, and it creates no topic and moves no
@@ -333,6 +368,13 @@ fn bus_ended(
     match result {
         Ok(Ok(())) | Err(_) => Error::BusStopped,
         Ok(Err(error)) => Error::BusServe(error),
+    }
+}
+
+fn host_ended(result: Result<Result<(), Error>, tokio::task::JoinError>) -> Error {
+    match result {
+        Ok(Ok(())) | Err(_) => Error::BusStopped,
+        Ok(Err(error)) => error,
     }
 }
 
@@ -454,6 +496,66 @@ mod tests {
             "the acknowledged notice was settled and the refused one was not",
         );
         assert_eq!(pending[0].topic(), Topic::Session(second).to_string());
+
+        serving.abort();
+    }
+
+    #[tokio::test]
+    async fn a_refused_publish_keeps_the_connection_a_broken_one_drops() {
+        let scratch = Scratch::new("refused-publish");
+        let socket = scratch.0.join("bus.sock");
+        let bus = BusConfig {
+            path: socket.clone(),
+            store: scratch.0.join("bus.sqlite"),
+            // One topic is all this bus will open, and the opener below takes it.
+            limits: Limits {
+                topics: NonZeroUsize::MIN,
+                ..Limits::default()
+            },
+            ..BusConfig::default()
+        };
+        let serving = tokio::spawn(serve_bus(bus, std::future::pending::<()>()));
+        wait_for_bus(&socket).await;
+
+        let opener = mokmok_event_bus::Client::connect(&socket).await.unwrap();
+        opener
+            .publish(
+                Topic::Global,
+                mokmok_event_bus::Payload::json(&"open".to_owned()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let refused = SessionID::from_uuid(Uuid::from_u128(0x12));
+        let mut relay = Relay::new(&socket);
+        let failure = relay
+            .publish(
+                Topic::Session(refused),
+                mokmok_event_bus::Payload::json(&"refused".to_owned()).unwrap(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                failure,
+                Err(crate::error::Error::Bus(mokmok_event_bus::Error::Refused(
+                    _
+                )))
+            ),
+            "{failure:?}",
+        );
+
+        // Removing the path is what separates a kept connection from a reconnection: only a dropped
+        // client has to dial it.
+        std::fs::remove_file(&socket).unwrap();
+
+        relay
+            .publish(
+                Topic::Global,
+                mokmok_event_bus::Payload::json(&"after".to_owned()).unwrap(),
+            )
+            .await
+            .expect("the refused publish kept the connection");
 
         serving.abort();
     }

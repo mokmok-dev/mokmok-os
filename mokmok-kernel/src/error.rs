@@ -58,6 +58,8 @@ pub enum Error {
     WriteRefused(Rejection),
     #[error("a stored payload could not be read back")]
     Payload(#[from] PayloadError),
+    #[error("a session payload could not be split for the bus: {0}")]
+    Wire(#[from] mokmok_session_wire::chunk::ChunkError),
     #[error("another writer moved the stream to version {found} before this append")]
     Conflicted { found: u64 },
     #[error("the session is {0:?}, so it admits no new turn")]

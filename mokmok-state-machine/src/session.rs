@@ -22,7 +22,8 @@ pub struct Session {
 }
 
 /// Where a session is in its lifecycle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// The state a fold starts from, before [`Fact::SessionOpened`].
     Unopened,
@@ -33,7 +34,8 @@ pub enum Phase {
 }
 
 /// How a closed session ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Ending {
     Completed,
     Cancelled,

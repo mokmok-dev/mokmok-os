@@ -1654,6 +1654,7 @@ dependencies = [
  "mokmok-sandbox",
  "mokmok-scheduler",
  "mokmok-search",
+ "mokmok-session-wire",
  "mokmok-skill",
  "mokmok-state-machine",
  "nix 0.31.3",
@@ -1740,6 +1741,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mokmok-session-wire"
+version = "0.0.0"
+dependencies = [
+ "mokmok-agent-runtime",
+ "mokmok-event-bus",
+ "mokmok-event-store",
+ "mokmok-protocol",
+ "mokmok-state-machine",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "mokmok-skill"
 version = "0.0.0"
 dependencies = [
@@ -1768,12 +1784,14 @@ dependencies = [
  "clap",
  "mokmok-agent-runtime",
  "mokmok-artifact",
- "mokmok-kernel",
+ "mokmok-event-bus",
  "mokmok-protocol",
+ "mokmok-session-wire",
  "mokmok-state-machine",
  "nix 0.31.3",
  "proptest",
  "ratatui",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

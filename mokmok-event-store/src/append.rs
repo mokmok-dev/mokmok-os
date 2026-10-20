@@ -94,6 +94,16 @@ impl OutboxMessage {
             payload,
         }
     }
+
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    #[must_use]
+    pub const fn payload(&self) -> &Payload {
+        &self.payload
+    }
 }
 
 /// The store-assigned identity of one outbox row.

@@ -31,8 +31,8 @@ Modules `append`, `error`, `event`, `model`, `payload`, `store`, and `write`.
 | Item | Where | What it is |
 | --- | --- | --- |
 | `Store` | `src/store.rs:80` | `open`, `append`, `consume`, `history`, `log`, `checkpoint`, `pending_outbox`, `settle_outbox` |
-| `Append`, `Committed`, `Outcome` | `src/append.rs:12,161,198` | The append program and its two answers |
-| `OutboxMessage`, `OutboxId`, `OutboxEntry` | `src/append.rs:81,101,116` | A message written in the same transaction as the events |
+| `Append`, `Committed`, `Outcome` | `src/append.rs:12,171,208` | The append program and its two answers |
+| `OutboxMessage`, `OutboxId`, `OutboxEntry` | `src/append.rs:81,111,126` | A message written in the same transaction as the events |
 | `WriteTx` | `src/write.rs:15` | `recorded`, `append`, `history`, `projection`, `put_projection` inside a consume |
 | `StreamId`, `ConsumerId`, `CommandId`, `Version`, `CommitPosition`, `Expected` | `src/model.rs:14,61,108,161,187,222` | The identifiers and the concurrency contract |
 | `NewEvent`, `Event`, `Slice`, `Kind` | `src/event.rs:58,75,144,14` | Stored events and a read window |
@@ -52,9 +52,9 @@ position, and `checkpoint` keyed by consumer.
 - An append batch commits atomically. `BEGIN IMMEDIATE` (`src/store.rs:294`), one `COMMIT`
   (`src/store.rs:128`), and a savepoint around the append program that rolls back on error
   (`src/store.rs:349`).
-- A repeated command identity commits nothing new. Deduplication reads
-  `recorded_in` (`src/store.rs:519`) before the version check (`src/store.rs:382`), and
-  `commit_log.command` is unique (`src/store.rs:23`). The answer is `Outcome::Replayed` with the
+- A repeated command identity commits nothing new. `expected` and `recorded_in`
+  (`src/store.rs:403`, `src/store.rs:535`) are the version check and the dedup read that decide it,
+  and `commit_log.command` is unique (`src/store.rs:23`). The answer is `Outcome::Replayed` with the
   original rows.
 - An expected version is enforced. `Expected::accepts` (`src/model.rs:233`) is checked at
   `src/store.rs:386`, and a mismatch answers `Outcome::Conflicted` with nothing written.
@@ -62,12 +62,12 @@ position, and `checkpoint` keyed by consumer.
   (`src/store.rs:35`) and numbering at `src/store.rs:446`.
 - Visible commit positions agree with the commit order. The position is the `commit_log` rowid
   (`src/store.rs:19`) and `CommitPosition` is a nonzero integer (`src/model.rs:187`).
-- A checkpoint never moves backward. `advance_checkpoint` (`src/store.rs:737`) uses the SQL `max`
+- A checkpoint never moves backward. `advance_checkpoint` (`src/store.rs:753`) uses the SQL `max`
   function, and its only caller is `consume` (`src/store.rs:161`).
 - A checkpoint cannot name processing that did not commit. `consume` (`src/store.rs:152-163`)
   interleaves the inbox check, the caller's writes, the inbox row, and the checkpoint inside one
-  transaction, and `live` (`src/store.rs:339`) fails when SQLite has already ended it.
-- An unknown schema is refused. `prepare` (`src/store.rs:301`) accepts `user_version` 0 or 1 and
+  transaction, and `live` (`src/store.rs:355`) fails when SQLite has already ended it.
+- An unknown schema is refused. `prepare` (`src/store.rs:317`) accepts `user_version` 0 or 1 and
   stamps 1.
 
 # Dependencies
@@ -92,7 +92,7 @@ own.
 
 Two behaviours the design does not describe. The store adopts a version-0 SQLite file, stamps it
 with version 1, and refuses anything above version 1 with `Error::Schema`.
-And `consume` documents (`src/store.rs:146`) that a `Committed` value from a different file
+And `consume` documents (`src/store.rs:162`) that a `Committed` value from a different file
 whose position collides is accepted, after which the inbox and the checkpoint name an unrelated
 commit.
 

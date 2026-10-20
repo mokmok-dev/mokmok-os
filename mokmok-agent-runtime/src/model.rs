@@ -6,7 +6,7 @@ use mokmok_skill::SkillName;
 use crate::context::Context;
 use crate::dialogue::Transcript;
 use crate::error::Error;
-use crate::record::{ArtifactRef, Receipt, Step};
+use crate::record::{ArtifactRef, Receipt, Step, StepId};
 
 /// What the model answered one attempt with.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -126,6 +126,22 @@ pub trait Journal {
         truncated: bool,
     ) -> Result<ArtifactRef, Error>;
 
+    /// Whether the journal already holds the step with `id`.
+    ///
+    /// A command stream delivers at least once. A line that arrives twice asks this before it
+    /// derives a new step, so a redelivery replays its own write instead of opening the next turn.
+    /// A journal with no dedup answers false, which is the shape a test journal starts from.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal failure when the dedup row cannot be read.
+    fn committed(
+        &self,
+        _id: StepId,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Commits every record of one step in order, or none of them.
     ///
     /// The identity the step was derived under is what makes a repeat a [`Receipt::Replayed`]
@@ -139,4 +155,68 @@ pub trait Journal {
         &mut self,
         step: Step,
     ) -> Result<Receipt, Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use mokmok_protocol::SessionID;
+
+    use crate::dialogue::Transcript;
+    use crate::error::Error;
+    use crate::record::{ArtifactRef, Receipt, Step, StepId, StepKey};
+    use crate::test_support::{TestJournal, session, task};
+
+    use super::Journal;
+
+    /// A journal with no dedup, so its `committed` is the port's default.
+    struct NoDedup(TestJournal);
+
+    impl Journal for NoDedup {
+        fn transcript(
+            &self,
+            session: SessionID,
+        ) -> Result<Transcript, Error> {
+            self.0.transcript(session)
+        }
+
+        fn put(
+            &mut self,
+            bytes: &[u8],
+            truncated: bool,
+        ) -> Result<ArtifactRef, Error> {
+            self.0.put(bytes, truncated)
+        }
+
+        fn append(
+            &mut self,
+            step: Step,
+        ) -> Result<Receipt, Error> {
+            self.0.append(step)
+        }
+    }
+
+    #[test]
+    fn committed_answers_whether_the_journal_holds_the_step() {
+        let session = session();
+        let mut journal = TestJournal::new(session, task(1));
+        let written = StepId::derive(session, StepKey::Task);
+        let absent = StepId::derive(session, StepKey::Speech { turn: 1 });
+        journal.mark(written);
+
+        assert!(journal.committed(written).unwrap());
+        assert!(!journal.committed(absent).unwrap());
+    }
+
+    #[test]
+    fn a_journal_without_dedup_answers_false_for_every_step() {
+        let session = session();
+        let mut inner = TestJournal::new(session, task(1));
+        let written = StepId::derive(session, StepKey::Task);
+        let absent = StepId::derive(session, StepKey::Speech { turn: 1 });
+        inner.mark(written);
+        let journal = NoDedup(inner);
+
+        assert!(!journal.committed(written).unwrap());
+        assert!(!journal.committed(absent).unwrap());
+    }
 }

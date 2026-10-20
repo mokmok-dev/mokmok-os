@@ -60,7 +60,7 @@ upgrade, before a session exists, so every response carries the request id. The 
 task per client and a wire with no opening frame: a peer that sends the old `open` frame is closed as
 malformed.
 
-Recovery reads the commit log directly. `Db::unsettled_sessions` (`mokmok-kernel/src/db.rs:425`)
+Recovery reads the commit log directly. `Db::unsettled_sessions` (`mokmok-kernel/src/db.rs:437`)
 groups the log by event stream and folds each one, so the log is the session index and no registry
 of live sessions exists. A session whose log is unreadable stops startup by design.
 
@@ -69,7 +69,7 @@ protocol (`mokmok-kernel/src/notify.rs`), so there is no endpoint to probe and n
 supervision tests bind their own notification socket to assert it.
 
 Crash injection takes two signals. A crash point fires only when the `--crash-after` flag names it
-and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:987`), so a production process cannot be
+and `MOKMOKD_CRASH` is set (`mokmok-kernel/src/config.rs:1029`), so a production process cannot be
 crashed by a flag alone.
 
 The provider group comes from a file, and authority does not. Both binaries read the provider, the

@@ -20,7 +20,8 @@ mod tests {
     use mokmok_event_bus::{Client, SubscriberId, Topic};
     use mokmok_event_store::{CommandId, Expected};
     use mokmok_kernel::{Db, Entry, Notice};
-    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_protocol::{CommandID, Moment, SessionID};
+    use mokmok_session_wire::SessionCommit;
     use mokmok_state_machine::{Fact, Resolution};
     use uuid::Uuid;
 
@@ -96,13 +97,16 @@ mod tests {
 
         for index in first..first + count {
             let command = CommandId::from_uuid(Uuid::from_u128(index));
-            let notice = Notice {
+            let notice = SessionCommit {
                 session,
-                command,
-                turn: None,
-                execution: None,
-                resolution: Some(Resolution::Unknown),
-                at: Moment::from_millis(1),
+                command: CommandID::from_uuid(command.as_uuid()),
+                notice: Notice {
+                    turn: None,
+                    execution: None,
+                    resolution: Some(Resolution::Unknown),
+                    at: Moment::from_millis(1),
+                },
+                records: Vec::new(),
             };
             db.append(
                 command,
@@ -642,6 +646,38 @@ mod tests {
             format!("published=4 socket={}\n", scratch.socket().display()),
         );
         assert!(!scratch.socket().exists());
+    }
+
+    #[test]
+    fn the_first_relay_pass_waits_its_interval_before_publishing() {
+        let scratch = Scratch::new("first-pass");
+        seed(&scratch.data(), 0xd1, 1);
+
+        let started = Instant::now();
+        let daemon = Daemon::start(&scratch, &[]);
+        wait_for_socket(&scratch.socket(), Duration::from_secs(5));
+        let notices = collect(
+            &scratch.socket(),
+            Topic::Session(session()),
+            SubscriberId::new(),
+            1,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            notices.len(),
+            1,
+            "the seeded notice was published: {notices:#?}",
+        );
+        // The first tick is scheduled a whole pass ahead, so no publish can precede that pass.
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "the first pass published after {elapsed:?}, which is inside its interval",
+        );
+
+        daemon.signal("TERM");
+        let finished = daemon.finish(Duration::from_secs(5));
+        assert_eq!(finished.code, Some(0), "{}", finished.err);
     }
 
     #[test]

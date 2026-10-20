@@ -13,10 +13,12 @@
 use std::ffi::OsString;
 use std::time::Duration;
 
-use mokmok_event_bus::Topic;
-use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome, Payload};
-use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+use mokmok_event_store::{CommandId, Expected, Outcome};
+use mokmok_protocol::{CommandID, ExecutionID, Moment, SessionID, TurnID};
 use mokmok_sandbox::Environment;
+use mokmok_session_wire::SessionCommit;
+
+pub use mokmok_session_wire::Notice;
 use mokmok_state_machine::{
     Attempt, Deadline, Fact, Phase, Resolution, State, TurnFact, TurnNumber, TurnOutcome,
 };
@@ -55,34 +57,32 @@ pub struct Report {
     pub transcript: Vec<String>,
 }
 
-/// A wakeup a subscriber can react to without reading the log.
-///
-/// The durable fact carries the change in full; this names it. It is written into the same
-/// transaction as the change, so a notice exists only after its history committed, and the relay
-/// publishes it afterwards.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct Notice {
-    pub session: SessionID,
-    /// The command whose transaction wrote this notice: a submit's is its own idempotency identity,
-    /// while recovery's is the identity it mints for the batch it writes, which no retry reuses.
-    pub command: CommandId,
-    pub turn: Option<TurnID>,
-    pub execution: Option<ExecutionID>,
-    pub resolution: Option<Resolution>,
-    pub at: Moment,
-}
-
-impl Notice {
-    /// The outbox row the relay publishes once the transaction that wrote it has committed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Payload`] when the notice cannot be encoded.
-    pub fn outbox(&self) -> Result<OutboxMessage, Error> {
-        Ok(OutboxMessage::new(
-            Topic::Session(self.session).to_string(),
-            Payload::json(self)?,
-        ))
+/// The commit a transaction publishes: the records it wrote and the identities it touched.
+pub fn published(
+    session: SessionID,
+    command: CommandId,
+    entries: &[Entry],
+    turn: Option<TurnID>,
+    execution: Option<ExecutionID>,
+    resolution: Option<Resolution>,
+    at: Moment,
+) -> SessionCommit {
+    SessionCommit {
+        session,
+        command: CommandID::from_uuid(command.as_uuid()),
+        notice: Notice {
+            turn,
+            execution,
+            resolution,
+            at,
+        },
+        records: entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Agent(record) => Some(record.clone()),
+                Entry::Session(_) | Entry::Turn(..) | Entry::Result(..) => None,
+            })
+            .collect(),
     }
 }
 
@@ -115,8 +115,8 @@ pub async fn submit(
         log.verify(session, &written)?;
     }
 
-    let launch = notice(session, command, turn, Some(execution), None, at)?;
-    match commit(&mut db, command, session, &written, vec![launch])? {
+    let launch = notice(session, command, &written, turn, Some(execution), None, at);
+    match commit(&mut db, command, session, &written, &[launch])? {
         Outcome::Committed(_) => {},
         Outcome::Replayed(_) => {
             // The command ran before. If this session holds nothing, the identity belongs to another
@@ -142,15 +142,16 @@ pub async fn submit(
     let notice = notice(
         session,
         command,
+        &settle,
         turn,
         Some(execution),
         Some(resolution),
         at,
-    )?;
+    );
     // The settlement is its own transaction, so it needs its own identity: the store's dedup row
     // is keyed on the command id, and reusing this submit's id would make the second append a
     // replay of the first.
-    match commit(&mut db, CommandId::new(), session, &settle, vec![notice])? {
+    match commit(&mut db, CommandId::new(), session, &settle, &[notice])? {
         Outcome::Committed(_) | Outcome::Replayed(_) => {},
         Outcome::Conflicted { found, .. } => {
             return Err(Error::Conflicted { found: found.get() });
@@ -293,20 +294,21 @@ fn settled(
 fn notice(
     session: SessionID,
     command: CommandId,
+    entries: &[Entry],
     turn: TurnID,
     execution: Option<ExecutionID>,
     resolution: Option<Resolution>,
     at: Moment,
-) -> Result<OutboxMessage, Error> {
-    Notice {
+) -> SessionCommit {
+    published(
         session,
         command,
-        turn: Some(turn),
+        entries,
+        Some(turn),
         execution,
         resolution,
         at,
-    }
-    .outbox()
+    )
 }
 
 /// Decides, confines, runs, and stores what one tool produced.
@@ -546,10 +548,14 @@ fn commit(
     command: CommandId,
     session: SessionID,
     entries: &[Entry],
-    notices: Vec<OutboxMessage>,
+    commits: &[SessionCommit],
 ) -> Result<Outcome, Error> {
     let stream = Db::stream(session);
     let expected = Expected::At(db.version(stream)?);
+    let notices = commits
+        .iter()
+        .map(SessionCommit::outbox)
+        .collect::<Result<Vec<_>, _>>()?;
 
     db.append(command, stream, expected, entries, notices)
 }
@@ -605,14 +611,15 @@ fn timestamp(at: Moment) -> uuid::Timestamp {
 /// collide with itself by minting twice before its clock moves.
 #[must_use]
 pub fn mint_session(at: Moment) -> SessionID {
-    SessionID::new(timestamp(at))
+    SessionID::mint(at)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Notice, outcome_of, timestamp};
+    use super::{outcome_of, timestamp};
     use mokmok_event_store::CommandId;
     use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+    use mokmok_session_wire::{Notice, SessionCommit};
     use mokmok_state_machine::{Resolution, TurnOutcome};
     use uuid::Uuid;
 
@@ -682,13 +689,16 @@ mod tests {
         let mut db = Db::open(&data.join("events.sqlite")).unwrap();
         let session = SessionID::from_uuid(Uuid::from_u128(7));
         let command = CommandId::from_uuid(Uuid::from_u128(8));
-        let notice = Notice {
+        let notice = SessionCommit {
             session,
-            command,
-            turn: None,
-            execution: None,
-            resolution: Some(Resolution::Unknown),
-            at: Moment::from_millis(1),
+            command: mokmok_protocol::CommandID::from_uuid(command.as_uuid()),
+            notice: Notice {
+                turn: None,
+                execution: None,
+                resolution: Some(Resolution::Unknown),
+                at: Moment::from_millis(1),
+            },
+            records: Vec::new(),
         };
 
         db.append(
@@ -705,9 +715,16 @@ mod tests {
         let pending = db.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].topic(), format!("session:{}", session.as_uuid()));
+        let mokmok_session_wire::SessionEvent::Commit(commit) = pending[0]
+            .payload()
+            .decode::<mokmok_session_wire::SessionEvent>()
+            .unwrap()
+        else {
+            panic!("a submit publishes a commit");
+        };
         assert_eq!(
-            pending[0].payload().decode::<Notice>().unwrap().command,
-            command,
+            commit.command,
+            mokmok_protocol::CommandID::from_uuid(command.as_uuid()),
         );
         let _ = std::fs::remove_dir_all(&data);
     }

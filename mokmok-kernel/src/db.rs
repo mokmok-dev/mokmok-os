@@ -311,6 +311,18 @@ impl Db {
             .version())
     }
 
+    /// Whether the log already holds this command, which makes a redelivered command a replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the dedup row cannot be read.
+    pub fn committed(
+        &self,
+        command: CommandId,
+    ) -> Result<bool, Error> {
+        self.store.committed(command).map_err(Error::Store)
+    }
+
     /// Appends one step: the entries in order, and the notifications to publish once the
     /// transaction has committed.
     ///
@@ -969,5 +981,27 @@ mod tests {
             db.streams().unwrap(),
             vec![Db::stream(older), Db::stream(newer)],
         );
+    }
+
+    #[test]
+    fn a_command_the_log_committed_is_read_back_and_a_new_one_is_not() {
+        let scratch = Scratch::new("committed");
+        let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
+        let committed = CommandId::new();
+        let uncommitted = CommandId::new();
+
+        assert!(!db.committed(committed).unwrap());
+
+        db.append(
+            committed,
+            Db::stream(session()),
+            Expected::New,
+            &[Entry::Session(Fact::SessionOpened)],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(db.committed(committed).unwrap());
+        assert!(!db.committed(uncommitted).unwrap());
     }
 }

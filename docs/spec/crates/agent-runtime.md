@@ -43,7 +43,7 @@ Modules `advance`, `context`, `dialogue`, `error`, `find`, `model`, `record`, `s
 | `EditReport`, `EditOutcome` | `src/edit.rs:77,46` | What one edit produced: applied, stale, or refused |
 | `Action`, `Answer`, `Usage` | `src/model.rs:14,47,63` | A final answer, a command, a find, an edit, a skill to load, a subagent to run, or malformed output |
 | `Tools`, `ToolCall`, `ToolReport`, `Exit` | `src/tool.rs:90,22,76,31` | The execution port and its vocabulary |
-| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:236,366,281,398,389,422` | The durable record, the step key, and the two answers to an append |
+| `Record`, `Step`, `StepId`, `RecordKey`, `Receipt`, `Refusal` | `src/record.rs:236,372,281,404,395,436` | The durable record, the step key, and the two answers to an append |
 | `FindRecord`, `MAX_QUERY_BYTES`, `clip_query`, `clip_prose` | `src/record.rs:141,24,36,60` | One find's durable record, and the caps on the query it holds and the prose the model said |
 | `EditIntentRecord`, `EditOutcomeRecord`, `MAX_PATCH_BYTES`, `patch_refusal` | `src/record.rs:183,203,29,42` | One edit's two durable records, and the cap on the patch it carries |
 | `SubagentIntentRecord`, `SubagentOutcomeRecord` | `src/record.rs:211,221` | One delegation's two durable records: the child identity and goal, then its reply and spend |

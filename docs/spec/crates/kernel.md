@@ -29,20 +29,23 @@ carries.[^crate]
 
 | Item | Where | What it is |
 | --- | --- | --- |
-| `Config`, `Args`, `Command` | `src/config.rs:375,253,263` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
-| `ProviderLayer`, `ProviderSettings`, `config_path`, `ProcessEnvironment` | `src/config.rs:61,89,554,588` | The provider group as the flags and the configuration file's keys at once, the same group once every layer has spoken, which owns the credential the environment answered, the path discovery looks in, and the process environment a value may name and a credential arrives in, read once by a binary and handed in |
-| `Global`, `Config` | `src/config.rs:201,375` | The flags every invocation shares, including `--skill-root`, and the resolved configuration that carries `skill_root` |
+| `Config`, `Args`, `Command` | `src/config.rs:432,253,263` | The resolved configuration and the five subcommands: submit, status, reconcile, serve, agent |
+| `ProviderLayer`, `ProviderSettings`, `config_path`, `ProcessEnvironment` | `src/config.rs:61,90,611,645` | The provider group as the flags and the configuration file's keys at once, the same group once every layer has spoken, which owns the credential the environment answered, the path discovery looks in, and the process environment a value may name and a credential arrives in, read once by a binary and handed in |
+| `Global`, `Config` | `src/config.rs:201,432` | The flags every invocation shares, including `--skill-root`, and the resolved configuration that carries `skill_root` |
 | `Db`, `Log`, `Entry`, `TurnRecord`, `ResultRecord` | `src/db.rs:276,103,45,89,96` | The appender over the event log and the folded view of one session |
 | `Authority` | `src/authority.rs:45` | The policy built from flags, with `access_at` and `may_invoke` |
 | `Plan`, `Ran`, `Refused`, `ExecutionResult`, `Blob` | `src/execution.rs:59,75,86,44,35` | One sandboxed execution and its recorded result |
-| `Relay`, `serve` | `src/serve.rs:51,145` | The outbox relay and the daemon loop |
+| `Relay`, `serve` | `src/serve.rs:51,146` | The outbox relay and the daemon loop, which now starts the session host too |
+| `Host`, `Host::start`, `Host::run` | `src/host.rs:44,66,104` | The daemon's command boundary and its one session thread per active session |
+| `slot::spawn`, `slot::run_turn` | `src/host/slot.rs:71,161` | One session's `Driver`, its bounded steps, and its streamed prose |
+| `SessionDefaults` | `src/config.rs:314` | The budgets every session the daemon drives runs under |
 | `submit`, `status`, `reconcile`, `outcome_of` | `src/slice.rs:97,351,514,533` | The vertical slice |
 | `Index` | `src/index.rs:19` | The finder: one BM25 corpus per root the operator granted, read in the daemon's own process |
 | `skill::discover`, `Library` | `src/skill.rs:30,136` | Discovery of a root's immediate subdirectories into adverts, and the recorded-task library activation reads |
 | `editor::Editor` | `src/editor.rs:32` | The model's editor: it plans a patch against the checkout, asks the authority for the write, and commits the bytes through a resolved directory |
 | `Authority::may_write_at`, `access_at` | `src/authority.rs:127,163` | The one place the write answer is decided, from the grants the operator named |
-| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:930,761,730,393` | The agent loop, its one-session world, and its scripted model. `Driver` shares one provider with the child sessions it delegates to |
-| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:388`, `src/roster.rs:20,43`, `src/slice.rs:607` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
+| `agent::run`, `agent::Driver`, `agent::Report`, `agent::Scripted` | `src/agent.rs:961,768,751,414` | The agent loop, its one-session world, and its scripted model. `Driver` shares one provider with the child sessions it delegates to |
+| `Db::streams`, `Summary`, `sessions`, `mint_session` | `src/db.rs:400`, `src/roster.rs:20,43`, `src/slice.rs:613` | The streams the log holds and what a chooser reads of each session, and a fresh identity for one that does not exist yet |
 | `Error` | `src/error.rs:17` | 26 variants |
 
 `authority`, `config`, `db`, `error`, `execution`, `notify`, `provider`, `recovery`, `roster`,
@@ -110,7 +113,7 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   the one place a dollar means anything: `$$` writes one literal dollar, and any other dollar is
   refused rather than passed through (`src/config.rs:685`).
 - The environment a reference names is read once by the two binaries and handed to resolution as
-  data, which `ProcessEnvironment` carries (`src/config.rs:588`).
+  data, which `ProcessEnvironment` carries (`src/config.rs:645`).
 - `config_path` decides the file from the environment, and `--config` names it outright; the two
   binaries also read the environment a value may name, and a file the operator named and that is not
   there is refused, while a file discovery looked for and did not find is silence
@@ -133,7 +136,7 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   (`src/recovery.rs:40-48`). It never records success or failure.
 - A notice is written inside the transaction that records the change it names (`src/db.rs:339`).
 - Recovery runs before the bus accepts a client and before readiness is reported
-  (`src/serve.rs:196-207`, readiness at `src/serve.rs:265`).
+  (`src/serve.rs:203-210`, readiness at `src/serve.rs:286`).
 - The provider validates its destination through `mokmok-egress`, pins the validated address, and
   disables redirects (`src/provider.rs:442-465`).
 - A watched provider call streams an answer over server-sent events, synthesizes the canonical whole
@@ -157,14 +160,14 @@ The design names the modules `config`, `bootstrap`, `services`, `lifecycle`, `re
 `shutdown`.[^architecture] The crate names them `authority`, `config`, `db`, `error`, `execution`,
 `agent`, `notify`, `provider`, `recovery`, `roster`, `serve`, and `slice`. There is no service
 registry and no lifecycle type; serving and shutdown both live in `serve_until_stopped`
-(`src/serve.rs:165-285`).
+(`src/serve.rs:174-313`).
 
 The design has the kernel initiate migrations. There is no migration module, no schema-version row,
 and no expected-version check. Schema creation is `CREATE TABLE IF NOT EXISTS` inside
 `mokmok_event_store::Store::open`.
 
 The design has the kernel expose health and readiness. Readiness is an `sd_notify` datagram
-(`src/notify.rs:24`, sent at `src/serve.rs:270`), not an endpoint. `Command` carries submit, status,
+(`src/notify.rs:24`, sent at `src/serve.rs:286`), not an endpoint. `Command` carries submit, status,
 reconcile, serve, and agent, and there is no health subcommand and no HTTP surface.
 
 The design puts a thin binary at `apps/mokmokd` invoking kernel bootstrap. There is no `apps`

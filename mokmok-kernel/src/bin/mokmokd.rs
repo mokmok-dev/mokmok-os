@@ -47,9 +47,13 @@ async fn run(args: Args) -> Result<(), Error> {
                 );
             }
         },
-        Command::Serve { socket, once } => {
+        Command::Serve {
+            socket,
+            once,
+            defaults,
+        } => {
             let socket = socket.clone().unwrap_or_else(|| config.socket());
-            let published = serve(&config, &socket, *once, at).await?;
+            let published = serve(&config, defaults, &socket, *once, at).await?;
             println!("published={published} socket={}", socket.display());
         },
         Command::Agent(Agent::Run(run)) => print_agent(&agent::run(&config, run, at).await?),

@@ -44,7 +44,7 @@ pub use record::{
     SubagentIntentRecord, SubagentOutcomeRecord, TaskRecord, clip_prose, clip_query, patch_refusal,
 };
 pub use skill::{NO_SKILLS, Read, Skills};
-pub use speech::speak;
+pub use speech::{speak, speak_as};
 pub use subagent::{
     SubagentCall, SubagentOutcome, Subagents, child_budget, child_session, child_task, clip_goal,
 };

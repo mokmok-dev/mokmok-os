@@ -18,6 +18,12 @@ impl SubscriberId {
         Self(uuid::Uuid::new_v4())
     }
 
+    /// Rebuilds an identity a caller derived, so a subscriber can resume the checkpoint it owns.
+    #[must_use]
+    pub const fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+
     pub(crate) const fn as_uuid(self) -> uuid::Uuid {
         self.0
     }

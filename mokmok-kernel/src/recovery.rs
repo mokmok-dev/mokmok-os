@@ -14,9 +14,11 @@ use mokmok_event_store::{CommandId, Expected, Outcome};
 use mokmok_protocol::{ExecutionID, Moment, SessionID};
 use mokmok_state_machine::{Fact, Resolution, State, TurnFact, TurnOutcome};
 
+use mokmok_session_wire::SessionCommit;
+
 use crate::db::{Db, Entry, Log};
 use crate::error::Error;
-use crate::slice::Notice;
+use crate::slice::published;
 
 /// Records an unknown outcome for every execution the session left in flight.
 ///
@@ -73,19 +75,23 @@ pub fn recover(
     }
 
     log.verify(session, &entries)?;
-    let notices = recovered
+    let commits = recovered
         .iter()
         .map(|execution| {
-            Notice {
+            published(
                 session,
                 command,
-                turn: log.turn_of(*execution),
-                execution: Some(*execution),
-                resolution: Some(Resolution::Unknown),
+                &entries,
+                log.turn_of(*execution),
+                Some(*execution),
+                Some(Resolution::Unknown),
                 at,
-            }
-            .outbox()
+            )
         })
+        .collect::<Vec<_>>();
+    let notices = commits
+        .iter()
+        .map(SessionCommit::outbox)
         .collect::<Result<Vec<_>, _>>()?;
     let stream = Db::stream(session);
     let expected = Expected::At(db.version(stream)?);
@@ -129,9 +135,8 @@ pub fn recover_unsettled(
 mod tests {
     use super::recover;
     use crate::db::{Db, Entry};
-    use crate::slice::Notice;
     use mokmok_event_store::{CommandId, Expected};
-    use mokmok_protocol::{ExecutionID, Moment, SessionID, TurnID};
+    use mokmok_protocol::{CommandID, ExecutionID, Moment, SessionID, TurnID};
     use mokmok_state_machine::{Attempt, Deadline, Fact, TurnFact, TurnNumber};
     use uuid::Uuid;
 
@@ -189,9 +194,15 @@ mod tests {
 
         let pending = db.pending().unwrap();
         assert_eq!(pending.len(), 1);
-        let notice = pending[0].payload().decode::<Notice>().unwrap();
-        assert_eq!(notice.execution, Some(execution));
-        assert_ne!(notice.command, command);
+        let event = pending[0]
+            .payload()
+            .decode::<mokmok_session_wire::SessionEvent>()
+            .unwrap();
+        let mokmok_session_wire::SessionEvent::Commit(commit) = event else {
+            panic!("recovery publishes a commit");
+        };
+        assert_eq!(commit.notice.execution, Some(execution));
+        assert_ne!(commit.command, CommandID::from_uuid(command.as_uuid()));
 
         let _ = std::fs::remove_dir_all(&directory);
     }

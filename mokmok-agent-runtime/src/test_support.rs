@@ -689,6 +689,13 @@ impl crate::model::Journal for TestJournal {
         })
     }
 
+    fn committed(
+        &self,
+        id: StepId,
+    ) -> Result<bool, Error> {
+        Ok(self.written.contains(&id))
+    }
+
     fn append(
         &mut self,
         step: Step,

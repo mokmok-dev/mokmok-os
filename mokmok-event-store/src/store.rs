@@ -130,6 +130,22 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Whether the log already holds a command's transaction.
+    ///
+    /// A caller that receives a command again, after a crash between its write and its
+    /// acknowledgement, asks this before writing: a command the log holds is a replay, not a
+    /// second execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the dedup row cannot be read.
+    pub fn committed(
+        &self,
+        command: CommandId,
+    ) -> Result<bool, Error> {
+        recorded_in(&self.connection, command).map(|recorded| recorded.is_some())
+    }
+
     /// One transaction: inbox dedup, the caller's writes, the inbox row, and the checkpoint.
     ///
     /// `commit` must come from this store's log. A commit from another file whose position happens
@@ -1383,6 +1399,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3]
         );
+    }
+
+    #[test]
+    fn an_outbox_message_keeps_its_topic_in_the_row_a_relay_reads() {
+        let mut store = store();
+        let stream = StreamId::new();
+        let message = OutboxMessage::new("turn.done", Payload::json(&1).unwrap());
+
+        assert_eq!(message.topic(), "turn.done");
+
+        committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1).outbox(message),
+        );
+
+        let pending = store.pending_outbox(max(1)).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic(), "turn.done");
+    }
+
+    #[test]
+    fn committed_names_a_command_the_log_holds_and_no_other() {
+        let mut store = store();
+        let command = CommandId::new();
+
+        assert!(!store.committed(command).unwrap());
+
+        committed(
+            &mut store,
+            &append(command, StreamId::new(), Expected::New, 1),
+        );
+
+        assert!(store.committed(command).unwrap());
+        assert!(!store.committed(CommandId::new()).unwrap());
     }
 
     #[test]
