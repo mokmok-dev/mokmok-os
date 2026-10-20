@@ -26,7 +26,7 @@ mod tests {
         Reply, RosterChunk, RosterEntry, SessionCommit, SessionEvent, command_topic, daemon_topic,
         session_topic,
     };
-    use mokmok_state_machine::{Attempt, Fact, Phase, TurnFact, TurnNumber};
+    use mokmok_state_machine::{Attempt, Ending, Fact, Phase, TurnFact, TurnNumber};
     use mokmok_tui::{BusRoster, Engine, Error, Listing, Roster, Update};
     use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -187,6 +187,12 @@ mod tests {
     }
 
     #[derive(Clone)]
+    enum CancelReply {
+        Closing,
+        Refused(Refusal),
+    }
+
+    #[derive(Clone)]
     struct Behaviour {
         protocol: u16,
         welcome_distractor: bool,
@@ -195,6 +201,7 @@ mod tests {
         roster_chunks: Vec<Vec<RosterEntry>>,
         history: HistoryReply,
         speak: SpeakReply,
+        cancel: CancelReply,
     }
 
     impl Default for Behaviour {
@@ -207,6 +214,7 @@ mod tests {
                 roster_chunks: vec![vec![entry(session(), "hold a conversation")]],
                 history: HistoryReply::Folded(opened_records()),
                 speak: SpeakReply::Echo,
+                cancel: CancelReply::Closing,
             }
         }
     }
@@ -215,6 +223,8 @@ mod tests {
     struct Fake {
         socket: PathBuf,
         behaviour: Arc<Mutex<Behaviour>>,
+        /// The protocol the client named in its `Hello`, for a case that pins the wire version.
+        hello: Arc<Mutex<Option<u16>>>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -242,10 +252,12 @@ mod tests {
                 NonZeroUsize::new(connections).expect("the case asks for a connection");
             let behaviour = Arc::new(Mutex::new(behaviour));
             let revision = Arc::new(AtomicU64::new(0));
+            let hello: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let served_socket = socket.clone();
             let daemon_behaviour = Arc::clone(&behaviour);
             let daemon_revision = Arc::clone(&revision);
+            let daemon_hello = Arc::clone(&hello);
             let thread = std::thread::Builder::new()
                 .name("fake-daemon".to_owned())
                 .spawn(move || {
@@ -257,7 +269,12 @@ mod tests {
                         // The server owns this runtime's only blocking await. A daemon that answered
                         // inside the same `select!` could win the race and leave a parked connection
                         // open, which is exactly the state the reconnect case is about.
-                        tokio::spawn(respond(served_socket, daemon_behaviour, daemon_revision));
+                        tokio::spawn(respond(
+                            served_socket,
+                            daemon_behaviour,
+                            daemon_revision,
+                            daemon_hello,
+                        ));
                         let _ = serve(config, async move {
                             let _ = stopped.await;
                         })
@@ -271,9 +288,15 @@ mod tests {
             Self {
                 socket,
                 behaviour,
+                hello,
                 stop: Some(stop),
                 thread: Some(thread),
             }
+        }
+
+        /// The protocol the client named in its `Hello`, once it has named one.
+        fn hello(&self) -> Option<u16> {
+            *self.hello.lock().expect("the hello is readable")
         }
 
         fn set_roster(
@@ -343,6 +366,7 @@ mod tests {
         socket: PathBuf,
         behaviour: Arc<Mutex<Behaviour>>,
         revision: Arc<AtomicU64>,
+        hello: Arc<Mutex<Option<u16>>>,
     ) {
         let Some(client) = connect(&socket).await else {
             return;
@@ -360,7 +384,7 @@ mod tests {
                     continue;
                 };
                 let behaviour = behaviour.lock().expect("the behaviour is readable").clone();
-                handle(&client, &behaviour, &revision, command).await;
+                handle(&client, &behaviour, &revision, &hello, command).await;
             }
             if commands.ack(batch.after()).await.is_err() {
                 return;
@@ -372,10 +396,15 @@ mod tests {
         client: &Client,
         behaviour: &Behaviour,
         revision: &AtomicU64,
+        hello_protocol: &Mutex<Option<u16>>,
         command: WireCommand,
     ) {
         match command {
-            WireCommand::Hello { request: hello, .. } => {
+            WireCommand::Hello {
+                request: hello,
+                protocol,
+            } => {
+                *hello_protocol.lock().expect("the hello is writable") = Some(protocol);
                 if behaviour.refusal_distractor {
                     send(
                         client,
@@ -450,6 +479,9 @@ mod tests {
                 line,
             } => {
                 speak(client, behaviour, request, session, &line).await;
+            },
+            WireCommand::Cancel { request, session } => {
+                cancel(client, behaviour, request, session).await;
             },
         }
     }
@@ -588,6 +620,56 @@ mod tests {
                 .await;
             },
             SpeakReply::Refused(reason) => {
+                send(
+                    client,
+                    command_topic(),
+                    &Reply::Ack {
+                        request,
+                        outcome: Outcome::Refused {
+                            reason: reason.clone(),
+                        },
+                    },
+                )
+                .await;
+            },
+        }
+    }
+
+    async fn cancel(
+        client: &Client,
+        behaviour: &Behaviour,
+        request: CommandID,
+        session: SessionID,
+    ) {
+        match &behaviour.cancel {
+            CancelReply::Closing => {
+                accepted(client, request, session).await;
+                let commit = SessionCommit {
+                    session,
+                    command: request,
+                    notice: Notice {
+                        turn: None,
+                        execution: None,
+                        resolution: None,
+                        at: Moment::EPOCH,
+                    },
+                    records: vec![
+                        Record::Session {
+                            fact: Fact::CancelRequested,
+                        },
+                        Record::Session {
+                            fact: Fact::SessionClosed,
+                        },
+                    ],
+                };
+                send(
+                    client,
+                    session_topic(session),
+                    &SessionEvent::Commit(commit),
+                )
+                .await;
+            },
+            CancelReply::Refused(reason) => {
                 send(
                     client,
                     command_topic(),
@@ -751,6 +833,19 @@ mod tests {
     }
 
     #[test]
+    fn the_client_names_the_wire_version_that_covers_the_cancel_command() {
+        let scratch = Scratch::new("hello-version");
+        let (fake, roster) = attached(&scratch, Behaviour::default());
+        roster.expect("the handshake answers");
+
+        assert_eq!(
+            fake.hello(),
+            Some(2),
+            "the terminal names the version a daemon must speak to take its cancel",
+        );
+    }
+
+    #[test]
     fn the_roster_reads_every_chunk_of_one_revision() {
         let scratch = Scratch::new("roster-chunks");
         let (_fake, roster) = attached(
@@ -873,6 +968,47 @@ mod tests {
         assert!(
             matches!(error, Error::Refused(Refusal::Untasked { .. })),
             "{error:?}",
+        );
+    }
+
+    #[test]
+    fn a_cancel_is_published_and_the_close_reaches_the_fold() {
+        let scratch = Scratch::new("cancel");
+        let (_fake, roster) = attached(&scratch, Behaviour::default());
+        let roster = roster.expect("the handshake answers");
+        let mut engine = roster.start(session()).expect("the history arrives");
+
+        engine.cancel().expect("the cancel is published");
+        let fold = wait_for_fold(&mut engine, |fold| {
+            matches!(fold.session.phase(), Phase::Closed(Ending::Cancelled))
+        });
+
+        assert_eq!(fold.session.phase(), Phase::Closed(Ending::Cancelled));
+        assert!(!engine.busy(), "the session is closed and owes nothing");
+    }
+
+    #[test]
+    fn a_refused_cancel_is_a_screen_update() {
+        let scratch = Scratch::new("cancel-refused");
+        let (_fake, roster) = attached(
+            &scratch,
+            Behaviour {
+                cancel: CancelReply::Refused(Refusal::Untasked { session: session() }),
+                ..Behaviour::default()
+            },
+        );
+        let roster = roster.expect("the handshake answers");
+        let mut engine = roster.start(session()).expect("the history arrives");
+
+        engine.cancel().expect("the cancel is published");
+        let update = wait_for_update(&mut engine, |update| matches!(update, Update::Refused(_)));
+
+        assert!(
+            matches!(
+                update,
+                Update::Refused(Error::Refused(Refusal::Untasked { .. }))
+            ),
+            "{update:?}",
         );
     }
 

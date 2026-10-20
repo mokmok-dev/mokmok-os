@@ -27,6 +27,7 @@ const GOAL: &str = "Work with me in this checkout. I will type what I want.";
                   Tab       show the next session this process holds\n  \
                   Ctrl-O    list the sessions the log holds, and open one of them\n  \
                   Ctrl-N    start a session with a goal you type\n  \
+                  Ctrl-X    stop the session you are in\n  \
                   Esc       close the list or the prompt\n  \
                   Ctrl-C    leave, with every session open and resumable"
 )]

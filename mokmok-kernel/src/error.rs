@@ -68,6 +68,8 @@ pub enum Error {
     Divergent,
     #[error("no session {0} is recorded in the log")]
     UnknownSession(uuid::Uuid),
+    #[error("the execution was cancelled before it settled")]
+    Cancelled,
     #[error("{0} is not a name a principal or a tool can carry")]
     InvalidName(#[from] mokmok_capability::InvalidName),
     #[error("the agent history is not one this build can fold: {0}")]

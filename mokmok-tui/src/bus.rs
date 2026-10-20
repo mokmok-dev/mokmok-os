@@ -48,6 +48,10 @@ enum Request {
         session: SessionID,
         line: String,
     },
+    Cancel {
+        request: CommandID,
+        session: SessionID,
+    },
     List,
     Stop,
 }
@@ -420,6 +424,18 @@ impl Engine for RemoteEngine {
         Ok(())
     }
 
+    fn cancel(&mut self) -> Result<(), Error> {
+        self.commands
+            .send(Request::Cancel {
+                request: fresh(),
+                session: self.session,
+            })
+            .map_err(|_| Error::BusThread)?;
+        self.pending = true;
+
+        Ok(())
+    }
+
     fn step(&mut self) -> impl std::future::Future<Output = Result<Progress, Error>> {
         std::future::ready(Ok(Progress::Awaiting))
     }
@@ -730,6 +746,17 @@ async fn run(
                     )
                     .await?;
                 },
+                Request::Cancel { request, session } => {
+                    if let Some(updates) = watchers.get(&session) {
+                        pending.insert(request, updates.clone());
+                    }
+                    publish(
+                        client,
+                        command_topic(),
+                        &Command::Cancel { request, session },
+                    )
+                    .await?;
+                },
                 Request::List => {
                     publish(
                         client,
@@ -858,7 +885,7 @@ mod tests {
     };
     use mokmok_protocol::{CommandID, SessionID};
     use mokmok_session_wire::{HistoryChunk, Notice, Refusal, SessionCommit};
-    use mokmok_state_machine::{Fact, Phase, TurnFact, TurnNumber};
+    use mokmok_state_machine::{Ending, Fact, Phase, TurnFact, TurnNumber};
     use tokio::sync::mpsc::unbounded_channel;
     use uuid::Uuid;
 
@@ -999,6 +1026,46 @@ mod tests {
                 .any(|update| matches!(update, Update::Refused(_))),
         );
         assert!(!engine.busy());
+    }
+
+    #[test]
+    fn a_cancel_publishes_the_command_and_folds_the_close() {
+        let (updates, received) = channel();
+        let (commands, mut requests) = unbounded_channel::<Request>();
+        let mut engine = RemoteEngine::new(session(), commands, received);
+
+        updates.send(Internal::Commit(commit(opened()))).unwrap();
+        engine.drain();
+        assert!(engine.busy(), "the daemon owes the turn");
+
+        engine.cancel().expect("the request reaches the bus thread");
+        assert!(engine.busy(), "the cancel is still owed by the daemon");
+
+        let published = requests
+            .try_recv()
+            .expect("the bus thread was handed a request");
+        assert!(
+            matches!(&published, Request::Cancel { session: named, .. } if *named == session()),
+            "the bus thread was handed the session's cancel",
+        );
+
+        updates
+            .send(Internal::Commit(commit(vec![
+                Record::Session {
+                    fact: Fact::CancelRequested,
+                },
+                Record::Session {
+                    fact: Fact::SessionClosed,
+                },
+            ])))
+            .unwrap();
+        engine.drain();
+
+        assert_eq!(
+            engine.fold().unwrap().session.phase(),
+            Phase::Closed(Ending::Cancelled),
+        );
+        assert!(!engine.busy(), "the daemon closed the session");
     }
 
     #[test]

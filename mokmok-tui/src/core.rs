@@ -49,6 +49,7 @@ enum Mode {
 enum Reaction {
     Idle,
     Speak(String),
+    Cancel,
     Quit,
     List,
     Adopt(SessionID),
@@ -200,6 +201,10 @@ fn status(
     fold: &Transcript,
     input: &str,
 ) -> String {
+    if fold.session.phase() == Phase::Draining {
+        return "the agent is stopping".to_owned();
+    }
+
     match mode(fold) {
         Mode::Ended(ending) => closed_phrase(ending),
         Mode::Waiting if input.len() >= MAX_SPEECH_BYTES => "the line is full".to_owned(),
@@ -684,6 +689,10 @@ impl<E: Engine> Manager<E> {
                 Reaction::Idle
             },
             Key::Escape => Reaction::Idle,
+            Key::Cancel => match mode(&folds[self.focus]) {
+                Mode::Waiting | Mode::Working => Reaction::Cancel,
+                Mode::Ended(_) => Reaction::Idle,
+            },
             Key::Interrupt => Reaction::Quit,
         }
     }
@@ -745,7 +754,7 @@ impl<E: Engine> Manager<E> {
 
                 Reaction::Idle
             },
-            Key::Next | Key::New => Reaction::Idle,
+            Key::Next | Key::New | Key::Cancel => Reaction::Idle,
         }
     }
 
@@ -787,6 +796,7 @@ impl<E: Engine> Manager<E> {
             Reaction::Quit => return Ok(Keep::Leaving),
             Reaction::Idle => {},
             Reaction::Speak(line) => self.held[self.focus].engine.speak(&line)?,
+            Reaction::Cancel => self.held[self.focus].engine.cancel()?,
             Reaction::List => {
                 self.listed = world.listed()?;
                 self.open_list(folds);
@@ -1199,6 +1209,7 @@ mod tests {
     struct Fake {
         session: SessionID,
         fold: Transcript,
+        cancels: Rc<std::cell::Cell<usize>>,
     }
 
     impl Fake {
@@ -1209,11 +1220,16 @@ mod tests {
             Self {
                 session,
                 fold: Transcript::replay(session, records).expect("a hand-written history folds"),
+                cancels: Rc::new(std::cell::Cell::new(0)),
             }
         }
 
         fn awaiting() -> Self {
             Self::new(session(), &awaiting())
+        }
+
+        fn cancels(&self) -> usize {
+            self.cancels.get()
         }
     }
 
@@ -1230,6 +1246,12 @@ mod tests {
             &mut self,
             _line: &str,
         ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<(), Error> {
+            self.cancels.set(self.cancels.get() + 1);
+
             Ok(())
         }
 
@@ -1263,6 +1285,10 @@ mod tests {
             line: &str,
         ) -> Result<(), Error> {
             self.base.speak(line)
+        }
+
+        fn cancel(&mut self) -> Result<(), Error> {
+            self.base.cancel()
         }
 
         fn step(&mut self) -> impl std::future::Future<Output = Result<Progress, Error>> {
@@ -1413,6 +1439,10 @@ mod tests {
         ) -> Result<(), Error> {
             self.spoken.borrow_mut().push(line.to_owned());
 
+            Ok(())
+        }
+
+        fn cancel(&mut self) -> Result<(), Error> {
             Ok(())
         }
 
@@ -2547,11 +2577,53 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_x_asks_the_session_to_stop() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        assert_eq!(react(&mut manager, Key::Cancel), Reaction::Cancel);
+
+        let world = FakeWorld::with(Vec::new());
+        let folds = folds_of(&manager);
+        manager
+            .apply(Reaction::Cancel, &folds, &world)
+            .expect("the engine takes the cancel");
+
+        assert_eq!(
+            manager.held[0].engine.cancels(),
+            1,
+            "the key reached the session's own engine",
+        );
+
+        let mut ended = holding(vec![Fake::new(session(), &closed())]);
+        assert_eq!(
+            react(&mut ended, Key::Cancel),
+            Reaction::Idle,
+            "a session that ended has no work to stop",
+        );
+    }
+
+    #[test]
+    fn a_session_a_cancel_is_draining_says_it_is_stopping() {
+        let turn = turn_id(session(), 1);
+        let mut records = in_flight(turn);
+        records.push(Record::Session {
+            fact: Fact::CancelRequested,
+        });
+
+        assert_eq!(status(&fold_of(&records), ""), "the agent is stopping");
+    }
+
+    #[test]
     fn the_panes_ignore_the_keys_that_are_not_theirs() {
         let mut manager = holding(vec![Fake::awaiting()]);
         manager.pane = Some(Pane::List { cursor: 0 });
 
-        for key in [Key::Char('a'), Key::Backspace, Key::Next, Key::New] {
+        for key in [
+            Key::Char('a'),
+            Key::Backspace,
+            Key::Next,
+            Key::New,
+            Key::Cancel,
+        ] {
             assert_eq!(react(&mut manager, key), Reaction::Idle);
         }
 
@@ -2561,6 +2633,11 @@ mod tests {
         assert_eq!(
             manager.held[0].input, "",
             "a character typed in the listing does not reach the conversation",
+        );
+        assert_eq!(
+            manager.held[0].engine.cancels(),
+            0,
+            "a key the listing does not answer to never reaches the session",
         );
     }
 

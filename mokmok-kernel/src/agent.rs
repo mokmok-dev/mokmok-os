@@ -26,9 +26,12 @@ use mokmok_artifact::{BlobStore, ContentHash};
 use mokmok_event_store::{CommandId, Expected, Outcome};
 use mokmok_protocol::{CommandID, Moment, SessionID, TurnID};
 use mokmok_sandbox::{Confined, Environment};
-use mokmok_state_machine::{Attempt, Ending, Fact, Resolution, Turn, TurnNumber};
+use mokmok_state_machine::{
+    Attempt, Ending, Fact, Phase, Resolution, State, Turn, TurnFact, TurnNumber,
+};
 
 use crate::authority::Authority;
+use crate::cancel::CancelToken;
 use crate::clock::Clock;
 use crate::config::{Config, ConfigError, CrashPoint, ProviderKind, Run};
 use crate::db::{Db, Entry, Log};
@@ -230,6 +233,76 @@ impl Ledger {
     pub fn records(&self) -> &[Record] {
         &self.log.ordered
     }
+
+    /// Records a cancel, settling whatever the session had in flight as cancelled.
+    ///
+    /// A session already draining or already cancelled has recorded the fact this asks for, so the
+    /// answer is [`Receipt::Replayed`] and the log gains nothing: a redelivered cancel converges on
+    /// the state the first one left.
+    ///
+    /// # Errors
+    ///
+    /// Returns the replay's failure when the history is not one this build folds, the ledger's own
+    /// failure when the append is one the machines refuse, and [`Error::Store`] when the write
+    /// cannot commit.
+    pub fn cancel(
+        &mut self,
+        session: SessionID,
+        at: Moment,
+    ) -> Result<Receipt, Error> {
+        self.stamp(at);
+
+        let state = self.log.state(session)?;
+        if matches!(
+            state.phase(),
+            Phase::Draining | Phase::Closed(Ending::Cancelled)
+        ) {
+            return Ok(Receipt::Replayed);
+        }
+
+        let mut entries = vec![Entry::Session(Fact::CancelRequested)];
+        for (execution, held) in state.executions() {
+            if held.state() != State::InFlight {
+                continue;
+            }
+            entries.push(Entry::Session(Fact::ExecutionSettled {
+                execution,
+                resolution: Resolution::Cancelled,
+            }));
+            if let Some(turn) = self.log.turn_of(execution) {
+                entries.push(Entry::Turn(
+                    turn,
+                    TurnFact::ToolResolved {
+                        execution,
+                        resolution: Resolution::Cancelled,
+                    },
+                ));
+            }
+        }
+
+        self.log.verify(session, &entries)?;
+        let records: Vec<Record> = entries.iter().filter_map(record_of).collect();
+        let command = CommandId::new();
+        let notice = self
+            .notice(session, command, &records)
+            .outbox()
+            .map_err(Error::Payload)?;
+        let stream = Db::stream(session);
+        let expected = Expected::At(self.db.version(stream)?);
+
+        match self
+            .db
+            .append(command, stream, expected, &entries, vec![notice])?
+        {
+            Outcome::Committed(_) => {
+                self.log.absorb(&entries);
+
+                Ok(Receipt::Written)
+            },
+            Outcome::Replayed(_) => Ok(Receipt::Replayed),
+            Outcome::Conflicted { found, .. } => Err(Error::Conflicted { found: found.get() }),
+        }
+    }
 }
 
 impl Journal for Ledger {
@@ -325,6 +398,7 @@ pub struct Shell {
     program: PathBuf,
     store: BlobStore,
     clock: Arc<dyn Clock>,
+    cancel: Option<CancelToken>,
 }
 
 impl Shell {
@@ -343,7 +417,16 @@ impl Shell {
             config: config.clone(),
             program,
             clock,
+            cancel: None,
         })
+    }
+
+    /// Points the tool at the signal a host shares with the session's thread.
+    pub fn watch(
+        &mut self,
+        cancel: CancelToken,
+    ) {
+        self.cancel = Some(cancel);
     }
 
     async fn run(
@@ -372,7 +455,16 @@ impl Shell {
         })?;
         let authority = Authority::new(&self.config, at)?;
 
-        match execution::run(&self.config, &sandbox, &authority, &plan, at).await? {
+        match execution::run(
+            &self.config,
+            &sandbox,
+            &authority,
+            &plan,
+            at,
+            self.cancel.as_ref(),
+        )
+        .await?
+        {
             Ran::Settled { resolution, result } => {
                 let stdout = self.read(&result.stdout)?;
                 let stderr = self.read(&result.stderr)?;
@@ -403,6 +495,9 @@ impl Shell {
                     observation: observation(Resolution::Refused, &[], &[]),
                 })
             },
+            // A cancelled workload has no exit and produced nothing worth reporting, so the step
+            // fails out of its intent and the ledger settles the execution cancelled.
+            Ran::Cancelled => Err(Error::Cancelled),
         }
     }
 
@@ -925,6 +1020,26 @@ impl Driver {
         Ok(self.ledger.records().to_vec())
     }
 
+    /// Points the tool at the signal that stops a workload in flight.
+    pub fn watch(
+        &mut self,
+        cancel: CancelToken,
+    ) {
+        self.shell.watch(cancel);
+    }
+
+    /// Records a cancel, settling whatever the session had in flight as cancelled.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Ledger::cancel`].
+    pub fn cancel(
+        &mut self,
+        at: Moment,
+    ) -> Result<Receipt, Error> {
+        self.ledger.cancel(self.session, at)
+    }
+
     /// Performs at most one bounded step of the same [`advance`] `agent run` calls, stamping what
     /// it commits with `at`.
     ///
@@ -1103,6 +1218,22 @@ fn entry_of(record: Record) -> Entry {
         Record::Session { fact } => Entry::Session(fact),
         Record::Turn { turn, fact } => Entry::Turn(turn, fact),
         other => Entry::Agent(other),
+    }
+}
+
+/// The record one log entry folds as, for the notice a reader replays.
+///
+/// The inverse of [`entry_of`], so a commit's records are exactly the history it committed. A
+/// slice-era result is left out, as it is from [`Log::ordered`](crate::db::Log::ordered).
+fn record_of(entry: &Entry) -> Option<Record> {
+    match entry {
+        Entry::Session(fact) => Some(Record::Session { fact: *fact }),
+        Entry::Turn(turn, fact) => Some(Record::Turn {
+            turn: *turn,
+            fact: *fact,
+        }),
+        Entry::Agent(record) => Some(record.clone()),
+        Entry::Result(..) => None,
     }
 }
 

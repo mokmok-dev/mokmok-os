@@ -30,7 +30,7 @@ keeps a consumer's fold equal to the daemon's transcript.
 | Item | Where | What it is |
 | --- | --- | --- |
 | `PROTOCOL` | `src/lib.rs:27` | The wire version both ends name |
-| `Command` | `src/lib.rs:35` | A client's intent: `Hello`, `List`, `Create`, `Open`, `Speak`, `History` |
+| `Command` | `src/lib.rs:35` | A client's intent: `Hello`, `List`, `Create`, `Open`, `Speak`, `History`, `Cancel` |
 | `Reply`, `Outcome` | `src/lib.rs:85,99` | The daemon's `Welcome` or `Ack`, and an accepted session or a refusal |
 | `Refusal` | `src/lib.rs:108` | The domain refusals the daemon decides at its boundary |
 | `SessionEvent` | `src/lib.rs:134` | A commit, a history chunk, a history refusal, a seed, or a trouble phrase |
