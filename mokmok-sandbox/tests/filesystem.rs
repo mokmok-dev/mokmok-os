@@ -5,7 +5,7 @@ mod common;
 #[cfg(test)]
 mod tests {
     use crate::common::tests::{Scratch, config, issued, program, shell, which, within};
-    use mokmok_sandbox::{Access, Capability, Confined, Exposure, Outcome, Sandbox};
+    use mokmok_sandbox::{Access, Capability, Confined, Exposure, Outcome, Refusal, Sandbox};
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -137,5 +137,49 @@ mod tests {
         );
         assert_eq!(completed.outcome(), Outcome::Exited(1));
         completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_named_workdir_inside_an_exposure_is_the_workloads_cwd() {
+        let scratch = Scratch::new("workdir-named");
+        let granted = scratch.path().join("granted/work");
+        std::fs::create_dir_all(&granted).unwrap();
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let mut request = shell("pwd");
+        request.workdir = Some(granted.clone());
+        request.exposures.push(Exposure::read_write(&granted));
+        let mut capabilities = issued();
+        capabilities.push(Capability::issued(&granted, Access::READ_WRITE));
+
+        let run = sandbox.spawn(&request, &capabilities).unwrap();
+        let completed = within("wait", run.wait()).await.unwrap();
+
+        let cwd = std::fs::canonicalize(&granted).unwrap();
+        assert_eq!(completed.workspace(), cwd.as_path());
+        assert_eq!(completed.stdout().text(), format!("{}\n", cwd.display()));
+        completed.cleanup().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_workdir_that_is_a_file_is_refused() {
+        let scratch = Scratch::new("workdir-file");
+        let granted = scratch.path().join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let file = granted.join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let sandbox = Confined::new(config(&scratch)).unwrap();
+        let mut request = shell("pwd");
+        request.workdir = Some(file);
+        request.exposures.push(Exposure::read_write(&granted));
+        let mut capabilities = issued();
+        capabilities.push(Capability::issued(&granted, Access::READ_WRITE));
+
+        match sandbox.spawn(&request, &capabilities) {
+            Err(Refusal::Workdir { message, .. }) => {
+                assert_eq!(message, "it is not a directory");
+            },
+            Ok(_) => panic!("a file was accepted as the workload directory"),
+            Err(other) => panic!("the file was refused as another kind: {other:?}"),
+        }
     }
 }
