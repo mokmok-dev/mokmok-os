@@ -77,7 +77,7 @@ of its own; a restart re-bootstraps from the daemon.
   `try_recv`, and every request is an unbounded send (`src/bus.rs:444`).
 - The bus thread owns the socket and gives each subscription its own reader task. A
   `Subscription::next` future is never cancelled and asked again, because the server keeps the
-  parked pull and refuses the second one (`src/bus.rs:452`, `src/bus.rs:624`).
+  parked pull and refuses the second one (`src/bus.rs:452`, `src/bus.rs:637`).
 - A refusal or a trouble phrase is a session's own news and draws as `Line::Trouble`; the process
   keeps the other sessions and the keys (`src/core.rs:526`).
 - A session the daemon refuses leaves an empty fold. The engine reports it as not busy, so the core
