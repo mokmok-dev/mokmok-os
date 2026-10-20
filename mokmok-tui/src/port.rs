@@ -38,6 +38,13 @@ pub trait Engine {
         line: &str,
     ) -> Result<(), Error>;
 
+    /// Asks the session to stop: a tool in flight is killed, and the session closes cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's failure, and its refusal when the session cannot take a cancel.
+    fn cancel(&mut self) -> Result<(), Error>;
+
     /// Performs at most one bounded step of the loop.
     ///
     /// The future is not `Send`: a streamed step may hold the line being typed and a callback that
@@ -218,6 +225,8 @@ pub enum Key {
     List,
     /// The pane that names a new session's goal is opened.
     New,
+    /// The session's work is stopped.
+    Cancel,
     /// The open pane is closed.
     Escape,
     /// The human leaves, with every session as it stands.

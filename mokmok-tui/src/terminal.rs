@@ -138,6 +138,7 @@ fn mapped(key: &KeyEvent) -> Option<Key> {
             KeyCode::Char('c') => Some(Key::Interrupt),
             KeyCode::Char('n') => Some(Key::New),
             KeyCode::Char('o') => Some(Key::List),
+            KeyCode::Char('x') => Some(Key::Cancel),
             _ => None,
         };
     }
@@ -447,6 +448,11 @@ mod tests {
         assert_eq!(
             mapped(&KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             Some(Key::List),
+        );
+        assert_eq!(
+            mapped(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Some(Key::Cancel),
+            "Ctrl-X stops the session the human is in",
         );
         assert_eq!(
             mapped(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),

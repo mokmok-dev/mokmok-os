@@ -26,7 +26,7 @@ mod tests {
         Reply, RosterChunk, RosterEntry, SessionCommit, SessionEvent, command_topic, daemon_topic,
         session_topic,
     };
-    use mokmok_state_machine::{Attempt, Fact, Phase, TurnFact, TurnNumber};
+    use mokmok_state_machine::{Attempt, Ending, Fact, Phase, TurnFact, TurnNumber};
     use mokmok_tui::{BusRoster, Engine, Error, Listing, Roster, Update};
     use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -187,6 +187,12 @@ mod tests {
     }
 
     #[derive(Clone)]
+    enum CancelReply {
+        Closing,
+        Refused(Refusal),
+    }
+
+    #[derive(Clone)]
     struct Behaviour {
         protocol: u16,
         welcome_distractor: bool,
@@ -195,6 +201,7 @@ mod tests {
         roster_chunks: Vec<Vec<RosterEntry>>,
         history: HistoryReply,
         speak: SpeakReply,
+        cancel: CancelReply,
     }
 
     impl Default for Behaviour {
@@ -207,6 +214,7 @@ mod tests {
                 roster_chunks: vec![vec![entry(session(), "hold a conversation")]],
                 history: HistoryReply::Folded(opened_records()),
                 speak: SpeakReply::Echo,
+                cancel: CancelReply::Closing,
             }
         }
     }
@@ -451,6 +459,9 @@ mod tests {
             } => {
                 speak(client, behaviour, request, session, &line).await;
             },
+            WireCommand::Cancel { request, session } => {
+                cancel(client, behaviour, request, session).await;
+            },
         }
     }
 
@@ -588,6 +599,56 @@ mod tests {
                 .await;
             },
             SpeakReply::Refused(reason) => {
+                send(
+                    client,
+                    command_topic(),
+                    &Reply::Ack {
+                        request,
+                        outcome: Outcome::Refused {
+                            reason: reason.clone(),
+                        },
+                    },
+                )
+                .await;
+            },
+        }
+    }
+
+    async fn cancel(
+        client: &Client,
+        behaviour: &Behaviour,
+        request: CommandID,
+        session: SessionID,
+    ) {
+        match &behaviour.cancel {
+            CancelReply::Closing => {
+                accepted(client, request, session).await;
+                let commit = SessionCommit {
+                    session,
+                    command: request,
+                    notice: Notice {
+                        turn: None,
+                        execution: None,
+                        resolution: None,
+                        at: Moment::EPOCH,
+                    },
+                    records: vec![
+                        Record::Session {
+                            fact: Fact::CancelRequested,
+                        },
+                        Record::Session {
+                            fact: Fact::SessionClosed,
+                        },
+                    ],
+                };
+                send(
+                    client,
+                    session_topic(session),
+                    &SessionEvent::Commit(commit),
+                )
+                .await;
+            },
+            CancelReply::Refused(reason) => {
                 send(
                     client,
                     command_topic(),
@@ -873,6 +934,47 @@ mod tests {
         assert!(
             matches!(error, Error::Refused(Refusal::Untasked { .. })),
             "{error:?}",
+        );
+    }
+
+    #[test]
+    fn a_cancel_is_published_and_the_close_reaches_the_fold() {
+        let scratch = Scratch::new("cancel");
+        let (_fake, roster) = attached(&scratch, Behaviour::default());
+        let roster = roster.expect("the handshake answers");
+        let mut engine = roster.start(session()).expect("the history arrives");
+
+        engine.cancel().expect("the cancel is published");
+        let fold = wait_for_fold(&mut engine, |fold| {
+            matches!(fold.session.phase(), Phase::Closed(Ending::Cancelled))
+        });
+
+        assert_eq!(fold.session.phase(), Phase::Closed(Ending::Cancelled));
+        assert!(!engine.busy(), "the session is closed and owes nothing");
+    }
+
+    #[test]
+    fn a_refused_cancel_is_a_screen_update() {
+        let scratch = Scratch::new("cancel-refused");
+        let (_fake, roster) = attached(
+            &scratch,
+            Behaviour {
+                cancel: CancelReply::Refused(Refusal::Untasked { session: session() }),
+                ..Behaviour::default()
+            },
+        );
+        let roster = roster.expect("the handshake answers");
+        let mut engine = roster.start(session()).expect("the history arrives");
+
+        engine.cancel().expect("the cancel is published");
+        let update = wait_for_update(&mut engine, |update| matches!(update, Update::Refused(_)));
+
+        assert!(
+            matches!(
+                update,
+                Update::Refused(Error::Refused(Refusal::Untasked { .. }))
+            ),
+            "{update:?}",
         );
     }
 
