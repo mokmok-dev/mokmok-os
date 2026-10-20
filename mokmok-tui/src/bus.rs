@@ -467,9 +467,11 @@ fn bus_thread(
 
     match runtime.block_on(attach(socket, nonce, shared, requests, ready)) {
         Ok(()) => {},
-        Err(_error) => {
-            // A handshake failure is sent on `ready`; a failure after it is the bus going away, and
-            // the engines already carry a link update. Nothing else owns the process here.
+        Err(error) => {
+            // A handshake that never answered is the caller's error to report. A failure after
+            // `ready` is the bus going away, and the engines already carry a link update; the
+            // send then has no receiver and the error is the engines' news alone.
+            let _ = ready.send(Err(error));
         },
     }
 }

@@ -1042,13 +1042,16 @@ mod tests {
         status,
     };
     use crate::Error;
-    use crate::port::{Engine, Entry, Event, Key, Line, Listing, Roster, Screen, Sheet, View};
+    use crate::port::{
+        Engine, Entry, Event, Key, Line, Link, Listing, Roster, Screen, Sheet, Update, View,
+    };
     use mokmok_agent_runtime::{
         Action, AnswerRecord, ArtifactRef, Budget, CallRecord, MAX_SPEECH_BYTES, Progress, Record,
         Setting, SpeechRecord, Task, TaskRecord, Transcript, UNKNOWN_WARNING, Usage, execution_id,
         turn_id,
     };
     use mokmok_protocol::{SessionID, TurnID};
+    use mokmok_session_wire::Refusal;
     use mokmok_state_machine::{
         Attempt, Deadline, Ending, Fact, Phase, Resolution, TurnFact, TurnNumber, TurnOutcome,
     };
@@ -1236,6 +1239,46 @@ mod tests {
 
         fn reopen(&mut self) -> Result<(), Error> {
             Ok(())
+        }
+    }
+
+    /// An engine that reports what a case hands it and answers whether it is still working.
+    struct Scripted {
+        base: Fake,
+        busy: bool,
+        updates: Vec<Update>,
+    }
+
+    impl Engine for Scripted {
+        fn session(&self) -> SessionID {
+            self.base.session()
+        }
+
+        fn fold(&self) -> Result<Transcript, Error> {
+            self.base.fold()
+        }
+
+        fn speak(
+            &mut self,
+            line: &str,
+        ) -> Result<(), Error> {
+            self.base.speak(line)
+        }
+
+        fn step(&mut self) -> impl std::future::Future<Output = Result<Progress, Error>> {
+            std::future::ready(Ok(Progress::Awaiting))
+        }
+
+        fn reopen(&mut self) -> Result<(), Error> {
+            self.base.reopen()
+        }
+
+        fn busy(&self) -> bool {
+            self.busy
+        }
+
+        fn drain(&mut self) -> Vec<Update> {
+            std::mem::take(&mut self.updates)
         }
     }
 
@@ -2659,6 +2702,200 @@ mod tests {
             mode(&fold_of(&[Record::Task(task())])),
             Mode::Waiting
         ));
+    }
+
+    #[test]
+    fn the_frame_carries_a_streaming_line_and_a_trouble_phrase() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        *manager.held[0].streaming.borrow_mut() = "half an answer".to_owned();
+        manager.held[0].trouble = "the bus stopped".to_owned();
+
+        let view = manager.view(&folds_of(&manager));
+
+        assert!(
+            view.lines
+                .contains(&Line::Agent("half an answer".to_owned())),
+            "{:?}",
+            view.lines,
+        );
+        assert!(
+            view.lines
+                .contains(&Line::Trouble("the bus stopped".to_owned())),
+            "{:?}",
+            view.lines,
+        );
+    }
+
+    #[test]
+    fn the_hints_name_the_keys_the_pane_and_the_turn_answer_to() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        assert_eq!(
+            manager.hints(&folds_of(&manager)),
+            "enter send  tab next  ^O sessions  ^N new  ^C quit",
+        );
+
+        manager.pane = Some(Pane::List { cursor: 0 });
+        assert_eq!(
+            manager.hints(&folds_of(&manager)),
+            "↑↓ choose  enter open  esc close",
+        );
+
+        manager.pane = Some(Pane::New {
+            goal: String::new(),
+        });
+        assert_eq!(
+            manager.hints(&folds_of(&manager)),
+            "enter create  esc cancel",
+        );
+
+        let working = Manager::holding(Fake::new(session(), &in_flight(turn_id(session(), 1))));
+        assert_eq!(
+            working.hints(&folds_of(&working)),
+            "enter send  tab next  ^O sessions  ^N new  ^C quit",
+        );
+
+        let ended = Manager::holding(Fake::new(session(), &closed()));
+        assert_eq!(
+            ended.hints(&folds_of(&ended)),
+            "tab next  ^O sessions  ^N new  ^C quit",
+        );
+    }
+
+    #[test]
+    fn the_placeholder_names_a_waiting_session_and_nothing_else() {
+        let waiting = Manager::holding(Fake::awaiting());
+        assert_eq!(
+            waiting.placeholder(&folds_of(&waiting)),
+            "Send a line to the agent…",
+        );
+
+        let working = Manager::holding(Fake::new(session(), &in_flight(turn_id(session(), 1))));
+        assert_eq!(working.placeholder(&folds_of(&working)), "");
+
+        let ended = Manager::holding(Fake::new(session(), &closed()));
+        assert_eq!(ended.placeholder(&folds_of(&ended)), "");
+
+        let mut manager = holding(vec![Fake::awaiting()]);
+        manager.pane = Some(Pane::List { cursor: 0 });
+        assert_eq!(manager.placeholder(&folds_of(&manager)), "");
+
+        manager.pane = Some(Pane::New {
+            goal: String::new(),
+        });
+        assert_eq!(
+            manager.placeholder(&folds_of(&manager)),
+            "what should this session do?",
+        );
+    }
+
+    #[test]
+    fn a_session_whose_bus_is_not_answering_says_so() {
+        let mut manager = holding(vec![Fake::awaiting()]);
+        assert_eq!(manager.status(&folds_of(&manager)), "your turn");
+
+        manager.held[0].link = Link::Reconnecting;
+        assert_eq!(
+            manager.status(&folds_of(&manager)),
+            "the bus is not answering"
+        );
+    }
+
+    #[test]
+    fn the_driver_takes_every_update_a_session_reported() {
+        let mut manager = holding(vec![
+            Scripted {
+                base: Fake::awaiting(),
+                busy: false,
+                updates: vec![
+                    Update::Fragment("half".to_owned()),
+                    Update::Trouble("the bus stopped".to_owned()),
+                    Update::Link(Link::Reconnecting),
+                ],
+            },
+            Scripted {
+                base: Fake::new(others(2), &awaiting()),
+                busy: false,
+                updates: vec![Update::Refused(Error::Refused(Refusal::NotAwaiting {
+                    session: others(2),
+                }))],
+            },
+        ]);
+
+        manager.drain().expect("the updates land");
+
+        assert_eq!(&*manager.held[0].streaming.borrow(), "half");
+        assert_eq!(manager.held[0].trouble, "the bus stopped");
+        assert_eq!(manager.held[0].link, Link::Reconnecting);
+        assert!(
+            manager.held[1].trouble.contains("not waiting"),
+            "{}",
+            manager.held[1].trouble,
+        );
+    }
+
+    #[test]
+    fn any_busy_follows_the_engines_and_not_the_screen() {
+        let quiet = holding(vec![Fake::awaiting(), Fake::awaiting()]);
+        assert!(!quiet.any_busy());
+
+        let busy = Manager::holding(Scripted {
+            base: Fake::awaiting(),
+            busy: true,
+            updates: Vec::new(),
+        });
+        assert!(busy.any_busy());
+    }
+
+    struct ScriptedWorld;
+
+    impl Roster for ScriptedWorld {
+        type Engine = Scripted;
+
+        fn listed(&self) -> Result<Vec<Listing>, Error> {
+            Ok(Vec::new())
+        }
+
+        fn resume(
+            &self,
+            _listing: &Listing,
+        ) -> Result<Scripted, Error> {
+            Err(Error::Terminal(std::io::Error::other(
+                "the case opens nothing",
+            )))
+        }
+
+        fn create(
+            &self,
+            _goal: &str,
+        ) -> Result<Scripted, Error> {
+            Err(Error::Terminal(std::io::Error::other(
+                "the case creates nothing",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_answered_while_a_session_is_busy_keeps_the_loop_running() {
+        let world = ScriptedWorld;
+        let busy = Scripted {
+            base: Fake::new(session(), &in_flight(turn_id(session(), 1))),
+            busy: true,
+            updates: Vec::new(),
+        };
+        let mut screen = Recording::with([Event::Key(Key::Char('a')), Event::Key(Key::Interrupt)]);
+
+        let outcome = run(&world, busy, &mut screen)
+            .await
+            .expect("the conversation ends");
+
+        assert_eq!(outcome.left.len(), 1);
+        assert_eq!(
+            screen.frames.len(),
+            2,
+            "a key that does not leave is followed by another frame",
+        );
+        assert_eq!(screen.frames[0].input, "");
+        assert_eq!(screen.frames[1].input, "a");
     }
 
     proptest! {
