@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use clap::builder::TypedValueParser as _;
@@ -196,6 +197,69 @@ impl fmt::Debug for Credential {
     }
 }
 
+/// The rlimits and capture cap every confined tool runs under.
+///
+/// Zero leaves an rlimit as the daemon inherited it, so a flag that does not name a resource
+/// leaves it alone. `output` is excluded from that rule because a cap of zero captures nothing,
+/// which would hide every tool's answer from the model.
+#[derive(Clone, Copy, Debug, clap::Args)]
+pub struct ExecutionLimits {
+    /// Bytes of address space one tool may use; zero leaves the inherited limit alone.
+    #[arg(long, global = true, value_name = "BYTES", default_value_t = 0)]
+    pub address_space_bytes: u64,
+    /// Whole seconds of CPU time one tool may use; zero leaves the inherited limit alone.
+    #[arg(long, global = true, value_name = "SECONDS", default_value_t = 0)]
+    pub cpu_seconds: u64,
+    /// Bytes a single file one tool writes may reach; zero leaves the inherited limit alone.
+    #[arg(long, global = true, value_name = "BYTES", default_value_t = 0)]
+    pub file_size_bytes: u64,
+    /// Open file descriptors one tool may hold; zero leaves the inherited limit alone.
+    #[arg(long, global = true, value_name = "COUNT", default_value_t = 0)]
+    pub open_files: u64,
+    /// Bytes captured per stream before the rest is discarded.
+    #[arg(long, global = true, value_name = "BYTES", default_value_t = DEFAULT_OUTPUT_BYTES)]
+    pub output_bytes: u64,
+}
+
+const DEFAULT_OUTPUT_BYTES: u64 = 1_048_576;
+
+impl Default for ExecutionLimits {
+    fn default() -> Self {
+        Self {
+            address_space_bytes: 0,
+            cpu_seconds: 0,
+            file_size_bytes: 0,
+            open_files: 0,
+            output_bytes: DEFAULT_OUTPUT_BYTES,
+        }
+    }
+}
+
+impl ExecutionLimits {
+    /// The sandbox's limits, with zero read as "leave the inherited limit alone".
+    ///
+    /// A cap too large for the host's `usize` becomes the largest representable one, which is
+    /// unbounded in practice and the same answer `usize::MAX` gives every other capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ZeroOutputBytes`] when `--output-bytes` is zero.
+    pub fn resolve(&self) -> Result<mokmok_sandbox::Limits, ConfigError> {
+        Ok(mokmok_sandbox::Limits {
+            address_space: nonzero(self.address_space_bytes),
+            cpu: nonzero(self.cpu_seconds),
+            file_size: nonzero(self.file_size_bytes),
+            open_files: nonzero(self.open_files),
+            output: NonZeroUsize::new(usize::try_from(self.output_bytes).unwrap_or(usize::MAX))
+                .ok_or(ConfigError::ZeroOutputBytes)?,
+        })
+    }
+}
+
+const fn nonzero(value: u64) -> Option<NonZeroU64> {
+    NonZeroU64::new(value)
+}
+
 /// The options every invocation shares, whichever subcommand runs. Split out of [`Args`] so a
 /// second binary can flatten exactly these flags and inherit exactly these rules.
 #[derive(Debug, clap::Args)]
@@ -245,6 +309,9 @@ pub struct Global {
     /// The provider group: the flags, and the keys the configuration file may set.
     #[command(flatten)]
     pub provider: ProviderLayer,
+    /// The rlimits and capture cap every confined tool runs under.
+    #[command(flatten)]
+    pub limits: ExecutionLimits,
 }
 
 /// The CLI surface of `mokmokd`.
@@ -458,6 +525,8 @@ pub struct Config {
     pub crash_after: Option<CrashPoint>,
     /// The provider group every invocation carries; only an agent run asks it a question.
     pub provider: ProviderSettings,
+    /// The resource limits every confined tool runs under.
+    pub limits: mokmok_sandbox::Limits,
 }
 
 impl Config {
@@ -592,6 +661,7 @@ impl Config {
             confiner: runnable(&confiner)?,
             crash_after: global.crash_after,
             provider,
+            limits: global.limits.resolve()?,
         })
     }
 
@@ -1168,6 +1238,8 @@ pub enum ConfigError {
     NotRelative(String),
     #[error("{0} is not a NAME=VALUE pair, so it cannot set an environment variable")]
     NotAnAssignment(String),
+    #[error("--output-bytes is zero, which captures nothing, so the model would never see a tool")]
+    ZeroOutputBytes,
     #[error("the checkout {checkout} is not covered by any --allow-write grant")]
     CheckoutUngranted { checkout: PathBuf },
     #[error("no --session is named, so there is no session to work in")]
@@ -1289,11 +1361,14 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Agent, Args, Command, Config, ConfigError, Credential, Global, ProcessEnvironment,
-        ProviderKind, ProviderLayer, Submit, config_path_for, relative_path, uuid_of,
+        Agent, Args, Command, Config, ConfigError, Credential, ExecutionLimits, Global,
+        ProcessEnvironment, ProviderKind, ProviderLayer, Submit, config_path_for, relative_path,
+        uuid_of,
     };
     use clap::{CommandFactory as _, Parser as _, ValueEnum as _};
+    use mokmok_sandbox::Limits;
     use std::ffi::{OsStr, OsString};
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Path, PathBuf};
 
@@ -1331,6 +1406,7 @@ mod tests {
                 crash_after: None,
                 config: None,
                 provider: ProviderLayer::default(),
+                limits: ExecutionLimits::default(),
             },
             command: Command::Submit(Submit {
                 session: "018f2f1e-0000-7000-8000-000000000000".to_owned(),
@@ -1354,6 +1430,77 @@ mod tests {
         assert!(config.sandbox_root.is_dir());
         assert_eq!(config.events, config.data_dir.join("events.sqlite"));
         assert_eq!(config.socket(), config.data_dir.join("bus.sock"));
+    }
+
+    #[test]
+    fn a_zero_limit_is_unbounded_and_a_nonzero_one_is_set() {
+        assert_eq!(
+            ExecutionLimits::default().resolve().unwrap(),
+            Limits::default()
+        );
+
+        let bounded = ExecutionLimits {
+            address_space_bytes: 64 * 1024 * 1024,
+            cpu_seconds: 2,
+            file_size_bytes: 1024 * 1024,
+            open_files: 64,
+            output_bytes: 4096,
+        };
+        let limits = bounded.resolve().unwrap();
+
+        assert_eq!(limits.address_space, NonZeroU64::new(64 * 1024 * 1024));
+        assert_eq!(limits.cpu, NonZeroU64::new(2));
+        assert_eq!(limits.file_size, NonZeroU64::new(1024 * 1024));
+        assert_eq!(limits.open_files, NonZeroU64::new(64));
+        assert_eq!(limits.output, NonZeroUsize::new(4096).unwrap());
+    }
+
+    #[test]
+    fn a_zero_output_cap_is_refused() {
+        let scratch = Scratch::new("zero-output");
+        let args = Args::try_parse_from([
+            "mokmokd",
+            "--data-dir",
+            scratch.0.to_str().unwrap(),
+            "--confiner",
+            "/bin/sh",
+            "--output-bytes",
+            "0",
+            "serve",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            Config::resolve(&args, None, &ProcessEnvironment::default()),
+            Err(ConfigError::ZeroOutputBytes),
+        ));
+    }
+
+    #[test]
+    fn the_execution_limits_are_flags_of_agent_run_and_serve() {
+        for subcommand in [&["agent", "run"][..], &["serve"][..]] {
+            let error = Args::try_parse_from(
+                std::iter::once("mokmokd")
+                    .chain(subcommand.iter().copied())
+                    .chain(["--help"]),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = error.to_string();
+            for flag in [
+                "--address-space-bytes",
+                "--cpu-seconds",
+                "--file-size-bytes",
+                "--open-files",
+                "--output-bytes",
+            ] {
+                assert!(
+                    help.contains(flag),
+                    "{subcommand:?} does not accept {flag}:\n{help}",
+                );
+            }
+        }
     }
 
     #[test]

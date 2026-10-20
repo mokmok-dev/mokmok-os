@@ -17,7 +17,7 @@ use mokmok_artifact::BlobStore;
 use mokmok_capability::{Denial, Name};
 use mokmok_protocol::{ExecutionID, Moment};
 use mokmok_sandbox::{
-    Capability, Completed, Confined, Environment, Error as SandboxError, Exposure, Failure,
+    Capability, Completed, Confined, Environment, Error as SandboxError, Exposure, Failure, Limits,
     Outcome, Refusal, Request, Sandbox, Started,
 };
 use mokmok_state_machine::Resolution;
@@ -64,6 +64,8 @@ pub struct Plan {
     /// own variables do not reach a model-driven shell.
     pub environment: Environment,
     pub deadline: Duration,
+    /// The rlimits and capture cap this execution runs under.
+    pub limits: Limits,
     /// Workspace-relative paths to register after the run, when they exist.
     pub artifacts: Vec<PathBuf>,
     /// Every path the workload may reach, as the operator granted it.
@@ -130,6 +132,7 @@ pub async fn run(
     request.exposures = exposures;
     request.deadline = Some(plan.deadline);
     request.artifacts.clone_from(&plan.artifacts);
+    request.limits = plan.limits;
 
     let run = match sandbox.spawn(&request, &issued) {
         Ok(run) => run,

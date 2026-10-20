@@ -345,6 +345,7 @@ impl Shell {
             args: vec![OsString::from("-c"), OsString::from(call.command.clone())],
             environment: Environment::Exact(self.config.tool_env.clone()),
             deadline: call.deadline,
+            limits: self.config.limits,
             artifacts: Vec::new(),
             exposures: execution::exposures(&self.config),
         };
@@ -1270,6 +1271,7 @@ mod tests {
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
+            limits: mokmok_sandbox::Limits::default(),
             provider: ProviderSettings::default(),
         }
     }

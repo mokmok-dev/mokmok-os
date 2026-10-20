@@ -1288,6 +1288,53 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_runs_under_the_limits_the_operator_named() {
+        let scratch = Scratch::new("limits");
+        let path = scratch.0.join("script.json");
+        script(
+            &path,
+            &[
+                json!({"action": "command", "command": "ulimit -v; ulimit -n; ulimit -f"}),
+                json!({"action": "final"}),
+            ],
+        );
+
+        // `ulimit -v` prints KiB and `ulimit -f` prints 512-byte blocks, so the unit conversions
+        // show up here rather than being asserted by construction.
+        let ran = run(
+            &scratch,
+            &agent_args(
+                &scratch,
+                &path,
+                &[
+                    "--address-space-bytes",
+                    "67108864",
+                    "--open-files",
+                    "64",
+                    "--file-size-bytes",
+                    "1048576",
+                ],
+            ),
+        );
+        assert!(ran.ok, "{}\n{}", ran.out, ran.err);
+
+        let (log, _) = log_of(&scratch);
+        let observation = log
+            .ordered
+            .iter()
+            .find_map(|record| match record {
+                Record::Result { report, .. } => Some(report.observation.as_str()),
+                _ => None,
+            })
+            .expect("the log holds the command's report");
+
+        assert!(
+            observation.contains("stdout: 65536\n64\n2048"),
+            "the workload did not run under the limits the operator named: {observation}",
+        );
+    }
+
+    #[test]
     fn the_step_lines_name_the_answer_and_the_turn_the_log_gave_them() {
         let scratch = Scratch::new("step-lines");
         let path = scratch.0.join("script.json");

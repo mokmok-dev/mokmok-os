@@ -324,6 +324,7 @@ async fn run_tool(
         args: submit.args.iter().map(OsString::from).collect(),
         environment: Environment::Exact(config.tool_env.clone()),
         deadline: Duration::from_secs(submit.deadline_seconds),
+        limits: config.limits,
         artifacts: submit
             .artifacts
             .iter()
