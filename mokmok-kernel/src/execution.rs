@@ -23,6 +23,7 @@ use mokmok_sandbox::{
 use mokmok_state_machine::Resolution;
 
 use crate::authority::Authority;
+use crate::cancel::CancelToken;
 use crate::config::Config;
 use crate::error::Error;
 
@@ -81,6 +82,8 @@ pub enum Ran {
         resolution: Resolution,
         result: ExecutionResult,
     },
+    /// The run was stopped before it finished, so it produced no result to record.
+    Cancelled,
 }
 
 /// Why an attempt never reached the workload.
@@ -96,6 +99,9 @@ pub enum Refused {
 
 /// Runs one tool: decide, confine, execute, store, and report.
 ///
+/// A `cancel` token that fires before the workload finishes answers [`Ran::Cancelled`] instead of a
+/// result, and the workload is killed rather than waited on.
+///
 /// # Errors
 ///
 /// Returns [`Error::InvalidName`] when the program is not a name the policy can carry,
@@ -108,6 +114,7 @@ pub async fn run(
     authority: &Authority,
     plan: &Plan,
     at: Moment,
+    cancel: Option<&CancelToken>,
 ) -> Result<Ran, Error> {
     let tool =
         Name::new(plan.program.to_string_lossy().into_owned()).map_err(Error::InvalidName)?;
@@ -139,7 +146,18 @@ pub async fn run(
         Err(refusal) => return Ok(Ran::Refused(Refused::Sandbox(refusal))),
     };
 
-    let completed = match run.wait().await {
+    // The wait owns the `Run`, so dropping it on a cancel kills the workload's whole group and
+    // removes the directory it ran in: a stopped workload leaves nothing half-written behind for
+    // a reader to mistake for an answer.
+    let waited = std::pin::pin!(run.wait());
+    let completed = match cancel {
+        Some(token) => tokio::select! {
+            completed = waited => completed,
+            () = token.cancelled() => return Ok(Ran::Cancelled),
+        },
+        None => waited.await,
+    };
+    let completed = match completed {
         Ok(completed) => completed,
         Err(SandboxError::Confine(failure)) => {
             return Ok(Ran::Refused(Refused::Confined(failure)));

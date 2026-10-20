@@ -12,6 +12,7 @@
 
 pub mod agent;
 mod authority;
+mod cancel;
 mod clock;
 mod config;
 mod db;

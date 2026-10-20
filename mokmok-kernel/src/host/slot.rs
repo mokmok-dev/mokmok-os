@@ -13,6 +13,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::Driver;
+use crate::cancel::CancelToken;
 use crate::clock::Clock;
 use crate::config::{Config, Run};
 
@@ -33,6 +34,15 @@ pub enum Command {
         request: CommandID,
         line: String,
         /// The instant the line's speech record is stamped with, read where the host accepted it.
+        at: Moment,
+        reply: oneshot::Sender<Result<Receipt, Refusal>>,
+    },
+    /// Records a cancel on a thread that is not stepping, and drives the session to its close.
+    ///
+    /// A thread inside a turn reads this once that turn ends; the token on [`Handle`] is what ends
+    /// it, and the session's ledger answers this as a replay by then.
+    Cancel {
+        /// The instant the cancel's records are stamped with, read where the host accepted it.
         at: Moment,
         reply: oneshot::Sender<Result<Receipt, Refusal>>,
     },
@@ -65,6 +75,8 @@ pub enum Event {
 /// The host's handle to one session's thread.
 pub struct Handle {
     pub commands: Sender<Command>,
+    /// The signal that stops a turn the thread is in the middle of.
+    pub cancel: CancelToken,
 }
 
 /// Starts a session thread. It opens nothing until the host sends [`Command::Open`].
@@ -79,6 +91,8 @@ pub fn spawn(
     events: mpsc::UnboundedSender<Event>,
 ) -> std::io::Result<Handle> {
     let (commands, command) = std::sync::mpsc::channel();
+    let cancel = CancelToken::new();
+    let watching = cancel.clone();
     let name = format!("mokmok-session-{}", session.as_uuid());
     // The handle is dropped so the thread is not joined on the daemon's stop path: a step in flight
     // is left to finish, and the log already covers a step cut off by the process leaving.
@@ -94,11 +108,13 @@ pub fn spawn(
 
             return;
         };
-        serve(&config, session, &clock, &command, &events, &runtime);
+        serve(
+            &config, session, &clock, &command, &events, &runtime, &watching,
+        );
         let _ = events.send(Event::Stopped { session });
     })?;
 
-    Ok(Handle { commands })
+    Ok(Handle { commands, cancel })
 }
 
 fn serve(
@@ -108,6 +124,7 @@ fn serve(
     commands: &Receiver<Command>,
     events: &mpsc::UnboundedSender<Event>,
     runtime: &Runtime,
+    cancel: &CancelToken,
 ) {
     let mut driver: Option<Driver> = None;
 
@@ -120,7 +137,8 @@ fn serve(
                 }
 
                 match Driver::open(config, &run, clock.now(), Arc::clone(clock)) {
-                    Ok(opened) => {
+                    Ok(mut opened) => {
+                        opened.watch(cancel.clone());
                         report(&opened, session, events);
                         let _ = reply.send(Ok(()));
                         driver = Some(opened);
@@ -146,11 +164,30 @@ fn serve(
                 match held.speak_as(&line, request, at) {
                     Ok(receipt) => {
                         let _ = reply.send(Ok(receipt));
-                        run_turn(held, session, events, runtime, clock);
+                        run_turn(held, session, events, runtime, clock, cancel);
                         report(held, session, events);
                     },
                     Err(error) => {
                         let _ = reply.send(Err(refusal(session, &error)));
+                    },
+                }
+            },
+            Command::Cancel { at, reply } => {
+                let Some(held) = driver.as_mut() else {
+                    let _ = reply.send(Err(Refusal::UnknownSession { session }));
+                    continue;
+                };
+
+                match held.cancel(at) {
+                    Ok(receipt) => {
+                        let _ = reply.send(Ok(receipt));
+                        run_turn(held, session, events, runtime, clock, cancel);
+                        report(held, session, events);
+                    },
+                    Err(error) => {
+                        let _ = reply.send(Err(Refusal::Unavailable {
+                            detail: error.to_string(),
+                        }));
                     },
                 }
             },
@@ -169,6 +206,7 @@ fn run_turn(
     events: &mpsc::UnboundedSender<Event>,
     runtime: &Runtime,
     clock: &Arc<dyn Clock>,
+    cancel: &CancelToken,
 ) {
     let mut prose = Prose::new(session, events);
 
@@ -191,6 +229,21 @@ fn run_turn(
         let at = clock.now();
         let result = runtime.block_on(driver.step_watched(&mut |text| prose.observe(text), at));
         prose.flush();
+
+        // A cancel that landed while this step ran is read here, before the step's own failure is:
+        // the interrupted tool's step fails by design, and the ledger settles it cancelled.
+        if cancel.is_cancelled() {
+            if let Err(error) = driver.cancel(clock.now()) {
+                let _ = events.send(Event::Trouble {
+                    session,
+                    detail: error.to_string(),
+                });
+
+                return;
+            }
+
+            continue;
+        }
 
         match result {
             Ok(Progress::Yielded | Progress::Advanced(Move::Halt(Halt::Draining))) => {

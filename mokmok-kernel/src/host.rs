@@ -15,7 +15,7 @@ use mokmok_session_wire::{
     Command, DaemonEvent, Outcome, PROTOCOL, Refusal, Reply, RosterEntry, SessionEvent,
     command_topic, daemon_subscriber, daemon_topic, history_chunks, roster_chunks, session_topic,
 };
-use mokmok_state_machine::Phase;
+use mokmok_state_machine::{Ending, Phase};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::Clock;
@@ -146,6 +146,7 @@ impl Host {
                 line,
             } => self.speak(request, session, line, at).await,
             Command::History { request, session } => self.history(request, session).await,
+            Command::Cancel { request, session } => self.cancel(request, session, at).await,
         }
     }
 
@@ -349,6 +350,94 @@ impl Host {
         match receipt.await {
             Ok(Ok(_)) => self.accept(request, session).await?,
             Ok(Err(reason)) => self.refuse(request, reason).await?,
+            Err(_) => {
+                return self
+                    .refuse(
+                        request,
+                        Refusal::Unavailable {
+                            detail: "the session's thread stopped".to_owned(),
+                        },
+                    )
+                    .await;
+            },
+        }
+        self.refresh_roster().await?;
+        self.publish_roster().await
+    }
+
+    /// Stops the session's work and lets it close cancelled.
+    ///
+    /// A session that is already draining or already cancelled answers [`Reply::Ack`] without a
+    /// write, which is what makes a redelivered cancel cost the log nothing. A thread inside a turn
+    /// reads no command until that turn ends, so its token is set first and the step in flight stops
+    /// there.
+    async fn cancel(
+        &mut self,
+        request: CommandID,
+        session: SessionID,
+        at: Moment,
+    ) -> Result<(), Error> {
+        let known = match self.known(session).await {
+            Ok(known) => known,
+            Err(error) => {
+                return self
+                    .refuse(
+                        request,
+                        Refusal::Unavailable {
+                            detail: error.to_string(),
+                        },
+                    )
+                    .await;
+            },
+        };
+
+        if known.task.is_none() {
+            let reason = if known.has_facts || self.created.contains_key(&session) {
+                Refusal::Untasked { session }
+            } else {
+                Refusal::UnknownSession { session }
+            };
+
+            return self.refuse(request, reason).await;
+        }
+        match known.phase {
+            Phase::Closed(Ending::Completed) => {
+                return self.refuse(request, Refusal::Closed { session }).await;
+            },
+            Phase::Draining | Phase::Closed(Ending::Cancelled) => {
+                return self.accept(request, session).await;
+            },
+            Phase::Unopened | Phase::Accepting => {},
+        }
+
+        if let Err(reason) = self.ensure(session, true).await {
+            return self.refuse(request, reason).await;
+        }
+        let Some(handle) = self.slots.get(&session) else {
+            return self
+                .refuse(request, Refusal::UnknownSession { session })
+                .await;
+        };
+
+        // The token stops a step already in flight; the command is what a thread between steps
+        // reads. A thread inside a turn reads it once that turn ends, which the token makes quick.
+        handle.cancel.cancel();
+        let (reply, receipt) = oneshot::channel();
+        if handle
+            .commands
+            .send(SlotCommand::Cancel { at, reply })
+            .is_err()
+        {
+            self.slots.remove(&session);
+
+            return self
+                .refuse(request, Refusal::UnknownSession { session })
+                .await;
+        }
+
+        match receipt.await {
+            Ok(Ok(_)) => self.accept(request, session).await?,
+            Ok(Err(reason)) => return self.refuse(request, reason).await,
             Err(_) => {
                 return self
                     .refuse(
@@ -740,7 +829,7 @@ mod tests {
         Command, DaemonEvent, Outcome, PROTOCOL, Refusal, Reply, RosterChunk, RosterEntry,
         SessionCommit, SessionEvent, command_topic, daemon_topic, session_topic,
     };
-    use mokmok_state_machine::{Fact, Phase};
+    use mokmok_state_machine::{Ending, Fact, Phase, Resolution, Session, TurnFact};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -752,6 +841,10 @@ mod tests {
 
     /// The longest one test waits for one delivery or one turn.
     const WAIT: Duration = Duration::from_secs(1);
+
+    /// The longest one test waits for a cancelled workload to be killed and the session to close.
+    /// Generous on purpose: a bound tight enough to notice a slow machine would fail a good run.
+    const SETTLE: Duration = Duration::from_secs(5);
 
     const GOAL: &str = "port the parser";
     const OTHER_GOAL: &str = "write the release notes";
@@ -823,6 +916,71 @@ mod tests {
             context_turns: 16,
             tool_deadline_seconds: 30,
             steps: 64,
+        }
+    }
+
+    /// The confiner `cargo mutants` names, or the one a workspace build put beside the test binary.
+    fn confiner() -> PathBuf {
+        if let Some(named) = std::env::var_os("MOKMOK_CONFINER") {
+            let path = PathBuf::from(named);
+            assert!(path.is_file(), "{} is not a file", path.display());
+
+            return path;
+        }
+
+        // A lib test binary lives in `target/<profile>/deps`, and the confiner is built beside that
+        // directory rather than inside it.
+        let path = std::env::current_exe()
+            .expect("the test binary has a path")
+            .parent()
+            .and_then(Path::parent)
+            .expect("the test binary sits in a profile directory")
+            .join("mokmok-sandbox-confine");
+        assert!(
+            path.is_file(),
+            "{} is missing: build the confiner before running this package's tests alone, or name \
+             it with MOKMOK_CONFINER",
+            path.display(),
+        );
+
+        path
+    }
+
+    /// The first shell on `PATH`, which is where a confined workload can find one.
+    fn shell() -> PathBuf {
+        let path = std::env::var_os("PATH").expect("a PATH");
+
+        for directory in std::env::split_paths(&path) {
+            for name in ["sh", "bash"] {
+                let candidate = directory.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+
+        panic!("no shell on PATH, so the agent cannot run a tool");
+    }
+
+    /// The directories the workload may read and execute in.
+    fn reachable() -> Vec<PathBuf> {
+        ["/nix/store", "/bin", "/usr", "/lib", "/lib64"]
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+
+    /// A configuration whose model commands run as a real confined workload.
+    fn tooled(
+        scratch: &Scratch,
+        script: Option<&Path>,
+    ) -> Config {
+        Config {
+            allow_tool: vec![shell()],
+            allow_path: reachable(),
+            confiner: confiner(),
+            ..config(scratch, script)
         }
     }
 
@@ -898,6 +1056,52 @@ mod tests {
         .unwrap();
     }
 
+    /// Asserts the durable history of a cancelled run: one cancel, the execution settled cancelled,
+    /// a pass through `Draining`, and a cancelled close.
+    fn assert_cancelled_history(
+        log: &Log,
+        session: SessionID,
+    ) {
+        assert_eq!(
+            log.session
+                .iter()
+                .filter(|fact| **fact == Fact::CancelRequested)
+                .count(),
+            1,
+            "the log holds one cancel: {:?}",
+            log.session,
+        );
+        assert!(
+            log.session.iter().any(|fact| matches!(
+                fact,
+                Fact::ExecutionSettled {
+                    resolution: Resolution::Cancelled,
+                    ..
+                }
+            )),
+            "the tool in flight settled cancelled: {:?}",
+            log.session,
+        );
+
+        // `Draining` is the state the machine refuses a new launch in, and the cancelled close is
+        // only reachable from it, so replaying to the fact proves the history passed through it.
+        let requested = log
+            .session
+            .iter()
+            .position(|fact| *fact == Fact::CancelRequested)
+            .expect("the cancel is in the log");
+        assert_eq!(
+            Session::replay(session, &log.session[..=requested])
+                .unwrap()
+                .phase(),
+            Phase::Draining,
+        );
+        assert_eq!(
+            Session::replay(session, &log.session).unwrap().phase(),
+            Phase::Closed(Ending::Cancelled),
+        );
+    }
+
     async fn wait_for_socket(socket: &Path) {
         let deadline = tokio::time::Instant::now() + WAIT;
         while !socket.exists() {
@@ -928,6 +1132,22 @@ mod tests {
             name: &str,
             answers: Option<&[serde_json::Value]>,
         ) -> Self {
+            Self::open(name, answers, false).await
+        }
+
+        /// A bench whose model commands run as a real confined workload.
+        async fn tooled(
+            name: &str,
+            answers: Option<&[serde_json::Value]>,
+        ) -> Self {
+            Self::open(name, answers, true).await
+        }
+
+        async fn open(
+            name: &str,
+            answers: Option<&[serde_json::Value]>,
+            run_tools: bool,
+        ) -> Self {
             let scratch = Scratch::new(name);
             let script = answers.map(|answers| {
                 let path = scratch.0.join("script.json");
@@ -935,7 +1155,11 @@ mod tests {
 
                 path
             });
-            let config = config(&scratch, script.as_deref());
+            let config = if run_tools {
+                tooled(&scratch, script.as_deref())
+            } else {
+                config(&scratch, script.as_deref())
+            };
             let socket = scratch.0.join("bus.sock");
             let bus = tokio::spawn(mokmok_event_bus::serve(
                 BusConfig {
@@ -1193,6 +1417,30 @@ mod tests {
             session: SessionID,
         ) -> Log {
             Db::open(&self.config.events).unwrap().log(session).unwrap()
+        }
+
+        /// Polls the session's log until `done` holds, failing once [`SETTLE`] passes.
+        async fn settled(
+            &self,
+            session: SessionID,
+            done: impl Fn(&Log) -> bool,
+        ) -> Log {
+            let deadline = tokio::time::Instant::now() + SETTLE;
+
+            loop {
+                let log = self.log(session);
+                if done(&log) {
+                    return log;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the session never reached the expected state within {SETTLE:?}: \
+                     phase={:?} facts={:?}",
+                    log.state(session).map(|state| state.phase()),
+                    log.session,
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 
@@ -1842,6 +2090,228 @@ mod tests {
             .await;
 
         assert_eq!(refused_reason(&refused), &Refusal::Closed { session });
+    }
+
+    #[tokio::test]
+    async fn a_cancel_kills_a_running_tool_and_closes_the_session_cancelled() {
+        let mut bench = Bench::tooled(
+            "cancel-running",
+            Some(&[json!({"action": "command", "command": "while :; do :; done"})]),
+        )
+        .await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "hello".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+        bench
+            .settled(session, |log| {
+                log.turns
+                    .iter()
+                    .any(|record| matches!(record.fact, TurnFact::ToolRequested { .. }))
+            })
+            .await;
+
+        let cancelled_at = tokio::time::Instant::now();
+        assert_eq!(
+            bench
+                .asked(&Command::Cancel {
+                    request: request(3),
+                    session,
+                })
+                .await,
+            accepted(request(3), session),
+        );
+
+        let log = bench
+            .settled(session, |log| {
+                log.state(session)
+                    .is_ok_and(|state| state.phase() == Phase::Closed(Ending::Cancelled))
+            })
+            .await;
+
+        assert!(
+            cancelled_at.elapsed() < SETTLE,
+            "the workload stopped and the session closed within {SETTLE:?}",
+        );
+        assert_cancelled_history(&log, session);
+
+        // A terminal folds the notice, not the log, so the cancel it must draw is in the commit.
+        bench.publish_pending().await;
+        let commit = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::Commit(commit)
+                    if commit
+                        .records
+                        .iter()
+                        .any(|record| matches!(record, Record::Session { fact: Fact::CancelRequested })))
+            })
+            .await;
+        let SessionEvent::Commit(commit) = commit else {
+            unreachable!("the predicate selected a commit");
+        };
+        assert!(
+            commit.records.iter().any(|record| matches!(
+                record,
+                Record::Session {
+                    fact: Fact::ExecutionSettled {
+                        resolution: Resolution::Cancelled,
+                        ..
+                    }
+                }
+            )),
+            "the commit that names the cancel names the settlement too: {:?}",
+            commit.records,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_cancel_answers_ack_and_writes_no_second_fact() {
+        let mut bench = Bench::start(
+            "cancel-replay",
+            Some(&[json!({"action": "final", "say": "done"})]),
+        )
+        .await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "hello".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+        assert_eq!(bench.roster_turns(session, 1).await.phase, Phase::Accepting);
+
+        for _ in 0..2 {
+            assert_eq!(
+                bench
+                    .asked(&Command::Cancel {
+                        request: request(3),
+                        session,
+                    })
+                    .await,
+                accepted(request(3), session),
+                "a cancel the daemon already holds is answered, not refused",
+            );
+        }
+
+        let log = bench
+            .settled(session, |log| {
+                log.state(session)
+                    .is_ok_and(|state| state.phase() == Phase::Closed(Ending::Cancelled))
+            })
+            .await;
+
+        assert_eq!(
+            log.session
+                .iter()
+                .filter(|fact| **fact == Fact::CancelRequested)
+                .count(),
+            1,
+            "the replayed cancel wrote nothing a second time: {:?}",
+            log.session,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_refuses_an_unknown_untasked_or_closed_session() {
+        let mut bench = Bench::start("cancel-refusals", None).await;
+
+        let unknown = session_of(3);
+        let refused = bench
+            .asked(&Command::Cancel {
+                request: request(1),
+                session: unknown,
+            })
+            .await;
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::UnknownSession { session: unknown },
+        );
+
+        let untasked = session_of(4);
+        seed_facts(&bench.config, untasked);
+        let refused = bench
+            .asked(&Command::Cancel {
+                request: request(2),
+                session: untasked,
+            })
+            .await;
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::Untasked { session: untasked }
+        );
+
+        let created = session_of(5);
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(3),
+                    session: created,
+                    goal: GOAL.to_owned(),
+                    checkout: bench.scratch.checkout(),
+                })
+                .await,
+            accepted(request(3), created),
+        );
+        let refused = bench
+            .asked(&Command::Cancel {
+                request: request(4),
+                session: created,
+            })
+            .await;
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::Untasked { session: created }
+        );
+
+        let closed = session_of(6);
+        seed_closed(&bench.config, &bench.scratch, closed);
+        let refused = bench
+            .asked(&Command::Cancel {
+                request: request(5),
+                session: closed,
+            })
+            .await;
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::Closed { session: closed }
+        );
     }
 
     #[tokio::test]

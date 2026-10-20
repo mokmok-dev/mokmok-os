@@ -339,9 +339,12 @@ async fn run_tool(
     })?;
     let authority = Authority::new(config, at)?;
 
-    match execution::run(config, &sandbox, &authority, &plan, at).await? {
+    match execution::run(config, &sandbox, &authority, &plan, at, None).await? {
         Ran::Settled { resolution, result } => Ok((resolution, Some(result))),
         Ran::Refused(_) => Ok((Resolution::Refused, None)),
+        // A one-shot submit has no one to cancel it, so this is the cancellation the kernel never
+        // asks for.
+        Ran::Cancelled => Ok((Resolution::Cancelled, None)),
     }
 }
 
