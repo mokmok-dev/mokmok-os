@@ -338,7 +338,7 @@ pub struct SessionDefaults {
 impl SessionDefaults {
     /// The run one session is opened under.
     #[must_use]
-    pub fn run(
+    pub const fn run(
         &self,
         session: String,
         goal: String,

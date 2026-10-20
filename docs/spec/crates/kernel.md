@@ -136,7 +136,7 @@ answered from the environment (`src/config.rs:175`), and one opened corpus per s
   (`src/recovery.rs:40-48`). It never records success or failure.
 - A notice is written inside the transaction that records the change it names (`src/db.rs:339`).
 - Recovery runs before the bus accepts a client and before readiness is reported
-  (`src/serve.rs:196-207`, readiness at `src/serve.rs:265`).
+  (`src/serve.rs:203-210`, readiness at `src/serve.rs:286`).
 - The provider validates its destination through `mokmok-egress`, pins the validated address, and
   disables redirects (`src/provider.rs:442-465`).
 - A watched provider call streams an answer over server-sent events, synthesizes the canonical whole
@@ -160,14 +160,14 @@ The design names the modules `config`, `bootstrap`, `services`, `lifecycle`, `re
 `shutdown`.[^architecture] The crate names them `authority`, `config`, `db`, `error`, `execution`,
 `agent`, `notify`, `provider`, `recovery`, `roster`, `serve`, and `slice`. There is no service
 registry and no lifecycle type; serving and shutdown both live in `serve_until_stopped`
-(`src/serve.rs:165-285`).
+(`src/serve.rs:174-313`).
 
 The design has the kernel initiate migrations. There is no migration module, no schema-version row,
 and no expected-version check. Schema creation is `CREATE TABLE IF NOT EXISTS` inside
 `mokmok_event_store::Store::open`.
 
 The design has the kernel expose health and readiness. Readiness is an `sd_notify` datagram
-(`src/notify.rs:24`, sent at `src/serve.rs:270`), not an endpoint. `Command` carries submit, status,
+(`src/notify.rs:24`, sent at `src/serve.rs:286`), not an endpoint. `Command` carries submit, status,
 reconcile, serve, and agent, and there is no health subcommand and no HTTP surface.
 
 The design puts a thin binary at `apps/mokmokd` invoking kernel bootstrap. There is no `apps`

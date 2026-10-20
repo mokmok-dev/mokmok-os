@@ -218,7 +218,7 @@ async fn serve_until_stopped(
     // The host needs a bound socket to subscribe. The bus task binds it; waiting here is the same
     // bounded probe readiness uses later, and it keeps a slow bind from looking like a refused
     // daemon.
-    wait_for_bus(&socket).await?;
+    waited_for_bus(&socket, &mut bus).await?;
     let daemon = AgentID::from_uuid(uuid::Uuid::new_v4());
     let client = mokmok_event_bus::Client::connect(&socket)
         .await
@@ -282,7 +282,7 @@ async fn serve_until_stopped(
             // Readiness is a bus that answers a session and an outbox that drained, because that is
             // what a dependent connecting now finds. A socket file is neither of those things: a
             // process killed with SIGKILL leaves one behind.
-            wait_for_bus(&socket).await?;
+            waited_for_bus(&socket, &mut bus).await?;
             report(&notifier, Message::Ready);
             ready = Some(Cadence::new(notifier.ping(), Instant::now()));
         } else if let Some(cadence) = &mut ready {
@@ -333,6 +333,20 @@ async fn wait_for_bus(socket: &Path) -> Result<(), Error> {
         }
 
         tokio::time::sleep(RETRY).await;
+    }
+}
+
+/// Waits for the bus this process spawned, and answers its bind failure before the probe's timeout.
+///
+/// A peer that holds the socket and accepts without answering keeps every probe waiting, so the
+/// probe alone reports a silent peer where the bus already named the live one.
+async fn waited_for_bus(
+    socket: &Path,
+    bus: &mut tokio::task::JoinHandle<Result<(), mokmok_event_bus::ServeError>>,
+) -> Result<(), Error> {
+    tokio::select! {
+        result = bus => Err(bus_ended(result)),
+        result = wait_for_bus(socket) => result,
     }
 }
 

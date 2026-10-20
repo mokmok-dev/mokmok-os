@@ -84,7 +84,7 @@ downgrades a failure to a log line, so a security fact can be lost with a line p
 
 The design has redaction remove protected payloads according to policy. `Redaction` is literal
 string replacement over rules the caller supplies, nothing reads a policy, and the daemon installs
-`Redaction::none()` (`mokmok-kernel/src/serve.rs:300`).
+`Redaction::none()` (`mokmok-kernel/src/serve.rs:317`).
 
 Behaviour the design does not name: the JSON-lines shape with its level and target framing
 (`src/format.rs:88-95`), stderr as the writer with a reloadable `EnvFilter` (`src/init.rs:74-88`),

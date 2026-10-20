@@ -137,7 +137,6 @@ mod tests {
     use crate::db::{Db, Entry};
     use mokmok_event_store::{CommandId, Expected};
     use mokmok_protocol::{CommandID, ExecutionID, Moment, SessionID, TurnID};
-    use mokmok_session_wire::SessionCommit;
     use mokmok_state_machine::{Attempt, Deadline, Fact, TurnFact, TurnNumber};
     use uuid::Uuid;
 

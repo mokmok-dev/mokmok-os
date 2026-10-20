@@ -97,7 +97,7 @@ fn mode(fold: &Transcript) -> Mode {
 ///
 /// The bus engine uses the same rule to report itself busy, so the conversation never asks a
 /// remote session to step locally and never parks while it is still working.
-pub(crate) fn working(fold: &Transcript) -> bool {
+pub fn working(fold: &Transcript) -> bool {
     match fold.session.phase() {
         Phase::Closed(_) => false,
         Phase::Draining => true,
@@ -832,7 +832,6 @@ impl<E: Engine> Manager<E> {
                 engine,
                 input,
                 scroll,
-                streaming: _,
                 ..
             } = &mut self.held[index];
             let streamed = Rc::clone(&pending);
@@ -1034,9 +1033,6 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Duration;
 
     use proptest::prelude::*;

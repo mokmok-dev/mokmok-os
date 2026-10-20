@@ -58,7 +58,7 @@ pub struct Report {
 }
 
 /// The commit a transaction publishes: the records it wrote and the identities it touched.
-pub(crate) fn published(
+pub fn published(
     session: SessionID,
     command: CommandId,
     entries: &[Entry],
