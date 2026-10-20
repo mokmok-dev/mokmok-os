@@ -1402,6 +1402,40 @@ mod tests {
     }
 
     #[test]
+    fn an_outbox_message_keeps_its_topic_in_the_row_a_relay_reads() {
+        let mut store = store();
+        let stream = StreamId::new();
+        let message = OutboxMessage::new("turn.done", Payload::json(&1).unwrap());
+
+        assert_eq!(message.topic(), "turn.done");
+
+        committed(
+            &mut store,
+            &append(CommandId::new(), stream, Expected::New, 1).outbox(message),
+        );
+
+        let pending = store.pending_outbox(max(1)).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].topic(), "turn.done");
+    }
+
+    #[test]
+    fn committed_names_a_command_the_log_holds_and_no_other() {
+        let mut store = store();
+        let command = CommandId::new();
+
+        assert!(!store.committed(command).unwrap());
+
+        committed(
+            &mut store,
+            &append(command, StreamId::new(), Expected::New, 1),
+        );
+
+        assert!(store.committed(command).unwrap());
+        assert!(!store.committed(CommandId::new()).unwrap());
+    }
+
+    #[test]
     fn a_checkpoint_never_moves_backwards() {
         let mut store = store();
         let stream = StreamId::new();
