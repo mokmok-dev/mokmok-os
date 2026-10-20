@@ -1,6 +1,6 @@
 {
   "harness": "e1d245d40dd46ce011f1d49b3a15eb0ceca0e176135bc7bd75dc0dc8ebe6fecb",
-  "generated": "2026-10-20T14:03:34Z",
+  "generated": "2026-10-20T14:43:45Z",
   "members": [
     {
       "name": "mokmok-agent-runtime",
@@ -72,12 +72,12 @@
       "name": "mokmok-kernel",
       "score": 100.0,
       "target": 100.0,
-      "tested": 414,
-      "caught": 414,
+      "tested": 424,
+      "caught": 424,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "4ff65d61d0b45a2cb7119959dc272fdc96be6c04fe7188547c6bd7c76d2b425a"
+      "digest": "ce4bd14acba197023a7f578be33e61a98581e31ec8b62dc752ee9b48facc8123"
     },
     {
       "name": "mokmok-observability",
@@ -154,7 +154,7 @@
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "2843a8e970f1792f36771447110180d22153591a26d547306c80f29fc5a09d60"
+      "digest": "f9b97d85b0587c141dab636a7243511b3f3058e62435957cef1b52272b7a7b46"
     },
     {
       "name": "mokmok-skill",
@@ -182,12 +182,12 @@
       "name": "mokmok-tui",
       "score": 100.0,
       "target": 100.0,
-      "tested": 382,
-      "caught": 382,
+      "tested": 385,
+      "caught": 385,
       "missed": [],
       "timeout": 0,
       "timed_out": [],
-      "digest": "e9dd6a531a6eb9922ca3800e4ea6e1e7f9482812e3d32e91a3bc919f09f1afd6"
+      "digest": "cae69ec738d727faa77616b701be71e62e3e51a9aee4763c0cbf55628006af5f"
     }
   ]
 }
