@@ -931,6 +931,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_driver_answers_the_records_its_log_holds() {
+        let scratch = Scratch::new("driver-records");
+        let path = scratch.0.join("script.json");
+        script(&path, &[json!({"action": "final", "say": "hi there"})]);
+        let (config, run) = driver_config(&scratch, &path);
+        let mut driver =
+            Driver::open(&config, &run, Moment::from_millis(0)).expect("the driver opens");
+
+        assert!(
+            driver.records().expect("the ledger reads").is_empty(),
+            "a driver that opened an empty log reports no records",
+        );
+
+        driver.speak("hello").expect("the line opens turn 1");
+        assert!(settled(&mut driver).await, "the turn settled");
+
+        let records = driver.records().expect("the ledger reads");
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record, Record::Task(_))),
+            "the records the driver reports are the ones its log holds: {records:?}",
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| matches!(record, Record::Speech(_))),
+            "{records:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn the_attempt_ceiling_waits_when_a_line_is_held() {
         let scratch = Scratch::new("driver-ceiling");
         let path = scratch.0.join("script.json");

@@ -982,4 +982,26 @@ mod tests {
             vec![Db::stream(older), Db::stream(newer)],
         );
     }
+
+    #[test]
+    fn a_command_the_log_committed_is_read_back_and_a_new_one_is_not() {
+        let scratch = Scratch::new("committed");
+        let mut db = Db::open(&scratch.0.join("events.sqlite")).unwrap();
+        let committed = CommandId::new();
+        let uncommitted = CommandId::new();
+
+        assert!(!db.committed(committed).unwrap());
+
+        db.append(
+            committed,
+            Db::stream(session()),
+            Expected::New,
+            &[Entry::Session(Fact::SessionOpened)],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(db.committed(committed).unwrap());
+        assert!(!db.committed(uncommitted).unwrap());
+    }
 }

@@ -302,3 +302,60 @@ impl<'a> Prose<'a> {
         self.at = Instant::now();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mokmok_protocol::SessionID;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    use super::{Event, PROSE_TICK, Prose};
+
+    const CAP: usize = 4096;
+
+    fn session() -> SessionID {
+        SessionID::from_uuid(Uuid::from_u128(0x51))
+    }
+
+    fn fragment(receiver: &mut mpsc::UnboundedReceiver<Event>) -> String {
+        match receiver.try_recv() {
+            Ok(Event::Fragment { text, .. }) => text,
+            other => panic!("expected one prose fragment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prose_holds_a_fragment_under_its_cap_and_sends_it_at_the_cap() {
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut prose = Prose::new(session(), &events);
+        let head = "a".repeat(CAP - 1);
+
+        prose.observe(&head);
+        assert!(
+            received.try_recv().is_err(),
+            "a fragment under the cap and inside the tick waits",
+        );
+
+        prose.observe("b");
+        assert_eq!(fragment(&mut received), format!("{head}b"));
+
+        prose.flush();
+        assert!(
+            received.try_recv().is_err(),
+            "an empty buffer flushes nothing",
+        );
+    }
+
+    #[test]
+    fn prose_sends_a_held_fragment_once_its_tick_elapses() {
+        let (events, mut received) = mpsc::unbounded_channel();
+        let mut prose = Prose::new(session(), &events);
+
+        std::thread::sleep(PROSE_TICK + Duration::from_millis(10));
+        prose.observe("held");
+
+        assert_eq!(fragment(&mut received), "held");
+    }
+}

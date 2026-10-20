@@ -499,4 +499,64 @@ mod tests {
 
         serving.abort();
     }
+
+    #[tokio::test]
+    async fn a_refused_publish_keeps_the_connection_a_broken_one_drops() {
+        let scratch = Scratch::new("refused-publish");
+        let socket = scratch.0.join("bus.sock");
+        let bus = BusConfig {
+            path: socket.clone(),
+            store: scratch.0.join("bus.sqlite"),
+            // One topic is all this bus will open, and the opener below takes it.
+            limits: Limits {
+                topics: NonZeroUsize::MIN,
+                ..Limits::default()
+            },
+            ..BusConfig::default()
+        };
+        let serving = tokio::spawn(serve_bus(bus, std::future::pending::<()>()));
+        wait_for_bus(&socket).await;
+
+        let opener = mokmok_event_bus::Client::connect(&socket).await.unwrap();
+        opener
+            .publish(
+                Topic::Global,
+                mokmok_event_bus::Payload::json(&"open".to_owned()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let refused = SessionID::from_uuid(Uuid::from_u128(0x12));
+        let mut relay = Relay::new(&socket);
+        let failure = relay
+            .publish(
+                Topic::Session(refused),
+                mokmok_event_bus::Payload::json(&"refused".to_owned()).unwrap(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                failure,
+                Err(crate::error::Error::Bus(mokmok_event_bus::Error::Refused(
+                    _
+                )))
+            ),
+            "{failure:?}",
+        );
+
+        // Removing the path is what separates a kept connection from a reconnection: only a dropped
+        // client has to dial it.
+        std::fs::remove_file(&socket).unwrap();
+
+        relay
+            .publish(
+                Topic::Global,
+                mokmok_event_bus::Payload::json(&"after".to_owned()).unwrap(),
+            )
+            .await
+            .expect("the refused publish kept the connection");
+
+        serving.abort();
+    }
 }

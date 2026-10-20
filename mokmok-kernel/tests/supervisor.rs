@@ -649,6 +649,38 @@ mod tests {
     }
 
     #[test]
+    fn the_first_relay_pass_waits_its_interval_before_publishing() {
+        let scratch = Scratch::new("first-pass");
+        seed(&scratch.data(), 0xd1, 1);
+
+        let started = Instant::now();
+        let daemon = Daemon::start(&scratch, &[]);
+        wait_for_socket(&scratch.socket(), Duration::from_secs(5));
+        let notices = collect(
+            &scratch.socket(),
+            Topic::Session(session()),
+            SubscriberId::new(),
+            1,
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            notices.len(),
+            1,
+            "the seeded notice was published: {notices:#?}",
+        );
+        // The first tick is scheduled a whole pass ahead, so no publish can precede that pass.
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "the first pass published after {elapsed:?}, which is inside its interval",
+        );
+
+        daemon.signal("TERM");
+        let finished = daemon.finish(Duration::from_secs(5));
+        assert_eq!(finished.code, Some(0), "{}", finished.err);
+    }
+
+    #[test]
     fn once_drains_the_pending_outbox_and_reports_nothing_to_a_supervisor() {
         let scratch = Scratch::new("once");
         seed(&scratch.data(), 0x81, 4);

@@ -1325,4 +1325,40 @@ mod tests {
             log.ordered,
         );
     }
+
+    #[test]
+    fn the_ledger_answers_its_records_and_the_commands_it_committed() {
+        let scratch = Scratch::new("records");
+        let config = config(&scratch.0);
+        let session = SessionID::from_uuid(Uuid::from_u128(9));
+        let mut ledger = Ledger::open(&config, session, Some(task()), Moment::EPOCH).unwrap();
+        let committed = StepId::derive(session, StepKey::Task);
+        let absent = StepId::derive(session, StepKey::Speech { turn: 1 });
+
+        assert_eq!(ledger.records().len(), 0);
+        assert!(!ledger.committed(committed).unwrap());
+        assert!(!ledger.committed(absent).unwrap());
+
+        let step = Step::new(
+            committed,
+            session,
+            vec![
+                Record::Session {
+                    fact: Fact::SessionOpened,
+                },
+                Record::Task(TaskRecord { task: task() }),
+            ],
+        );
+        assert_eq!(ledger.append(step).unwrap(), Receipt::Written);
+
+        assert_eq!(ledger.records().len(), 2);
+        assert!(matches!(
+            ledger.records().first(),
+            Some(Record::Session {
+                fact: Fact::SessionOpened
+            }),
+        ));
+        assert!(ledger.committed(committed).unwrap());
+        assert!(!ledger.committed(absent).unwrap());
+    }
 }

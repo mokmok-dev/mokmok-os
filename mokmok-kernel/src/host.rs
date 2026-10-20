@@ -715,3 +715,1228 @@ struct Known {
 fn join(error: tokio::task::JoinError) -> Error {
     Error::Io(std::io::Error::other(error))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use mokmok_agent_runtime::{MAX_SPEECH_BYTES, Record, TaskRecord};
+    use mokmok_event_bus::{
+        Client, Config as BusConfig, Payload, SubscriberId, Subscription, Topic,
+    };
+    use mokmok_event_store::{CommandId, Expected};
+    use mokmok_protocol::{AgentID, CommandID, Moment, SessionID};
+    use mokmok_session_wire::{
+        Command, DaemonEvent, Outcome, PROTOCOL, Refusal, Reply, RosterChunk, RosterEntry,
+        SessionEvent, command_topic, daemon_topic, session_topic,
+    };
+    use mokmok_state_machine::{Fact, Phase};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::Host;
+    use crate::config::{Config, ProviderKind, ProviderSettings, SessionDefaults};
+    use crate::db::{Db, Entry, Log};
+    use crate::error::Error;
+    use crate::serve::Relay;
+
+    /// The longest one test waits for one delivery or one turn.
+    const WAIT: Duration = Duration::from_secs(1);
+
+    const GOAL: &str = "port the parser";
+    const OTHER_GOAL: &str = "write the release notes";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mokmok-host-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            for directory in ["data/artifacts", "data/sandbox", "checkout"] {
+                std::fs::create_dir_all(path.join(directory)).unwrap();
+            }
+
+            Self(path)
+        }
+
+        fn data(&self) -> PathBuf {
+            self.0.join("data")
+        }
+
+        fn checkout(&self) -> PathBuf {
+            self.0.join("checkout")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn config(
+        scratch: &Scratch,
+        script: Option<&Path>,
+    ) -> Config {
+        let program = std::env::current_exe().unwrap();
+
+        Config {
+            data_dir: scratch.data(),
+            events: scratch.data().join("events.sqlite"),
+            artifacts: scratch.data().join("artifacts"),
+            sandbox_root: scratch.data().join("sandbox"),
+            allow_tool: vec![program.clone()],
+            allow_path: Vec::new(),
+            allow_write: vec![scratch.checkout()],
+            search_root: Vec::new(),
+            search_index: scratch.data().join("search"),
+            skill_root: Vec::new(),
+            tool_env: Vec::new(),
+            confiner: program,
+            crash_after: None,
+            provider: ProviderSettings {
+                kind: ProviderKind::Scripted,
+                script: script.map(Path::to_path_buf),
+                ..ProviderSettings::default()
+            },
+        }
+    }
+
+    fn defaults() -> SessionDefaults {
+        SessionDefaults {
+            max_turns: 6,
+            token_budget: 0,
+            context_bytes: 0,
+            observation_bytes: 4096,
+            context_turns: 16,
+            tool_deadline_seconds: 30,
+            steps: 64,
+        }
+    }
+
+    const fn session_of(seed: u128) -> SessionID {
+        SessionID::from_uuid(Uuid::from_u128(seed))
+    }
+
+    const fn request(seed: u128) -> CommandID {
+        CommandID::from_uuid(Uuid::from_u128(seed))
+    }
+
+    fn accepted(
+        request: CommandID,
+        session: SessionID,
+    ) -> Reply {
+        Reply::Ack {
+            request,
+            outcome: Outcome::Accepted { session },
+        }
+    }
+
+    fn refused_reason(reply: &Reply) -> &Refusal {
+        match reply {
+            Reply::Ack {
+                outcome: Outcome::Refused { reason },
+                ..
+            } => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    fn seed_facts(
+        config: &Config,
+        session: SessionID,
+    ) {
+        let mut db = Db::open(&config.events).unwrap();
+        db.append(
+            CommandId::new(),
+            Db::stream(session),
+            Expected::New,
+            &[Entry::Session(Fact::SessionOpened)],
+            Vec::new(),
+        )
+        .unwrap();
+    }
+
+    /// Writes a task and a close into `session`'s log, so it folds closed with no driver.
+    fn seed_closed(
+        config: &Config,
+        scratch: &Scratch,
+        session: SessionID,
+    ) {
+        let task = defaults()
+            .run(
+                session.as_uuid().to_string(),
+                GOAL.to_owned(),
+                scratch.checkout(),
+            )
+            .task(config)
+            .unwrap();
+        let mut db = Db::open(&config.events).unwrap();
+        db.append(
+            CommandId::new(),
+            Db::stream(session),
+            Expected::New,
+            &[
+                Entry::Session(Fact::SessionOpened),
+                Entry::Agent(Record::Task(TaskRecord { task })),
+                Entry::Session(Fact::SessionClosed),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+    }
+
+    async fn wait_for_socket(socket: &Path) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !socket.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bus bound {} within {WAIT:?}",
+                socket.display(),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// One daemon on a bus of its own, with a client a test drives it through.
+    struct Bench {
+        scratch: Scratch,
+        config: Config,
+        socket: PathBuf,
+        client: Client,
+        daemon: AgentID,
+        commands: Subscription,
+        host: tokio::task::JoinHandle<Result<(), Error>>,
+        bus: tokio::task::JoinHandle<Result<(), mokmok_event_bus::ServeError>>,
+    }
+
+    impl Bench {
+        async fn start(
+            name: &str,
+            answers: Option<&[serde_json::Value]>,
+        ) -> Self {
+            let scratch = Scratch::new(name);
+            let script = answers.map(|answers| {
+                let path = scratch.0.join("script.json");
+                std::fs::write(&path, serde_json::to_vec(answers).unwrap()).unwrap();
+
+                path
+            });
+            let config = config(&scratch, script.as_deref());
+            let socket = scratch.0.join("bus.sock");
+            let bus = tokio::spawn(mokmok_event_bus::serve(
+                BusConfig {
+                    path: socket.clone(),
+                    store: scratch.0.join("bus.sqlite"),
+                    ..BusConfig::default()
+                },
+                std::future::pending::<()>(),
+            ));
+
+            wait_for_socket(&socket).await;
+
+            let client = Client::connect(&socket).await.unwrap();
+            let daemon = AgentID::from_uuid(Uuid::from_u128(0xda_e0));
+            let host = Host::start(
+                config.clone(),
+                defaults(),
+                Moment::from_millis(0),
+                daemon,
+                client.clone(),
+            )
+            .await
+            .unwrap();
+            let host = tokio::spawn(host.run());
+            let commands = client
+                .subscribe(Topic::Global, SubscriberId::new())
+                .await
+                .unwrap();
+
+            Self {
+                scratch,
+                config,
+                socket,
+                client,
+                daemon,
+                commands,
+                host,
+                bus,
+            }
+        }
+
+        async fn send(
+            &self,
+            command: &Command,
+        ) {
+            self.client
+                .publish(command_topic(), Payload::json(command).unwrap())
+                .await
+                .unwrap();
+        }
+
+        async fn asked(
+            &mut self,
+            command: &Command,
+        ) -> Reply {
+            self.send(command).await;
+            self.reply(command.request()).await
+        }
+
+        async fn reply(
+            &mut self,
+            request: CommandID,
+        ) -> Reply {
+            loop {
+                let batch = tokio::time::timeout(WAIT, self.commands.next())
+                    .await
+                    .expect("a reply arrives within one second")
+                    .expect("the command subscription reads");
+                for event in batch.events() {
+                    let Ok(reply) = event.payload().decode::<Reply>() else {
+                        continue;
+                    };
+                    if reply_request(&reply) == request {
+                        self.commands.ack(batch.after_event(event)).await.unwrap();
+
+                        return reply;
+                    }
+                }
+                self.commands.ack(batch.after()).await.unwrap();
+            }
+        }
+
+        async fn watch(
+            &self,
+            topic: Topic,
+        ) -> Subscription {
+            self.client
+                .subscribe(topic, SubscriberId::new())
+                .await
+                .unwrap()
+        }
+
+        async fn session_event(
+            &self,
+            topic: Topic,
+            want: impl Fn(&SessionEvent) -> bool,
+        ) -> SessionEvent {
+            let mut subscription = self.watch(topic).await;
+            loop {
+                let batch = tokio::time::timeout(WAIT, subscription.next())
+                    .await
+                    .expect("a session event arrives within one second")
+                    .expect("the session subscription reads");
+                for event in batch.events() {
+                    let Ok(decoded) = event.payload().decode::<SessionEvent>() else {
+                        continue;
+                    };
+                    if want(&decoded) {
+                        return decoded;
+                    }
+                }
+                subscription.ack(batch.after()).await.unwrap();
+            }
+        }
+
+        async fn roster_chunk(
+            &self,
+            want: impl Fn(&RosterChunk) -> bool,
+        ) -> RosterChunk {
+            let mut subscription = self.watch(daemon_topic(self.daemon)).await;
+            loop {
+                let batch = tokio::time::timeout(WAIT, subscription.next())
+                    .await
+                    .expect("a roster arrives within one second")
+                    .expect("the daemon subscription reads");
+                for event in batch.events() {
+                    let Ok(DaemonEvent::Roster(chunk)) = event.payload().decode::<DaemonEvent>()
+                    else {
+                        continue;
+                    };
+                    if want(&chunk) {
+                        return chunk;
+                    }
+                }
+                subscription.ack(batch.after()).await.unwrap();
+            }
+        }
+
+        /// The newest roster the bus holds that `want` selects.
+        async fn latest_roster(
+            &self,
+            want: impl Fn(&RosterChunk) -> bool,
+        ) -> RosterChunk {
+            let mut subscription = self.watch(daemon_topic(self.daemon)).await;
+            let mut latest = None;
+            loop {
+                let batch = tokio::time::timeout(WAIT, subscription.next())
+                    .await
+                    .expect("a roster arrives within one second")
+                    .expect("the daemon subscription reads");
+                for event in batch.events() {
+                    let Ok(DaemonEvent::Roster(chunk)) = event.payload().decode::<DaemonEvent>()
+                    else {
+                        continue;
+                    };
+                    if want(&chunk) {
+                        latest = Some(chunk);
+                    }
+                }
+                let caught_up = batch.after().seq().get() >= batch.window().next().get();
+                subscription.ack(batch.after()).await.unwrap();
+                if caught_up {
+                    break;
+                }
+            }
+
+            latest.expect("a roster the bus holds")
+        }
+
+        async fn roster_turns(
+            &self,
+            session: SessionID,
+            turns: u64,
+        ) -> RosterEntry {
+            let chunk = self
+                .roster_chunk(|chunk| {
+                    chunk
+                        .entries
+                        .iter()
+                        .any(|entry| entry.session == session && entry.turns == turns)
+                })
+                .await;
+
+            chunk
+                .entries
+                .into_iter()
+                .find(|entry| entry.session == session && entry.turns == turns)
+                .unwrap()
+        }
+
+        /// Waits until the fragment holding `want` reaches the bus.
+        async fn progress(
+            &self,
+            session: SessionID,
+            want: &str,
+        ) {
+            let mut subscription = self.watch(daemon_topic(self.daemon)).await;
+            loop {
+                let batch = tokio::time::timeout(WAIT, subscription.next())
+                    .await
+                    .expect("a progress fragment arrives within one second")
+                    .expect("the daemon subscription reads");
+                for event in batch.events() {
+                    let Ok(DaemonEvent::Progress {
+                        session: named,
+                        text,
+                    }) = event.payload().decode::<DaemonEvent>()
+                    else {
+                        continue;
+                    };
+                    if named == session && text == want {
+                        return;
+                    }
+                }
+                subscription.ack(batch.after()).await.unwrap();
+            }
+        }
+
+        /// Publishes every notice the log holds, the way a serving daemon's relay does.
+        async fn publish_pending(&self) {
+            let mut db = Db::open(&self.config.events).unwrap();
+            let mut relay = Relay::new(&self.socket);
+            let published = tokio::time::timeout(WAIT, relay.once(&mut db))
+                .await
+                .expect("the relay drains within one second")
+                .unwrap();
+
+            assert!(published > 0, "a settled turn left notices to publish");
+        }
+
+        fn log(
+            &self,
+            session: SessionID,
+        ) -> Log {
+            Db::open(&self.config.events).unwrap().log(session).unwrap()
+        }
+    }
+
+    impl Drop for Bench {
+        fn drop(&mut self) {
+            self.host.abort();
+            self.bus.abort();
+        }
+    }
+
+    const fn reply_request(reply: &Reply) -> CommandID {
+        match reply {
+            Reply::Welcome { request, .. } | Reply::Ack { request, .. } => *request,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hello_names_the_daemon_and_refuses_another_protocol() {
+        let mut bench = Bench::start("hello", None).await;
+
+        let welcome = bench
+            .asked(&Command::Hello {
+                request: request(1),
+                protocol: PROTOCOL,
+            })
+            .await;
+
+        assert_eq!(
+            welcome,
+            Reply::Welcome {
+                request: request(1),
+                daemon: bench.daemon,
+                protocol: PROTOCOL,
+            },
+        );
+
+        let refused = bench
+            .asked(&Command::Hello {
+                request: request(2),
+                protocol: PROTOCOL + 1,
+            })
+            .await;
+
+        assert_eq!(
+            refused,
+            Reply::Ack {
+                request: request(2),
+                outcome: Outcome::Refused {
+                    reason: Refusal::Unsupported {
+                        protocol: PROTOCOL + 1,
+                    },
+                },
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn create_seeds_a_granted_checkout_and_refuses_every_other() {
+        let mut bench = Bench::start("create", None).await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        let created = bench
+            .asked(&Command::Create {
+                request: request(1),
+                session,
+                goal: GOAL.to_owned(),
+                checkout: checkout.clone(),
+            })
+            .await;
+
+        assert_eq!(created, accepted(request(1), session));
+
+        let seeded = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::Seeded { .. })
+            })
+            .await;
+        let SessionEvent::Seeded {
+            session: seeded_session,
+            task,
+        } = seeded
+        else {
+            unreachable!("the predicate selected a seed");
+        };
+
+        assert_eq!(seeded_session, session);
+        assert_eq!(task.task.goal, GOAL);
+        assert_eq!(task.task.setting.checkout, checkout);
+
+        let outside = bench.scratch.0.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let refused = bench
+            .asked(&Command::Create {
+                request: request(2),
+                session: session_of(2),
+                goal: GOAL.to_owned(),
+                checkout: outside.clone(),
+            })
+            .await;
+
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::CheckoutUngranted { checkout: outside },
+        );
+
+        let missing = checkout.join("missing");
+        let refused = bench
+            .asked(&Command::Create {
+                request: request(3),
+                session: session_of(3),
+                goal: GOAL.to_owned(),
+                checkout: missing.clone(),
+            })
+            .await;
+
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::CheckoutUngranted { checkout: missing },
+        );
+
+        for (seed, goal) in [(4, String::new()), (5, "  \n\t".to_owned())] {
+            let refused = bench
+                .asked(&Command::Create {
+                    request: request(seed),
+                    session: session_of(seed),
+                    goal,
+                    checkout: checkout.clone(),
+                })
+                .await;
+
+            assert_eq!(
+                refused_reason(&refused),
+                &Refusal::Malformed {
+                    detail: "the goal is empty".to_owned(),
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_holds_a_goal_at_the_speech_ceiling() {
+        let mut bench = Bench::start("create-ceiling", None).await;
+        let checkout = bench.scratch.checkout();
+
+        let at_ceiling = bench
+            .asked(&Command::Create {
+                request: request(1),
+                session: session_of(1),
+                goal: "a".repeat(MAX_SPEECH_BYTES),
+                checkout: checkout.clone(),
+            })
+            .await;
+
+        assert_eq!(at_ceiling, accepted(request(1), session_of(1)));
+
+        let refused = bench
+            .asked(&Command::Create {
+                request: request(2),
+                session: session_of(2),
+                goal: "a".repeat(MAX_SPEECH_BYTES + 1),
+                checkout,
+            })
+            .await;
+
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::TooMuch {
+                limit: MAX_SPEECH_BYTES,
+                found: MAX_SPEECH_BYTES + 1,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_created_session_takes_its_goal_twice_and_refuses_a_different_one() {
+        let mut bench = Bench::start("create-goal", None).await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        for (seed, goal) in [(1, GOAL), (2, GOAL)] {
+            let reply = bench
+                .asked(&Command::Create {
+                    request: request(seed),
+                    session,
+                    goal: goal.to_owned(),
+                    checkout: checkout.clone(),
+                })
+                .await;
+
+            assert_eq!(reply, accepted(request(seed), session));
+        }
+
+        let refused = bench
+            .asked(&Command::Create {
+                request: request(3),
+                session,
+                goal: OTHER_GOAL.to_owned(),
+                checkout,
+            })
+            .await;
+
+        assert_eq!(refused_reason(&refused), &Refusal::GoalDiffers { session },);
+    }
+
+    #[tokio::test]
+    async fn a_committed_task_accepts_its_own_goal_and_refuses_another() {
+        let mut bench = Bench::start(
+            "task-goal",
+            Some(&[json!({"action": "final", "say": "done"})]),
+        )
+        .await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout: checkout.clone(),
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "hello".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+        bench.progress(session, "done").await;
+
+        let same = bench
+            .asked(&Command::Create {
+                request: request(3),
+                session,
+                goal: GOAL.to_owned(),
+                checkout: checkout.clone(),
+            })
+            .await;
+
+        assert_eq!(same, accepted(request(3), session));
+
+        let refused = bench
+            .asked(&Command::Create {
+                request: request(4),
+                session,
+                goal: OTHER_GOAL.to_owned(),
+                checkout,
+            })
+            .await;
+
+        assert_eq!(refused_reason(&refused), &Refusal::GoalDiffers { session },);
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_session_that_holds_facts_without_a_task() {
+        let mut bench = Bench::start("facts-only", None).await;
+        let session = session_of(7);
+        seed_facts(&bench.config, session);
+
+        let refused = bench
+            .asked(&Command::Create {
+                request: request(1),
+                session,
+                goal: GOAL.to_owned(),
+                checkout: bench.scratch.checkout(),
+            })
+            .await;
+
+        assert_eq!(refused_reason(&refused), &Refusal::Untasked { session });
+    }
+
+    #[tokio::test]
+    async fn open_reaches_a_created_session_without_opening_a_driver() {
+        let mut bench = Bench::start("open", None).await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Open {
+                    request: request(2),
+                    session,
+                })
+                .await,
+            accepted(request(2), session),
+        );
+
+        // Speak is the first command that owes a driver, and the absent script is what makes the
+        // difference between opening one here and not opening one at all visible.
+        let refused = bench
+            .asked(&Command::Speak {
+                request: request(3),
+                session,
+                line: "hello".to_owned(),
+            })
+            .await;
+
+        assert!(
+            matches!(refused_reason(&refused), Refusal::Unavailable { .. }),
+            "{refused:?}",
+        );
+
+        let unknown = session_of(2);
+        let refused = bench
+            .asked(&Command::Open {
+                request: request(4),
+                session: unknown,
+            })
+            .await;
+
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::UnknownSession { session: unknown },
+        );
+    }
+
+    #[tokio::test]
+    async fn speak_refuses_an_empty_line_and_a_line_past_the_ceiling() {
+        let mut bench = Bench::start("speak-bounds", None).await;
+        let session = session_of(9);
+
+        for (seed, line) in [(1, String::new()), (2, " \t\n".to_owned())] {
+            let refused = bench
+                .asked(&Command::Speak {
+                    request: request(seed),
+                    session,
+                    line,
+                })
+                .await;
+
+            assert_eq!(
+                refused_reason(&refused),
+                &Refusal::Malformed {
+                    detail: "an empty line opens no turn".to_owned(),
+                },
+            );
+        }
+
+        let at_ceiling = bench
+            .asked(&Command::Speak {
+                request: request(3),
+                session,
+                line: "a".repeat(MAX_SPEECH_BYTES),
+            })
+            .await;
+
+        assert_eq!(
+            refused_reason(&at_ceiling),
+            &Refusal::UnknownSession { session },
+        );
+
+        let refused = bench
+            .asked(&Command::Speak {
+                request: request(4),
+                session,
+                line: "a".repeat(MAX_SPEECH_BYTES + 1),
+            })
+            .await;
+
+        assert_eq!(
+            refused_reason(&refused),
+            &Refusal::TooMuch {
+                limit: MAX_SPEECH_BYTES,
+                found: MAX_SPEECH_BYTES + 1,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spoken_line_commits_a_turn_and_the_next_line_opens_another() {
+        let mut bench = Bench::start(
+            "speak",
+            Some(&[
+                json!({"action": "find", "query": "quokka", "say": "looking"}),
+                json!({"action": "final", "say": "done"}),
+            ]),
+        )
+        .await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "hello".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+
+        bench.progress(session, "looking").await;
+        assert_eq!(
+            bench.roster_turns(session, 1).await.phase,
+            Phase::Accepting,
+            "the first line settled and the session waits for another",
+        );
+
+        bench.publish_pending().await;
+
+        let find = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::Commit(commit)
+                    if commit.records.iter().any(|record| matches!(record, Record::Find(_))))
+            })
+            .await;
+        let SessionEvent::Commit(find) = find else {
+            unreachable!("the predicate selected a commit");
+        };
+
+        assert_eq!(find.session, session);
+        assert!(
+            find.records
+                .iter()
+                .any(|record| matches!(record, Record::Find(_))),
+            "{:?}",
+            find.records,
+        );
+
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(3),
+                    session,
+                    line: "again".to_owned(),
+                })
+                .await,
+            accepted(request(3), session),
+        );
+
+        bench.progress(session, "done").await;
+        assert_eq!(
+            bench.roster_turns(session, 2).await.phase,
+            Phase::Accepting,
+            "the second line opened another turn",
+        );
+        bench.publish_pending().await;
+
+        let answer = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::Commit(commit)
+                    if commit.records.iter().any(|record| matches!(record, Record::Answer(_))))
+            })
+            .await;
+        let SessionEvent::Commit(answer) = answer else {
+            unreachable!("the predicate selected a commit");
+        };
+
+        assert_eq!(answer.session, session);
+
+        let log = bench.log(session);
+
+        assert_eq!(
+            log.ordered
+                .iter()
+                .filter(|record| matches!(record, Record::Speech(_)))
+                .count(),
+            2,
+            "each line is its own speech record: {:?}",
+            log.ordered,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_refuses_a_line_once_it_is_opened() {
+        let mut bench = Bench::start("closed", Some(&[json!({"action": "final"})])).await;
+        let session = session_of(1);
+        seed_closed(&bench.config, &bench.scratch, session);
+
+        assert_eq!(
+            bench
+                .asked(&Command::Open {
+                    request: request(1),
+                    session,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+
+        let refused = bench
+            .asked(&Command::Speak {
+                request: request(2),
+                session,
+                line: "again".to_owned(),
+            })
+            .await;
+
+        assert_eq!(refused_reason(&refused), &Refusal::Closed { session });
+    }
+
+    #[tokio::test]
+    async fn history_refuses_an_unknown_session_and_seeds_a_created_one() {
+        let mut bench = Bench::start("history", None).await;
+        let unknown = session_of(2);
+
+        bench
+            .send(&Command::History {
+                request: request(1),
+                session: unknown,
+            })
+            .await;
+
+        let refused = bench
+            .session_event(session_topic(unknown), |event| {
+                matches!(event, SessionEvent::HistoryRefused { .. })
+            })
+            .await;
+
+        assert_eq!(
+            refused,
+            SessionEvent::HistoryRefused {
+                request: request(1),
+                session: unknown,
+                reason: Refusal::UnknownSession { session: unknown },
+            },
+        );
+
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(2),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(2), session),
+        );
+
+        let seeded = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::Seeded { .. })
+            })
+            .await;
+        let SessionEvent::Seeded { task, .. } = seeded else {
+            unreachable!("the predicate selected a seed");
+        };
+
+        bench
+            .send(&Command::History {
+                request: request(3),
+                session,
+            })
+            .await;
+
+        let history = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::History(_))
+            })
+            .await;
+        let SessionEvent::History(chunk) = history else {
+            unreachable!("the predicate selected a history chunk");
+        };
+
+        assert_eq!(chunk.request, request(3));
+        assert_eq!(chunk.session, session);
+        assert_eq!(chunk.seed, Some(task));
+        assert!(chunk.records.is_empty(), "{:?}", chunk.records);
+        assert!(chunk.last);
+    }
+
+    #[tokio::test]
+    async fn history_answers_the_records_a_session_committed() {
+        let mut bench = Bench::start(
+            "history-records",
+            Some(&[json!({"action": "final", "say": "done"})]),
+        )
+        .await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "hello".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+        bench.progress(session, "done").await;
+
+        bench
+            .send(&Command::History {
+                request: request(3),
+                session,
+            })
+            .await;
+
+        let history = bench
+            .session_event(session_topic(session), |event| {
+                matches!(event, SessionEvent::History(_))
+            })
+            .await;
+        let SessionEvent::History(chunk) = history else {
+            unreachable!("the predicate selected a history chunk");
+        };
+
+        assert!(
+            chunk
+                .records
+                .iter()
+                .any(|record| matches!(record, Record::Task(_))),
+            "{:?}",
+            chunk.records,
+        );
+        assert!(
+            chunk
+                .records
+                .iter()
+                .any(|record| matches!(record, Record::Speech(_))),
+            "{:?}",
+            chunk.records,
+        );
+    }
+
+    #[tokio::test]
+    async fn list_names_a_created_session_once_after_its_task_commits() {
+        let mut bench = Bench::start(
+            "list-created",
+            Some(&[json!({"action": "final", "say": "done"})]),
+        )
+        .await;
+        let session = session_of(1);
+        let other = session_of(2);
+        let checkout = bench.scratch.checkout();
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout,
+                })
+                .await,
+            accepted(request(1), session),
+        );
+        assert_eq!(
+            bench
+                .asked(&Command::Speak {
+                    request: request(2),
+                    session,
+                    line: "hello".to_owned(),
+                })
+                .await,
+            accepted(request(2), session),
+        );
+        bench.progress(session, "done").await;
+        seed_facts(&bench.config, other);
+
+        let before = bench.latest_roster(|_| true).await.revision;
+
+        bench
+            .send(&Command::List {
+                request: request(3),
+            })
+            .await;
+
+        let listed = bench
+            .roster_chunk(|chunk| {
+                chunk.revision > before
+                    && chunk.entries.iter().any(|entry| entry.session == session)
+            })
+            .await;
+
+        assert_eq!(
+            listed
+                .entries
+                .iter()
+                .filter(|entry| entry.session == session)
+                .count(),
+            1,
+            "the session the log already lists is not added again: {:?}",
+            listed.entries,
+        );
+    }
+
+    #[tokio::test]
+    async fn list_reports_a_created_session_before_its_first_record() {
+        let mut bench = Bench::start("list", None).await;
+        let session = session_of(1);
+        let checkout = bench.scratch.checkout();
+        seed_facts(&bench.config, session_of(2));
+
+        assert_eq!(
+            bench
+                .asked(&Command::Create {
+                    request: request(1),
+                    session,
+                    goal: GOAL.to_owned(),
+                    checkout: checkout.clone(),
+                })
+                .await,
+            accepted(request(1), session),
+        );
+
+        let created = bench
+            .roster_chunk(|chunk| chunk.entries.iter().any(|entry| entry.session == session))
+            .await;
+
+        assert_eq!(created.daemon, bench.daemon);
+
+        let entry = created
+            .entries
+            .into_iter()
+            .find(|entry| entry.session == session)
+            .unwrap();
+
+        assert_eq!(entry.phase, Phase::Unopened);
+        assert_eq!(entry.goal.as_deref(), Some(GOAL));
+        assert_eq!(entry.checkout.as_deref(), Some(checkout.as_path()));
+        assert_eq!(entry.turns, 0);
+
+        bench
+            .send(&Command::List {
+                request: request(2),
+            })
+            .await;
+
+        let listed = bench
+            .roster_chunk(|chunk| chunk.revision > created.revision)
+            .await;
+
+        assert!(
+            listed
+                .entries
+                .iter()
+                .any(|entry| entry.session == session && entry.phase == Phase::Unopened),
+            "{:?}",
+            listed.entries,
+        );
+    }
+}
