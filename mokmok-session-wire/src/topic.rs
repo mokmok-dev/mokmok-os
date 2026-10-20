@@ -91,6 +91,20 @@ mod tests {
     }
 
     #[test]
+    fn a_session_checkpoint_is_stable_for_the_same_process_and_session() {
+        let nonce = Uuid::from_u128(1);
+
+        assert_eq!(
+            session_subscriber(nonce, session(3)),
+            session_subscriber(nonce, session(3)),
+        );
+        assert_eq!(
+            session_subscriber(nonce, session(4)),
+            session_subscriber(nonce, session(4)),
+        );
+    }
+
+    #[test]
     fn a_daemon_view_is_scoped_by_process_and_daemon() {
         let agent = mokmok_protocol::AgentID::from_uuid(Uuid::from_u128(9));
 

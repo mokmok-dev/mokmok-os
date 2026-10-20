@@ -169,13 +169,14 @@ fn refuse_oversized<T: serde::Serialize + ?Sized>(value: &T) -> Result<(), Chunk
 mod tests {
     use std::path::PathBuf;
 
-    use mokmok_agent_runtime::Record;
+    use mokmok_agent_runtime::{Budget, Record, Setting, Task, TaskRecord};
+    use mokmok_event_store::Payload;
     use mokmok_protocol::{AgentID, CommandID, SessionID};
     use mokmok_state_machine::{Ending, Phase};
     use uuid::Uuid;
 
-    use super::{HISTORY_BYTES, history_chunks, roster_chunks};
-    use crate::{DaemonEvent, RosterEntry, SessionEvent};
+    use super::{ChunkError, HISTORY_BYTES, ROSTER_BYTES, history_chunks, roster_chunks};
+    use crate::{DaemonEvent, HistoryChunk, RosterEntry, SessionEvent};
 
     fn session() -> SessionID {
         SessionID::from_uuid(Uuid::from_u128(1))
@@ -194,6 +195,54 @@ mod tests {
             turn: mokmok_protocol::TurnID::from_uuid(Uuid::from_u128(4)),
             text: text.to_owned(),
         })
+    }
+
+    fn speech_of_size(bytes: usize) -> Record {
+        let empty = Payload::json(&speech("")).unwrap().as_str().len();
+
+        speech(&"x".repeat(bytes - empty))
+    }
+
+    fn entry_of_size(
+        index: u64,
+        bytes: usize,
+    ) -> RosterEntry {
+        let base = RosterEntry {
+            session: SessionID::from_uuid(Uuid::from_u128(100 + u128::from(index))),
+            phase: Phase::Closed(Ending::Completed),
+            goal: Some(String::new()),
+            checkout: None,
+            turns: index,
+        };
+        let empty = Payload::json(&base).unwrap().as_str().len();
+
+        RosterEntry {
+            goal: Some("x".repeat(bytes - empty)),
+            ..base
+        }
+    }
+
+    fn task() -> TaskRecord {
+        TaskRecord {
+            task: Task {
+                goal: "hold a conversation".to_owned(),
+                setting: Setting {
+                    checkout: "/checkout".into(),
+                    readable: Vec::new(),
+                    writable: Vec::new(),
+                    program: "/bin/sh".into(),
+                    deadline: std::time::Duration::from_secs(120),
+                    search: Vec::new(),
+                    skills: Vec::new(),
+                    delegate: false,
+                },
+                budget: Budget::default(),
+            },
+        }
+    }
+
+    fn record_bytes(record: &Record) -> usize {
+        Payload::json(record).unwrap().as_str().len()
     }
 
     #[test]
@@ -270,5 +319,181 @@ mod tests {
             seen += chunk.entries.len();
         }
         assert_eq!(seen, 60);
+    }
+
+    #[test]
+    fn history_fills_each_chunk_to_its_ceiling_and_seeds_only_the_last() {
+        let records: Vec<Record> = (0..9).map(|_| speech_of_size(64 * 1024)).collect();
+        let seed = task();
+
+        let chunks =
+            history_chunks(session(), request(), Some(seed.clone()), records.clone()).unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        let mut collected = Vec::new();
+        let mut held = Vec::new();
+        for (index, event) in chunks.iter().enumerate() {
+            let SessionEvent::History(chunk) = event else {
+                panic!("a history request answers a history chunk");
+            };
+            assert_eq!(chunk.request, request());
+            assert_eq!(chunk.session, session());
+            assert_eq!(chunk.index, u32::try_from(index).unwrap());
+            assert_eq!(chunk.last, index + 1 == chunks.len());
+            held.push(chunk.records.len());
+            collected.extend(chunk.records.iter().cloned());
+            if chunk.last {
+                assert_eq!(chunk.seed.as_ref(), Some(&seed));
+            } else {
+                assert!(chunk.seed.is_none());
+            }
+        }
+        assert_eq!(held, [4, 4, 1]);
+        assert_eq!(collected, records);
+        assert_eq!(
+            [0, 1]
+                .iter()
+                .map(|index| {
+                    let SessionEvent::History(chunk) = &chunks[*index] else {
+                        panic!("a history request answers a history chunk");
+                    };
+                    chunk.records.iter().map(record_bytes).sum::<usize>()
+                })
+                .collect::<Vec<_>>(),
+            [HISTORY_BYTES, HISTORY_BYTES],
+        );
+    }
+
+    #[test]
+    fn history_keeps_a_record_bigger_than_a_chunk_in_one_chunk() {
+        let record = speech_of_size(HISTORY_BYTES + 4096);
+
+        let chunks = history_chunks(session(), request(), None, vec![record.clone()]).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        let SessionEvent::History(chunk) = &chunks[0] else {
+            panic!("a history request answers a history chunk");
+        };
+        assert_eq!(chunk.index, 0);
+        assert!(chunk.last);
+        assert_eq!(chunk.records, vec![record]);
+    }
+
+    #[test]
+    fn history_refuses_a_record_that_exceeds_the_bus_frame() {
+        let record = speech_of_size(1024 * 1024 + 4096);
+
+        let error = history_chunks(session(), request(), None, vec![record]).unwrap_err();
+
+        match error {
+            ChunkError::RecordTooLarge { limit, found } => {
+                assert_eq!(limit, 1024 * 1024);
+                assert!(found > limit, "{found}");
+            },
+            other @ ChunkError::Payload(_) => {
+                panic!("an oversized record is refused, not {other:?}");
+            },
+        }
+    }
+
+    #[test]
+    fn a_history_payload_exactly_at_the_frame_ceiling_is_published() {
+        let ceiling = 1024 * 1024;
+        let probe = speech_of_size(ceiling);
+        let payload = |record: &Record| {
+            Payload::json(&SessionEvent::History(HistoryChunk {
+                request: request(),
+                session: session(),
+                index: 0,
+                last: true,
+                seed: None,
+                records: vec![record.clone()],
+            }))
+            .unwrap()
+            .as_str()
+            .len()
+        };
+        let overhead = payload(&probe) - record_bytes(&probe);
+        let record = speech_of_size(ceiling - overhead);
+        assert_eq!(payload(&record), ceiling);
+
+        let chunks = history_chunks(session(), request(), None, vec![record]).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(Payload::json(&chunks[0]).unwrap().as_str().len(), ceiling);
+    }
+
+    #[test]
+    fn roster_fills_each_chunk_to_its_ceiling_and_marks_only_the_last() {
+        let entries: Vec<RosterEntry> = (0..9)
+            .map(|index| entry_of_size(index, 64 * 1024))
+            .collect();
+
+        let chunks = roster_chunks(agent(), 7, entries.clone()).unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        let mut seen = Vec::new();
+        let mut held = Vec::new();
+        for (index, event) in chunks.iter().enumerate() {
+            let DaemonEvent::Roster(chunk) = event else {
+                panic!("a roster request answers a roster chunk");
+            };
+            assert_eq!(chunk.daemon, agent());
+            assert_eq!(chunk.revision, 7);
+            assert_eq!(chunk.index, u32::try_from(index).unwrap());
+            assert_eq!(chunk.last, index + 1 == chunks.len());
+            held.push(chunk.entries.len());
+            seen.extend(chunk.entries.iter().cloned());
+        }
+        assert_eq!(held, [4, 4, 1]);
+        assert_eq!(seen, entries);
+        assert_eq!(
+            [0, 1]
+                .iter()
+                .map(|index| {
+                    let DaemonEvent::Roster(chunk) = &chunks[*index] else {
+                        panic!("a roster request answers a roster chunk");
+                    };
+                    chunk
+                        .entries
+                        .iter()
+                        .map(|entry| Payload::json(entry).unwrap().as_str().len())
+                        .sum::<usize>()
+                })
+                .collect::<Vec<_>>(),
+            [ROSTER_BYTES, ROSTER_BYTES],
+        );
+    }
+
+    #[test]
+    fn roster_refuses_an_entry_that_exceeds_the_bus_frame() {
+        let entry = entry_of_size(0, 1024 * 1024 + 4096);
+
+        let error = roster_chunks(agent(), 7, vec![entry]).unwrap_err();
+
+        match error {
+            ChunkError::RecordTooLarge { limit, found } => {
+                assert_eq!(limit, 1024 * 1024);
+                assert!(found > limit, "{found}");
+            },
+            other @ ChunkError::Payload(_) => {
+                panic!("an oversized entry is refused, not {other:?}");
+            },
+        }
+    }
+
+    #[test]
+    fn roster_keeps_an_entry_bigger_than_a_chunk_in_one_chunk() {
+        let entry = entry_of_size(0, ROSTER_BYTES + 4096);
+
+        let chunks = roster_chunks(agent(), 7, vec![entry.clone()]).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        let DaemonEvent::Roster(chunk) = &chunks[0] else {
+            panic!("a roster request answers a roster chunk");
+        };
+        assert_eq!(chunk.index, 0);
+        assert!(chunk.last);
+        assert_eq!(chunk.entries, vec![entry]);
     }
 }
