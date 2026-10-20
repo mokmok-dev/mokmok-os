@@ -1495,6 +1495,25 @@ mod tests {
                 },
             },
         );
+
+        // The version before `Cancel` was added. A daemon that answered it would accept the
+        // handshake and then meet a command it cannot decode, so it is refused here instead.
+        let previous = bench
+            .asked(&Command::Hello {
+                request: request(3),
+                protocol: 1,
+            })
+            .await;
+
+        assert_eq!(
+            previous,
+            Reply::Ack {
+                request: request(3),
+                outcome: Outcome::Refused {
+                    reason: Refusal::Unsupported { protocol: 1 },
+                },
+            },
+        );
     }
 
     #[tokio::test]

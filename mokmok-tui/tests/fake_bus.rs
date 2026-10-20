@@ -223,6 +223,8 @@ mod tests {
     struct Fake {
         socket: PathBuf,
         behaviour: Arc<Mutex<Behaviour>>,
+        /// The protocol the client named in its `Hello`, for a case that pins the wire version.
+        hello: Arc<Mutex<Option<u16>>>,
         stop: Option<tokio::sync::oneshot::Sender<()>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -250,10 +252,12 @@ mod tests {
                 NonZeroUsize::new(connections).expect("the case asks for a connection");
             let behaviour = Arc::new(Mutex::new(behaviour));
             let revision = Arc::new(AtomicU64::new(0));
+            let hello: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let served_socket = socket.clone();
             let daemon_behaviour = Arc::clone(&behaviour);
             let daemon_revision = Arc::clone(&revision);
+            let daemon_hello = Arc::clone(&hello);
             let thread = std::thread::Builder::new()
                 .name("fake-daemon".to_owned())
                 .spawn(move || {
@@ -265,7 +269,12 @@ mod tests {
                         // The server owns this runtime's only blocking await. A daemon that answered
                         // inside the same `select!` could win the race and leave a parked connection
                         // open, which is exactly the state the reconnect case is about.
-                        tokio::spawn(respond(served_socket, daemon_behaviour, daemon_revision));
+                        tokio::spawn(respond(
+                            served_socket,
+                            daemon_behaviour,
+                            daemon_revision,
+                            daemon_hello,
+                        ));
                         let _ = serve(config, async move {
                             let _ = stopped.await;
                         })
@@ -279,9 +288,15 @@ mod tests {
             Self {
                 socket,
                 behaviour,
+                hello,
                 stop: Some(stop),
                 thread: Some(thread),
             }
+        }
+
+        /// The protocol the client named in its `Hello`, once it has named one.
+        fn hello(&self) -> Option<u16> {
+            *self.hello.lock().expect("the hello is readable")
         }
 
         fn set_roster(
@@ -351,6 +366,7 @@ mod tests {
         socket: PathBuf,
         behaviour: Arc<Mutex<Behaviour>>,
         revision: Arc<AtomicU64>,
+        hello: Arc<Mutex<Option<u16>>>,
     ) {
         let Some(client) = connect(&socket).await else {
             return;
@@ -368,7 +384,7 @@ mod tests {
                     continue;
                 };
                 let behaviour = behaviour.lock().expect("the behaviour is readable").clone();
-                handle(&client, &behaviour, &revision, command).await;
+                handle(&client, &behaviour, &revision, &hello, command).await;
             }
             if commands.ack(batch.after()).await.is_err() {
                 return;
@@ -380,10 +396,15 @@ mod tests {
         client: &Client,
         behaviour: &Behaviour,
         revision: &AtomicU64,
+        hello_protocol: &Mutex<Option<u16>>,
         command: WireCommand,
     ) {
         match command {
-            WireCommand::Hello { request: hello, .. } => {
+            WireCommand::Hello {
+                request: hello,
+                protocol,
+            } => {
+                *hello_protocol.lock().expect("the hello is writable") = Some(protocol);
                 if behaviour.refusal_distractor {
                     send(
                         client,
@@ -809,6 +830,19 @@ mod tests {
             },
             other => panic!("the refusal names the protocol: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_client_names_the_wire_version_that_covers_the_cancel_command() {
+        let scratch = Scratch::new("hello-version");
+        let (fake, roster) = attached(&scratch, Behaviour::default());
+        roster.expect("the handshake answers");
+
+        assert_eq!(
+            fake.hello(),
+            Some(2),
+            "the terminal names the version a daemon must speak to take its cancel",
+        );
     }
 
     #[test]

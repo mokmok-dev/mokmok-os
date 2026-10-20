@@ -24,7 +24,10 @@ pub use topic::{session_subscriber, session_topic};
 
 /// The wire version both ends must name. A daemon answers a newer client with
 /// [`Refusal::Unsupported`] rather than guessing at a shape it does not know.
-pub const PROTOCOL: u16 = 1;
+///
+/// Version 2 adds [`Command::Cancel`]. A daemon that answers version 1 cannot decode it, so the
+/// handshake refuses the other end instead of leaving it to fail later on a command it never named.
+pub const PROTOCOL: u16 = 2;
 
 /// A client's intent, published on [`command_topic`].
 ///
