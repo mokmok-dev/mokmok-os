@@ -17,6 +17,7 @@ mod db;
 mod editor;
 mod error;
 mod execution;
+mod host;
 mod index;
 mod notify;
 mod provider;

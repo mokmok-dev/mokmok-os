@@ -283,6 +283,9 @@ pub enum Command {
         /// Relay what is pending and exit, instead of serving until interrupted.
         #[arg(long)]
         once: bool,
+        /// The budgets every session the daemon drives runs under.
+        #[command(flatten)]
+        defaults: SessionDefaults,
     },
     /// Drive a session with a model, one bounded step at a time.
     #[command(subcommand)]
@@ -300,6 +303,60 @@ pub enum Agent {
         #[arg(long)]
         session: String,
     },
+}
+
+/// The budgets a daemon gives every session it drives.
+///
+/// A client names a goal, a checkout, and a line; it never names a budget. These are the operator's
+/// flags on `mokmokd serve`, and a session built from them inherits exactly what the command line
+/// stated.
+#[derive(Clone, Debug, clap::Args)]
+pub struct SessionDefaults {
+    /// How many turns one session may open.
+    #[arg(long, default_value_t = 8)]
+    pub max_turns: u32,
+    /// How many tokens one session may spend; zero means unbounded.
+    #[arg(long, default_value_t = 400_000)]
+    pub token_budget: u64,
+    /// How many bytes of context the model is shown in total; zero means unbounded.
+    #[arg(long, default_value_t = 131_072)]
+    pub context_bytes: u64,
+    /// How many bytes of one observation the model is shown; zero means unbounded.
+    #[arg(long, default_value_t = 4096)]
+    pub observation_bytes: u64,
+    /// How many settled turns the model is shown; zero means all of them.
+    #[arg(long, default_value_t = 16)]
+    pub context_turns: u32,
+    /// Seconds one command may run before the sandbox stops it.
+    #[arg(long, default_value_t = 120)]
+    pub tool_deadline_seconds: u64,
+    /// How many steps one dispatched turn performs before it yields.
+    #[arg(long, default_value_t = 64)]
+    pub steps: usize,
+}
+
+impl SessionDefaults {
+    /// The run one session is opened under.
+    #[must_use]
+    pub fn run(
+        &self,
+        session: String,
+        goal: String,
+        checkout: PathBuf,
+    ) -> Run {
+        Run {
+            session,
+            goal,
+            checkout,
+            max_turns: self.max_turns,
+            token_budget: self.token_budget,
+            context_bytes: self.context_bytes,
+            observation_bytes: self.observation_bytes,
+            context_turns: self.context_turns,
+            tool_deadline_seconds: self.tool_deadline_seconds,
+            steps: self.steps,
+        }
+    }
 }
 
 /// One `agent run`.

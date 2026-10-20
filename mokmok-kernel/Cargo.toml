@@ -18,6 +18,7 @@ mokmok-event-store = { workspace = true }
 mokmok-observability = { workspace = true }
 mokmok-patch = { workspace = true }
 mokmok-protocol = { workspace = true }
+mokmok-session-wire = { workspace = true }
 mokmok-sandbox = { workspace = true }
 mokmok-scheduler = { workspace = true }
 mokmok-search = { workspace = true }

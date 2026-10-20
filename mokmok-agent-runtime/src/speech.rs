@@ -1,6 +1,6 @@
 //! Committing one human line as the input of the session's next turn.
 
-use mokmok_protocol::SessionID;
+use mokmok_protocol::{CommandID, SessionID};
 use mokmok_state_machine::{Fact, TurnFact, TurnNumber};
 
 use crate::advance::{Move, next, turn_id};
@@ -28,6 +28,33 @@ pub fn speak(
     session: SessionID,
     text: &str,
 ) -> Result<Receipt, Error> {
+    write(journal, session, text, None)
+}
+
+/// Commits one human line under a bus request's identity.
+///
+/// The request derives the step id, so a redelivered command whose write already committed answers
+/// [`Receipt::Replayed`] instead of opening the turn after it. The check is against the journal,
+/// not a process-local set, so it survives a daemon restart.
+///
+/// # Errors
+///
+/// The same errors as [`speak`].
+pub fn speak_as(
+    journal: &mut impl Journal,
+    session: SessionID,
+    text: &str,
+    request: CommandID,
+) -> Result<Receipt, Error> {
+    write(journal, session, text, Some(request))
+}
+
+fn write(
+    journal: &mut impl Journal,
+    session: SessionID,
+    text: &str,
+    request: Option<CommandID>,
+) -> Result<Receipt, Error> {
     if text.len() > MAX_SPEECH_BYTES {
         return Err(Error::TooMuch {
             limit: MAX_SPEECH_BYTES,
@@ -35,11 +62,18 @@ pub fn speak(
         });
     }
 
+    let requested = request.map(|request| StepId::derive(session, StepKey::SpeechBy { request }));
+    if let Some(id) = requested
+        && journal.committed(id)?
+    {
+        return Ok(Receipt::Replayed);
+    }
+
     let transcript = journal.transcript(session)?;
 
     let step = match next(&transcript) {
-        Move::Begin { task } => open_step(session, &task, text),
-        Move::Await => extend_step(session, &transcript, text),
+        Move::Begin { task } => open_step(session, &task, text, requested),
+        Move::Await => extend_step(session, &transcript, text, requested),
         _ => return Err(Error::NotAwaiting),
     };
 
@@ -50,6 +84,7 @@ fn open_step(
     session: SessionID,
     task: &Task,
     text: &str,
+    requested: Option<StepId>,
 ) -> Step {
     let turn = turn_id(session, 1);
     let records = vec![
@@ -69,13 +104,16 @@ fn open_step(
         }),
     ];
 
-    Step::new(StepId::derive(session, StepKey::Task), session, records)
+    let id = requested.unwrap_or_else(|| StepId::derive(session, StepKey::Task));
+
+    Step::new(id, session, records)
 }
 
 fn extend_step(
     session: SessionID,
     transcript: &crate::dialogue::Transcript,
     text: &str,
+    requested: Option<StepId>,
 ) -> Step {
     let number = transcript
         .newest_turn()
@@ -95,21 +133,21 @@ fn extend_step(
         }),
     ];
 
-    Step::new(
-        StepId::derive(session, StepKey::Speech { turn: number }),
-        session,
-        records,
-    )
+    let id = requested.unwrap_or_else(|| StepId::derive(session, StepKey::Speech { turn: number }));
+
+    Step::new(id, session, records)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SPEECH_BYTES, speak};
+    use super::{MAX_SPEECH_BYTES, speak, speak_as};
     use crate::error::Error;
     use crate::model::Journal;
     use crate::record::Receipt;
     use crate::test_support::{TestJournal, session, task, turn_id};
+    use mokmok_protocol::CommandID;
     use proptest::prelude::*;
+    use uuid::Uuid;
 
     /// Lines spread across the bound and lines exactly on it, so a case lands where an off-by-one shows.
     fn arb_line() -> impl Strategy<Value = String> {
@@ -142,6 +180,22 @@ mod tests {
             matches!(refused, Error::TooMuch { limit, found }
                 if limit == MAX_SPEECH_BYTES && found == MAX_SPEECH_BYTES + 1),
             "{refused}",
+        );
+    }
+
+    #[test]
+    fn a_request_that_already_committed_replays_instead_of_opening_a_second_turn() {
+        let session = session();
+        let mut journal = TestJournal::new(session, task(4));
+        let request = CommandID::from_uuid(Uuid::from_u128(9));
+
+        assert_eq!(
+            speak_as(&mut journal, session, "hello", request).unwrap(),
+            Receipt::Written,
+        );
+        assert_eq!(
+            speak_as(&mut journal, session, "hello", request).unwrap(),
+            Receipt::Replayed,
         );
     }
 

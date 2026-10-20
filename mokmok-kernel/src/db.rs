@@ -311,6 +311,18 @@ impl Db {
             .version())
     }
 
+    /// Whether the log already holds this command, which makes a redelivered command a replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Store`] when the dedup row cannot be read.
+    pub fn committed(
+        &self,
+        command: CommandId,
+    ) -> Result<bool, Error> {
+        self.store.committed(command).map_err(Error::Store)
+    }
+
     /// Appends one step: the entries in order, and the notifications to publish once the
     /// transaction has committed.
     ///

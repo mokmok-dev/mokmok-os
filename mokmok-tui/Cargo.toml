@@ -9,20 +9,22 @@ purity = "shell"
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 mokmok-agent-runtime = { workspace = true }
-mokmok-kernel = { workspace = true }
+mokmok-event-bus = { workspace = true }
 mokmok-protocol = { workspace = true }
+mokmok-session-wire = { workspace = true }
 mokmok-state-machine = { workspace = true }
 ratatui = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 unicode-width = { workspace = true }
+uuid = { workspace = true, features = ["std", "v4", "v7"] }
 
 [dev-dependencies]
 mokmok-artifact = { workspace = true }
 nix = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

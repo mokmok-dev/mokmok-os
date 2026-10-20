@@ -6,7 +6,7 @@ use mokmok_skill::SkillName;
 use crate::context::Context;
 use crate::dialogue::Transcript;
 use crate::error::Error;
-use crate::record::{ArtifactRef, Receipt, Step};
+use crate::record::{ArtifactRef, Receipt, Step, StepId};
 
 /// What the model answered one attempt with.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -125,6 +125,22 @@ pub trait Journal {
         bytes: &[u8],
         truncated: bool,
     ) -> Result<ArtifactRef, Error>;
+
+    /// Whether the journal already holds the step with `id`.
+    ///
+    /// A command stream delivers at least once. A line that arrives twice asks this before it
+    /// derives a new step, so a redelivery replays its own write instead of opening the next turn.
+    /// A journal with no dedup answers false, which is the shape a test journal starts from.
+    ///
+    /// # Errors
+    ///
+    /// Returns a journal failure when the dedup row cannot be read.
+    fn committed(
+        &self,
+        _id: StepId,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
 
     /// Commits every record of one step in order, or none of them.
     ///

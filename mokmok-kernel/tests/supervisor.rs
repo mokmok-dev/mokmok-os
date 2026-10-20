@@ -20,7 +20,8 @@ mod tests {
     use mokmok_event_bus::{Client, SubscriberId, Topic};
     use mokmok_event_store::{CommandId, Expected};
     use mokmok_kernel::{Db, Entry, Notice};
-    use mokmok_protocol::{Moment, SessionID};
+    use mokmok_protocol::{CommandID, Moment, SessionID};
+    use mokmok_session_wire::SessionCommit;
     use mokmok_state_machine::{Fact, Resolution};
     use uuid::Uuid;
 
@@ -96,13 +97,16 @@ mod tests {
 
         for index in first..first + count {
             let command = CommandId::from_uuid(Uuid::from_u128(index));
-            let notice = Notice {
+            let notice = SessionCommit {
                 session,
-                command,
-                turn: None,
-                execution: None,
-                resolution: Some(Resolution::Unknown),
-                at: Moment::from_millis(1),
+                command: CommandID::from_uuid(command.as_uuid()),
+                notice: Notice {
+                    turn: None,
+                    execution: None,
+                    resolution: Some(Resolution::Unknown),
+                    at: Moment::from_millis(1),
+                },
+                records: Vec::new(),
             };
             db.append(
                 command,

@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: The workspace as it stands
-description: The sixteen workspace members, who composes each one, and how they map onto the design's crate set.
+description: The seventeen workspace members, who composes each one, and how they map onto the design's crate set.
 resource: ../../Cargo.toml
 tags: [mokmok-os, architecture, workspace]
 status: draft
@@ -18,18 +18,19 @@ sources:
     last_modified: 2026-10-15T08:39:00Z
 ---
 
-# The sixteen members
+# The seventeen members
 
-`Cargo.toml` lists sixteen members.[^manifest] Each one carries a target logical boundary from the
-design's crate map, and four of them have no section in the design at all.
+`Cargo.toml` lists seventeen members.[^manifest] Each one carries a target logical boundary from the
+design's crate map, and five of them have no section in the design at all.
 
 | Member | Design section | Dependents | How it is composed |
 | --- | --- | --- | --- |
-| `mokmok-protocol` | 5.1 | Twelve members | Used for `Moment` and eight identifier markers |
-| `mokmok-event-store` | 5.2 | `mokmok-kernel` | The kernel's one appender, `Db` |
-| `mokmok-event-bus` | 5.3 | `mokmok-kernel` | A publisher per topic in the relay; a subscriber only in tests |
-| `mokmok-state-machine` | 5.4 | `mokmok-agent-runtime`, `mokmok-kernel`, `mokmok-tui` | The fold behind the kernel's log verify path |
-| `mokmok-agent-runtime` | 5.5 | `mokmok-kernel`, `mokmok-tui` | Stepped by the kernel's driver and by the terminal front end |
+| `mokmok-protocol` | 5.1 | Thirteen members | Used for `Moment` and eight identifier markers |
+| `mokmok-event-store` | 5.2 | `mokmok-kernel`, `mokmok-session-wire` | The kernel's one appender, `Db`, and the outbox row a commit becomes |
+| `mokmok-event-bus` | 5.3 | `mokmok-kernel`, `mokmok-session-wire` | The daemon's relay and host clients, and the terminal's one client |
+| `mokmok-session-wire` | None | `mokmok-kernel`, `mokmok-tui` | The command and record vocabulary the daemon and the terminal share |
+| `mokmok-state-machine` | 5.4 | `mokmok-agent-runtime`, `mokmok-kernel`, `mokmok-session-wire`, `mokmok-tui` | The fold behind the kernel's log verify path and the phase a listing carries |
+| `mokmok-agent-runtime` | 5.5 | `mokmok-kernel`, `mokmok-session-wire`, `mokmok-tui` | Stepped by the daemon's host, folded by the terminal, and carried as records on the bus |
 | `mokmok-scheduler` | 5.6 | Declared by `mokmok-kernel` | Nowhere. No symbol from it appears in kernel code or tests |
 | `mokmok-capability` | 5.7 | `mokmok-kernel` | Wrapped by `mokmok-kernel/src/authority.rs` |
 | `mokmok-sandbox` | 5.8 | `mokmok-kernel` | Driven by `mokmok-kernel/src/execution.rs` |
@@ -39,8 +40,8 @@ design's crate map, and four of them have no section in the design at all.
 | `mokmok-search` | None | `mokmok-kernel` | One corpus per granted root, read by the kernel's finder |
 | `mokmok-patch` | None | `mokmok-kernel` | One unified diff read into recomputed counts, applied in memory by the kernel's editor |
 | `mokmok-skill` | None | `mokmok-agent-runtime`, `mokmok-kernel` | One `SKILL.md` frozen into an advert by the kernel's discovery, activated through the kernel's library |
-| `mokmok-kernel` | 5.12 | `mokmok-tui` | The daemon binary and the TUI |
-| `mokmok-tui` | None | Nobody | An application above the kernel |
+| `mokmok-kernel` | 5.12 | Nobody | The daemon binary and its session host |
+| `mokmok-tui` | None | Nobody | A bus client above the daemon |
 
 # The physical split differs from the plan
 
@@ -59,6 +60,7 @@ created the grouped crates `mokmok-agent`, `mokmok-security`, or `mokmok-executi
 | `mokmok-kernel` | Composition and lifecycle | `mokmok-kernel` |
 | Not in the plan | Tracing | `mokmok-observability` |
 | Not in the plan | A user interface | `mokmok-tui` |
+| Not in the plan | The terminal protocol over the bus | `mokmok-session-wire` |
 | Not in the plan | Search over the files an agent works on | `mokmok-search` |
 
 Two of the design's ordering decisions held. The contract layer, the event store, and the event bus
@@ -73,9 +75,9 @@ the terminal front end are the two cases, and they are opposite ones.
 `mokmok-scheduler` is implemented, tested, and composed nowhere. The kernel declares it as a
 dependency and does not use it, so no running process claims a lease.
 
-`mokmok-tui` is composed by nobody and composes the kernel, which is what an application does. It is
-the only member other than `mokmok-kernel` that depends on `mokmok-kernel`, and
-[the dependency rules](verification/dependency-rules.md) name it as the allowlisted case.
+`mokmok-tui` is composed by nobody and composes the bus and the wire contract, which is what an
+application does. It no longer depends on `mokmok-kernel`; [the dependency rules](verification/dependency-rules.md)
+still name it as a composition root, and the bus carries the session now.
 
 # Dependency shape
 

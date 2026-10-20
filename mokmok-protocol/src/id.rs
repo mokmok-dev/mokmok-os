@@ -1,5 +1,7 @@
 mod marker;
 
+use crate::moment::Moment;
+
 pub use marker::*;
 
 mod private {
@@ -38,6 +40,28 @@ impl<M: private::Sealed> ID<M> {
     #[must_use]
     pub const fn as_uuid(&self) -> uuid::Uuid {
         self.value
+    }
+}
+
+impl ID<Session> {
+    /// Mints one session identity from a caller's clock reading.
+    ///
+    /// The clock is the caller's because no crate below a binary reads one here. Two identities
+    /// minted from the same reading differ in their random bits, so a caller cannot collide with
+    /// itself by minting twice before its clock moves.
+    #[must_use]
+    pub fn mint(at: Moment) -> Self {
+        // `Timestamp::from_unix_time` takes whole seconds and a sub-second nanosecond count, which
+        // is why the milliseconds are split rather than converted as one number.
+        let millis = at.as_millis();
+        let timestamp = uuid::Timestamp::from_unix_time(
+            millis / 1_000,
+            u32::try_from((millis % 1_000) * 1_000_000).unwrap_or(0),
+            0,
+            0,
+        );
+
+        Self::new(timestamp)
     }
 }
 

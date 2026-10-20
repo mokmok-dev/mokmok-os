@@ -18,13 +18,13 @@ use std::time::Duration;
 
 use mokmok_agent_runtime::{
     Action, Answer, AnswerRecord, ArtifactRef, Budget, Context, Error as AgentError, Exit, Halt,
-    Journal, Move, Progress, Provider, Receipt, Record, Setting, Step, SubagentCall,
+    Journal, Move, Progress, Provider, Receipt, Record, Setting, Step, StepId, SubagentCall,
     SubagentOutcome, Subagents, Task, ToolCall, ToolReport, Tools, Transcript, Usage, advance,
     advance_watched, child_session, child_task, observation,
 };
 use mokmok_artifact::{BlobStore, ContentHash};
-use mokmok_event_store::{CommandId, Expected, OutboxMessage, Outcome};
-use mokmok_protocol::{Moment, SessionID, TurnID};
+use mokmok_event_store::{CommandId, Expected, Outcome};
+use mokmok_protocol::{CommandID, Moment, SessionID, TurnID};
 use mokmok_sandbox::{Confined, Environment};
 use mokmok_state_machine::{Attempt, Ending, Fact, Resolution, Turn, TurnNumber};
 
@@ -125,13 +125,13 @@ impl Ledger {
         })
     }
 
-    /// The outbox notice one committed step carries, taken from the records it wrote.
+    /// The commit one step carries, taken from the records it wrote.
     fn notice(
         &self,
         session: SessionID,
         command: CommandId,
         records: &[Record],
-    ) -> Result<OutboxMessage, Error> {
+    ) -> mokmok_session_wire::SessionCommit {
         let mut turn = None;
         let mut execution = None;
         let mut resolution = None;
@@ -195,15 +195,25 @@ impl Ledger {
             }
         }
 
-        Notice {
+        mokmok_session_wire::SessionCommit {
             session,
-            command,
-            turn,
-            execution,
-            resolution,
-            at: self.at,
+            command: CommandID::from_uuid(command.as_uuid()),
+            notice: Notice {
+                turn,
+                execution,
+                resolution,
+                at: self.at,
+            },
+            records: records.to_vec(),
         }
-        .outbox()
+    }
+}
+
+impl Ledger {
+    /// The records the log holds, in the order the fold replays them.
+    #[must_use]
+    pub fn records(&self) -> &[Record] {
+        &self.log.ordered
     }
 }
 
@@ -240,6 +250,15 @@ impl Journal for Ledger {
         })
     }
 
+    fn committed(
+        &self,
+        id: StepId,
+    ) -> Result<bool, AgentError> {
+        self.db
+            .committed(CommandId::from_uuid(id.as_uuid()))
+            .map_err(journal)
+    }
+
     fn append(
         &mut self,
         step: Step,
@@ -260,6 +279,8 @@ impl Journal for Ledger {
         let expected = Expected::At(self.db.version(stream).map_err(journal)?);
         let notice = self
             .notice(session, command, &step.records)
+            .outbox()
+            .map_err(Error::Payload)
             .map_err(journal)?;
 
         match self
@@ -848,6 +869,31 @@ impl Driver {
         mokmok_agent_runtime::speak(&mut self.ledger, self.session, line)
     }
 
+    /// Commits one human line under a bus request's identity.
+    ///
+    /// A daemon drives this one, because its command stream delivers at least once and a
+    /// redelivered line must replay the write it already made.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`speak`](Self::speak).
+    pub fn speak_as(
+        &mut self,
+        line: &str,
+        request: CommandID,
+    ) -> Result<Receipt, AgentError> {
+        mokmok_agent_runtime::speak_as(&mut self.ledger, self.session, line, request)
+    }
+
+    /// The records the session's log holds, in the order the fold replays them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ledger's failure when its history cannot be read.
+    pub fn records(&self) -> Result<Vec<Record>, Error> {
+        Ok(self.ledger.records().to_vec())
+    }
+
     /// Performs at most one bounded step of the same [`advance`] `agent run` calls.
     ///
     /// # Errors
@@ -985,13 +1031,16 @@ pub fn cancel(
     log.verify(session, &entries)?;
 
     let command = CommandId::new();
-    let notice = Notice {
+    let notice = mokmok_session_wire::SessionCommit {
         session,
-        command,
-        turn: None,
-        execution: None,
-        resolution: None,
-        at,
+        command: CommandID::from_uuid(command.as_uuid()),
+        notice: Notice {
+            turn: None,
+            execution: None,
+            resolution: None,
+            at,
+        },
+        records: Vec::new(),
     }
     .outbox()?;
     let stream = Db::stream(session);

@@ -130,6 +130,22 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Whether the log already holds a command's transaction.
+    ///
+    /// A caller that receives a command again, after a crash between its write and its
+    /// acknowledgement, asks this before writing: a command the log holds is a replay, not a
+    /// second execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] when the dedup row cannot be read.
+    pub fn committed(
+        &self,
+        command: CommandId,
+    ) -> Result<bool, Error> {
+        recorded_in(&self.connection, command).map(|recorded| recorded.is_some())
+    }
+
     /// One transaction: inbox dedup, the caller's writes, the inbox row, and the checkpoint.
     ///
     /// `commit` must come from this store's log. A commit from another file whose position happens

@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+name = "mokmok-session-wire"
+version.workspace = true
+
+[package.metadata.mokmok]
+purity = "adapter"
+
+[dependencies]
+mokmok-agent-runtime = { workspace = true }
+mokmok-event-bus = { workspace = true }
+mokmok-event-store = { workspace = true }
+mokmok-protocol = { workspace = true }
+mokmok-state-machine = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["std", "v5"] }
+
+[lints]
+workspace = true

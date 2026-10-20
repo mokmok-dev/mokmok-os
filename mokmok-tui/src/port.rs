@@ -104,6 +104,19 @@ pub enum Update {
     Stepped(Result<Progress, Error>),
     /// The session's world failed somewhere a step did not cover, such as the line being spoken.
     Failed(Error),
+    /// The daemon refused one command. It is a line on the screen, not the end of the process.
+    Refused(Error),
+    /// A phrase the daemon decided the screen should carry, such as why a turn stopped.
+    Trouble(String),
+    /// Whether the bus this process reads is answering.
+    Link(Link),
+}
+
+/// Whether the bus the session reads is answering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Link {
+    Connected,
+    Reconnecting,
 }
 
 /// One session the log holds, as a chooser shows it.

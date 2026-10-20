@@ -3,6 +3,7 @@
 * [mokmok-protocol](protocol.md) - typed identifiers and the serde message contracts
 * [mokmok-event-store](event-store.md) - one SQLite file holding the ordered commit log, streams, projections, and the outbox
 * [mokmok-event-bus](event-bus.md) - the WebSocket server on a Unix socket and the delivery and checkpoint contract
+* [mokmok-session-wire](session-wire.md) - the command, reply, commit, history, roster, and progress payloads a terminal and a daemon exchange
 
 # Domain and orchestration
 

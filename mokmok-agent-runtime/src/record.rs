@@ -1,6 +1,6 @@
 //! The runtime's durable vocabulary: one record per decision or outcome the loop commits.
 
-use mokmok_protocol::{ExecutionID, SessionID, TurnID};
+use mokmok_protocol::{CommandID, ExecutionID, SessionID, TurnID};
 use mokmok_skill::SkillName;
 use mokmok_state_machine::{Attempt, Fact, Rejection, TurnFact, TurnOutcome};
 
@@ -313,6 +313,11 @@ pub enum StepKey {
     Close { turn: u64, session: bool },
     /// A human's line, written under the turn it opens.
     Speech { turn: u64 },
+    /// A human's line, keyed by the bus request that asked for it.
+    ///
+    /// A command stream is at-least-once. Deriving the step from the request makes a redelivered
+    /// line replay its own write instead of opening the next turn.
+    SpeechBy { request: CommandID },
 }
 
 impl StepId {
@@ -357,6 +362,7 @@ impl StepKey {
                 session: true,
             } => format!("close:{turn}:session"),
             Self::Speech { turn } => format!("speech:{turn}"),
+            Self::SpeechBy { request } => format!("speech-by:{}", request.as_uuid()),
         }
     }
 }

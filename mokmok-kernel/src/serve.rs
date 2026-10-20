@@ -14,14 +14,15 @@ use mokmok_event_bus::{
     Config as BusConfig, Error as BusError, Payload, Topic, serve as serve_bus, signals,
 };
 use mokmok_observability::{Config as LogConfig, Redaction, init};
-use mokmok_protocol::Moment;
+use mokmok_protocol::{AgentID, Moment};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, SessionDefaults};
 use crate::db::Db;
 use crate::error::Error;
+use crate::host::Host;
 use crate::notify::{Cadence, Message, Notifier};
 use crate::recovery;
 
@@ -144,6 +145,7 @@ impl Relay {
 /// it.
 pub async fn serve(
     config: &Config,
+    defaults: &SessionDefaults,
     socket: &Path,
     once: bool,
     at: Moment,
@@ -166,11 +168,12 @@ pub async fn serve(
         return relay.once(&mut db).await;
     }
 
-    serve_until_stopped(config, bus, at).await
+    serve_until_stopped(config, defaults, bus, at).await
 }
 
 async fn serve_until_stopped(
     config: &Config,
+    defaults: &SessionDefaults,
     bus: BusConfig,
     at: Moment,
 ) -> Result<usize, Error> {
@@ -212,6 +215,20 @@ async fn serve_until_stopped(
         let _ = stopped.await;
     }));
 
+    // The host needs a bound socket to subscribe. The bus task binds it; waiting here is the same
+    // bounded probe readiness uses later, and it keeps a slow bind from looking like a refused
+    // daemon.
+    wait_for_bus(&socket).await?;
+    let daemon = AgentID::from_uuid(uuid::Uuid::new_v4());
+    let client = mokmok_event_bus::Client::connect(&socket)
+        .await
+        .map_err(Error::Bus)?;
+    let mut host = tokio::spawn(
+        Host::start(config.clone(), defaults.clone(), at, daemon, client)
+            .await?
+            .run(),
+    );
+
     let mut relay = Relay::new(&socket);
     let notifier = Notifier::from_env()?;
     // The first tick waits a whole interval, so the bus has bound before the first pass rather
@@ -229,6 +246,7 @@ async fn serve_until_stopped(
             // toss.
             biased;
             result = &mut bus => return Err(bus_ended(result)),
+            result = &mut host => return Err(host_ended(result)),
             () = &mut shutdown => break,
             // A stop that arrives while a pass runs is honoured after it. That is the drain: the
             // pass is the unit of durable progress, and a cancelled one would only cost a
@@ -283,6 +301,9 @@ async fn serve_until_stopped(
     // The bus unlinks its socket on the way out, so it is awaited before the process ends: a
     // restart must not meet a socket this instance left behind.
     report(&notifier, Message::Stopping);
+    // A session thread in a step is left to finish; the log already covers a step cut off by the
+    // process leaving.
+    host.abort();
     let _ = stop.send(());
     if let Ok(ended) = bus.await {
         ended?;
@@ -333,6 +354,13 @@ fn bus_ended(
     match result {
         Ok(Ok(())) | Err(_) => Error::BusStopped,
         Ok(Err(error)) => Error::BusServe(error),
+    }
+}
+
+fn host_ended(result: Result<Result<(), Error>, tokio::task::JoinError>) -> Error {
+    match result {
+        Ok(Ok(())) | Err(_) => Error::BusStopped,
+        Ok(Err(error)) => error,
     }
 }
 
