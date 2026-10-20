@@ -62,6 +62,9 @@
             cargoCommonArgs
             // {
               inherit cargoArtifacts;
+              # The package's check phase runs the test suite, including the view tests that
+              # materialize a git worktree.
+              nativeBuildInputs = [ pkgs.git ];
             }
           );
 
@@ -93,6 +96,9 @@
                   cargoArtifacts
                   ;
                 cargoNextestExtraArgs = "--no-tests=pass";
+                # `mokmok-sandbox`'s view tests materialize a real git worktree, and the build
+                # sandbox's own PATH does not carry git.
+                nativeBuildInputs = [ pkgs.git ];
               }
             );
 

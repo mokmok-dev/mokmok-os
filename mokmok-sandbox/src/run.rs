@@ -89,6 +89,7 @@ pub enum Reporting {
 pub struct Run {
     child: Child,
     workspace: Workspace,
+    directory: PathBuf,
     id: ExecutionID,
     pid: u32,
     stdout: Pump,
@@ -103,7 +104,8 @@ pub struct Run {
 }
 
 impl Run {
-    /// Takes over an already-spawned child, its own workspace, and the request it came from.
+    /// Takes over an already-spawned child, its own workspace, the directory it runs in, and the
+    /// request it came from.
     ///
     /// # Errors
     ///
@@ -111,6 +113,7 @@ impl Run {
     pub fn start(
         mut child: Child,
         workspace: Workspace,
+        directory: PathBuf,
         request: &Request,
         grace: Duration,
         reporting: Reporting,
@@ -135,6 +138,7 @@ impl Run {
         Ok(Self {
             child,
             workspace,
+            directory,
             id: request.execution,
             pid,
             stdout: Pump::spawn(stdout, cap),
@@ -162,7 +166,7 @@ impl Run {
     /// The directory the workload runs in, and where its artifacts are looked for.
     #[must_use]
     pub fn workspace(&self) -> &Path {
-        self.workspace.work()
+        &self.directory
     }
 
     /// One signal to the workload.
@@ -256,11 +260,10 @@ impl Run {
             outcome_of(status)
         };
 
-        let work = self.workspace.work();
         let artifacts = self
             .artifacts
             .iter()
-            .filter_map(|declared| artifact::register(work, declared))
+            .filter_map(|declared| artifact::register(&self.directory, declared))
             .collect();
         let completed = Completed {
             id: self.id,
@@ -269,7 +272,7 @@ impl Run {
             stdout,
             stderr,
             artifacts,
-            workspace: work.to_path_buf(),
+            workspace: self.directory.clone(),
             directory: self.workspace.directory().to_path_buf(),
             cleaned: false,
         };

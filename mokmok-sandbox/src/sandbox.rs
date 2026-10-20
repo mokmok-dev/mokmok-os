@@ -34,15 +34,17 @@ pub trait Sandbox {
     /// An `Ok` means the workload possibly started; only such a confinement failure means it did
     /// not run.
     ///
-    /// The workload's working directory is its workspace, its stdin is `/dev/null`, and its
-    /// environment is built as [`Request::environment`] says.
+    /// The workload's working directory is [`Request::workdir`] when the request names one, and
+    /// its workspace when it does not; its stdin is `/dev/null`, and its environment is built as
+    /// [`Request::environment`] says.
     ///
     /// # Errors
     ///
     /// Returns a [`Refusal`], having created nothing, when an exposure is uncovered or cannot be
     /// resolved, a declared artifact is not a plain relative path, the program is not absolute,
-    /// the execution id is already in use, the execution directory cannot be prepared, or the
-    /// child cannot be started.
+    /// the workload directory named in [`Request::workdir`] is not absolute, is not a directory,
+    /// or lies outside every exposure, the execution id is already in use, the execution
+    /// directory cannot be prepared, or the child cannot be started.
     fn spawn(
         &self,
         request: &Request,
@@ -90,13 +92,19 @@ impl Sandbox for Confined {
         request: &Request,
         issued: &[Capability],
     ) -> Result<Run, Refusal> {
-        let exposures = check(request, issued)?;
+        let checked = check(request, issued)?;
         let workspace = prepare_workspace(&self.config.root, request.execution)?;
         let work = resolve_work(&workspace)?;
+        let directory = checked.workdir.unwrap_or_else(|| work.clone());
         let plan_path = workspace.plan();
         let written = plan::Plan::write(
             &plan_path,
-            &plan::Plan::of(request, &expose_of(&request.program), &work, &exposures),
+            &plan::Plan::of(
+                request,
+                &expose_of(&request.program),
+                &work,
+                &checked.exposures,
+            ),
         );
 
         if let Err(source) = written {
@@ -110,7 +118,7 @@ impl Sandbox for Confined {
 
         let mut command = Command::new(&self.config.confiner);
         command.arg(&plan_path);
-        configure(&mut command, request, &workspace);
+        configure(&mut command, request, &directory);
         // The confiner is deliberately left in the supervisor's group: it calls `setsid` itself,
         // and `setsid` fails with `EPERM` for a process that already leads a group. That is what
         // makes the workload's group id the child pid the supervisor holds.
@@ -123,6 +131,7 @@ impl Sandbox for Confined {
         Run::start(
             child,
             workspace,
+            directory,
             request,
             self.config.grace,
             Reporting::Confiner,
@@ -153,9 +162,12 @@ impl Sandbox for LimitsOnly {
         request: &Request,
         issued: &[Capability],
     ) -> Result<Run, Refusal> {
-        check(request, issued)?;
+        let checked = check(request, issued)?;
 
         let workspace = prepare_workspace(&self.config.root, request.execution)?;
+        let directory = checked
+            .workdir
+            .unwrap_or_else(|| workspace.work().to_path_buf());
         let mut command = Command::new(SHELL);
         command
             .arg("-c")
@@ -165,7 +177,7 @@ impl Sandbox for LimitsOnly {
             // A shell cannot `setsid`, so it is made a group leader and `exec` keeps that group
             // across the replacement.
             .process_group(0);
-        configure(&mut command, request, &workspace);
+        configure(&mut command, request, &directory);
         let child = command.spawn().map_err(|source| {
             let _ = workspace.remove();
 
@@ -175,6 +187,7 @@ impl Sandbox for LimitsOnly {
         Run::start(
             child,
             workspace,
+            directory,
             request,
             self.config.grace,
             Reporting::Exit,
@@ -207,6 +220,8 @@ pub enum Refusal {
     Exists(ExecutionID),
     #[error("the artifact path {} is not a plain path relative to the workspace", .0.display())]
     Artifact(PathBuf),
+    #[error("the workload directory {} cannot be used: {message}", path.display())]
+    Workdir { path: PathBuf, message: String },
     #[error("the program {} is not an absolute path", .0.display())]
     Program(PathBuf),
     #[error("the confiner {} is not an executable file", .0.display())]
@@ -223,12 +238,17 @@ pub enum Refusal {
 
 /// Everything the two backends do the same way, before they create anything.
 ///
-/// Returns the resolved exposures, which is what the plan records: the gate, the plan, and the
-/// rule the confiner builds then name the same object.
+/// The exposures are resolved, which is what the plan records: the gate, the plan, and the rule
+/// the confiner builds then name the same object.
+struct Checked {
+    exposures: Vec<Exposure>,
+    workdir: Option<PathBuf>,
+}
+
 fn check(
     request: &Request,
     issued: &[Capability],
-) -> Result<Vec<Exposure>, Refusal> {
+) -> Result<Checked, Refusal> {
     if let Some(path) = request
         .artifacts
         .iter()
@@ -281,7 +301,52 @@ fn check(
         ));
     }
 
-    Ok(resolved)
+    let workdir = workdir_of(request.workdir.as_deref(), &resolved)?;
+
+    Ok(Checked {
+        exposures: resolved,
+        workdir,
+    })
+}
+
+/// Validates the workload directory against the resolved exposures, and resolves it so the cwd
+/// and the rules name the same object.
+fn workdir_of(
+    workdir: Option<&Path>,
+    exposures: &[Exposure],
+) -> Result<Option<PathBuf>, Refusal> {
+    let Some(path) = workdir else {
+        return Ok(None);
+    };
+
+    if !path.is_absolute() {
+        return Err(Refusal::Workdir {
+            path: path.to_path_buf(),
+            message: "it is not an absolute path".to_owned(),
+        });
+    }
+
+    let resolved = match capability::resolve(path) {
+        Ok(resolved) if resolved.is_dir() => resolved,
+        Ok(_) | Err(_) => {
+            return Err(Refusal::Workdir {
+                path: path.to_path_buf(),
+                message: "it is not a directory".to_owned(),
+            });
+        },
+    };
+
+    if !exposures
+        .iter()
+        .any(|exposure| resolved.starts_with(exposure.as_path()))
+    {
+        return Err(Refusal::Workdir {
+            path: path.to_path_buf(),
+            message: "it is outside every exposure".to_owned(),
+        });
+    }
+
+    Ok(Some(resolved))
 }
 
 /// Creates this execution's own directory, mapping an id already in use to its own refusal so a
@@ -322,10 +387,10 @@ fn expose_of(program: &Path) -> PathBuf {
 fn configure(
     command: &mut Command,
     request: &Request,
-    workspace: &Workspace,
+    directory: &Path,
 ) {
     command
-        .current_dir(workspace.work())
+        .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -39,6 +39,11 @@ pub struct Request {
     pub environment: Environment,
     /// The paths the caller wants the workload to reach, each covered by an issued capability.
     pub exposures: Vec<Exposure>,
+    /// The directory the workload runs in, when it is not the execution's own workspace.
+    ///
+    /// Absolute, and it must lie inside one of `exposures`; the sandbox neither creates nor
+    /// removes it.
+    pub workdir: Option<PathBuf>,
     pub limits: Limits,
     /// This one execution's deadline. The agent's budget is a different responsibility and lives
     /// with the agent runtime.
@@ -59,6 +64,7 @@ impl Request {
             args: Vec::new(),
             environment: Environment::default(),
             exposures: Vec::new(),
+            workdir: None,
             limits: Limits::default(),
             deadline: None,
             artifacts: Vec::new(),

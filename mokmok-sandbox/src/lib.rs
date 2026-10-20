@@ -33,6 +33,11 @@
 //! Resource limits are the sandbox's own per-execution [`Limits`] and [`Request::deadline`]. The
 //! agent's execution budget is a different responsibility and lives with the agent runtime.
 //!
+//! A longer session holds its authority somewhere of its own: [`Scope`] is an isolated view of
+//! one checkout — a git worktree, a copy, or an existing directory — paired with a ledger of
+//! issued capabilities that records grants over the session, snapshots them for one spawn, and
+//! revokes them by id as the workload's authority narrows.
+//!
 //! ```no_run
 //! use std::path::PathBuf;
 //! use std::time::Duration;
@@ -90,6 +95,8 @@ mod plan;
 mod request;
 mod run;
 mod sandbox;
+mod scope;
+mod view;
 mod workspace;
 
 pub use artifact::Artifact;
@@ -102,3 +109,4 @@ pub use plan::{Reached, open_resolved, open_resolved_dir};
 pub use request::{Environment, Request};
 pub use run::{Completed, Error, Failure, Outcome, Run, Signal, Started};
 pub use sandbox::{Confined, LimitsOnly, Refusal, Sandbox};
+pub use scope::{Backing, Grant, GrantID, OpenSpec, Retired, Scope, ScopeError, Snapshot};
