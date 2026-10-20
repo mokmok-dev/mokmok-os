@@ -796,6 +796,7 @@ mod tests {
             tool_env: Vec::new(),
             confiner: program,
             crash_after: None,
+            limits: mokmok_sandbox::Limits::default(),
             provider: ProviderSettings {
                 kind: ProviderKind::Scripted,
                 script: script.map(Path::to_path_buf),

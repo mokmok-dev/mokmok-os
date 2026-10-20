@@ -2001,6 +2001,7 @@ mod tests {
             tool_env: Vec::new(),
             confiner: PathBuf::from("/bin/sh"),
             crash_after: None,
+            limits: mokmok_sandbox::Limits::default(),
             provider: ProviderSettings {
                 kind: ProviderKind::Ollama,
                 model: Some("m".to_owned()),
