@@ -16,3 +16,7 @@ if command -v nix >/dev/null 2>&1; then
 else
   echo "nix is not on PATH: run 'nix flake check' before pushing, CI requires it" >&2
 fi
+
+# CI does not score mutants, so this is the gate's only enforcement point.
+./scripts/mutants.sh --all
+./scripts/mutants.sh --check-baseline
