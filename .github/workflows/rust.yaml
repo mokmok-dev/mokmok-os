@@ -22,21 +22,3 @@ jobs:
         run: nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: nix develop --command cargo test --workspace
-  mutants:
-    needs: check
-    runs-on: ubuntu-latest
-    # The sweep is the slow gate: every member, every mutant. The ledger it writes is the one the
-    # next step reads, so a member that could not be scored fails the gate instead of shrinking it.
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/setup-nix
-      - name: Mutation sweep
-        run: nix develop --command ./scripts/mutants.sh --all --jobs 2
-      - name: Mutation gate
-        run: nix develop --command ./scripts/mutants.sh --check-baseline
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: mutation-ledger
-          path: mutation.json

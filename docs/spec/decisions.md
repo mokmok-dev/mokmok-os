@@ -152,7 +152,9 @@ either waiting for a caller or the manifest line is stale, and the difference ma
 reading the dependency graph.
 
 The mutation gate's reach. `scripts/mutants.sh` scores one package per run, selected by
-`MUTANTS_PACKAGE`, and enforces a 95% floor. It is not part of `nix flake check`. The ledger now has
-to name every workspace member before `--check-baseline` passes, and a source digest that no longer
-matches marks that member's score stale, so a member nobody has run the gate against is visible. A
-match-heavy module can still sit outside the score while the gate reports a high number.
+`MUTANTS_PACKAGE`, and enforces a 95% floor. It is not part of `nix flake check`. The `rust`
+workflow does not score mutants. `scripts/check.sh` runs the sweep and the ledger read, so the local
+check is the gate's only enforcement point. The ledger now has to name every workspace member
+before `--check-baseline` passes, and a source digest that no longer matches marks that member's
+score stale, so a member nobody has run the gate against is visible. A match-heavy module can still
+sit outside the score while the gate reports a high number.

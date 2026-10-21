@@ -21,8 +21,8 @@ sources:
     last_modified: 2026-10-18T00:00:00Z
   - id: rust
     resource: ../../../.github/workflows/rust.yaml
-    title: the Rust workflow that runs the mutation gate
-    last_modified: 2026-10-18T00:00:00Z
+    title: the Rust workflow that formats, lints, and tests the workspace
+    last_modified: 2026-10-21T00:00:00Z
 ---
 
 # How to read this bundle
@@ -49,7 +49,7 @@ The table below is that strategy with a third column for what exists in this tre
 | --- | --- | --- |
 | Unit | Local behaviour | `#[test]` and `#[tokio::test]` cases in every crate |
 | Property and model-based | Invariants across generated sequences | `proptest` in twelve crates, and `proptest-state-machine` in `mokmok-state-machine` |
-| Mutation | Weak assertions | `scripts/mutants.sh`: one package per run at a 95% floor, a `pure` member must kill every mutant and time none out, `--all` scores every member into `mutation.json`; the `rust` workflow runs the sweep and the gate on every pull request |
+| Mutation | Weak assertions | `scripts/mutants.sh`: one package per run at a 95% floor, a `pure` member must kill every mutant and time none out, `--all` scores every member into `mutation.json`; `scripts/check.sh` runs the sweep and the gate locally, and no CI job scores a mutant |
 | Fuzzing | Unexpected input | Absent |
 | Concurrency | Controlled interleavings | Real concurrent tests using two stores, two writers, and a churning publisher; no Loom |
 | Integration | Real boundary behaviour | Real SQLite files, real Unix sockets, real Landlock confinement, real subprocesses |
@@ -66,15 +66,13 @@ Two further checks cover the systemd unit and the NixOS module.
 
 The `rust` workflow adds the fast loop the Rust workspace is developed in: a `check` job runs
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-and `cargo test --workspace` inside the dev shell. A `mutants` job then runs
-`scripts/mutants.sh --all --jobs 2` and reads the ledger back with `--check-baseline`, so the
-mutation gate is enforced on every pull request instead of being a script the operator has to
-remember.[^rust]
+and `cargo test --workspace` inside the dev shell. The workflow does not run the mutation gate.[^rust]
 
 One package per invocation, selected by `MUTANTS_PACKAGE`, still gives a fast local score with a
 floor of 95% by default. `--all` sweeps every member, writes each one's score and target to
 `mutation.json`, and exports the confiner the kernel's and the tui's integration tests need;
-`--check-baseline` reads that ledger back and reports which rows moved. That read also holds the
+`--check-baseline` reads that ledger back and reports which rows moved. `scripts/check.sh` ends with
+both commands, so the local check is the gate's only enforcement point. That read also holds the
 policy to the purity ladder: a member whose role is `pure` must report no surviving and no timed-out
 mutant, every workspace member must have a row, and the counted mutants across the ledger must reach
 98% killed. Thirteen mutants across seven members are excluded as equivalent, each with its proof
