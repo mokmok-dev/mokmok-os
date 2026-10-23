@@ -1,0 +1,13 @@
+{
+  "name": "@mokmok-os/monorepo",
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "vitest --run --passWithNoTests",
+    "typecheck": "tsc --build"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "vitest": "catalog:"
+  }
+}
