@@ -1,6 +1,7 @@
 **/node_modules/
 **/dist/
 **/*.tsbuildinfo
+**/.stryker-tmp/
 /.direnv/
 /.pre-commit-config.yaml
 /result

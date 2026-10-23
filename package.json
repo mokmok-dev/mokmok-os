@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "vitest --run --passWithNoTests",
-    "typecheck": "tsc --build"
+    "typecheck": "tsc --build && tsc -p packages/message/tsconfig.test.json"
   },
   "devDependencies": {
     "@types/node": "catalog:",
