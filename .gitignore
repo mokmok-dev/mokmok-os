@@ -5,3 +5,5 @@
 /.pre-commit-config.yaml
 /result
 /result-*
+**/.stryker-tmp/
+/packages/event-bus/reports/

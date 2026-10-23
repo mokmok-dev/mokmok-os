@@ -45,7 +45,7 @@
                 src = dependencySrc;
                 inherit (pkgs) pnpm;
                 fetcherVersion = 4;
-                hash = "sha256-VxuWidXjBa5iEzNsBJ2zbyc2ScUmxjrsQXu6mYnnxRo=";
+                hash = "sha256-fEnzwNoPEzhAo8KA54eRgmzyPWZduF12k/LsAYqgm4w=";
               };
               runPnpm =
                 name: command:

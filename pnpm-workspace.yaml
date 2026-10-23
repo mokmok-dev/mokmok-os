@@ -3,9 +3,19 @@ packages:
   - packages/*
 
 catalog:
+  "@stryker-mutator/core": 10.0.0
+  "@stryker-mutator/vitest-runner": 10.0.0
   "@types/node": 26.6.5
+  "@types/ws": ^8.18.2
+  effect: 4.0.6
+  fast-check: ^4.10.2
+  typescript: 5.9.3
   vitest: 5.0.5
+  ws: ^8.22.0
 
 catalogMode: strict
 
 catalogPrune: true
+
+minimumReleaseAgeExclude:
+  - effect@4.0.6

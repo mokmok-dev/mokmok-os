@@ -1,0 +1,29 @@
+{
+  "name": "mokmok-os/event-bus",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest --run",
+    "mutants": "stryker run"
+  },
+  "dependencies": {
+    "effect": "catalog:",
+    "ws": "catalog:"
+  },
+  "devDependencies": {
+    "@stryker-mutator/core": "catalog:",
+    "@stryker-mutator/vitest-runner": "catalog:",
+    "@types/node": "catalog:",
+    "@types/ws": "catalog:",
+    "fast-check": "catalog:",
+    "typescript": "catalog:"
+  }
+}
