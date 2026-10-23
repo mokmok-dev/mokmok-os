@@ -1,4 +1,6 @@
 **/node_modules/
+**/dist/
+**/*.tsbuildinfo
 /.direnv/
 /.pre-commit-config.yaml
 /result
