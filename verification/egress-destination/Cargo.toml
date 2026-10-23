@@ -1,0 +1,14 @@
+[package]
+edition = "2024"
+name = "verify-egress-destination"
+publish = false
+version = "0.0.0"
+
+# A verification harness is not a workspace member: the workspace builds and tests only the
+# crates that ship, and this crate needs a nightly toolchain for `std::net`'s `is_global`.
+[workspace]
+
+[dependencies]
+mokmok-egress = { path = "../../mokmok-egress" }
+mokmok-protocol = { path = "../../mokmok-protocol" }
+uuid = "1"
