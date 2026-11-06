@@ -68,6 +68,17 @@
                 cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
               }
             );
+            test = craneLib.cargoTest (
+              commonArgs
+              // {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+              }
+            );
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             mutants = craneLib.mkCargoDerivation (
               commonArgs
               // {
@@ -80,15 +91,6 @@
                 nativeBuildInputs = [ pkgs.cargo-mutants ];
                 buildPhaseCargoCommand = "cargo mutants --workspace --jobs 4 --timeout 60 --no-shuffle";
                 doInstallCargoArtifacts = false;
-              }
-            );
-            test = craneLib.cargoTest (
-              commonArgs
-              // {
-                inherit
-                  src
-                  cargoArtifacts
-                  ;
               }
             );
           };

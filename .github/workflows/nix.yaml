@@ -12,7 +12,8 @@ permissions:
   contents: read
 jobs:
   check:
-    # macos-14 is arm64, exercising aarch64-darwin and the case-insensitive
+    timeout-minutes: 45
+    # macos-latest is arm64, exercising aarch64-darwin and the case-insensitive
     # file system the filename hash exists for.
     strategy:
       fail-fast: false
