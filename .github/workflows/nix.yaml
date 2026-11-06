@@ -12,7 +12,13 @@ permissions:
   contents: read
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # macos-14 is arm64, exercising aarch64-darwin and the case-insensitive
+    # file system the filename hash exists for.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-nix

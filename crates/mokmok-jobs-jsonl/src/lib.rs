@@ -718,6 +718,16 @@ mod tests {
     }
 
     #[test]
+    fn store_paths_distinguish_case() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let upper = mokmok_jobs_core::JobId::parse("Job").expect("literal is valid");
+        let lower = mokmok_jobs_core::JobId::parse("job").expect("literal is valid");
+        assert_ne!(store.path(&upper), store.path(&lower));
+        Ok(())
+    }
+
+    #[test]
     fn every_event_variant_round_trips_through_the_line_format() {
         use mokmok_jobs_core::{Envelope, JobEvent, JobId};
 
