@@ -166,14 +166,13 @@ where
             return Ok(current);
         }
         let (current, needs_header, mut file) = if let Some(version) = state.versions.get(key) {
-            match OpenOptions::new().append(true).open(&path) {
-                Ok(file) => (*version, false, file),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let (version, needs_header, file) = ensure::<K, E>(&path, key)?;
-                    state.versions.insert(key.clone(), version);
-                    (version, needs_header, file)
-                },
-                Err(error) => return Err(error_at(&path, &error)),
+            if let Ok(file) = OpenOptions::new().append(true).open(&path) {
+                (*version, false, file)
+            } else {
+                // A missing file is the common case; every other error repeats in `ensure`.
+                let (version, needs_header, file) = ensure::<K, E>(&path, key)?;
+                state.versions.insert(key.clone(), version);
+                (version, needs_header, file)
             }
         } else {
             let (version, needs_header, file) = ensure::<K, E>(&path, key)?;
