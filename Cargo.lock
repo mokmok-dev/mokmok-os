@@ -301,6 +301,7 @@ name = "mokmok-jobs-jsonl"
 version = "2026.11.1"
 dependencies = [
  "mokmok-jobs-core",
+ "serde",
  "serde_json",
  "tempfile",
 ]

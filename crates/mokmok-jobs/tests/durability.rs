@@ -10,6 +10,8 @@ use mokmok_jobs::{
 use mokmok_jobs_jsonl::JsonlEventStore;
 use mokmok_jobs_memory::RecordingPublisher;
 
+type Store = JsonlEventStore<JobId, JobEvent>;
+
 fn attempts(count: u32) -> Result<NonZeroU32, Box<dyn std::error::Error>> {
     NonZeroU32::new(count).ok_or_else(|| "attempts must be nonzero".into())
 }
@@ -24,11 +26,11 @@ fn submitted(max_attempts: u32) -> Result<JobEvent, Box<dyn std::error::Error>> 
 #[test]
 fn durable_log_replays_after_reopen() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("jobs.jsonl");
+    let root = directory.path().join("jobs");
     let id = JobId::parse("durable")?;
     {
         let system = JobSystem::new(
-            Arc::new(JsonlEventStore::open(&path)?),
+            Arc::new(Store::open(&root)?),
             Arc::new(RecordingPublisher::new()),
         );
         system.ask(
@@ -48,7 +50,7 @@ fn durable_log_replays_after_reopen() -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let system = JobSystem::new(
-        Arc::new(JsonlEventStore::open(&path)?),
+        Arc::new(Store::open(&root)?),
         Arc::new(RecordingPublisher::new()),
     );
     assert!(matches!(
@@ -69,8 +71,8 @@ fn durable_log_replays_after_reopen() -> Result<(), Box<dyn std::error::Error>> 
 #[test]
 fn stale_actor_is_fenced_then_recovers() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("jobs.jsonl");
-    let store: Arc<dyn EventStore> = Arc::new(JsonlEventStore::open(&path)?);
+    let root = directory.path().join("jobs");
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(Store::open(&root)?);
     let first = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     let second = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     let id = JobId::parse("fenced")?;
@@ -114,21 +116,25 @@ fn stale_actor_is_fenced_then_recovers() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
-fn torn_tail_is_discarded_on_open() -> Result<(), Box<dyn std::error::Error>> {
+fn a_torn_tail_in_one_stream_does_not_affect_another() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("jobs.jsonl");
+    let root = directory.path().join("jobs");
     let first = JobId::parse("first")?;
     let second = JobId::parse("second")?;
     {
-        let store = JsonlEventStore::open(&path)?;
+        let store = Store::open(&root)?;
         store.append(&first, Version::ZERO, &[submitted(1)?])?;
     }
     {
-        let mut file = OpenOptions::new().append(true).open(&path)?;
-        file.write_all(b"{\"kind\":\"submitted\",")?;
+        let path = std::fs::read_dir(&root)?
+            .next()
+            .ok_or("no stream file".to_owned())??
+            .path();
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        file.write_all(b"{\"stream\":\"first\",")?;
     }
 
-    let store = JsonlEventStore::open(&path)?;
+    let store = Store::open(&root)?;
     store.append(&second, Version::ZERO, &[submitted(1)?])?;
     assert_eq!(store.load(&first)?.len(), 1);
     assert_eq!(store.load(&second)?.len(), 1);

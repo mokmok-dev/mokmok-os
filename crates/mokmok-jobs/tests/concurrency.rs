@@ -3,14 +3,14 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use mokmok_jobs::{Error, EventStore, JobCommand, JobError, JobId, JobState, JobSystem};
+use mokmok_jobs::{Error, EventStore, JobCommand, JobError, JobEvent, JobId, JobState, JobSystem};
 use mokmok_jobs_memory::{MemoryEventStore, RecordingPublisher};
 
 const WORKERS: usize = 8;
 
 #[test]
 fn concurrent_starts_admit_one_winner() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     let id = JobId::parse("concurrent")?;
     system.ask(
@@ -57,7 +57,7 @@ fn concurrent_starts_admit_one_winner() -> Result<(), Box<dyn std::error::Error>
 
 #[test]
 fn expired_actors_still_answer_from_the_log() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::with_idle_timeout(
         Arc::clone(&store),
         Arc::new(RecordingPublisher::new()),

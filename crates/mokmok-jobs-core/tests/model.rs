@@ -121,12 +121,12 @@ mod tests {
                 Property::always(
                     "replay rebuilds the same state",
                     |model: &Self, state: &ModelState| {
-                        let envelopes: Vec<Envelope> = state
+                        let envelopes: Vec<Envelope<JobId, JobEvent>> = state
                             .log
                             .iter()
                             .enumerate()
                             .map(|(index, event)| Envelope {
-                                job_id: model.id.clone(),
+                                stream: model.id.clone(),
                                 version: Version::new(
                                     u64::try_from(index).expect("log index fits in u64") + 1,
                                 ),
