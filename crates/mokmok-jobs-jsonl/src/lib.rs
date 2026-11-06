@@ -101,6 +101,8 @@ where
         let length = u64::try_from(committed).map_err(|error| StoreError::Io(error.to_string()))?;
         file.set_len(length)
             .map_err(|error| error_at(path, &error))?;
+        // The truncation must survive a crash before the next append, or the torn tail returns.
+        file.sync_data().map_err(|error| error_at(path, &error))?;
     }
     let (version, _) = parse_stream::<K, E>(path, &bytes[..committed], key)?;
     Ok((version, committed == 0, file))
