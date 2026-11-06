@@ -4,8 +4,11 @@ name = "mokmok-jobs-jsonl"
 version.workspace = true
 
 [dependencies]
-mokmok-jobs-core = { path = "../mokmok-jobs-core" }
+mokmok-jobs-core.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

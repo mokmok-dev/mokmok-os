@@ -4,7 +4,7 @@ name = "mokmok-jobs-memory"
 version.workspace = true
 
 [dependencies]
-mokmok-jobs-core = { path = "../mokmok-jobs-core" }
+mokmok-jobs-core.workspace = true
 
 [lints]
 workspace = true

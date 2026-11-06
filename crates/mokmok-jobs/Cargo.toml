@@ -4,11 +4,11 @@ name = "mokmok-jobs"
 version.workspace = true
 
 [dependencies]
-mokmok-jobs-core = { path = "../mokmok-jobs-core" }
+mokmok-jobs-core.workspace = true
 
 [dev-dependencies]
-mokmok-jobs-jsonl = { path = "../mokmok-jobs-jsonl" }
-mokmok-jobs-memory = { path = "../mokmok-jobs-memory" }
+mokmok-jobs-jsonl.workspace = true
+mokmok-jobs-memory.workspace = true
 tempfile.workspace = true
 
 [lints]
