@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+name = "mokmok-jobs"
+version.workspace = true
+
+[dependencies]
+mokmok-jobs-core.workspace = true
+
+[dev-dependencies]
+mokmok-jobs-jsonl.workspace = true
+mokmok-jobs-memory.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

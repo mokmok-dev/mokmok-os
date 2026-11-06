@@ -1,0 +1,14 @@
+[package]
+edition.workspace = true
+name = "mokmok-jobs-core"
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+stateright.workspace = true
+
+[lints]
+workspace = true

@@ -68,6 +68,20 @@
                 cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
               }
             );
+            mutants = craneLib.mkCargoDerivation (
+              commonArgs
+              // {
+                inherit
+                  src
+                  cargoArtifacts
+                  ;
+                pname = "mokmok-os-mutants";
+                version = "2026.11.1";
+                nativeBuildInputs = [ pkgs.cargo-mutants ];
+                buildPhaseCargoCommand = "cargo mutants --workspace --jobs 4 --timeout 60 --no-shuffle";
+                doInstallCargoArtifacts = false;
+              }
+            );
             test = craneLib.cargoTest (
               commonArgs
               // {
