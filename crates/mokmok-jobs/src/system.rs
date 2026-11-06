@@ -704,6 +704,18 @@ mod tests {
     }
 
     #[test]
+    fn the_same_job_always_gets_the_same_lifecycle_stripe() {
+        let system = JobSystem::without_idle_timeout(
+            Arc::new(MemoryEventStore::<JobId, JobEvent>::new()),
+            Arc::new(RecordingPublisher::new()),
+        );
+        let id = JobId::parse("stable").expect("literal is valid");
+        let first = system.inner.registry.lifecycle(&id);
+        let second = system.inner.registry.lifecycle(&id);
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
     fn a_slow_cold_start_does_not_block_another_job() {
         let blocked = JobId::parse("slow-a").expect("literal is valid");
         let (entered_tx, entered_rx) = mpsc::channel();
