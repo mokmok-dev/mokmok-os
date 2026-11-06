@@ -100,3 +100,78 @@ impl EventPublisher for RecordingPublisher {
 fn poisoned() -> StoreError {
     StoreError::Io("event store lock poisoned".to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    fn id() -> JobId {
+        JobId::parse("memory").expect("literal is valid")
+    }
+
+    fn submitted() -> JobEvent {
+        JobEvent::Submitted {
+            input: b"in".to_vec(),
+            max_attempts: NonZeroU32::new(1).expect("literal is nonzero"),
+        }
+    }
+
+    #[test]
+    fn append_commits_a_contiguous_stream() {
+        let store = MemoryEventStore::new();
+        let id = id();
+        let last = store
+            .append(&id, Version::ZERO, &[submitted()])
+            .expect("first append fits");
+        assert_eq!(last, Version::new(1));
+        let last = store
+            .append(&id, Version::new(1), &[JobEvent::Started { attempt: 1 }])
+            .expect("second append fits");
+        assert_eq!(last, Version::new(2));
+        let events = store.load(&id).expect("stream reads back");
+        let versions: Vec<u64> = events.iter().map(|event| event.version.get()).collect();
+        assert_eq!(versions, vec![1, 2]);
+    }
+
+    #[test]
+    fn append_rejects_a_stale_expected_version() {
+        let store = MemoryEventStore::new();
+        let id = id();
+        store
+            .append(&id, Version::ZERO, &[submitted()])
+            .expect("first append fits");
+        let error = store
+            .append(&id, Version::ZERO, &[JobEvent::Started { attempt: 1 }])
+            .expect_err("stale append is refused");
+        assert!(matches!(
+            error,
+            StoreError::Conflict {
+                expected,
+                actual,
+            } if expected == Version::ZERO && actual == Version::new(1)
+        ));
+        assert_eq!(store.load(&id).expect("stream reads back").len(), 1);
+    }
+
+    #[test]
+    fn publisher_records_every_event_in_order() {
+        let publisher = RecordingPublisher::new();
+        let id = id();
+        let first = Envelope {
+            job_id: id.clone(),
+            version: Version::new(1),
+            event: submitted(),
+        };
+        let second = Envelope {
+            job_id: id,
+            version: Version::new(2),
+            event: JobEvent::Started { attempt: 1 },
+        };
+        publisher.publish(std::slice::from_ref(&first));
+        publisher.publish(std::slice::from_ref(&second));
+        assert_eq!(publisher.published(), vec![first, second]);
+        assert_eq!(publisher.len(), 2);
+    }
+}

@@ -148,7 +148,7 @@ fn scan(
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index + 1);
-    if committed < bytes.len() {
+    if committed != bytes.len() {
         let length = u64::try_from(committed).map_err(|error| StoreError::Io(error.to_string()))?;
         file.set_len(length)
             .map_err(|error| error_at(path, &error))?;
@@ -198,6 +198,79 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
+
+    fn submitted() -> JobEvent {
+        JobEvent::Submitted {
+            input: b"in".to_vec(),
+            max_attempts: NonZeroU32::new(1).expect("literal is nonzero"),
+        }
+    }
+
+    #[test]
+    fn open_creates_missing_parent_directories() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory
+            .path()
+            .join("nested")
+            .join("deeper")
+            .join("jobs.jsonl");
+        let store = JsonlEventStore::open(&path)?;
+        let id = JobId::parse("nested").expect("literal is valid");
+        store.append(&id, Version::ZERO, &[submitted()])?;
+        assert_eq!(store.load(&id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reopening_twice_keeps_every_committed_record() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("jobs.jsonl");
+        let id = JobId::parse("reopen").expect("literal is valid");
+        {
+            let store = JsonlEventStore::open(&path)?;
+            store.append(&id, Version::ZERO, &[submitted()])?;
+            store.append(&id, Version::new(1), &[JobEvent::Started { attempt: 1 }])?;
+        }
+        {
+            drop(JsonlEventStore::open(&path)?);
+        }
+        let store = JsonlEventStore::open(&path)?;
+        assert_eq!(store.load(&id)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn opening_an_existing_stream_keeps_its_version() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("jobs.jsonl");
+        let id = JobId::parse("versioned").expect("literal is valid");
+        {
+            let store = JsonlEventStore::open(&path)?;
+            store.append(&id, Version::ZERO, &[submitted()])?;
+        }
+        let store = JsonlEventStore::open(&path)?;
+        store.append(&id, Version::new(1), &[JobEvent::Started { attempt: 1 }])?;
+        assert_eq!(store.load(&id)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn torn_tail_is_discarded_on_open() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("jobs.jsonl");
+        let id = JobId::parse("torn").expect("literal is valid");
+        {
+            let store = JsonlEventStore::open(&path)?;
+            store.append(&id, Version::ZERO, &[submitted()])?;
+        }
+        {
+            let mut file = OpenOptions::new().append(true).open(&path)?;
+            file.write_all(b"{\"kind\":\"submitted\",")?;
+        }
+        let store = JsonlEventStore::open(&path)?;
+        assert_eq!(store.load(&id)?.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn every_event_variant_round_trips_through_the_line_format() {

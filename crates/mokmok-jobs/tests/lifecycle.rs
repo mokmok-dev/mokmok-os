@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use mokmok_jobs::{
     Envelope, Error, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
-    JobSystem, Version,
+    JobSystem, StoreError, Version,
 };
 use mokmok_jobs_memory::{MemoryEventStore, RecordingPublisher};
 
@@ -103,6 +103,25 @@ fn terminal_state_rejects_cancel_without_appending() -> Result<(), Box<dyn std::
     assert!(matches!(rejected, Err(Error::Job(JobError::Terminal))));
     assert_eq!(store.load(&id)?.len(), before);
     Ok(())
+}
+
+#[test]
+fn errors_carry_their_message_and_source() {
+    let job = Error::from(JobError::Terminal);
+    assert!(job.to_string().contains("terminal"));
+    assert!(std::error::Error::source(&job).is_some());
+
+    let store = Error::from(StoreError::Io("disk".to_owned()));
+    assert!(store.to_string().contains("disk"));
+    assert!(std::error::Error::source(&store).is_some());
+
+    let unavailable = Error::ActorUnavailable;
+    assert!(unavailable.to_string().contains("unavailable"));
+    assert!(std::error::Error::source(&unavailable).is_none());
+
+    let spawn = Error::Spawn("nope".to_owned());
+    assert!(spawn.to_string().contains("nope"));
+    assert!(std::error::Error::source(&spawn).is_none());
 }
 
 #[test]

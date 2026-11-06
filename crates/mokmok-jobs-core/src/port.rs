@@ -8,7 +8,7 @@ use crate::job::JobEvent;
 use crate::stream::{JobId, Version};
 
 /// One event with the stream position it was committed at.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     pub job_id: JobId,
     pub version: Version,
@@ -77,3 +77,26 @@ impl fmt::Display for StoreError {
 }
 
 impl std::error::Error for StoreError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_store_error_has_a_message() {
+        let cases = [
+            (
+                StoreError::Conflict {
+                    expected: Version::new(1),
+                    actual: Version::new(3),
+                },
+                "expected version 1",
+            ),
+            (StoreError::Io("disk".to_owned()), "disk"),
+            (StoreError::Corrupt("line".to_owned()), "line"),
+        ];
+        for (error, expected) in cases {
+            assert!(error.to_string().contains(expected));
+        }
+    }
+}

@@ -338,3 +338,128 @@ fn handle(
         events: envelopes,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use mokmok_jobs_core::JobEvent;
+    use mokmok_jobs_memory::{MemoryEventStore, RecordingPublisher};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryEventStore,
+        loads: AtomicUsize,
+    }
+
+    impl EventStore for CountingStore {
+        fn load(
+            &self,
+            id: &JobId,
+        ) -> Result<Vec<Envelope>, StoreError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.inner.load(id)
+        }
+
+        fn append(
+            &self,
+            id: &JobId,
+            expected: Version,
+            events: &[JobEvent],
+        ) -> Result<Version, StoreError> {
+            self.inner.append(id, expected, events)
+        }
+    }
+
+    struct BlockingStore {
+        inner: MemoryEventStore,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl EventStore for BlockingStore {
+        fn load(
+            &self,
+            id: &JobId,
+        ) -> Result<Vec<Envelope>, StoreError> {
+            self.inner.load(id)
+        }
+
+        fn append(
+            &self,
+            id: &JobId,
+            expected: Version,
+            events: &[JobEvent],
+        ) -> Result<Version, StoreError> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().expect("release lock").recv();
+            self.inner.append(id, expected, events)
+        }
+    }
+
+    fn submit() -> JobCommand {
+        JobCommand::Submit {
+            input: b"in".to_vec(),
+            max_attempts: NonZeroU32::new(1).expect("literal is nonzero"),
+        }
+    }
+
+    #[test]
+    fn a_cached_actor_serves_the_next_command_without_reloading() {
+        let store = Arc::new(CountingStore::default());
+        let event_store: Arc<dyn EventStore> = store.clone();
+        let system = JobSystem::new(event_store, Arc::new(RecordingPublisher::new()));
+        let id = JobId::parse("cached").expect("literal is valid");
+
+        system.ask(&id, submit()).expect("submit commits");
+        let loads = store.loads.load(Ordering::SeqCst);
+        system.ask(&id, JobCommand::Start).expect("start commits");
+
+        assert_eq!(
+            store.loads.load(Ordering::SeqCst),
+            loads,
+            "the cached actor must not reload the stream"
+        );
+    }
+
+    #[test]
+    fn dropping_the_system_waits_for_an_in_flight_command() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let store: Arc<dyn EventStore> = Arc::new(BlockingStore {
+            inner: MemoryEventStore::new(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let system = JobSystem::new(store, Arc::new(RecordingPublisher::new()));
+        let id = JobId::parse("blocking").expect("literal is valid");
+        let actor = system.actor(&id).expect("actor spawns");
+        let (reply, wait) = mpsc::channel();
+        actor
+            .tx
+            .send(Request {
+                command: submit(),
+                reply,
+            })
+            .expect("actor accepts the command");
+        drop(actor);
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("append started");
+
+        let dropper = thread::spawn(move || drop(system));
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !dropper.is_finished(),
+            "drop returned while a command was in flight"
+        );
+
+        release_tx.send(()).expect("append releases");
+        dropper.join().expect("dropper did not panic");
+        drop(wait);
+    }
+}

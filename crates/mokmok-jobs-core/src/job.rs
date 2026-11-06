@@ -9,7 +9,7 @@ use crate::port::Envelope;
 use crate::stream::Version;
 
 /// Where one job stands, derived only from its event stream.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum JobState {
     #[default]
     New,
@@ -36,7 +36,7 @@ pub enum JobState {
 }
 
 /// One committed fact about a job.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobEvent {
     Submitted {
@@ -667,6 +667,32 @@ mod tests {
             ));
             assert_eq!(state, before);
         }
+    }
+
+    #[test]
+    fn every_job_error_has_a_message() {
+        let cases = [
+            (JobError::InvalidJobId("bad id".to_owned()), "bad id"),
+            (JobError::AlreadySubmitted, "already submitted"),
+            (JobError::NotSubmitted, "not submitted"),
+            (JobError::NotQueued, "not queued"),
+            (JobError::NotRunning, "not running"),
+            (JobError::Terminal, "terminal"),
+            (JobError::CorruptHistory("stale".to_owned()), "stale"),
+        ];
+        for (error, expected) in cases {
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn corrupt_history_names_the_state_and_the_event() {
+        let mut state = JobState::New;
+        let error = evolve(&mut state, &JobEvent::Started { attempt: 1 })
+            .expect_err("started cannot follow new");
+        let message = error.to_string();
+        assert!(message.contains("new"), "{message}");
+        assert!(message.contains("started"), "{message}");
     }
 
     #[test]
