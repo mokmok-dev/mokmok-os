@@ -23,4 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-nix
-      - run: nix flake check --print-build-logs
+      - if: matrix.os == 'ubuntu-latest'
+        run: nix flake check --print-build-logs
+      # The pre-commit check's Darwin closure builds Swift from source; the test
+      # check is the one that exercises the case-insensitive file system.
+      - if: matrix.os == 'macos-latest'
+        run: nix build .#checks.aarch64-darwin.test --print-build-logs
