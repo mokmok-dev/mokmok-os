@@ -1,1 +1,5 @@
 minimum_test_timeout = 60
+
+# The fallback retries the same open with create(true). Every non-NotFound
+# failure fails there too, so this mutation has no observable effect.
+exclude_re = ["mokmok-jobs-jsonl/src/lib.rs:157:31: .*NotFound with true"]

@@ -116,6 +116,12 @@ mod tests {
     }
 
     #[test]
+    fn stream_key_exposes_the_job_id_text() {
+        let id = JobId::parse("job-1").expect("literal is valid");
+        assert_eq!(StreamKey::as_str(&id), "job-1");
+    }
+
+    #[test]
     fn version_counts_forward_from_zero() {
         assert_eq!(Version::ZERO.get(), 0);
         assert_eq!(Version::new(7).next().get(), 8);

@@ -536,13 +536,21 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let id = mokmok_jobs_core::JobId::parse("header").expect("literal is valid");
+        let before = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
         store.append(&id, Version::ZERO, &[submitted()])?;
         let text = fs::read_to_string(store.path(&id))?;
         let header: serde_json::Value =
             serde_json::from_str(text.lines().next().expect("header line"))?;
         assert_eq!(header["format"], 1);
         assert_eq!(header["stream"], "header");
-        assert!(header["created_at"].is_u64());
+        let created = header["created_at"]
+            .as_u64()
+            .expect("created_at is a number");
+        assert!(created >= before);
         Ok(())
     }
 
@@ -573,6 +581,73 @@ mod tests {
             }],
         )?;
         assert_eq!(store.load(&id)?[0].event.text, "hello");
+        Ok(())
+    }
+
+    #[test]
+    fn a_read_error_that_is_not_missing_is_reported() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = mokmok_jobs_core::JobId::parse("directory").expect("literal is valid");
+        fs::create_dir(store.path(&id))?;
+        let error = store
+            .load(&id)
+            .expect_err("a directory is not a stream file");
+        assert!(matches!(error, StoreError::Io(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_append_reports_a_read_error_that_is_not_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = mokmok_jobs_core::JobId::parse("empty-directory").expect("literal is valid");
+        fs::create_dir(store.path(&id))?;
+        let error = store
+            .append(&id, Version::ZERO, &[])
+            .expect_err("a directory is not a stream file");
+        assert!(matches!(error, StoreError::Io(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_cached_stream_forces_a_fresh_version() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = mokmok_jobs_core::JobId::parse("deleted").expect("literal is valid");
+        store.append(&id, Version::ZERO, &[submitted()])?;
+        fs::remove_file(store.path(&id))?;
+        let error = store
+            .append(
+                &id,
+                Version::new(1),
+                &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+            )
+            .expect_err("the cached file is gone");
+        assert!(matches!(
+            error,
+            StoreError::Conflict {
+                expected,
+                actual,
+            } if expected == Version::new(1) && actual == Version::ZERO
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn an_envelope_for_another_stream_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = mokmok_jobs_core::JobId::parse("named").expect("literal is valid");
+        fs::write(
+            store.path(&id),
+            b"{\"format\":1,\"stream\":\"named\",\"created_at\":1}\n{\"stream\":\"other\",\"version\":1,\"event\":{\"kind\":\"started\",\"attempt\":1}}\n",
+        )?;
+        let error = store
+            .load(&id)
+            .expect_err("an envelope from another stream is refused");
+        assert!(matches!(error, StoreError::Corrupt(_)));
         Ok(())
     }
 
