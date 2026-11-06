@@ -75,7 +75,7 @@ impl<K, E> JsonlEventStore<K, E> {
     where
         K: StreamKey,
     {
-        self.root.join(format!("{}.jsonl", escape(key.as_str())))
+        self.root.join(file_name(key.as_str()))
     }
 }
 
@@ -279,6 +279,25 @@ fn escape(raw: &str) -> String {
         }
     }
     escaped
+}
+
+/// The readable prefix bounds a key whose escapes expand it past the 255-byte
+/// component limit, and the hash keeps `A` apart from `a` on a case-insensitive
+/// filesystem. The header still holds the raw key, so a hash collision reads
+/// back as [`StoreError::Corrupt`] rather than mixing two streams.
+fn file_name(raw: &str) -> String {
+    let escaped = escape(raw);
+    let prefix = &escaped[..escaped.len().min(200)];
+    format!("{prefix}-{:016x}.jsonl", stable_hash(raw))
+}
+
+fn stable_hash(raw: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in raw.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn now_millis() -> u64 {
@@ -659,6 +678,43 @@ mod tests {
         assert_ne!(escape(".x"), escape("_.x"));
         assert_eq!(escape("a:b"), "a%3Ab");
         assert_eq!(escape("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn stable_hash_matches_the_fnv_1a_vectors() {
+        assert_eq!(stable_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_hash("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(stable_hash("foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn a_long_colon_key_stores_in_one_bounded_file_name() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = mokmok_jobs_core::JobId::parse(":".repeat(128)).expect("literal is valid");
+        let name = file_name(id.as_str());
+        assert!(name.len() <= 255);
+        assert!(name.starts_with(&escape(id.as_str())[..200]));
+        assert!(name.contains(&format!("{:016x}", stable_hash(id.as_str()))));
+        store.append(&id, Version::ZERO, &[submitted()])?;
+        assert_eq!(store.load(&id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_alphanumeric_key_still_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = mokmok_jobs_core::JobId::parse("k".repeat(128)).expect("literal is valid");
+        store.append(&id, Version::ZERO, &[submitted()])?;
+        assert_eq!(store.load(&id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn file_names_distinguish_case() {
+        assert_ne!(file_name("A"), file_name("a"));
     }
 
     #[test]
