@@ -1,8 +1,15 @@
 //! JSONL platform adapter for `mokmok-jobs`: one append-only file per stream.
 //!
 //! Each file starts with a header line naming its format, stream key, and
-//! creation time. One writer process per root. Correctness across processes is
-//! not claimed; the logical fence is the store's version check.
+//! creation time.
+//!
+//! One store instance owns a root. The version cache lives in the instance, so
+//! opening the same root twice gives two writers with separate caches. One
+//! writer can then append a duplicate version after the other has moved on.
+//! Callers should share one `Arc<JsonlEventStore>` across `JobSystem`s.
+//!
+//! Correctness across processes is not claimed; the logical fence is the
+//! store's version check.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -46,6 +53,11 @@ struct StoredEnvelope<'a, K, E> {
 impl<K, E> JsonlEventStore<K, E> {
     /// Opens or creates the root directory. No stream is read until it is
     /// touched.
+    ///
+    /// One instance owns a root. The version cache lives in the instance, so
+    /// opening the same root twice gives two writers with separate caches. One
+    /// writer can then append a duplicate version after the other has moved on.
+    /// Share one `Arc<JsonlEventStore>` across systems instead.
     ///
     /// # Errors
     ///

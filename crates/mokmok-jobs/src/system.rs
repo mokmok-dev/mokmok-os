@@ -144,6 +144,8 @@ impl From<StoreError> for Error {
 impl JobSystem {
     /// Builds a system that retires each actor after [`DEFAULT_IDLE_TIMEOUT`].
     ///
+    /// Share one store instance per root across systems.
+    ///
     /// See [`JobSystem::with_idle_timeout`] for what retirement does, and
     /// [`JobSystem::without_idle_timeout`] to opt out.
     #[must_use]
