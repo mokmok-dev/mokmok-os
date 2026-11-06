@@ -451,7 +451,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("append started");
 
-        let dropper = thread::spawn(move || drop(system));
+        let (drop_started, drop_wait) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            let _ = drop_started.send(());
+            drop(system);
+        });
+        drop_wait
+            .recv_timeout(Duration::from_secs(5))
+            .expect("drop started");
         thread::sleep(Duration::from_millis(200));
         assert!(
             !dropper.is_finished(),
