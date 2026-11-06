@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::job::JobError;
+use crate::port::StreamKey;
 
 const MAX_JOB_ID_LEN: usize = 128;
 
@@ -44,6 +45,12 @@ impl TryFrom<String> for JobId {
 impl From<JobId> for String {
     fn from(id: JobId) -> Self {
         id.0
+    }
+}
+
+impl StreamKey for JobId {
+    fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -106,6 +113,12 @@ mod tests {
             JobId::try_from(String::new()),
             Err(JobError::InvalidJobId(_))
         ));
+    }
+
+    #[test]
+    fn stream_key_exposes_the_job_id_text() {
+        let id = JobId::parse("job-1").expect("literal is valid");
+        assert_eq!(StreamKey::as_str(&id), "job-1");
     }
 
     #[test]

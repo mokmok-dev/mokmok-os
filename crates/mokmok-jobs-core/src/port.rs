@@ -1,22 +1,32 @@
-//! The two ports the outside world implements for a job system.
+//! The ports the outside world implements for a job system.
 
 use std::fmt;
+use std::hash::Hash;
 
 use serde::{Deserialize, Serialize};
 
 use crate::job::JobEvent;
 use crate::stream::{JobId, Version};
 
-/// One event with the stream position it was committed at.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Envelope {
-    pub job_id: JobId,
-    pub version: Version,
-    pub event: JobEvent,
+/// A stable identity for one stored event stream.
+///
+/// Adapters use [`as_str`](Self::as_str) to derive a file name. Two keys must
+/// never share a file, so an adapter escapes the raw value before joining it
+/// to a path.
+pub trait StreamKey: Clone + Eq + Hash + Send + Sync + 'static {
+    fn as_str(&self) -> &str;
 }
 
-/// A durable, append-only log of one event stream per job.
-pub trait EventStore: Send + Sync {
+/// One event with the stream position it was committed at.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope<K, E> {
+    pub stream: K,
+    pub version: Version,
+    pub event: E,
+}
+
+/// A durable, append-only log of one event stream per key.
+pub trait EventStore<K: StreamKey, E>: Send + Sync {
     /// `JobSystem` calls this while it holds the job's replay lock, so an
     /// implementation must not send a command back to that same job.
     ///
@@ -26,8 +36,8 @@ pub trait EventStore: Send + Sync {
     /// read or holds a record the store cannot trust.
     fn load(
         &self,
-        id: &JobId,
-    ) -> Result<Vec<Envelope>, StoreError>;
+        key: &K,
+    ) -> Result<Vec<Envelope<K, E>>, StoreError>;
 
     /// Commits the whole slice or nothing, returning the last committed version.
     ///
@@ -36,9 +46,9 @@ pub trait EventStore: Send + Sync {
     /// Returns [`StoreError::Conflict`] when the stream's version is not `expected`.
     fn append(
         &self,
-        id: &JobId,
+        key: &K,
         expected: Version,
-        events: &[JobEvent],
+        events: &[E],
     ) -> Result<Version, StoreError>;
 }
 
@@ -50,7 +60,7 @@ pub trait EventStore: Send + Sync {
 pub trait EventPublisher: Send + Sync {
     fn publish(
         &self,
-        envelopes: &[Envelope],
+        envelopes: &[Envelope<JobId, JobEvent>],
     );
 }
 

@@ -9,6 +9,6 @@ mod system;
 
 pub use mokmok_jobs_core::{
     Envelope, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
-    StoreError, Version, decide, evolve,
+    StoreError, StreamKey, Version, decide, evolve,
 };
 pub use system::{Appended, Error, JobSystem};

@@ -5,38 +5,46 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use mokmok_jobs_core::{
-    Envelope, EventPublisher, EventStore, JobEvent, JobId, StoreError, Version,
+    Envelope, EventPublisher, EventStore, JobEvent, JobId, StoreError, StreamKey, Version,
 };
 
-#[derive(Debug, Default)]
-pub struct MemoryEventStore {
-    streams: Mutex<HashMap<JobId, Vec<Envelope>>>,
+#[derive(Debug)]
+pub struct MemoryEventStore<K, E> {
+    streams: Mutex<HashMap<K, Vec<Envelope<K, E>>>>,
 }
 
-impl MemoryEventStore {
+impl<K, E> Default for MemoryEventStore<K, E> {
+    fn default() -> Self {
+        Self {
+            streams: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K, E> MemoryEventStore<K, E> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl EventStore for MemoryEventStore {
+impl<K: StreamKey, E: Clone + Send + Sync> EventStore<K, E> for MemoryEventStore<K, E> {
     fn load(
         &self,
-        id: &JobId,
-    ) -> Result<Vec<Envelope>, StoreError> {
+        key: &K,
+    ) -> Result<Vec<Envelope<K, E>>, StoreError> {
         let streams = self.streams.lock().map_err(|_| poisoned())?;
-        Ok(streams.get(id).cloned().unwrap_or_default())
+        Ok(streams.get(key).cloned().unwrap_or_default())
     }
 
     fn append(
         &self,
-        id: &JobId,
+        key: &K,
         expected: Version,
-        events: &[JobEvent],
+        events: &[E],
     ) -> Result<Version, StoreError> {
         let mut streams = self.streams.lock().map_err(|_| poisoned())?;
-        let log = streams.entry(id.clone()).or_default();
+        let log = streams.entry(key.clone()).or_default();
         let length = u64::try_from(log.len()).map_err(|error| StoreError::Io(error.to_string()))?;
         let actual = Version::new(length);
         if actual != expected {
@@ -46,7 +54,7 @@ impl EventStore for MemoryEventStore {
         for event in events {
             version = version.next();
             log.push(Envelope {
-                job_id: id.clone(),
+                stream: key.clone(),
                 version,
                 event: event.clone(),
             });
@@ -58,7 +66,7 @@ impl EventStore for MemoryEventStore {
 
 #[derive(Debug, Default)]
 pub struct RecordingPublisher {
-    published: Mutex<Vec<Envelope>>,
+    published: Mutex<Vec<Envelope<JobId, JobEvent>>>,
 }
 
 impl RecordingPublisher {
@@ -68,7 +76,7 @@ impl RecordingPublisher {
     }
 
     #[must_use]
-    pub fn published(&self) -> Vec<Envelope> {
+    pub fn published(&self) -> Vec<Envelope<JobId, JobEvent>> {
         self.published
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -88,7 +96,7 @@ impl RecordingPublisher {
 impl EventPublisher for RecordingPublisher {
     fn publish(
         &self,
-        envelopes: &[Envelope],
+        envelopes: &[Envelope<JobId, JobEvent>],
     ) {
         self.published
             .lock()
@@ -160,12 +168,12 @@ mod tests {
         let publisher = RecordingPublisher::new();
         let id = id();
         let first = Envelope {
-            job_id: id.clone(),
+            stream: id.clone(),
             version: Version::new(1),
             event: submitted(),
         };
         let second = Envelope {
-            job_id: id,
+            stream: id,
             version: Version::new(2),
             event: JobEvent::Started { attempt: 1 },
         };

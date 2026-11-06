@@ -6,7 +6,7 @@ use std::num::NonZeroU32;
 use serde::{Deserialize, Serialize};
 
 use crate::port::Envelope;
-use crate::stream::Version;
+use crate::stream::{JobId, Version};
 
 /// Where one job stands, derived only from its event stream.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -272,18 +272,18 @@ impl JobState {
     ///
     /// Returns [`JobError::CorruptHistory`] when the envelopes mix job ids, skip a
     /// version, or carry an event the preceding state cannot take.
-    pub fn replay(events: &[Envelope]) -> Result<Self, JobError> {
+    pub fn replay(events: &[Envelope<JobId, JobEvent>]) -> Result<Self, JobError> {
         let Some(first) = events.first() else {
             return Ok(Self::New);
         };
         let mut state = Self::New;
         let mut version = Version::new(1);
         for envelope in events {
-            if envelope.job_id != first.job_id {
+            if envelope.stream != first.stream {
                 return Err(JobError::CorruptHistory(format!(
                     "stream changed from {} to {}",
-                    first.job_id.as_str(),
-                    envelope.job_id.as_str()
+                    first.stream.as_str(),
+                    envelope.stream.as_str()
                 )));
             }
             if envelope.version != version {
@@ -705,12 +705,12 @@ mod tests {
         let id = JobId::parse("replay").expect("literal is valid");
         let events = vec![
             Envelope {
-                job_id: id.clone(),
+                stream: id.clone(),
                 version: Version::new(1),
                 event: submitted(),
             },
             Envelope {
-                job_id: id,
+                stream: id,
                 version: Version::new(3),
                 event: JobEvent::Started { attempt: 1 },
             },
@@ -727,12 +727,12 @@ mod tests {
         let second = JobId::parse("second").expect("literal is valid");
         let events = vec![
             Envelope {
-                job_id: first,
+                stream: first,
                 version: Version::new(1),
                 event: submitted(),
             },
             Envelope {
-                job_id: second,
+                stream: second,
                 version: Version::new(2),
                 event: JobEvent::Started { attempt: 1 },
             },
@@ -793,7 +793,7 @@ mod tests {
         ) {
             let id = JobId::parse("proptest").expect("literal is valid");
             let mut state = JobState::New;
-            let mut log: Vec<Envelope> = Vec::new();
+            let mut log: Vec<Envelope<JobId, JobEvent>> = Vec::new();
             for command in commands {
                 let Ok(events) = decide(&state, command) else {
                     continue;
@@ -801,7 +801,7 @@ mod tests {
                 for event in events {
                     let position = u64::try_from(log.len()).expect("log length fits u64");
                     let envelope = Envelope {
-                        job_id: id.clone(),
+                        stream: id.clone(),
                         version: Version::new(position + 1),
                         event,
                     };

@@ -13,7 +13,7 @@ fn attempts(count: u32) -> Result<NonZeroU32, Box<dyn std::error::Error>> {
 
 #[test]
 fn retryable_failure_requeues_then_succeeds() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     let id = JobId::parse("retryable")?;
 
@@ -75,7 +75,7 @@ fn retryable_failure_requeues_then_succeeds() -> Result<(), Box<dyn std::error::
 
 #[test]
 fn terminal_state_rejects_cancel_without_appending() -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     let id = JobId::parse("terminal")?;
     system.ask(
@@ -127,7 +127,7 @@ fn errors_carry_their_message_and_source() {
 #[test]
 fn rejected_command_appends_nothing_and_publishes_nothing() -> Result<(), Box<dyn std::error::Error>>
 {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let publisher = Arc::new(RecordingPublisher::new());
     let event_sink: Arc<dyn EventPublisher> = publisher.clone();
     let system = JobSystem::new(Arc::clone(&store), event_sink);
@@ -143,7 +143,7 @@ fn rejected_command_appends_nothing_and_publishes_nothing() -> Result<(), Box<dy
 #[test]
 fn publisher_receives_every_committed_event_in_version_order()
 -> Result<(), Box<dyn std::error::Error>> {
-    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::new());
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let publisher = Arc::new(RecordingPublisher::new());
     let event_sink: Arc<dyn EventPublisher> = publisher.clone();
     let system = JobSystem::new(Arc::clone(&store), event_sink);

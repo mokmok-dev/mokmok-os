@@ -8,5 +8,5 @@ mod port;
 mod stream;
 
 pub use job::{JobCommand, JobError, JobEvent, JobState, decide, evolve};
-pub use port::{Envelope, EventPublisher, EventStore, StoreError};
+pub use port::{Envelope, EventPublisher, EventStore, StoreError, StreamKey};
 pub use stream::{JobId, Version};

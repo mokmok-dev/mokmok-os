@@ -8,8 +8,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mokmok_jobs_core::{
-    Envelope, EventPublisher, EventStore, JobCommand, JobError, JobId, JobState, StoreError,
-    Version, decide, evolve,
+    Envelope, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
+    StoreError, Version, decide, evolve,
 };
 
 /// A handle to the job actors, cheap to clone and share across threads.
@@ -27,7 +27,7 @@ struct Registry {
 }
 
 struct Inner {
-    store: Arc<dyn EventStore>,
+    store: Arc<dyn EventStore<JobId, JobEvent>>,
     publisher: Arc<dyn EventPublisher>,
     registry: Arc<Registry>,
     idle: Option<Duration>,
@@ -44,7 +44,7 @@ struct Actor {
 // drop joins the actor thread.
 struct Worker {
     registry: Weak<Registry>,
-    store: Arc<dyn EventStore>,
+    store: Arc<dyn EventStore<JobId, JobEvent>>,
     publisher: Arc<dyn EventPublisher>,
     id: JobId,
     idle: Option<Duration>,
@@ -66,7 +66,7 @@ enum Dispatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Appended {
     pub version: Version,
-    pub events: Vec<Envelope>,
+    pub events: Vec<Envelope<JobId, JobEvent>>,
 }
 
 #[derive(Debug)]
@@ -116,7 +116,7 @@ impl From<StoreError> for Error {
 impl JobSystem {
     #[must_use]
     pub fn new(
-        store: Arc<dyn EventStore>,
+        store: Arc<dyn EventStore<JobId, JobEvent>>,
         publisher: Arc<dyn EventPublisher>,
     ) -> Self {
         Self::build(store, publisher, None)
@@ -129,7 +129,7 @@ impl JobSystem {
     /// retires an actor as soon as its mailbox is empty.
     #[must_use]
     pub fn with_idle_timeout(
-        store: Arc<dyn EventStore>,
+        store: Arc<dyn EventStore<JobId, JobEvent>>,
         publisher: Arc<dyn EventPublisher>,
         idle: Duration,
     ) -> Self {
@@ -137,7 +137,7 @@ impl JobSystem {
     }
 
     fn build(
-        store: Arc<dyn EventStore>,
+        store: Arc<dyn EventStore<JobId, JobEvent>>,
         publisher: Arc<dyn EventPublisher>,
         idle: Option<Duration>,
     ) -> Self {
@@ -405,7 +405,7 @@ fn run(
 }
 
 fn handle(
-    store: &dyn EventStore,
+    store: &dyn EventStore<JobId, JobEvent>,
     publisher: &dyn EventPublisher,
     id: &JobId,
     state: &mut JobState,
@@ -428,7 +428,7 @@ fn handle(
     for event in &events {
         next_version = next_version.next();
         envelopes.push(Envelope {
-            job_id: id.clone(),
+            stream: id.clone(),
             version: next_version,
             event: event.clone(),
         });
@@ -456,15 +456,15 @@ mod tests {
 
     #[derive(Default)]
     struct CountingStore {
-        inner: MemoryEventStore,
+        inner: MemoryEventStore<JobId, JobEvent>,
         loads: AtomicUsize,
     }
 
-    impl EventStore for CountingStore {
+    impl EventStore<JobId, JobEvent> for CountingStore {
         fn load(
             &self,
             id: &JobId,
-        ) -> Result<Vec<Envelope>, StoreError> {
+        ) -> Result<Vec<Envelope<JobId, JobEvent>>, StoreError> {
             self.loads.fetch_add(1, Ordering::SeqCst);
             self.inner.load(id)
         }
@@ -480,16 +480,16 @@ mod tests {
     }
 
     struct BlockingStore {
-        inner: MemoryEventStore,
+        inner: MemoryEventStore<JobId, JobEvent>,
         entered: Sender<()>,
         release: Mutex<Receiver<()>>,
     }
 
-    impl EventStore for BlockingStore {
+    impl EventStore<JobId, JobEvent> for BlockingStore {
         fn load(
             &self,
             id: &JobId,
-        ) -> Result<Vec<Envelope>, StoreError> {
+        ) -> Result<Vec<Envelope<JobId, JobEvent>>, StoreError> {
             self.inner.load(id)
         }
 
@@ -515,7 +515,7 @@ mod tests {
     fn blocked_store(
         entered: Sender<()>,
         release: Receiver<()>,
-    ) -> Arc<dyn EventStore> {
+    ) -> Arc<dyn EventStore<JobId, JobEvent>> {
         Arc::new(BlockingStore {
             inner: MemoryEventStore::new(),
             entered,
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn a_cached_actor_serves_the_next_command_without_reloading() {
         let store = Arc::new(CountingStore::default());
-        let event_store: Arc<dyn EventStore> = store.clone();
+        let event_store: Arc<dyn EventStore<JobId, JobEvent>> = store.clone();
         let system = JobSystem::new(event_store, Arc::new(RecordingPublisher::new()));
         let id = JobId::parse("cached").expect("literal is valid");
 
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn an_idle_actor_is_offloaded_and_the_next_command_replays() {
         let store = Arc::new(CountingStore::default());
-        let event_store: Arc<dyn EventStore> = store.clone();
+        let event_store: Arc<dyn EventStore<JobId, JobEvent>> = store.clone();
         let system = JobSystem::with_idle_timeout(
             event_store,
             Arc::new(RecordingPublisher::new()),
