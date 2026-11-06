@@ -1,7 +1,9 @@
 //! The actor registry that serializes commands per job.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
@@ -21,12 +23,35 @@ pub struct JobSystem {
     inner: Arc<Inner>,
 }
 
+const LIFECYCLE_STRIPES: usize = 64;
+
 struct Registry {
     entries: Mutex<HashMap<JobId, Arc<Actor>>>,
-    // A replay holds this until its actor is registered. A retirement takes it before
-    // removing its entry, so the actor a replay replaces cannot commit and retire
-    // between that load and the spawn, leaving the replay behind the log.
-    lifecycle: Mutex<()>,
+    // A replay holds the job's stripe until its actor is registered. A retirement takes
+    // the same stripe before removing its entry, so the actor a replay replaces cannot
+    // commit and retire between that load and the spawn, leaving the replay behind the log.
+    // Striping keeps a slow load for one job from blocking a replay or retirement for
+    // another.
+    lifecycles: Vec<Mutex<()>>,
+}
+
+impl Registry {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            lifecycles: (0..LIFECYCLE_STRIPES).map(|_| Mutex::new(())).collect(),
+        }
+    }
+
+    fn lifecycle(
+        &self,
+        id: &JobId,
+    ) -> &Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        let index = usize::try_from(hasher.finish()).unwrap_or(usize::MAX) % self.lifecycles.len();
+        &self.lifecycles[index]
+    }
 }
 
 struct Inner {
@@ -165,10 +190,7 @@ impl JobSystem {
             inner: Arc::new(Inner {
                 store,
                 publisher,
-                registry: Arc::new(Registry {
-                    entries: Mutex::new(HashMap::new()),
-                    lifecycle: Mutex::new(()),
-                }),
+                registry: Arc::new(Registry::new()),
                 idle,
             }),
         }
@@ -209,10 +231,10 @@ impl JobSystem {
         JobState::replay(&envelopes).map_err(Error::Job)
     }
 
-    // The registry lock orders a command send against retirement's final check: a send
-    // under the guard either lands before `try_recv`, which then serves it in place, or
-    // after the entry is gone, which sends the next command through `replay` and a
-    // fresh actor. Neither side can drop it in between.
+    // The entries guard orders a command send against retirement's final check: a send
+    // under it either lands before `try_recv`, which then serves it in place, or after
+    // the entry is gone, which sends the next command through `replay` and a fresh
+    // actor. The job's stripe serializes a cold replay with that retirement.
     fn deliver(
         &self,
         id: &JobId,
@@ -232,7 +254,7 @@ impl JobSystem {
         let lifecycle = self
             .inner
             .registry
-            .lifecycle
+            .lifecycle(id)
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let (state, version) = self.replay(id)?;
@@ -359,14 +381,14 @@ fn dispatch(
 }
 
 // Removes the entry only after the mailbox is known empty, so a command sent under the
-// guard is never dropped between that check and the removal.
+// entries guard is never dropped between that check and the removal.
 fn retire(
     worker: &Worker,
     requests: &Receiver<Request>,
 ) -> Option<Request> {
     let registry = worker.registry.upgrade()?;
     let _lifecycle = registry
-        .lifecycle
+        .lifecycle(&worker.id)
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let mut entries = registry
@@ -532,6 +554,35 @@ mod tests {
         }
     }
 
+    struct SlowLoadStore {
+        inner: MemoryEventStore<JobId, JobEvent>,
+        blocked: JobId,
+        entered: Sender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl EventStore<JobId, JobEvent> for SlowLoadStore {
+        fn load(
+            &self,
+            id: &JobId,
+        ) -> Result<Vec<Envelope<JobId, JobEvent>>, StoreError> {
+            if id == &self.blocked {
+                let _ = self.entered.send(());
+                let _ = self.release.lock().expect("release lock").recv();
+            }
+            self.inner.load(id)
+        }
+
+        fn append(
+            &self,
+            id: &JobId,
+            expected: Version,
+            events: &[JobEvent],
+        ) -> Result<Version, StoreError> {
+            self.inner.append(id, expected, events)
+        }
+    }
+
     fn blocked_store(
         entered: Sender<()>,
         release: Receiver<()>,
@@ -646,6 +697,59 @@ mod tests {
         let appended = asking
             .join()
             .expect("asking thread did not panic")
+            .expect("submit commits");
+        assert_eq!(appended.version, Version::new(1));
+    }
+
+    #[test]
+    fn a_slow_cold_start_does_not_block_another_job() {
+        let blocked = JobId::parse("slow-a").expect("literal is valid");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let store = Arc::new(SlowLoadStore {
+            inner: MemoryEventStore::new(),
+            blocked: blocked.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let system = JobSystem::without_idle_timeout(store, Arc::new(RecordingPublisher::new()));
+        let other = (0_u32..1024)
+            .map(|n| JobId::parse(format!("fast-{n}")).expect("literal is valid"))
+            .find(|other| {
+                !std::ptr::eq(
+                    system.inner.registry.lifecycle(&blocked),
+                    system.inner.registry.lifecycle(other),
+                )
+            })
+            .expect("some job id hashes outside the blocked job's stripe");
+
+        let slow = {
+            let system = system.clone();
+            thread::spawn(move || system.ask(&blocked, submit()))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slow load started");
+
+        let (fast_tx, fast_rx) = mpsc::channel();
+        let fast = thread::spawn(move || {
+            let _ = fast_tx.send(system.ask(&other, submit()));
+        });
+        let result = fast_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("an unrelated job's cold start waited on the slow load");
+        assert!(
+            result.is_ok(),
+            "the unrelated job's cold start failed: {:?}",
+            result.err()
+        );
+        fast.join()
+            .expect("the unrelated asking thread did not panic");
+
+        release_tx.send(()).expect("the slow load releases");
+        let appended = slow
+            .join()
+            .expect("the slow asking thread did not panic")
             .expect("submit commits");
         assert_eq!(appended.version, Version::new(1));
     }
