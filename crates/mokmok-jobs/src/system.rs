@@ -12,6 +12,9 @@ use mokmok_jobs_core::{
     StoreError, Version, decide, evolve,
 };
 
+/// The idle timeout [`JobSystem::new`] applies to every actor.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A handle to the job actors, cheap to clone and share across threads.
 #[derive(Clone)]
 pub struct JobSystem {
@@ -114,8 +117,24 @@ impl From<StoreError> for Error {
 }
 
 impl JobSystem {
+    /// Builds a system that retires each actor after [`DEFAULT_IDLE_TIMEOUT`].
+    ///
+    /// See [`JobSystem::with_idle_timeout`] for what retirement does, and
+    /// [`JobSystem::without_idle_timeout`] to opt out.
     #[must_use]
     pub fn new(
+        store: Arc<dyn EventStore<JobId, JobEvent>>,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Self {
+        Self::build(store, publisher, Some(DEFAULT_IDLE_TIMEOUT))
+    }
+
+    /// Builds a system that keeps each actor for as long as the system lives.
+    ///
+    /// For callers whose commands for a job are spaced far apart, or whose tests
+    /// need an actor that stays registered.
+    #[must_use]
+    pub fn without_idle_timeout(
         store: Arc<dyn EventStore<JobId, JobEvent>>,
         publisher: Arc<dyn EventPublisher>,
     ) -> Self {
@@ -126,7 +145,8 @@ impl JobSystem {
     ///
     /// The actor's thread then exits and its registry entry is removed. The next
     /// command replays the job's log and spawns a fresh actor. [`Duration::ZERO`]
-    /// retires an actor as soon as its mailbox is empty.
+    /// retires an actor as soon as its mailbox is empty. [`JobSystem::new`] uses
+    /// [`DEFAULT_IDLE_TIMEOUT`].
     #[must_use]
     pub fn with_idle_timeout(
         store: Arc<dyn EventStore<JobId, JobEvent>>,
@@ -538,6 +558,32 @@ mod tests {
             store.loads.load(Ordering::SeqCst),
             loads,
             "the cached actor must not reload the stream"
+        );
+    }
+
+    #[test]
+    fn the_default_idle_timeout_is_sixty_seconds() {
+        assert_eq!(DEFAULT_IDLE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn without_idle_timeout_keeps_the_actor() {
+        let store = Arc::new(CountingStore::default());
+        let event_store: Arc<dyn EventStore<JobId, JobEvent>> = store.clone();
+        let system =
+            JobSystem::without_idle_timeout(event_store, Arc::new(RecordingPublisher::new()));
+        let id = JobId::parse("resident").expect("literal is valid");
+
+        system.ask(&id, submit()).expect("submit commits");
+        let loads = store.loads.load(Ordering::SeqCst);
+        // Longer than the 20ms the retirement test waits, shorter than the 60s default.
+        thread::sleep(Duration::from_millis(50));
+        system.ask(&id, JobCommand::Start).expect("start commits");
+
+        assert_eq!(
+            store.loads.load(Ordering::SeqCst),
+            loads,
+            "an opted-out actor must not retire"
         );
     }
 
