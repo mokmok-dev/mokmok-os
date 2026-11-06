@@ -1,0 +1,11 @@
+[package]
+edition.workspace = true
+name = "mokmok-jobs-jsonl"
+version.workspace = true
+
+[dependencies]
+mokmok-jobs-core = { path = "../mokmok-jobs-core" }
+serde_json.workspace = true
+
+[lints]
+workspace = true
