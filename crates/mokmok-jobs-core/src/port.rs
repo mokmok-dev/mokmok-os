@@ -17,6 +17,9 @@ pub struct Envelope {
 
 /// A durable, append-only log of one event stream per job.
 pub trait EventStore: Send + Sync {
+    /// `JobSystem` calls this while it holds the job's replay lock, so an
+    /// implementation must not send a command back to that same job.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Io`] or [`StoreError::Corrupt`] when the log cannot be

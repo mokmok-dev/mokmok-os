@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use mokmok_jobs_core::{
     Envelope, EventPublisher, EventStore, JobCommand, JobError, JobId, JobState, StoreError,
@@ -16,25 +18,47 @@ pub struct JobSystem {
     inner: Arc<Inner>,
 }
 
+struct Registry {
+    entries: Mutex<HashMap<JobId, Arc<Actor>>>,
+    // A replay holds this until its actor is registered. A retirement takes it before
+    // removing its entry, so the actor a replay replaces cannot commit and retire
+    // between that load and the spawn, leaving the replay behind the log.
+    lifecycle: Mutex<()>,
+}
+
 struct Inner {
     store: Arc<dyn EventStore>,
     publisher: Arc<dyn EventPublisher>,
-    actors: Mutex<HashMap<JobId, Arc<Actor>>>,
+    registry: Arc<Registry>,
+    idle: Option<Duration>,
 }
 
 struct Actor {
-    tx: mpsc::Sender<Request>,
+    tx: Sender<Request>,
     // Taken by `Inner`'s drop, which must join only after every sender is closed.
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
+// `Weak<Registry>` and not `Weak<Inner>`: an `Arc<Inner>` upgraded on the retirement
+// path would drop on the actor's own thread, running `Inner::drop` there, and that
+// drop joins the actor thread.
+struct Worker {
+    registry: Weak<Registry>,
+    store: Arc<dyn EventStore>,
+    publisher: Arc<dyn EventPublisher>,
+    id: JobId,
+    idle: Option<Duration>,
+    state: JobState,
+    version: Version,
+}
+
 struct Request {
     command: JobCommand,
-    reply: mpsc::Sender<Result<Appended, Error>>,
+    reply: Sender<Result<Appended, Error>>,
 }
 
 enum Dispatch {
-    Reply(Result<Appended, Error>),
+    Reply(Receiver<Result<Appended, Error>>),
     Gone(JobCommand),
 }
 
@@ -95,11 +119,37 @@ impl JobSystem {
         store: Arc<dyn EventStore>,
         publisher: Arc<dyn EventPublisher>,
     ) -> Self {
+        Self::build(store, publisher, None)
+    }
+
+    /// Builds a system that offloads a job's actor after `idle` passes with no command.
+    ///
+    /// The actor's thread then exits and its registry entry is removed. The next
+    /// command replays the job's log and spawns a fresh actor. [`Duration::ZERO`]
+    /// retires an actor as soon as its mailbox is empty.
+    #[must_use]
+    pub fn with_idle_timeout(
+        store: Arc<dyn EventStore>,
+        publisher: Arc<dyn EventPublisher>,
+        idle: Duration,
+    ) -> Self {
+        Self::build(store, publisher, Some(idle))
+    }
+
+    fn build(
+        store: Arc<dyn EventStore>,
+        publisher: Arc<dyn EventPublisher>,
+        idle: Option<Duration>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 publisher,
-                actors: Mutex::new(HashMap::new()),
+                registry: Arc::new(Registry {
+                    entries: Mutex::new(HashMap::new()),
+                    lifecycle: Mutex::new(()),
+                }),
+                idle,
             }),
         }
     }
@@ -116,16 +166,11 @@ impl JobSystem {
         id: &JobId,
         command: JobCommand,
     ) -> Result<Appended, Error> {
-        let actor = self.actor(id)?;
-        match dispatch(&actor, command) {
-            Dispatch::Reply(reply) => reply,
-            Dispatch::Gone(command) => {
-                self.forget(id, &actor);
-                let fresh = self.actor(id)?;
-                match dispatch(&fresh, command) {
-                    Dispatch::Reply(reply) => reply,
-                    Dispatch::Gone(_) => Err(Error::ActorUnavailable),
-                }
+        match self.deliver(id, command)? {
+            Dispatch::Reply(reply) => reply.recv().unwrap_or(Err(Error::ActorUnavailable)),
+            Dispatch::Gone(command) => match self.deliver(id, command)? {
+                Dispatch::Reply(reply) => reply.recv().unwrap_or(Err(Error::ActorUnavailable)),
+                Dispatch::Gone(_) => Err(Error::ActorUnavailable),
             },
         }
     }
@@ -144,57 +189,53 @@ impl JobSystem {
         JobState::replay(&envelopes).map_err(Error::Job)
     }
 
-    fn actor(
+    // The registry lock orders a command send against retirement's final check: a send
+    // under the guard either lands before `try_recv`, which then serves it in place, or
+    // after the entry is gone, which sends the next command through `replay` and a
+    // fresh actor. Neither side can drop it in between.
+    fn deliver(
         &self,
         id: &JobId,
-    ) -> Result<Arc<Actor>, Error> {
-        if let Some(actor) = self.registered(id) {
-            return Ok(actor);
-        }
+        command: JobCommand,
+    ) -> Result<Dispatch, Error> {
+        let mut registry = self
+            .inner
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let command = match send_registered(&mut registry, id, command) {
+            Ok(outcome) => return Ok(outcome),
+            Err(command) => command,
+        };
+        drop(registry);
+        let lifecycle = self
+            .inner
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let (state, version) = self.replay(id)?;
+        let mut registry = self
+            .inner
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let command = match send_registered(&mut registry, id, command) {
+            Ok(outcome) => return Ok(outcome),
+            Err(command) => command,
+        };
+        // Spawning, inserting, and sending before the guards are released keeps a zero
+        // idle timeout from retiring the child before its first command is queued.
         let actor = self.spawn(id, state, version)?;
-        let mut actors = self
-            .inner
-            .actors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(registered) = actors.get(id) {
-            // The loser's `Arc` drop closes its mailbox, so its thread leaves `recv`.
-            return Ok(Arc::clone(registered));
+        let outcome = dispatch(&actor, command);
+        if !matches!(outcome, Dispatch::Gone(_)) {
+            registry.insert(id.clone(), actor);
         }
-        actors.insert(id.clone(), Arc::clone(&actor));
-        drop(actors);
-        Ok(actor)
-    }
-
-    fn registered(
-        &self,
-        id: &JobId,
-    ) -> Option<Arc<Actor>> {
-        self.inner
-            .actors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .cloned()
-    }
-
-    fn forget(
-        &self,
-        id: &JobId,
-        actor: &Arc<Actor>,
-    ) {
-        let mut actors = self
-            .inner
-            .actors
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if actors
-            .get(id)
-            .is_some_and(|registered| Arc::ptr_eq(registered, actor))
-        {
-            actors.remove(id);
-        }
+        drop(registry);
+        drop(lifecycle);
+        Ok(outcome)
     }
 
     fn replay(
@@ -216,12 +257,18 @@ impl JobSystem {
         version: Version,
     ) -> Result<Arc<Actor>, Error> {
         let (tx, requests) = mpsc::channel();
-        let store = Arc::clone(&self.inner.store);
-        let publisher = Arc::clone(&self.inner.publisher);
-        let actor_id = id.clone();
+        let worker = Worker {
+            registry: Arc::downgrade(&self.inner.registry),
+            store: Arc::clone(&self.inner.store),
+            publisher: Arc::clone(&self.inner.publisher),
+            id: id.clone(),
+            idle: self.inner.idle,
+            state,
+            version,
+        };
         let handle = thread::Builder::new()
             .name(format!("job-actor-{}", id.as_str()))
-            .spawn(move || run(store, publisher, actor_id, state, version, requests))
+            .spawn(move || run(worker, requests))
             .map_err(|error| Error::Spawn(error.to_string()))?;
         Ok(Arc::new(Actor {
             tx,
@@ -232,7 +279,11 @@ impl JobSystem {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let mut registry = self.actors.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut registry = self
+            .registry
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let drained: Vec<Arc<Actor>> = registry.drain().map(|(_, actor)| actor).collect();
         drop(registry);
         let mut handles = Vec::with_capacity(drained.len());
@@ -255,6 +306,25 @@ impl Drop for Inner {
     }
 }
 
+// An absent entry hands the command back, so the caller can spawn an actor and send it
+// without cloning. A closed mailbox leaves its entry behind, so remove it or the retry
+// finds the same dead actor again.
+fn send_registered(
+    registry: &mut HashMap<JobId, Arc<Actor>>,
+    id: &JobId,
+    command: JobCommand,
+) -> Result<Dispatch, JobCommand> {
+    let Some(registered) = registry.get(id) else {
+        return Err(command);
+    };
+    let actor = Arc::clone(registered);
+    let outcome = dispatch(&actor, command);
+    if matches!(outcome, Dispatch::Gone(_)) {
+        registry.remove(id);
+    }
+    Ok(outcome)
+}
+
 // The command comes back on a closed mailbox, so the retry resends the same value.
 #[allow(clippy::needless_pass_by_value)]
 fn dispatch(
@@ -263,28 +333,62 @@ fn dispatch(
 ) -> Dispatch {
     let (reply, wait) = mpsc::channel();
     match actor.tx.send(Request { command, reply }) {
-        Ok(()) => Dispatch::Reply(wait.recv().unwrap_or(Err(Error::ActorUnavailable))),
+        Ok(()) => Dispatch::Reply(wait),
         Err(mpsc::SendError(request)) => Dispatch::Gone(request.command),
     }
+}
+
+// Removes the entry only after the mailbox is known empty, so a command sent under the
+// guard is never dropped between that check and the removal.
+fn retire(
+    worker: &Worker,
+    requests: &Receiver<Request>,
+) -> Option<Request> {
+    let registry = worker.registry.upgrade()?;
+    let _lifecycle = registry
+        .lifecycle
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut entries = registry
+        .entries
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Ok(request) = requests.try_recv() {
+        return Some(request);
+    }
+    entries.remove(&worker.id);
+    None
 }
 
 // By value is what makes the spawned closure `'static`; the actor thread owns both.
 #[allow(clippy::needless_pass_by_value)]
 fn run(
-    store: Arc<dyn EventStore>,
-    publisher: Arc<dyn EventPublisher>,
-    id: JobId,
-    mut state: JobState,
-    mut version: Version,
-    requests: mpsc::Receiver<Request>,
+    mut worker: Worker,
+    requests: Receiver<Request>,
 ) {
-    while let Ok(request) = requests.recv() {
+    loop {
+        let request = match worker.idle {
+            None => match requests.recv() {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+            Some(idle) => match requests.recv_timeout(idle) {
+                Ok(request) => request,
+                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Timeout) => {
+                    let Some(request) = retire(&worker, &requests) else {
+                        return;
+                    };
+                    request
+                },
+            },
+        };
         let result = handle(
-            &*store,
-            &*publisher,
-            &id,
-            &mut state,
-            &mut version,
+            &*worker.store,
+            &*worker.publisher,
+            &worker.id,
+            &mut worker.state,
+            &mut worker.version,
             request.command,
         );
         if matches!(&result, Err(Error::Store(StoreError::Conflict { .. }))) {
@@ -343,7 +447,7 @@ fn handle(
 mod tests {
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use mokmok_jobs_core::JobEvent;
     use mokmok_jobs_memory::{MemoryEventStore, RecordingPublisher};
@@ -377,8 +481,8 @@ mod tests {
 
     struct BlockingStore {
         inner: MemoryEventStore,
-        entered: mpsc::Sender<()>,
-        release: Mutex<mpsc::Receiver<()>>,
+        entered: Sender<()>,
+        release: Mutex<Receiver<()>>,
     }
 
     impl EventStore for BlockingStore {
@@ -408,6 +512,17 @@ mod tests {
         }
     }
 
+    fn blocked_store(
+        entered: Sender<()>,
+        release: Receiver<()>,
+    ) -> Arc<dyn EventStore> {
+        Arc::new(BlockingStore {
+            inner: MemoryEventStore::new(),
+            entered,
+            release: Mutex::new(release),
+        })
+    }
+
     #[test]
     fn a_cached_actor_serves_the_next_command_without_reloading() {
         let store = Arc::new(CountingStore::default());
@@ -427,17 +542,87 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_actor_is_offloaded_and_the_next_command_replays() {
+        let store = Arc::new(CountingStore::default());
+        let event_store: Arc<dyn EventStore> = store.clone();
+        let system = JobSystem::with_idle_timeout(
+            event_store,
+            Arc::new(RecordingPublisher::new()),
+            Duration::from_millis(20),
+        );
+        let id = JobId::parse("idle").expect("literal is valid");
+
+        system.ask(&id, submit()).expect("submit commits");
+        let loads = store.loads.load(Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let empty = system
+                .inner
+                .registry
+                .entries
+                .lock()
+                .expect("registry lock")
+                .is_empty();
+            assert!(
+                empty || Instant::now() < deadline,
+                "actor was not offloaded"
+            );
+            if empty {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let appended = system.ask(&id, JobCommand::Start).expect("start commits");
+        assert_eq!(appended.version, Version::new(2));
+        assert_eq!(store.loads.load(Ordering::SeqCst), loads + 1);
+    }
+
+    #[test]
+    fn a_command_that_outlives_the_idle_deadline_still_answers() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let system = JobSystem::with_idle_timeout(
+            blocked_store(entered_tx, release_rx),
+            Arc::new(RecordingPublisher::new()),
+            Duration::from_millis(20),
+        );
+        let id = JobId::parse("slow").expect("literal is valid");
+
+        let asking = thread::spawn(move || system.ask(&id, submit()));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("append started");
+        thread::sleep(Duration::from_millis(100));
+        release_tx.send(()).expect("append releases");
+
+        let appended = asking
+            .join()
+            .expect("asking thread did not panic")
+            .expect("submit commits");
+        assert_eq!(appended.version, Version::new(1));
+    }
+
+    #[test]
     fn dropping_the_system_waits_for_an_in_flight_command() {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let store: Arc<dyn EventStore> = Arc::new(BlockingStore {
-            inner: MemoryEventStore::new(),
-            entered: entered_tx,
-            release: Mutex::new(release_rx),
-        });
-        let system = JobSystem::new(store, Arc::new(RecordingPublisher::new()));
+        let system = JobSystem::new(
+            blocked_store(entered_tx, release_rx),
+            Arc::new(RecordingPublisher::new()),
+        );
         let id = JobId::parse("blocking").expect("literal is valid");
-        let actor = system.actor(&id).expect("actor spawns");
+        let actor = system
+            .spawn(&id, JobState::New, Version::ZERO)
+            .expect("actor spawns");
+        system
+            .inner
+            .registry
+            .entries
+            .lock()
+            .expect("registry lock")
+            .insert(id, Arc::clone(&actor));
         let (reply, wait) = mpsc::channel();
         actor
             .tx
@@ -451,14 +636,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("append started");
 
-        let (drop_started, drop_wait) = mpsc::channel();
-        let dropper = thread::spawn(move || {
-            let _ = drop_started.send(());
-            drop(system);
-        });
-        drop_wait
-            .recv_timeout(Duration::from_secs(5))
-            .expect("drop started");
+        let dropping = system.clone();
+        drop(system);
+        let dropper = thread::spawn(move || drop(dropping));
         thread::sleep(Duration::from_millis(200));
         assert!(
             !dropper.is_finished(),
