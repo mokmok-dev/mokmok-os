@@ -27,7 +27,7 @@ fn submitted(max_attempts: u32) -> Result<JobEvent, Box<dyn std::error::Error>> 
 fn durable_log_replays_after_reopen() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("jobs");
-    let id = JobId::parse("durable")?;
+    let id = JobId::from_u128(1);
     {
         let system = JobSystem::new(
             Arc::new(Store::open(&root)?),
@@ -75,7 +75,7 @@ fn stale_actor_is_fenced_then_recovers() -> Result<(), Box<dyn std::error::Error
     let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(Store::open(&root)?);
     let first = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     let second = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
-    let id = JobId::parse("fenced")?;
+    let id = JobId::from_u128(2);
 
     first.ask(
         &id,
@@ -119,8 +119,8 @@ fn stale_actor_is_fenced_then_recovers() -> Result<(), Box<dyn std::error::Error
 fn a_torn_tail_in_one_stream_does_not_affect_another() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("jobs");
-    let first = JobId::parse("first")?;
-    let second = JobId::parse("second")?;
+    let first = JobId::from_u128(3);
+    let second = JobId::from_u128(4);
     {
         let store = Store::open(&root)?;
         store.append(&first, Version::ZERO, &[submitted(1)?])?;
@@ -131,7 +131,7 @@ fn a_torn_tail_in_one_stream_does_not_affect_another() -> Result<(), Box<dyn std
             .ok_or("no stream file".to_owned())??
             .path();
         let mut file = OpenOptions::new().append(true).open(path)?;
-        file.write_all(b"{\"stream\":\"first\",")?;
+        file.write_all(format!("{{\"stream\":\"{}\",", first.as_str()).as_bytes())?;
     }
 
     let store = Store::open(&root)?;

@@ -12,7 +12,7 @@ const WORKERS: usize = 8;
 fn concurrent_starts_admit_one_winner() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
-    let id = JobId::parse("concurrent")?;
+    let id = JobId::from_u128(1);
     system.ask(
         &id,
         JobCommand::Submit {
@@ -63,7 +63,7 @@ fn expired_actors_still_answer_from_the_log() -> Result<(), Box<dyn std::error::
         Arc::new(RecordingPublisher::new()),
         Duration::ZERO,
     );
-    let id = JobId::parse("expired")?;
+    let id = JobId::from_u128(2);
     system.ask(
         &id,
         JobCommand::Submit {

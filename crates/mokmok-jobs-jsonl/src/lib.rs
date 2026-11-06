@@ -1,5 +1,8 @@
 //! JSONL platform adapter for `mokmok-jobs`: one append-only file per stream.
 //!
+//! The file stem is the stream key. A `JobId` is a `UUIDv7`, so the file name is
+//! the id itself.
+//!
 //! Each file starts with a header line naming its format, stream key, and
 //! creation time.
 //!
@@ -52,7 +55,8 @@ struct StoredEnvelope<'a, K, E> {
 
 impl<K, E> JsonlEventStore<K, E> {
     /// Opens or creates the root directory. No stream is read until it is
-    /// touched.
+    /// touched. A stream's file is named `<key>.jsonl`; a `JobId` key is a
+    /// canonical lowercase UUID.
     ///
     /// One instance owns a root. The version cache lives in the instance, so
     /// opening the same root twice gives two writers with separate caches. One
@@ -87,7 +91,7 @@ impl<K, E> JsonlEventStore<K, E> {
     where
         K: StreamKey,
     {
-        self.root.join(file_name(key.as_str()))
+        self.root.join(format!("{}.jsonl", key.as_str()))
     }
 }
 
@@ -276,43 +280,6 @@ fn complete_prefix(bytes: &[u8]) -> &[u8] {
     }
 }
 
-fn escape(raw: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut escaped = String::with_capacity(raw.len());
-    for (index, byte) in raw.bytes().enumerate() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_')
-            || (byte == b'.' && index > 0)
-        {
-            escaped.push(char::from(byte));
-        } else {
-            escaped.push('%');
-            escaped.push(char::from(HEX[usize::from(byte >> 4)]));
-            escaped.push(char::from(HEX[usize::from(byte & 0x0F)]));
-        }
-    }
-    escaped
-}
-
-/// The readable prefix bounds a key whose escapes expand it past the 255-byte
-/// component limit, and the hash keeps `A` apart from `a` on a case-insensitive
-/// filesystem. The header still holds the raw key, so a hash collision reads
-/// back as [`StoreError::Corrupt`] rather than mixing two streams.
-fn file_name(raw: &str) -> String {
-    let escaped = escape(raw);
-    let prefix = &escaped[..escaped.len().min(200)];
-    format!("{prefix}-{:016x}.jsonl", stable_hash(raw))
-}
-
-fn stable_hash(raw: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in raw.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -339,9 +306,14 @@ fn error_at(
 mod tests {
     use std::num::NonZeroU32;
 
+    use mokmok_jobs_core::JobId;
     use serde::{Deserialize, Serialize};
 
     use super::*;
+
+    fn id(n: u128) -> JobId {
+        JobId::from_u128(n)
+    }
 
     fn submitted() -> mokmok_jobs_core::JobEvent {
         mokmok_jobs_core::JobEvent::Submitted {
@@ -350,9 +322,7 @@ mod tests {
         }
     }
 
-    fn store(
-        directory: &tempfile::TempDir
-    ) -> JsonlEventStore<mokmok_jobs_core::JobId, mokmok_jobs_core::JobEvent> {
+    fn store(directory: &tempfile::TempDir) -> JsonlEventStore<JobId, mokmok_jobs_core::JobEvent> {
         JsonlEventStore::open(directory.path().join("jobs")).expect("store opens")
     }
 
@@ -360,9 +330,8 @@ mod tests {
     fn open_creates_missing_parent_directories() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("nested").join("deeper");
-        let store =
-            JsonlEventStore::<mokmok_jobs_core::JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
-        let id = mokmok_jobs_core::JobId::parse("nested").expect("literal is valid");
+        let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
+        let id = id(1);
         store.append(&id, Version::ZERO, &[submitted()])?;
         assert_eq!(store.load(&id)?.len(), 1);
         assert!(root.is_dir());
@@ -373,8 +342,8 @@ mod tests {
     fn streams_live_in_separate_files() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let first = mokmok_jobs_core::JobId::parse("first").expect("literal is valid");
-        let second = mokmok_jobs_core::JobId::parse("second").expect("literal is valid");
+        let first = id(1);
+        let second = id(2);
         store.append(&first, Version::ZERO, &[submitted()])?;
         store.append(
             &second,
@@ -392,12 +361,9 @@ mod tests {
     fn reopening_twice_keeps_every_committed_record() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("jobs");
-        let id = mokmok_jobs_core::JobId::parse("reopen").expect("literal is valid");
+        let id = id(3);
         {
-            let store =
-                JsonlEventStore::<mokmok_jobs_core::JobId, mokmok_jobs_core::JobEvent>::open(
-                    &root,
-                )?;
+            let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
             store.append(&id, Version::ZERO, &[submitted()])?;
             store.append(
                 &id,
@@ -406,13 +372,11 @@ mod tests {
             )?;
         }
         {
-            drop(JsonlEventStore::<
-                mokmok_jobs_core::JobId,
-                mokmok_jobs_core::JobEvent,
-            >::open(&root)?);
+            drop(JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(
+                &root,
+            )?);
         }
-        let store =
-            JsonlEventStore::<mokmok_jobs_core::JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
+        let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
         assert_eq!(store.load(&id)?.len(), 2);
         Ok(())
     }
@@ -421,16 +385,12 @@ mod tests {
     fn opening_an_existing_stream_keeps_its_version() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("jobs");
-        let id = mokmok_jobs_core::JobId::parse("versioned").expect("literal is valid");
+        let id = id(4);
         {
-            let store =
-                JsonlEventStore::<mokmok_jobs_core::JobId, mokmok_jobs_core::JobEvent>::open(
-                    &root,
-                )?;
+            let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
             store.append(&id, Version::ZERO, &[submitted()])?;
         }
-        let store =
-            JsonlEventStore::<mokmok_jobs_core::JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
+        let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
         store.append(
             &id,
             Version::new(1),
@@ -443,13 +403,12 @@ mod tests {
     #[test]
     fn torn_tail_is_discarded_before_the_next_append() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let id = mokmok_jobs_core::JobId::parse("torn").expect("literal is valid");
-        {
-            let store = store(&directory);
-            store.append(&id, Version::ZERO, &[submitted()])?;
-            let mut file = OpenOptions::new().append(true).open(store.path(&id))?;
-            file.write_all(b"{\"stream\":\"torn\",")?;
-        }
+        let writer = store(&directory);
+        let id = id(5);
+        writer.append(&id, Version::ZERO, &[submitted()])?;
+        let mut file = OpenOptions::new().append(true).open(writer.path(&id))?;
+        file.write_all(format!("{{\"stream\":\"{}\",", id.as_str()).as_bytes())?;
+        drop(file);
         let store = store(&directory);
         assert_eq!(store.load(&id)?.len(), 1);
         let version = store.append(
@@ -466,7 +425,7 @@ mod tests {
     fn a_torn_header_is_replaced_on_append() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("torn-header").expect("literal is valid");
+        let id = id(6);
         fs::write(store.path(&id), b"{\"format\":1")?;
         assert_eq!(store.load(&id)?.len(), 0);
         store.append(&id, Version::ZERO, &[submitted()])?;
@@ -478,7 +437,7 @@ mod tests {
     fn a_missing_stream_loads_empty() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("missing").expect("literal is valid");
+        let id = id(7);
         assert_eq!(store.load(&id)?.len(), 0);
         Ok(())
     }
@@ -488,7 +447,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("empty").expect("literal is valid");
+        let id = id(8);
         assert_eq!(store.append(&id, Version::ZERO, &[])?, Version::ZERO);
         assert!(!store.path(&id).exists());
         store.append(&id, Version::ZERO, &[submitted()])?;
@@ -500,7 +459,7 @@ mod tests {
     fn a_stale_append_is_refused_without_writing() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("stale").expect("literal is valid");
+        let id = id(9);
         store.append(&id, Version::ZERO, &[submitted()])?;
         let error = store
             .append(
@@ -524,10 +483,14 @@ mod tests {
     fn a_header_for_another_stream_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("named").expect("literal is valid");
+        let other = id(11);
+        let id = id(10);
         fs::write(
             store.path(&id),
-            b"{\"format\":1,\"stream\":\"other\",\"created_at\":1}\n",
+            format!(
+                "{{\"format\":1,\"stream\":\"{}\",\"created_at\":1}}\n",
+                other.as_str()
+            ),
         )?;
         let error = store.load(&id).expect_err("mismatched header is refused");
         assert!(matches!(error, StoreError::Corrupt(_)));
@@ -538,10 +501,13 @@ mod tests {
     fn an_unsupported_format_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("future").expect("literal is valid");
+        let id = id(12);
         fs::write(
             store.path(&id),
-            b"{\"format\":2,\"stream\":\"future\",\"created_at\":1}\n",
+            format!(
+                "{{\"format\":2,\"stream\":\"{}\",\"created_at\":1}}\n",
+                id.as_str()
+            ),
         )?;
         let error = store.load(&id).expect_err("future format is refused");
         assert!(matches!(error, StoreError::Corrupt(_)));
@@ -552,10 +518,13 @@ mod tests {
     fn a_malformed_complete_line_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("malformed").expect("literal is valid");
+        let id = id(13);
         fs::write(
             store.path(&id),
-            b"{\"format\":1,\"stream\":\"malformed\",\"created_at\":1}\nnot json\n",
+            format!(
+                "{{\"format\":1,\"stream\":\"{}\",\"created_at\":1}}\nnot json\n",
+                id.as_str()
+            ),
         )?;
         let error = store.load(&id).expect_err("malformed line is refused");
         assert!(matches!(error, StoreError::Corrupt(_)));
@@ -567,7 +536,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("header").expect("literal is valid");
+        let id = id(14);
         let before = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -578,7 +547,7 @@ mod tests {
         let header: serde_json::Value =
             serde_json::from_str(text.lines().next().expect("header line"))?;
         assert_eq!(header["format"], 1);
-        assert_eq!(header["stream"], "header");
+        assert_eq!(header["stream"], id.as_str());
         let created = header["created_at"]
             .as_u64()
             .expect("created_at is a number");
@@ -620,7 +589,7 @@ mod tests {
     fn a_read_error_that_is_not_missing_is_reported() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("directory").expect("literal is valid");
+        let id = id(15);
         fs::create_dir(store.path(&id))?;
         let error = store
             .load(&id)
@@ -634,7 +603,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("empty-directory").expect("literal is valid");
+        let id = id(16);
         fs::create_dir(store.path(&id))?;
         let error = store
             .append(&id, Version::ZERO, &[])
@@ -647,7 +616,7 @@ mod tests {
     fn deleting_a_cached_stream_forces_a_fresh_version() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("deleted").expect("literal is valid");
+        let id = id(17);
         store.append(&id, Version::ZERO, &[submitted()])?;
         fs::remove_file(store.path(&id))?;
         let error = store
@@ -671,10 +640,15 @@ mod tests {
     fn an_envelope_for_another_stream_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("named").expect("literal is valid");
+        let other = id(19);
+        let id = id(18);
         fs::write(
             store.path(&id),
-            b"{\"format\":1,\"stream\":\"named\",\"created_at\":1}\n{\"stream\":\"other\",\"version\":1,\"event\":{\"kind\":\"started\",\"attempt\":1}}\n",
+            format!(
+                "{{\"format\":1,\"stream\":\"{}\",\"created_at\":1}}\n{{\"stream\":\"{}\",\"version\":1,\"event\":{{\"kind\":\"started\",\"attempt\":1}}}}\n",
+                id.as_str(),
+                other.as_str()
+            ),
         )?;
         let error = store
             .load(&id)
@@ -684,65 +658,8 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_escaped_into_one_safe_path_segment() {
-        assert_eq!(escape("plain-1_2.3"), "plain-1_2.3");
-        assert_eq!(escape(".hidden"), "%2Ehidden");
-        assert_eq!(escape("_.hidden"), "_.hidden");
-        assert_ne!(escape(".x"), escape("_.x"));
-        assert_eq!(escape("a:b"), "a%3Ab");
-        assert_eq!(escape("a/b"), "a%2Fb");
-    }
-
-    #[test]
-    fn stable_hash_matches_the_fnv_1a_vectors() {
-        assert_eq!(stable_hash(""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(stable_hash("a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(stable_hash("foobar"), 0x8594_4171_f739_67e8);
-    }
-
-    #[test]
-    fn a_long_colon_key_stores_in_one_bounded_file_name() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse(":".repeat(128)).expect("literal is valid");
-        let name = file_name(id.as_str());
-        assert!(name.len() <= 255);
-        assert!(name.starts_with(&escape(id.as_str())[..200]));
-        assert!(name.contains(&format!("{:016x}", stable_hash(id.as_str()))));
-        store.append(&id, Version::ZERO, &[submitted()])?;
-        assert_eq!(store.load(&id)?.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn a_long_alphanumeric_key_still_round_trips() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = mokmok_jobs_core::JobId::parse("k".repeat(128)).expect("literal is valid");
-        store.append(&id, Version::ZERO, &[submitted()])?;
-        assert_eq!(store.load(&id)?.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn file_names_distinguish_case() {
-        assert_ne!(file_name("A"), file_name("a"));
-    }
-
-    #[test]
-    fn store_paths_distinguish_case() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let upper = mokmok_jobs_core::JobId::parse("Job").expect("literal is valid");
-        let lower = mokmok_jobs_core::JobId::parse("job").expect("literal is valid");
-        assert_ne!(store.path(&upper), store.path(&lower));
-        Ok(())
-    }
-
-    #[test]
     fn every_event_variant_round_trips_through_the_line_format() {
-        use mokmok_jobs_core::{Envelope, JobEvent, JobId};
+        use mokmok_jobs_core::{Envelope, JobEvent};
 
         let events = [
             JobEvent::Submitted {
@@ -766,7 +683,7 @@ mod tests {
         ];
         for event in events {
             let envelope = Envelope {
-                stream: JobId::parse("encoded").expect("literal is valid"),
+                stream: id(20),
                 version: Version::new(1),
                 event: event.clone(),
             };

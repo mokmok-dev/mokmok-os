@@ -10,9 +10,10 @@ use crate::stream::{JobId, Version};
 
 /// A stable identity for one stored event stream.
 ///
-/// Adapters use [`as_str`](Self::as_str) to derive a file name. Two keys must
-/// never share a file, so an adapter escapes the raw value before joining it
-/// to a path.
+/// [`as_str`](Self::as_str) must be a non-empty, single path component of
+/// characters that are safe on every supported filesystem. [`JobId`] returns a
+/// canonical lowercase UUID, so an adapter uses it as the file stem without
+/// escaping.
 pub trait StreamKey: Clone + Eq + Hash + Send + Sync + 'static {
     fn as_str(&self) -> &str;
 }

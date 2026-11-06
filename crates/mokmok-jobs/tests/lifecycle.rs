@@ -15,7 +15,7 @@ fn attempts(count: u32) -> Result<NonZeroU32, Box<dyn std::error::Error>> {
 fn retryable_failure_requeues_then_succeeds() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
-    let id = JobId::parse("retryable")?;
+    let id = JobId::from_u128(1);
 
     let submitted = system.ask(
         &id,
@@ -77,7 +77,7 @@ fn retryable_failure_requeues_then_succeeds() -> Result<(), Box<dyn std::error::
 fn terminal_state_rejects_cancel_without_appending() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::new(MemoryEventStore::new());
     let system = JobSystem::new(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
-    let id = JobId::parse("terminal")?;
+    let id = JobId::from_u128(2);
     system.ask(
         &id,
         JobCommand::Submit {
@@ -131,7 +131,7 @@ fn rejected_command_appends_nothing_and_publishes_nothing() -> Result<(), Box<dy
     let publisher = Arc::new(RecordingPublisher::new());
     let event_sink: Arc<dyn EventPublisher> = publisher.clone();
     let system = JobSystem::new(Arc::clone(&store), event_sink);
-    let id = JobId::parse("rejected")?;
+    let id = JobId::from_u128(3);
 
     let rejected = system.ask(&id, JobCommand::Start);
     assert!(matches!(rejected, Err(Error::Job(JobError::NotSubmitted))));
@@ -147,7 +147,7 @@ fn publisher_receives_every_committed_event_in_version_order()
     let publisher = Arc::new(RecordingPublisher::new());
     let event_sink: Arc<dyn EventPublisher> = publisher.clone();
     let system = JobSystem::new(Arc::clone(&store), event_sink);
-    let id = JobId::parse("publisher")?;
+    let id = JobId::from_u128(4);
 
     system.ask(
         &id,

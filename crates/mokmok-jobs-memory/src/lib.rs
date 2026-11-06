@@ -116,7 +116,7 @@ mod tests {
     use super::*;
 
     fn id() -> JobId {
-        JobId::parse("memory").expect("literal is valid")
+        JobId::from_u128(1)
     }
 
     fn submitted() -> JobEvent {

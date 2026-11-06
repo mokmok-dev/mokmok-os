@@ -601,7 +601,7 @@ mod tests {
         let store = Arc::new(CountingStore::default());
         let event_store: Arc<dyn EventStore<JobId, JobEvent>> = store.clone();
         let system = JobSystem::new(event_store, Arc::new(RecordingPublisher::new()));
-        let id = JobId::parse("cached").expect("literal is valid");
+        let id = JobId::from_u128(1);
 
         system.ask(&id, submit()).expect("submit commits");
         let loads = store.loads.load(Ordering::SeqCst);
@@ -625,7 +625,7 @@ mod tests {
         let event_store: Arc<dyn EventStore<JobId, JobEvent>> = store.clone();
         let system =
             JobSystem::without_idle_timeout(event_store, Arc::new(RecordingPublisher::new()));
-        let id = JobId::parse("resident").expect("literal is valid");
+        let id = JobId::from_u128(2);
 
         system.ask(&id, submit()).expect("submit commits");
         let loads = store.loads.load(Ordering::SeqCst);
@@ -649,7 +649,7 @@ mod tests {
             Arc::new(RecordingPublisher::new()),
             Duration::from_millis(20),
         );
-        let id = JobId::parse("idle").expect("literal is valid");
+        let id = JobId::from_u128(3);
 
         system.ask(&id, submit()).expect("submit commits");
         let loads = store.loads.load(Ordering::SeqCst);
@@ -687,7 +687,7 @@ mod tests {
             Arc::new(RecordingPublisher::new()),
             Duration::from_millis(20),
         );
-        let id = JobId::parse("slow").expect("literal is valid");
+        let id = JobId::from_u128(4);
 
         let asking = thread::spawn(move || system.ask(&id, submit()));
         entered_rx
@@ -709,7 +709,7 @@ mod tests {
             Arc::new(MemoryEventStore::<JobId, JobEvent>::new()),
             Arc::new(RecordingPublisher::new()),
         );
-        let id = JobId::parse("stable").expect("literal is valid");
+        let id = JobId::from_u128(5);
         let first = system.inner.registry.lifecycle(&id);
         let second = system.inner.registry.lifecycle(&id);
         assert!(std::ptr::eq(first, second));
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn a_slow_cold_start_does_not_block_another_job() {
-        let blocked = JobId::parse("slow-a").expect("literal is valid");
+        let blocked = JobId::from_u128(6);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let store = Arc::new(SlowLoadStore {
@@ -728,7 +728,7 @@ mod tests {
         });
         let system = JobSystem::without_idle_timeout(store, Arc::new(RecordingPublisher::new()));
         let other = (0_u32..1024)
-            .map(|n| JobId::parse(format!("fast-{n}")).expect("literal is valid"))
+            .map(|n| JobId::from_u128(u128::from(n)))
             .find(|other| {
                 !std::ptr::eq(
                     system.inner.registry.lifecycle(&blocked),
@@ -776,7 +776,7 @@ mod tests {
             blocked_store(entered_tx, release_rx),
             Arc::new(RecordingPublisher::new()),
         );
-        let id = JobId::parse("blocking").expect("literal is valid");
+        let id = JobId::from_u128(7);
         let actor = system
             .spawn(&id, JobState::New, Version::ZERO)
             .expect("actor spawns");
