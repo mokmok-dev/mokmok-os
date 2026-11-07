@@ -1,1 +1,2 @@
 minimum_test_timeout = 60
+test_tool = "nextest"

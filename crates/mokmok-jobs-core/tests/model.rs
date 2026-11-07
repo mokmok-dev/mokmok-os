@@ -12,6 +12,13 @@ mod tests {
     };
     use stateright::{Checker, Model, Property};
 
+    /// The longest history `max_attempts = 3` allows: submit, then a start and a
+    /// retry for each attempt but the last, then a terminal event.
+    ///
+    /// The log is part of the state, so without this cap a state machine that
+    /// fails to advance grows the log forever and BFS never terminates.
+    const MAX_LOG: usize = 7;
+
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     enum Action {
         Submit(u32),
@@ -96,6 +103,9 @@ mod tests {
             for event in events {
                 evolve(&mut state, &event).expect("decide produced a legal event");
                 log.push(event);
+            }
+            if log.len() > MAX_LOG {
+                return None;
             }
             Some(ModelState { state, log })
         }
