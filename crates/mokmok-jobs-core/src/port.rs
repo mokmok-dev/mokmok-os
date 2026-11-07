@@ -1,12 +1,11 @@
-//! The ports the outside world implements for a job system.
+//! The ports the outside world implements for an event-sourced store.
 
 use std::fmt;
 use std::hash::Hash;
 
-use serde::{Deserialize, Serialize};
-
+use crate::cloud_event::CloudEvent;
 use crate::job::JobEvent;
-use crate::stream::{JobId, Version};
+use crate::stream::Version;
 
 /// A stable identity for one stored event stream.
 ///
@@ -14,21 +13,18 @@ use crate::stream::{JobId, Version};
 /// characters that are safe on every supported filesystem. [`JobId`] returns a
 /// canonical lowercase UUID, so an adapter uses it as the file stem without
 /// escaping.
+///
+/// [`JobId`]: crate::JobId
 pub trait StreamKey: Clone + Eq + Hash + Send + Sync + 'static {
     fn as_str(&self) -> &str;
 }
 
-/// One event with the stream position it was committed at.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Envelope<K, E> {
-    pub stream: K,
-    pub version: Version,
-    pub event: E,
-}
-
 /// A durable, append-only log of one event stream per key.
+///
+/// Both adapters persist the same [`CloudEvent`] records; only the place they
+/// keep them differs.
 pub trait EventStore<K: StreamKey, E>: Send + Sync {
-    /// `JobSystem` calls this while it holds the job's replay lock, so an
+    /// `JobSystem` calls this while it holds the stream's replay lock, so an
     /// implementation must not send a command back to that same job.
     ///
     /// # Errors
@@ -38,18 +34,23 @@ pub trait EventStore<K: StreamKey, E>: Send + Sync {
     fn load(
         &self,
         key: &K,
-    ) -> Result<Vec<Envelope<K, E>>, StoreError>;
+    ) -> Result<Vec<CloudEvent<E>>, StoreError>;
 
     /// Commits the whole slice or nothing, returning the last committed version.
     ///
+    /// `events` must be the records `expected.next()..` of `key`'s stream, which
+    /// [`check_append`] verifies.
+    ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Conflict`] when the stream's version is not `expected`.
+    /// Returns [`StoreError::Conflict`] when the stream's version is not `expected`,
+    /// and [`StoreError::Invalid`] when a record names another stream or skips a
+    /// position.
     fn append(
         &self,
         key: &K,
         expected: Version,
-        events: &[E],
+        events: &[CloudEvent<E>],
     ) -> Result<Version, StoreError>;
 }
 
@@ -61,13 +62,49 @@ pub trait EventStore<K: StreamKey, E>: Send + Sync {
 pub trait EventPublisher: Send + Sync {
     fn publish(
         &self,
-        envelopes: &[Envelope<JobId, JobEvent>],
+        events: &[CloudEvent<JobEvent>],
     );
+}
+
+/// Checks that `events` continue `expected` in `subject`, returning the last version.
+///
+/// Both adapters call this before persisting, so a caller cannot write a record that
+/// belongs to another stream or leaves a gap in the sequence.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Invalid`] when a record names another subject or does not
+/// follow the previous version.
+pub fn check_append<E>(
+    subject: &str,
+    expected: Version,
+    events: &[CloudEvent<E>],
+) -> Result<Version, StoreError> {
+    let mut version = expected;
+    for event in events {
+        let next = version.next();
+        if event.subject != subject {
+            return Err(StoreError::Invalid(format!(
+                "record for {:?} cannot enter stream {subject:?}",
+                event.subject
+            )));
+        }
+        if event.version != next {
+            return Err(StoreError::Invalid(format!(
+                "expected version {} but the record is {}",
+                next.get(),
+                event.version.get()
+            )));
+        }
+        version = next;
+    }
+    Ok(version)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
     Conflict { expected: Version, actual: Version },
+    Invalid(String),
     Io(String),
     Corrupt(String),
 }
@@ -84,6 +121,7 @@ impl fmt::Display for StoreError {
                 expected.get(),
                 actual.get()
             ),
+            Self::Invalid(message) => write!(formatter, "store refused: {message}"),
             Self::Io(message) => write!(formatter, "store i/o: {message}"),
             Self::Corrupt(message) => write!(formatter, "store is corrupt: {message}"),
         }
@@ -94,7 +132,52 @@ impl std::error::Error for StoreError {}
 
 #[cfg(test)]
 mod tests {
+    use crate::cloud_event::EventType;
+
     use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Tick(u64);
+
+    impl EventType for Tick {
+        fn event_type(&self) -> &'static str {
+            "dev.mokmok.tick"
+        }
+    }
+
+    fn event(
+        subject: &str,
+        version: u64,
+    ) -> CloudEvent<Tick> {
+        CloudEvent::new(subject, Version::new(version), Tick(version))
+    }
+
+    #[test]
+    fn check_append_accepts_a_contiguous_slice() {
+        let events = [event("s", 1), event("s", 2)];
+        assert_eq!(
+            check_append("s", Version::ZERO, &events),
+            Ok(Version::new(2))
+        );
+    }
+
+    #[test]
+    fn check_append_rejects_another_subject() {
+        let events = [event("other", 1)];
+        assert!(matches!(
+            check_append("s", Version::ZERO, &events),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn check_append_rejects_a_skipped_version() {
+        let events = [event("s", 2)];
+        assert!(matches!(
+            check_append("s", Version::ZERO, &events),
+            Err(StoreError::Invalid(_))
+        ));
+    }
 
     #[test]
     fn every_store_error_has_a_message() {
@@ -106,6 +189,7 @@ mod tests {
                 },
                 "expected version 1",
             ),
+            (StoreError::Invalid("gap".to_owned()), "gap"),
             (StoreError::Io("disk".to_owned()), "disk"),
             (StoreError::Corrupt("line".to_owned()), "line"),
         ];

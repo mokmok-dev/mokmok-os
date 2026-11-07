@@ -3,8 +3,9 @@
 //! The file stem is the stream key. A `JobId` is a `UUIDv7`, so the file name is
 //! the id itself.
 //!
-//! Each file starts with a header line naming its format, stream key, and
-//! creation time.
+//! Each line is one `CloudEvents` 1.0 JSON record from `mokmok-jobs-core`. The file
+//! holds no header and nothing else, so the same record shape is what the in-memory
+//! adapter keeps.
 //!
 //! One store instance owns a root. The version cache lives in the instance, so
 //! opening the same root twice gives two writers with separate caches. One
@@ -21,11 +22,9 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use mokmok_jobs_core::{Envelope, EventStore, StoreError, StreamKey, Version};
+use mokmok_jobs_core::{CloudEvent, EventStore, StoreError, StreamKey, Version, check_append};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-
-const FORMAT: u32 = 1;
 
 #[derive(Debug)]
 pub struct JsonlEventStore<K, E> {
@@ -37,20 +36,6 @@ pub struct JsonlEventStore<K, E> {
 #[derive(Debug)]
 struct Locked<K> {
     versions: HashMap<K, Version>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Header<K> {
-    format: u32,
-    stream: K,
-    created_at: u64,
-}
-
-#[derive(Serialize)]
-struct StoredEnvelope<'a, K, E> {
-    stream: &'a K,
-    version: Version,
-    event: &'a E,
 }
 
 impl<K, E> JsonlEventStore<K, E> {
@@ -95,12 +80,11 @@ impl<K, E> JsonlEventStore<K, E> {
     }
 }
 
-fn ensure<K, E>(
+fn ensure<E>(
     path: &Path,
-    key: &K,
-) -> Result<(Version, bool, File), StoreError>
+    subject: &str,
+) -> Result<(Version, File), StoreError>
 where
-    K: StreamKey + DeserializeOwned,
     E: DeserializeOwned,
 {
     let mut file = OpenOptions::new()
@@ -120,27 +104,27 @@ where
         // The truncation must survive a crash before the next append, or the torn tail returns.
         file.sync_data().map_err(|error| error_at(path, &error))?;
     }
-    let (version, _) = parse_stream::<K, E>(path, &bytes[..committed], key)?;
-    Ok((version, committed == 0, file))
+    let (version, _) = parse_stream::<E>(path, &bytes[..committed], subject)?;
+    Ok((version, file))
 }
 
 impl<K, E> EventStore<K, E> for JsonlEventStore<K, E>
 where
-    K: StreamKey + Serialize + DeserializeOwned,
+    K: StreamKey,
     E: Serialize + DeserializeOwned,
 {
     fn load(
         &self,
         key: &K,
-    ) -> Result<Vec<Envelope<K, E>>, StoreError> {
+    ) -> Result<Vec<CloudEvent<E>>, StoreError> {
         let path = self.path(key);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error_at(&path, &error)),
         };
-        let (_, envelopes) = parse_stream(&path, complete_prefix(&bytes), key)?;
-        Ok(envelopes)
+        let (_, events) = parse_stream(&path, complete_prefix(&bytes), key.as_str())?;
+        Ok(events)
     }
 
     #[allow(clippy::significant_drop_tightening)] // The guard is this stream's single-writer fence.
@@ -148,7 +132,7 @@ where
         &self,
         key: &K,
         expected: Version,
-        events: &[E],
+        events: &[CloudEvent<E>],
     ) -> Result<Version, StoreError> {
         let path = self.path(key);
         let mut state = self.lock()?;
@@ -156,7 +140,7 @@ where
             let current = match state.versions.get(key) {
                 Some(version) => *version,
                 None => match fs::read(&path) {
-                    Ok(bytes) => parse_stream::<K, E>(&path, complete_prefix(&bytes), key)?.0,
+                    Ok(bytes) => parse_stream::<E>(&path, complete_prefix(&bytes), key.as_str())?.0,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Version::ZERO,
                     Err(error) => return Err(error_at(&path, &error)),
                 },
@@ -169,19 +153,19 @@ where
             }
             return Ok(current);
         }
-        let (current, needs_header, mut file) = if let Some(version) = state.versions.get(key) {
+        let (current, mut file) = if let Some(version) = state.versions.get(key) {
             if let Ok(file) = OpenOptions::new().append(true).open(&path) {
-                (*version, false, file)
+                (*version, file)
             } else {
                 // A missing file is the common case; every other error repeats in `ensure`.
-                let (version, needs_header, file) = ensure::<K, E>(&path, key)?;
+                let (version, file) = ensure::<E>(&path, key.as_str())?;
                 state.versions.insert(key.clone(), version);
-                (version, needs_header, file)
+                (version, file)
             }
         } else {
-            let (version, needs_header, file) = ensure::<K, E>(&path, key)?;
+            let (version, file) = ensure::<E>(&path, key.as_str())?;
             state.versions.insert(key.clone(), version);
-            (version, needs_header, file)
+            (version, file)
         };
         if current != expected {
             return Err(StoreError::Conflict {
@@ -189,44 +173,27 @@ where
                 actual: current,
             });
         }
+        let last = check_append(key.as_str(), expected, events)?;
         let mut buffer = Vec::new();
-        if needs_header {
-            let header = Header {
-                format: FORMAT,
-                stream: key.clone(),
-                created_at: now_millis(),
-            };
-            serde_json::to_writer(&mut buffer, &header)
-                .map_err(|error| StoreError::Io(error.to_string()))?;
-            buffer.push(b'\n');
-        }
-        let mut version = current;
         for event in events {
-            version = version.next();
-            let envelope = StoredEnvelope {
-                stream: key,
-                version,
-                event,
-            };
-            serde_json::to_writer(&mut buffer, &envelope)
+            serde_json::to_writer(&mut buffer, event)
                 .map_err(|error| StoreError::Io(error.to_string()))?;
             buffer.push(b'\n');
         }
         file.write_all(&buffer)
             .map_err(|error| error_at(&path, &error))?;
         file.sync_data().map_err(|error| error_at(&path, &error))?;
-        state.versions.insert(key.clone(), version);
-        Ok(version)
+        state.versions.insert(key.clone(), last);
+        Ok(last)
     }
 }
 
-fn parse_stream<K, E>(
+fn parse_stream<E>(
     path: &Path,
     bytes: &[u8],
-    key: &K,
-) -> Result<(Version, Vec<Envelope<K, E>>), StoreError>
+    subject: &str,
+) -> Result<(Version, Vec<CloudEvent<E>>), StoreError>
 where
-    K: StreamKey + DeserializeOwned,
     E: DeserializeOwned,
 {
     if bytes.is_empty() {
@@ -234,43 +201,32 @@ where
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|error| StoreError::Corrupt(format!("{}: {error}", path.display())))?;
-    let mut lines = text.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| StoreError::Corrupt(format!("{}: missing header", path.display())))?;
-    let header: Header<K> =
-        serde_json::from_str(header_line).map_err(|error| corrupt(path, &error))?;
-    if header.format != FORMAT {
-        return Err(StoreError::Corrupt(format!(
-            "{}: unsupported format {}",
-            path.display(),
-            header.format
-        )));
-    }
-    if header.stream != *key {
-        return Err(StoreError::Corrupt(format!(
-            "{}: header names a different stream",
-            path.display()
-        )));
-    }
     let mut version = Version::ZERO;
-    let mut envelopes = Vec::new();
-    for (index, line) in lines.enumerate() {
-        let envelope: Envelope<K, E> =
+    let mut events = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let event: CloudEvent<E> =
             serde_json::from_str(line).map_err(|error| corrupt(path, &error))?;
         let expected = version.next();
-        if envelope.stream != *key || envelope.version != expected {
+        if event.subject != subject {
+            return Err(StoreError::Corrupt(format!(
+                "{}:{}: record names stream {} instead of {subject}",
+                path.display(),
+                index + 1,
+                event.subject
+            )));
+        }
+        if event.version != expected {
             return Err(StoreError::Corrupt(format!(
                 "{}:{}: expected version {}",
                 path.display(),
-                index + 2,
+                index + 1,
                 expected.get()
             )));
         }
-        version = envelope.version;
-        envelopes.push(envelope);
+        version = event.version;
+        events.push(event);
     }
-    Ok((version, envelopes))
+    Ok((version, events))
 }
 
 fn complete_prefix(bytes: &[u8]) -> &[u8] {
@@ -278,14 +234,6 @@ fn complete_prefix(bytes: &[u8]) -> &[u8] {
         Some(index) => &bytes[..=index],
         None => &[],
     }
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 fn corrupt(
@@ -306,7 +254,7 @@ fn error_at(
 mod tests {
     use std::num::NonZeroU32;
 
-    use mokmok_jobs_core::JobId;
+    use mokmok_jobs_core::{CloudEvent, EventType, JobEvent, JobId};
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -315,14 +263,30 @@ mod tests {
         JobId::from_u128(n)
     }
 
-    fn submitted() -> mokmok_jobs_core::JobEvent {
-        mokmok_jobs_core::JobEvent::Submitted {
+    fn submitted() -> JobEvent {
+        JobEvent::Submitted {
             input: b"in".to_vec(),
             max_attempts: NonZeroU32::new(1).expect("literal is nonzero"),
         }
     }
 
-    fn store(directory: &tempfile::TempDir) -> JsonlEventStore<JobId, mokmok_jobs_core::JobEvent> {
+    fn at(
+        id: &JobId,
+        version: u64,
+        event: JobEvent,
+    ) -> CloudEvent<JobEvent> {
+        CloudEvent::new(id.as_str(), Version::new(version), event)
+    }
+
+    fn first(id: &JobId) -> CloudEvent<JobEvent> {
+        at(id, 1, submitted())
+    }
+
+    fn line(record: &CloudEvent<JobEvent>) -> String {
+        serde_json::to_string(record).expect("record encodes")
+    }
+
+    fn store(directory: &tempfile::TempDir) -> JsonlEventStore<JobId, JobEvent> {
         JsonlEventStore::open(directory.path().join("jobs")).expect("store opens")
     }
 
@@ -330,9 +294,9 @@ mod tests {
     fn open_creates_missing_parent_directories() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("nested").join("deeper");
-        let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
+        let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
         let id = id(1);
-        store.append(&id, Version::ZERO, &[submitted()])?;
+        store.append(&id, Version::ZERO, &[first(&id)])?;
         assert_eq!(store.load(&id)?.len(), 1);
         assert!(root.is_dir());
         Ok(())
@@ -342,18 +306,21 @@ mod tests {
     fn streams_live_in_separate_files() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let first = id(1);
-        let second = id(2);
-        store.append(&first, Version::ZERO, &[submitted()])?;
+        let first_id = id(1);
+        let second_id = id(2);
+        store.append(&first_id, Version::ZERO, &[first(&first_id)])?;
         store.append(
-            &second,
+            &second_id,
             Version::ZERO,
-            &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+            &[at(&second_id, 1, JobEvent::Started { attempt: 1 })],
         )?;
-        assert_ne!(store.path(&first), store.path(&second));
-        assert_eq!(store.load(&first)?.len(), 1);
-        assert_eq!(store.load(&second)?.len(), 1);
-        assert_ne!(store.load(&first)?[0].event, store.load(&second)?[0].event);
+        assert_ne!(store.path(&first_id), store.path(&second_id));
+        assert_eq!(store.load(&first_id)?.len(), 1);
+        assert_eq!(store.load(&second_id)?.len(), 1);
+        assert_ne!(
+            store.load(&first_id)?[0].data,
+            store.load(&second_id)?[0].data
+        );
         Ok(())
     }
 
@@ -363,20 +330,18 @@ mod tests {
         let root = directory.path().join("jobs");
         let id = id(3);
         {
-            let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
-            store.append(&id, Version::ZERO, &[submitted()])?;
+            let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+            store.append(&id, Version::ZERO, &[first(&id)])?;
             store.append(
                 &id,
                 Version::new(1),
-                &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+                &[at(&id, 2, JobEvent::Started { attempt: 1 })],
             )?;
         }
         {
-            drop(JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(
-                &root,
-            )?);
+            drop(JsonlEventStore::<JobId, JobEvent>::open(&root)?);
         }
-        let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
+        let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
         assert_eq!(store.load(&id)?.len(), 2);
         Ok(())
     }
@@ -387,14 +352,14 @@ mod tests {
         let root = directory.path().join("jobs");
         let id = id(4);
         {
-            let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
-            store.append(&id, Version::ZERO, &[submitted()])?;
+            let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+            store.append(&id, Version::ZERO, &[first(&id)])?;
         }
-        let store = JsonlEventStore::<JobId, mokmok_jobs_core::JobEvent>::open(&root)?;
+        let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
         store.append(
             &id,
             Version::new(1),
-            &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
         )?;
         assert_eq!(store.load(&id)?.len(), 2);
         Ok(())
@@ -405,16 +370,16 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let writer = store(&directory);
         let id = id(5);
-        writer.append(&id, Version::ZERO, &[submitted()])?;
+        writer.append(&id, Version::ZERO, &[first(&id)])?;
         let mut file = OpenOptions::new().append(true).open(writer.path(&id))?;
-        file.write_all(format!("{{\"stream\":\"{}\",", id.as_str()).as_bytes())?;
+        file.write_all(format!("{{\"specversion\":\"1.0\",\"id\":\"{}", id.as_str()).as_bytes())?;
         drop(file);
         let store = store(&directory);
         assert_eq!(store.load(&id)?.len(), 1);
         let version = store.append(
             &id,
             Version::new(1),
-            &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
         )?;
         assert_eq!(version, Version::new(2));
         assert_eq!(store.load(&id)?.len(), 2);
@@ -422,13 +387,13 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_header_is_replaced_on_append() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_torn_first_record_is_replaced_on_append() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let id = id(6);
-        fs::write(store.path(&id), b"{\"format\":1")?;
+        fs::write(store.path(&id), b"{\"specversion\":\"1.0\"")?;
         assert_eq!(store.load(&id)?.len(), 0);
-        store.append(&id, Version::ZERO, &[submitted()])?;
+        store.append(&id, Version::ZERO, &[first(&id)])?;
         assert_eq!(store.load(&id)?.len(), 1);
         Ok(())
     }
@@ -450,7 +415,7 @@ mod tests {
         let id = id(8);
         assert_eq!(store.append(&id, Version::ZERO, &[])?, Version::ZERO);
         assert!(!store.path(&id).exists());
-        store.append(&id, Version::ZERO, &[submitted()])?;
+        store.append(&id, Version::ZERO, &[first(&id)])?;
         assert_eq!(store.append(&id, Version::new(1), &[])?, Version::new(1));
         Ok(())
     }
@@ -460,12 +425,12 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let id = id(9);
-        store.append(&id, Version::ZERO, &[submitted()])?;
+        store.append(&id, Version::ZERO, &[first(&id)])?;
         let error = store
             .append(
                 &id,
                 Version::ZERO,
-                &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+                &[at(&id, 1, JobEvent::Started { attempt: 1 })],
             )
             .expect_err("stale append is refused");
         assert!(matches!(
@@ -480,36 +445,44 @@ mod tests {
     }
 
     #[test]
-    fn a_header_for_another_stream_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
+    fn a_record_for_another_stream_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let other = id(11);
         let id = id(10);
-        fs::write(
-            store.path(&id),
-            format!(
-                "{{\"format\":1,\"stream\":\"{}\",\"created_at\":1}}\n",
-                other.as_str()
-            ),
-        )?;
-        let error = store.load(&id).expect_err("mismatched header is refused");
+        fs::write(store.path(&id), format!("{}\n", line(&first(&other))))?;
+        let error = store
+            .load(&id)
+            .expect_err("a record from another stream is refused");
         assert!(matches!(error, StoreError::Corrupt(_)));
         Ok(())
     }
 
     #[test]
-    fn an_unsupported_format_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
+    fn an_unsupported_specversion_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let id = id(12);
+        let mut value = serde_json::to_value(first(&id))?;
+        value["specversion"] = serde_json::Value::String("0.3".to_owned());
+        fs::write(store.path(&id), format!("{value}\n"))?;
+        let error = store
+            .load(&id)
+            .expect_err("a foreign specversion is refused");
+        assert!(matches!(error, StoreError::Corrupt(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_gap_in_the_sequence_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(13);
         fs::write(
             store.path(&id),
-            format!(
-                "{{\"format\":2,\"stream\":\"{}\",\"created_at\":1}}\n",
-                id.as_str()
-            ),
+            format!("{}\n", line(&at(&id, 2, submitted()))),
         )?;
-        let error = store.load(&id).expect_err("future format is refused");
+        let error = store.load(&id).expect_err("a gap is refused");
         assert!(matches!(error, StoreError::Corrupt(_)));
         Ok(())
     }
@@ -518,46 +491,63 @@ mod tests {
     fn a_malformed_complete_line_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = id(13);
-        fs::write(
-            store.path(&id),
-            format!(
-                "{{\"format\":1,\"stream\":\"{}\",\"created_at\":1}}\nnot json\n",
-                id.as_str()
-            ),
-        )?;
+        let id = id(14);
+        fs::write(store.path(&id), b"not json\n")?;
         let error = store.load(&id).expect_err("malformed line is refused");
         assert!(matches!(error, StoreError::Corrupt(_)));
         Ok(())
     }
 
     #[test]
-    fn the_header_records_the_format_stream_and_creation_time()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn a_stored_line_is_a_cloud_event() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = id(14);
-        let before = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis(),
-        )?;
-        store.append(&id, Version::ZERO, &[submitted()])?;
+        let id = id(15);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
         let text = fs::read_to_string(store.path(&id))?;
-        let header: serde_json::Value =
-            serde_json::from_str(text.lines().next().expect("header line"))?;
-        assert_eq!(header["format"], 1);
-        assert_eq!(header["stream"], id.as_str());
-        let created = header["created_at"]
-            .as_u64()
-            .expect("created_at is a number");
-        assert!(created >= before);
+        let record: serde_json::Value =
+            serde_json::from_str(text.lines().next().expect("record line"))?;
+        assert_eq!(record["specversion"], "1.0");
+        assert_eq!(record["id"], format!("{}:1", id.as_str()));
+        assert_eq!(record["source"], "mokmok://eventstore");
+        assert_eq!(record["type"], "dev.mokmok.job.submitted");
+        assert_eq!(record["subject"], id.as_str());
+        assert_eq!(record["sequence"], "1");
+        assert_eq!(record["sequencetype"], "Integer");
+        assert_eq!(record["data"]["kind"], "submitted");
+        Ok(())
+    }
+
+    #[test]
+    fn append_refuses_a_record_from_another_stream() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let other = id(17);
+        let id = id(16);
+        let error = store
+            .append(&id, Version::ZERO, &[first(&other)])
+            .expect_err("a record from another stream is refused");
+        assert!(matches!(error, StoreError::Invalid(_)));
+        assert_eq!(store.load(&id)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn append_refuses_a_record_that_skips_a_version() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(18);
+        let error = store
+            .append(&id, Version::ZERO, &[at(&id, 2, submitted())])
+            .expect_err("a skipped version is refused");
+        assert!(matches!(error, StoreError::Invalid(_)));
+        assert_eq!(store.load(&id)?.len(), 0);
         Ok(())
     }
 
     #[test]
     fn the_adapter_is_generic_over_key_and_event() -> Result<(), Box<dyn std::error::Error>> {
-        #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[derive(Clone, Debug, Eq, Hash, PartialEq)]
         struct NoteId(String);
 
         impl StreamKey for NoteId {
@@ -571,17 +561,24 @@ mod tests {
             text: String,
         }
 
+        impl EventType for Note {
+            fn event_type(&self) -> &'static str {
+                "dev.mokmok.note"
+            }
+        }
+
         let directory = tempfile::tempdir()?;
         let store = JsonlEventStore::<NoteId, Note>::open(directory.path().join("notes"))?;
         let id = NoteId("note-1".to_owned());
-        store.append(
-            &id,
-            Version::ZERO,
-            &[Note {
+        let record = CloudEvent::new(
+            id.as_str(),
+            Version::new(1),
+            Note {
                 text: "hello".to_owned(),
-            }],
-        )?;
-        assert_eq!(store.load(&id)?[0].event.text, "hello");
+            },
+        );
+        store.append(&id, Version::ZERO, &[record])?;
+        assert_eq!(store.load(&id)?[0].data.text, "hello");
         Ok(())
     }
 
@@ -589,7 +586,7 @@ mod tests {
     fn a_read_error_that_is_not_missing_is_reported() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = id(15);
+        let id = id(19);
         fs::create_dir(store.path(&id))?;
         let error = store
             .load(&id)
@@ -603,7 +600,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = id(16);
+        let id = id(20);
         fs::create_dir(store.path(&id))?;
         let error = store
             .append(&id, Version::ZERO, &[])
@@ -616,14 +613,14 @@ mod tests {
     fn deleting_a_cached_stream_forces_a_fresh_version() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
-        let id = id(17);
-        store.append(&id, Version::ZERO, &[submitted()])?;
+        let id = id(21);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
         fs::remove_file(store.path(&id))?;
         let error = store
             .append(
                 &id,
                 Version::new(1),
-                &[mokmok_jobs_core::JobEvent::Started { attempt: 1 }],
+                &[at(&id, 2, JobEvent::Started { attempt: 1 })],
             )
             .expect_err("the cached file is gone");
         assert!(matches!(
@@ -637,30 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn an_envelope_for_another_stream_is_corrupt() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let other = id(19);
-        let id = id(18);
-        fs::write(
-            store.path(&id),
-            format!(
-                "{{\"format\":1,\"stream\":\"{}\",\"created_at\":1}}\n{{\"stream\":\"{}\",\"version\":1,\"event\":{{\"kind\":\"started\",\"attempt\":1}}}}\n",
-                id.as_str(),
-                other.as_str()
-            ),
-        )?;
-        let error = store
-            .load(&id)
-            .expect_err("an envelope from another stream is refused");
-        assert!(matches!(error, StoreError::Corrupt(_)));
-        Ok(())
-    }
-
-    #[test]
     fn every_event_variant_round_trips_through_the_line_format() {
-        use mokmok_jobs_core::{Envelope, JobEvent};
-
         let events = [
             JobEvent::Submitted {
                 input: b"in".to_vec(),
@@ -681,17 +655,14 @@ mod tests {
                 reason: "stop".to_owned(),
             },
         ];
+        let id = id(22);
         for event in events {
-            let envelope = Envelope {
-                stream: id(20),
-                version: Version::new(1),
-                event: event.clone(),
-            };
-            let line = serde_json::to_string(&envelope).expect("event encodes");
-            assert!(!line.contains('\n'));
-            let decoded: Envelope<JobId, JobEvent> =
-                serde_json::from_str(&line).expect("event decodes");
-            assert_eq!(decoded, envelope);
+            let record = at(&id, 1, event);
+            let encoded = line(&record);
+            assert!(!encoded.contains('\n'));
+            let decoded: CloudEvent<JobEvent> =
+                serde_json::from_str(&encoded).expect("record decodes");
+            assert_eq!(decoded, record);
         }
     }
 }

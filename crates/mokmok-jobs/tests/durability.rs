@@ -4,8 +4,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use mokmok_jobs::{
-    Error, EventStore, JobCommand, JobError, JobEvent, JobId, JobState, JobSystem, StoreError,
-    Version,
+    CloudEvent, Error, EventStore, JobCommand, JobError, JobEvent, JobId, JobState, JobSystem,
+    StoreError, Version,
 };
 use mokmok_jobs_jsonl::JsonlEventStore;
 use mokmok_jobs_memory::RecordingPublisher;
@@ -123,7 +123,15 @@ fn a_torn_tail_in_one_stream_does_not_affect_another() -> Result<(), Box<dyn std
     let second = JobId::from_u128(4);
     {
         let store = Store::open(&root)?;
-        store.append(&first, Version::ZERO, &[submitted(1)?])?;
+        store.append(
+            &first,
+            Version::ZERO,
+            &[CloudEvent::new(
+                first.as_str(),
+                Version::new(1),
+                submitted(1)?,
+            )],
+        )?;
     }
     {
         let path = std::fs::read_dir(&root)?
@@ -131,11 +139,21 @@ fn a_torn_tail_in_one_stream_does_not_affect_another() -> Result<(), Box<dyn std
             .ok_or("no stream file".to_owned())??
             .path();
         let mut file = OpenOptions::new().append(true).open(path)?;
-        file.write_all(format!("{{\"stream\":\"{}\",", first.as_str()).as_bytes())?;
+        file.write_all(
+            format!("{{\"specversion\":\"1.0\",\"id\":\"{}", first.as_str()).as_bytes(),
+        )?;
     }
 
     let store = Store::open(&root)?;
-    store.append(&second, Version::ZERO, &[submitted(1)?])?;
+    store.append(
+        &second,
+        Version::ZERO,
+        &[CloudEvent::new(
+            second.as_str(),
+            Version::new(1),
+            submitted(1)?,
+        )],
+    )?;
     assert_eq!(store.load(&first)?.len(), 1);
     assert_eq!(store.load(&second)?.len(), 1);
     Ok(())

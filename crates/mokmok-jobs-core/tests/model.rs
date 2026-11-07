@@ -8,7 +8,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use mokmok_jobs_core::{
-        Envelope, JobCommand, JobEvent, JobId, JobState, Version, decide, evolve,
+        CloudEvent, JobCommand, JobEvent, JobId, JobState, Version, decide, evolve,
     };
     use stateright::{Checker, Model, Property};
 
@@ -121,19 +121,21 @@ mod tests {
                 Property::always(
                     "replay rebuilds the same state",
                     |model: &Self, state: &ModelState| {
-                        let envelopes: Vec<Envelope<JobId, JobEvent>> = state
+                        let records: Vec<CloudEvent<JobEvent>> = state
                             .log
                             .iter()
                             .enumerate()
-                            .map(|(index, event)| Envelope {
-                                stream: model.id.clone(),
-                                version: Version::new(
-                                    u64::try_from(index).expect("log index fits in u64") + 1,
-                                ),
-                                event: event.clone(),
+                            .map(|(index, event)| {
+                                CloudEvent::new(
+                                    model.id.as_str(),
+                                    Version::new(
+                                        u64::try_from(index).expect("log index fits in u64") + 1,
+                                    ),
+                                    event.clone(),
+                                )
                             })
                             .collect();
-                        JobState::replay(&envelopes).is_ok_and(|replayed| replayed == state.state)
+                        JobState::replay(&records).is_ok_and(|replayed| replayed == state.state)
                     },
                 ),
                 Property::always(

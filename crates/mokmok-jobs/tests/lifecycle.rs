@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use mokmok_jobs::{
-    Envelope, Error, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
+    CloudEvent, Error, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
     JobSystem, StoreError, Version,
 };
 use mokmok_jobs_memory::{MemoryEventStore, RecordingPublisher};
@@ -37,8 +37,8 @@ fn retryable_failure_requeues_then_succeeds() -> Result<(), Box<dyn std::error::
     assert_eq!(retried.version, Version::new(3));
     assert!(matches!(
         retried.events.as_slice(),
-        [Envelope {
-            event: JobEvent::RetryScheduled {
+        [CloudEvent {
+            data: JobEvent::RetryScheduled {
                 attempt: 2,
                 reason,
             },
@@ -63,7 +63,7 @@ fn retryable_failure_requeues_then_succeeds() -> Result<(), Box<dyn std::error::
     let versions: Vec<u64> = store
         .load(&id)?
         .iter()
-        .map(|envelope| envelope.version.get())
+        .map(|event| event.version.get())
         .collect();
     assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     assert!(matches!(
@@ -174,10 +174,7 @@ fn publisher_receives_every_committed_event_in_version_order()
 
     let recorded = publisher.published();
     assert_eq!(recorded, store.load(&id)?);
-    let versions: Vec<u64> = recorded
-        .iter()
-        .map(|envelope| envelope.version.get())
-        .collect();
+    let versions: Vec<u64> = recorded.iter().map(|event| event.version.get()).collect();
     assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     assert_eq!(publisher.len(), 5);
     Ok(())
