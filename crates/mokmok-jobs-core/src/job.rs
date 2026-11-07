@@ -702,7 +702,7 @@ mod tests {
 
     #[test]
     fn replay_rejects_skipped_versions() {
-        let id = JobId::parse("replay").expect("literal is valid");
+        let id = JobId::from_u128(1);
         let events = vec![
             Envelope {
                 stream: id.clone(),
@@ -723,8 +723,8 @@ mod tests {
 
     #[test]
     fn replay_rejects_mixed_streams() {
-        let first = JobId::parse("first").expect("literal is valid");
-        let second = JobId::parse("second").expect("literal is valid");
+        let first = JobId::from_u128(1);
+        let second = JobId::from_u128(2);
         let events = vec![
             Envelope {
                 stream: first,
@@ -791,7 +791,7 @@ mod tests {
         fn replay_matches_the_decisions_that_wrote_it(
             commands in prop::collection::vec(command_strategy(), 0..24),
         ) {
-            let id = JobId::parse("proptest").expect("literal is valid");
+            let id = JobId::from_u128(3);
             let mut state = JobState::New;
             let mut log: Vec<Envelope<JobId, JobEvent>> = Vec::new();
             for command in commands {

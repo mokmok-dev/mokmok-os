@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 mokmok-jobs-core.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 mokmok-jobs-jsonl.workspace = true

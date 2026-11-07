@@ -34,7 +34,7 @@ mod tests {
     impl JobModel {
         fn new() -> Self {
             Self {
-                id: JobId::parse("model").expect("literal is valid"),
+                id: JobId::from_u128(1),
             }
         }
 
