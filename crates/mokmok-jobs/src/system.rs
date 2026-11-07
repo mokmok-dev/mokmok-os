@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use mokmok_jobs_core::{
-    Envelope, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
+    CloudEvent, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
     StoreError, Version, decide, evolve,
 };
 
@@ -94,7 +94,7 @@ enum Dispatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Appended {
     pub version: Version,
-    pub events: Vec<Envelope<JobId, JobEvent>>,
+    pub events: Vec<CloudEvent<JobEvent>>,
 }
 
 #[derive(Debug)]
@@ -229,8 +229,8 @@ impl JobSystem {
         &self,
         id: &JobId,
     ) -> Result<JobState, Error> {
-        let envelopes = self.inner.store.load(id).map_err(Error::Store)?;
-        JobState::replay(&envelopes).map_err(Error::Job)
+        let records = self.inner.store.load(id).map_err(Error::Store)?;
+        JobState::replay(&records).map_err(Error::Job)
     }
 
     // The entries guard orders a command send against retirement's final check: a send
@@ -286,11 +286,11 @@ impl JobSystem {
         &self,
         id: &JobId,
     ) -> Result<(JobState, Version), Error> {
-        let envelopes = self.inner.store.load(id).map_err(Error::Store)?;
-        let state = JobState::replay(&envelopes).map_err(Error::Job)?;
-        let version = envelopes
+        let records = self.inner.store.load(id).map_err(Error::Store)?;
+        let state = JobState::replay(&records).map_err(Error::Job)?;
+        let version = records
             .last()
-            .map_or(Version::ZERO, |envelope| envelope.version);
+            .map_or(Version::ZERO, |record| record.version);
         Ok((state, version))
     }
 
@@ -468,22 +468,18 @@ fn handle(
         evolve(&mut next_state, event)?;
     }
     let mut next_version = *version;
-    let mut envelopes = Vec::with_capacity(events.len());
+    let mut records = Vec::with_capacity(events.len());
     for event in &events {
         next_version = next_version.next();
-        envelopes.push(Envelope {
-            stream: id.clone(),
-            version: next_version,
-            event: event.clone(),
-        });
+        records.push(CloudEvent::new(id.as_str(), next_version, event.clone()));
     }
-    let committed = store.append(id, *version, &events).map_err(Error::Store)?;
-    publisher.publish(&envelopes);
+    let committed = store.append(id, *version, &records).map_err(Error::Store)?;
+    publisher.publish(&records);
     *state = next_state;
     *version = committed;
     Ok(Appended {
         version: committed,
-        events: envelopes,
+        events: records,
     })
 }
 
@@ -508,7 +504,7 @@ mod tests {
         fn load(
             &self,
             id: &JobId,
-        ) -> Result<Vec<Envelope<JobId, JobEvent>>, StoreError> {
+        ) -> Result<Vec<CloudEvent<JobEvent>>, StoreError> {
             self.loads.fetch_add(1, Ordering::SeqCst);
             self.inner.load(id)
         }
@@ -517,7 +513,7 @@ mod tests {
             &self,
             id: &JobId,
             expected: Version,
-            events: &[JobEvent],
+            events: &[CloudEvent<JobEvent>],
         ) -> Result<Version, StoreError> {
             self.inner.append(id, expected, events)
         }
@@ -533,7 +529,7 @@ mod tests {
         fn load(
             &self,
             id: &JobId,
-        ) -> Result<Vec<Envelope<JobId, JobEvent>>, StoreError> {
+        ) -> Result<Vec<CloudEvent<JobEvent>>, StoreError> {
             self.inner.load(id)
         }
 
@@ -541,7 +537,7 @@ mod tests {
             &self,
             id: &JobId,
             expected: Version,
-            events: &[JobEvent],
+            events: &[CloudEvent<JobEvent>],
         ) -> Result<Version, StoreError> {
             let _ = self.entered.send(());
             let _ = self.release.lock().expect("release lock").recv();
@@ -567,7 +563,7 @@ mod tests {
         fn load(
             &self,
             id: &JobId,
-        ) -> Result<Vec<Envelope<JobId, JobEvent>>, StoreError> {
+        ) -> Result<Vec<CloudEvent<JobEvent>>, StoreError> {
             if id == &self.blocked {
                 let _ = self.entered.send(());
                 let _ = self.release.lock().expect("release lock").recv();
@@ -579,7 +575,7 @@ mod tests {
             &self,
             id: &JobId,
             expected: Version,
-            events: &[JobEvent],
+            events: &[CloudEvent<JobEvent>],
         ) -> Result<Version, StoreError> {
             self.inner.append(id, expected, events)
         }

@@ -11,8 +11,8 @@
 mod system;
 
 pub use mokmok_jobs_core::{
-    Envelope, EventPublisher, EventStore, JobCommand, JobError, JobEvent, JobId, JobState,
-    StoreError, StreamKey, Version, decide, evolve,
+    CloudEvent, EventPublisher, EventStore, EventType, JobCommand, JobError, JobEvent, JobId,
+    JobState, SOURCE, StoreError, StreamKey, Version, check_append, decide, evolve,
 };
 pub use system::{Appended, DEFAULT_IDLE_TIMEOUT, Error, JobSystem};
 

@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
-use crate::port::Envelope;
-use crate::stream::{JobId, Version};
+use crate::cloud_event::{CloudEvent, EventType};
+use crate::stream::Version;
 
 /// Where one job stands, derived only from its event stream.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -133,6 +133,19 @@ impl JobEvent {
             Self::Succeeded { .. } => "succeeded",
             Self::Failed { .. } => "failed",
             Self::Cancelled { .. } => "cancelled",
+        }
+    }
+}
+
+impl EventType for JobEvent {
+    fn event_type(&self) -> &'static str {
+        match self {
+            Self::Submitted { .. } => "dev.mokmok.job.submitted",
+            Self::Started { .. } => "dev.mokmok.job.started",
+            Self::RetryScheduled { .. } => "dev.mokmok.job.retry_scheduled",
+            Self::Succeeded { .. } => "dev.mokmok.job.succeeded",
+            Self::Failed { .. } => "dev.mokmok.job.failed",
+            Self::Cancelled { .. } => "dev.mokmok.job.cancelled",
         }
     }
 }
@@ -270,30 +283,29 @@ impl JobState {
     ///
     /// # Errors
     ///
-    /// Returns [`JobError::CorruptHistory`] when the envelopes mix job ids, skip a
+    /// Returns [`JobError::CorruptHistory`] when the records mix subjects, skip a
     /// version, or carry an event the preceding state cannot take.
-    pub fn replay(events: &[Envelope<JobId, JobEvent>]) -> Result<Self, JobError> {
+    pub fn replay(events: &[CloudEvent<JobEvent>]) -> Result<Self, JobError> {
         let Some(first) = events.first() else {
             return Ok(Self::New);
         };
         let mut state = Self::New;
         let mut version = Version::new(1);
-        for envelope in events {
-            if envelope.stream != first.stream {
+        for event in events {
+            if event.subject != first.subject {
                 return Err(JobError::CorruptHistory(format!(
                     "stream changed from {} to {}",
-                    first.stream.as_str(),
-                    envelope.stream.as_str()
+                    first.subject, event.subject
                 )));
             }
-            if envelope.version != version {
+            if event.version != version {
                 return Err(JobError::CorruptHistory(format!(
                     "expected version {} but found {}",
                     version.get(),
-                    envelope.version.get()
+                    event.version.get()
                 )));
             }
-            evolve(&mut state, &envelope.event)?;
+            evolve(&mut state, &event.data)?;
             version = version.next();
         }
         Ok(state)
@@ -686,6 +698,48 @@ mod tests {
     }
 
     #[test]
+    fn every_event_names_its_cloud_events_type() {
+        let cases = [
+            (
+                JobEvent::Submitted {
+                    input: b"in".to_vec(),
+                    max_attempts: NonZeroU32::new(1).expect("literal is nonzero"),
+                },
+                "dev.mokmok.job.submitted",
+            ),
+            (JobEvent::Started { attempt: 1 }, "dev.mokmok.job.started"),
+            (
+                JobEvent::RetryScheduled {
+                    attempt: 2,
+                    reason: "flaky".to_owned(),
+                },
+                "dev.mokmok.job.retry_scheduled",
+            ),
+            (
+                JobEvent::Succeeded {
+                    output: b"out".to_vec(),
+                },
+                "dev.mokmok.job.succeeded",
+            ),
+            (
+                JobEvent::Failed {
+                    reason: "broken".to_owned(),
+                },
+                "dev.mokmok.job.failed",
+            ),
+            (
+                JobEvent::Cancelled {
+                    reason: "stop".to_owned(),
+                },
+                "dev.mokmok.job.cancelled",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(event.event_type(), expected);
+        }
+    }
+
+    #[test]
     fn corrupt_history_names_the_state_and_the_event() {
         let mut state = JobState::New;
         let error = evolve(&mut state, &JobEvent::Started { attempt: 1 })
@@ -704,16 +758,12 @@ mod tests {
     fn replay_rejects_skipped_versions() {
         let id = JobId::from_u128(1);
         let events = vec![
-            Envelope {
-                stream: id.clone(),
-                version: Version::new(1),
-                event: submitted(),
-            },
-            Envelope {
-                stream: id,
-                version: Version::new(3),
-                event: JobEvent::Started { attempt: 1 },
-            },
+            CloudEvent::new(id.as_str(), Version::new(1), submitted()),
+            CloudEvent::new(
+                id.as_str(),
+                Version::new(3),
+                JobEvent::Started { attempt: 1 },
+            ),
         ];
         assert!(matches!(
             JobState::replay(&events),
@@ -726,16 +776,12 @@ mod tests {
         let first = JobId::from_u128(1);
         let second = JobId::from_u128(2);
         let events = vec![
-            Envelope {
-                stream: first,
-                version: Version::new(1),
-                event: submitted(),
-            },
-            Envelope {
-                stream: second,
-                version: Version::new(2),
-                event: JobEvent::Started { attempt: 1 },
-            },
+            CloudEvent::new(first.as_str(), Version::new(1), submitted()),
+            CloudEvent::new(
+                second.as_str(),
+                Version::new(2),
+                JobEvent::Started { attempt: 1 },
+            ),
         ];
         assert!(matches!(
             JobState::replay(&events),
@@ -793,20 +839,17 @@ mod tests {
         ) {
             let id = JobId::from_u128(3);
             let mut state = JobState::New;
-            let mut log: Vec<Envelope<JobId, JobEvent>> = Vec::new();
+            let mut log: Vec<CloudEvent<JobEvent>> = Vec::new();
             for command in commands {
                 let Ok(events) = decide(&state, command) else {
                     continue;
                 };
                 for event in events {
                     let position = u64::try_from(log.len()).expect("log length fits u64");
-                    let envelope = Envelope {
-                        stream: id.clone(),
-                        version: Version::new(position + 1),
-                        event,
-                    };
-                    evolve(&mut state, &envelope.event).expect("decide produced a legal event");
-                    log.push(envelope);
+                    let record =
+                        CloudEvent::new(id.as_str(), Version::new(position + 1), event);
+                    evolve(&mut state, &record.data).expect("decide produced a legal event");
+                    log.push(record);
                 }
             }
             let replayed = JobState::replay(&log).expect("log is consecutive");

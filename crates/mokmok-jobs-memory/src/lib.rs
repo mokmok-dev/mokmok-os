@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use mokmok_jobs_core::{
-    Envelope, EventPublisher, EventStore, JobEvent, JobId, StoreError, StreamKey, Version,
+    CloudEvent, EventPublisher, EventStore, JobEvent, StoreError, StreamKey, Version, check_append,
 };
 
 #[derive(Debug)]
 pub struct MemoryEventStore<K, E> {
-    streams: Mutex<HashMap<K, Vec<Envelope<K, E>>>>,
+    streams: Mutex<HashMap<K, Vec<CloudEvent<E>>>>,
 }
 
 impl<K, E> Default for MemoryEventStore<K, E> {
@@ -32,7 +32,7 @@ impl<K: StreamKey, E: Clone + Send + Sync> EventStore<K, E> for MemoryEventStore
     fn load(
         &self,
         key: &K,
-    ) -> Result<Vec<Envelope<K, E>>, StoreError> {
+    ) -> Result<Vec<CloudEvent<E>>, StoreError> {
         let streams = self.streams.lock().map_err(|_| poisoned())?;
         Ok(streams.get(key).cloned().unwrap_or_default())
     }
@@ -41,7 +41,7 @@ impl<K: StreamKey, E: Clone + Send + Sync> EventStore<K, E> for MemoryEventStore
         &self,
         key: &K,
         expected: Version,
-        events: &[E],
+        events: &[CloudEvent<E>],
     ) -> Result<Version, StoreError> {
         let mut streams = self.streams.lock().map_err(|_| poisoned())?;
         let log = streams.entry(key.clone()).or_default();
@@ -50,23 +50,16 @@ impl<K: StreamKey, E: Clone + Send + Sync> EventStore<K, E> for MemoryEventStore
         if actual != expected {
             return Err(StoreError::Conflict { expected, actual });
         }
-        let mut version = actual;
-        for event in events {
-            version = version.next();
-            log.push(Envelope {
-                stream: key.clone(),
-                version,
-                event: event.clone(),
-            });
-        }
+        let last = check_append(key.as_str(), expected, events)?;
+        log.extend_from_slice(events);
         drop(streams);
-        Ok(version)
+        Ok(last)
     }
 }
 
 #[derive(Debug, Default)]
 pub struct RecordingPublisher {
-    published: Mutex<Vec<Envelope<JobId, JobEvent>>>,
+    published: Mutex<Vec<CloudEvent<JobEvent>>>,
 }
 
 impl RecordingPublisher {
@@ -76,7 +69,7 @@ impl RecordingPublisher {
     }
 
     #[must_use]
-    pub fn published(&self) -> Vec<Envelope<JobId, JobEvent>> {
+    pub fn published(&self) -> Vec<CloudEvent<JobEvent>> {
         self.published
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -96,12 +89,12 @@ impl RecordingPublisher {
 impl EventPublisher for RecordingPublisher {
     fn publish(
         &self,
-        envelopes: &[Envelope<JobId, JobEvent>],
+        events: &[CloudEvent<JobEvent>],
     ) {
         self.published
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(envelopes);
+            .extend_from_slice(events);
     }
 }
 
@@ -112,6 +105,8 @@ fn poisoned() -> StoreError {
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
+
+    use mokmok_jobs_core::JobId;
 
     use super::*;
 
@@ -126,16 +121,28 @@ mod tests {
         }
     }
 
+    fn at(
+        id: &JobId,
+        version: u64,
+        event: JobEvent,
+    ) -> CloudEvent<JobEvent> {
+        CloudEvent::new(id.as_str(), Version::new(version), event)
+    }
+
     #[test]
     fn append_commits_a_contiguous_stream() {
         let store = MemoryEventStore::new();
         let id = id();
         let last = store
-            .append(&id, Version::ZERO, &[submitted()])
+            .append(&id, Version::ZERO, &[at(&id, 1, submitted())])
             .expect("first append fits");
         assert_eq!(last, Version::new(1));
         let last = store
-            .append(&id, Version::new(1), &[JobEvent::Started { attempt: 1 }])
+            .append(
+                &id,
+                Version::new(1),
+                &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+            )
             .expect("second append fits");
         assert_eq!(last, Version::new(2));
         let events = store.load(&id).expect("stream reads back");
@@ -148,10 +155,14 @@ mod tests {
         let store = MemoryEventStore::new();
         let id = id();
         store
-            .append(&id, Version::ZERO, &[submitted()])
+            .append(&id, Version::ZERO, &[at(&id, 1, submitted())])
             .expect("first append fits");
         let error = store
-            .append(&id, Version::ZERO, &[JobEvent::Started { attempt: 1 }])
+            .append(
+                &id,
+                Version::ZERO,
+                &[at(&id, 1, JobEvent::Started { attempt: 1 })],
+            )
             .expect_err("stale append is refused");
         assert!(matches!(
             error,
@@ -164,19 +175,23 @@ mod tests {
     }
 
     #[test]
+    fn append_rejects_a_record_from_another_stream() {
+        let store = MemoryEventStore::new();
+        let id = id();
+        let other = JobId::from_u128(2);
+        let error = store
+            .append(&id, Version::ZERO, &[at(&other, 1, submitted())])
+            .expect_err("a record from another stream is refused");
+        assert!(matches!(error, StoreError::Invalid(_)));
+        assert_eq!(store.load(&id).expect("stream reads back").len(), 0);
+    }
+
+    #[test]
     fn publisher_records_every_event_in_order() {
         let publisher = RecordingPublisher::new();
         let id = id();
-        let first = Envelope {
-            stream: id.clone(),
-            version: Version::new(1),
-            event: submitted(),
-        };
-        let second = Envelope {
-            stream: id,
-            version: Version::new(2),
-            event: JobEvent::Started { attempt: 1 },
-        };
+        let first = at(&id, 1, submitted());
+        let second = at(&id, 2, JobEvent::Started { attempt: 1 });
         publisher.publish(std::slice::from_ref(&first));
         publisher.publish(std::slice::from_ref(&second));
         assert_eq!(publisher.published(), vec![first, second]);
