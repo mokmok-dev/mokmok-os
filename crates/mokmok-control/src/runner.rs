@@ -14,8 +14,9 @@ use mokmok_acp::{
     ToolCallStatus, ToolKind, WebSocketConfig,
 };
 use mokmok_control_core::{
-    AgentUpdate, MAX_PROMPT_BYTES, PromptInput, TaskSpec, clip_to_char_boundary, compose_prompt,
+    MAX_PROMPT_BYTES, PromptInput, TaskSpec, clip_to_char_boundary, compose_prompt,
 };
+use mokmok_journal::JournalEvent;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -54,18 +55,18 @@ const BAD_WORKSPACE_ROOT: &str = "the workspace root does not exist";
 /// Runs a fixed transcript and completes at once, for tests and the demo mode.
 #[derive(Clone, Debug)]
 pub struct ScriptedRunner {
-    updates: Vec<AgentUpdate>,
+    events: Vec<JournalEvent>,
     summary: String,
 }
 
 impl ScriptedRunner {
     #[must_use]
     pub fn new(
-        updates: Vec<AgentUpdate>,
+        events: Vec<JournalEvent>,
         summary: impl Into<String>,
     ) -> Self {
         Self {
-            updates,
+            events,
             summary: summary.into(),
         }
     }
@@ -78,8 +79,8 @@ impl Runner for ScriptedRunner {
         reporter: &dyn Reporter,
     ) -> RunOutcome {
         let _ = reporter.started("scripted-session");
-        for update in &self.updates {
-            let _ = reporter.update(update.clone());
+        for event in &self.events {
+            let _ = reporter.update(event.clone());
         }
         RunOutcome::Completed {
             summary: self.summary.clone(),
@@ -671,7 +672,7 @@ impl AcpHandler<'_> {
         }
         let text = std::mem::take(&mut self.message);
         self.last_message = Some(clip_summary(&text));
-        let _ = self.reporter.update(AgentUpdate::Message { text });
+        let _ = self.reporter.update(JournalEvent::Message { text });
     }
 
     fn flush_thought(&mut self) {
@@ -680,7 +681,7 @@ impl AcpHandler<'_> {
         }
         let text = std::mem::take(&mut self.thought);
         self.last_message = Some(clip_summary(&text));
-        let _ = self.reporter.update(AgentUpdate::Thought { text });
+        let _ = self.reporter.update(JournalEvent::Thought { text });
     }
 
     fn finish(&mut self) {
@@ -689,6 +690,18 @@ impl AcpHandler<'_> {
         if !self.final_message.is_empty() {
             self.last_message = Some(clip_summary(&self.final_message));
         }
+    }
+
+    fn record_permission(
+        &mut self,
+        title: String,
+        allowed: bool,
+    ) {
+        let status = if allowed { "allowed" } else { "refused" };
+        let _ = self.reporter.update(JournalEvent::Permission {
+            title,
+            status: status.to_owned(),
+        });
     }
 }
 
@@ -727,7 +740,7 @@ impl Handler for AcpHandler<'_> {
                 self.flush_message();
                 self.flush_thought();
                 self.final_message.clear();
-                let _ = self.reporter.update(AgentUpdate::ToolCall {
+                let _ = self.reporter.update(JournalEvent::ToolCall {
                     title: call.title,
                     status: tool_status(call.status).to_owned(),
                 });
@@ -739,7 +752,7 @@ impl Handler for AcpHandler<'_> {
                 let title = update.fields.title;
                 let status = update.fields.status;
                 if title.is_some() || status.is_some() {
-                    let _ = self.reporter.update(AgentUpdate::ToolCall {
+                    let _ = self.reporter.update(JournalEvent::ToolCall {
                         title: title.unwrap_or_else(|| UNTITLED_TOOL_CALL.to_owned()),
                         status: status.map_or("pending", tool_status).to_owned(),
                     });
@@ -753,11 +766,20 @@ impl Handler for AcpHandler<'_> {
         &mut self,
         request: RequestPermissionRequest,
     ) -> RequestPermissionResponse {
+        let fields = request.tool_call.fields;
+        let title = fields
+            .title
+            .unwrap_or_else(|| UNTITLED_TOOL_CALL.to_owned());
+        // The buffered text was streamed before this request, so the transcript has to
+        // show it first even though the buffer would otherwise flush later.
+        self.flush_message();
+        self.flush_thought();
         let read_only = matches!(
-            request.tool_call.fields.kind,
+            fields.kind,
             Some(ToolKind::Read | ToolKind::Search | ToolKind::Think)
         );
         if !read_only {
+            self.record_permission(title, false);
             return RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
         }
         let options = &request.options;
@@ -769,14 +791,14 @@ impl Handler for AcpHandler<'_> {
                     .iter()
                     .find(|option| option.kind == PermissionOptionKind::AllowAlways)
             });
-        chosen.map_or_else(
-            || RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled),
-            |option| {
-                RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
-                    SelectedPermissionOutcome::new(option.option_id.clone()),
-                ))
-            },
-        )
+        let Some(option) = chosen else {
+            self.record_permission(title, false);
+            return RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
+        };
+        self.record_permission(title, true);
+        RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
+            SelectedPermissionOutcome::new(option.option_id.clone()),
+        ))
     }
 }
 
@@ -812,7 +834,7 @@ mod tests {
 
     #[derive(Default)]
     struct Capture {
-        updates: Mutex<Vec<AgentUpdate>>,
+        events: Mutex<Vec<JournalEvent>>,
     }
 
     impl Reporter for Capture {
@@ -825,12 +847,12 @@ mod tests {
 
         fn update(
             &self,
-            update: AgentUpdate,
+            event: JournalEvent,
         ) -> Result<(), String> {
-            self.updates
+            self.events
                 .lock()
                 .expect("the capture lock is not poisoned")
-                .push(update);
+                .push(event);
             Ok(())
         }
 
@@ -881,19 +903,82 @@ mod tests {
         notification(&json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-1"}))
     }
 
-    fn updates(capture: &Capture) -> Vec<AgentUpdate> {
+    fn permission(
+        kind: Option<&str>,
+        options: &serde_json::Value,
+    ) -> RequestPermissionRequest {
+        let mut tool_call = json!({"toolCallId": "call-1", "title": "read a file"});
+        if let Some(kind) = kind {
+            tool_call["kind"] = json!(kind);
+        }
+        serde_json::from_value(json!({
+            "sessionId": "session-1",
+            "toolCall": tool_call,
+            "options": options,
+        }))
+        .expect("the permission request decodes")
+    }
+
+    fn allow_once() -> serde_json::Value {
+        json!([{"optionId": "allow", "name": "Allow", "kind": "allow_once"}])
+    }
+
+    #[test]
+    fn an_allowed_permission_keeps_the_buffered_text_first() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        handler.session_update(text("agent_message_chunk", "answering"));
+        let response = handler.request_permission(permission(Some("read"), &allow_once()));
+        handler.finish();
+
+        assert!(matches!(
+            response.outcome,
+            RequestPermissionOutcome::Selected(_)
+        ));
+        assert_eq!(
+            events(&capture),
+            vec![
+                JournalEvent::Message {
+                    text: "answering".to_owned()
+                },
+                JournalEvent::Permission {
+                    title: "read a file".to_owned(),
+                    status: "allowed".to_owned()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_permission_is_recorded_too() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        let response = handler.request_permission(permission(Some("edit"), &allow_once()));
+        handler.finish();
+
+        assert_eq!(response.outcome, RequestPermissionOutcome::Cancelled);
+        assert_eq!(
+            events(&capture),
+            vec![JournalEvent::Permission {
+                title: "read a file".to_owned(),
+                status: "refused".to_owned()
+            }]
+        );
+    }
+
+    fn events(capture: &Capture) -> Vec<JournalEvent> {
         capture
-            .updates
+            .events
             .lock()
             .expect("the capture lock is not poisoned")
             .clone()
     }
 
     fn messages(capture: &Capture) -> Vec<String> {
-        updates(capture)
+        events(capture)
             .into_iter()
-            .filter_map(|update| match update {
-                AgentUpdate::Message { text } => Some(text),
+            .filter_map(|event| match event {
+                JournalEvent::Message { text } => Some(text),
                 _ => None,
             })
             .collect()
@@ -908,15 +993,15 @@ mod tests {
         handler.session_update(tool_call("read", "pending"));
         handler.finish();
         assert_eq!(
-            updates(&capture),
+            events(&capture),
             vec![
-                AgentUpdate::Thought {
+                JournalEvent::Thought {
                     text: "thinking".to_owned()
                 },
-                AgentUpdate::Message {
+                JournalEvent::Message {
                     text: "answering".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "read".to_owned(),
                     status: "pending".to_owned()
                 },
@@ -964,7 +1049,7 @@ mod tests {
         handler.session_update(text("agent_message_chunk", ""));
         handler.session_update(text("agent_thought_chunk", ""));
         handler.finish();
-        assert_eq!(updates(&capture), Vec::<AgentUpdate>::new());
+        assert_eq!(events(&capture), Vec::<JournalEvent>::new());
         assert_eq!(handler.last_message, None);
     }
 
@@ -993,8 +1078,8 @@ mod tests {
         let exact = "t".repeat(FLUSH_BYTES);
         handler.session_update(text("agent_thought_chunk", &exact));
         assert_eq!(
-            updates(&capture),
-            vec![AgentUpdate::Thought { text: exact }]
+            events(&capture),
+            vec![JournalEvent::Thought { text: exact }]
         );
     }
 

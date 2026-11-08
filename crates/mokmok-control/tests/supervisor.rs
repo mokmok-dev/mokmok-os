@@ -9,17 +9,22 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use mokmok_control::{
-        AgentUpdate, ControlCommand, ControlError, ControlEvent, ControlSystem, Error,
-        FailingRunner, NewTask, NoopPublisher, Reporter, RunOutcome, Runner, ScriptedRunner,
+        ControlCommand, ControlError, ControlEvent, ControlSystem, Error, FailingRunner, Journal,
+        JournalEvent, NewTask, NoopPublisher, Reporter, RunOutcome, Runner, ScriptedRunner,
         Supervisor, TaskId, TaskSpec, TaskStatus,
     };
     use mokmok_jobs_jsonl::JsonlEventStore;
     use mokmok_jobs_memory::MemoryEventStore;
+    use mokmok_journal::MemoryJournal;
 
-    fn message(text: &str) -> AgentUpdate {
-        AgentUpdate::Message {
+    fn message(text: &str) -> JournalEvent {
+        JournalEvent::Message {
             text: text.to_owned(),
         }
+    }
+
+    fn empty_journal() -> Arc<MemoryJournal> {
+        Arc::new(MemoryJournal::new())
     }
 
     fn new_task(agent: &str) -> NewTask {
@@ -44,7 +49,9 @@ mod tests {
         id: &TaskId,
         status: TaskStatus,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // A busy host stretches a run well past 10 s; the bound stays under cargo-mutants'
+        // 60 s, so a real hang still fails here.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if system.state(id).is_ok_and(|state| state.status == status) {
                 return;
@@ -106,11 +113,12 @@ mod tests {
     #[test]
     fn a_scripted_run_completes_the_task() -> Result<(), Box<dyn std::error::Error>> {
         let system = system();
+        let journal = empty_journal();
         let runner = Arc::new(ScriptedRunner::new(
             vec![message("one"), message("two")],
             "all done",
         ));
-        let supervisor = Supervisor::new(system.clone(), runner, 1);
+        let supervisor = Supervisor::new(system.clone(), runner, journal.clone(), 1);
 
         let id = supervisor.submit(new_task("scripted"))?;
         assert_eq!(supervisor.run_pending()?, 1);
@@ -118,8 +126,18 @@ mod tests {
         let state = system.state(&id)?;
         assert_eq!(state.status, TaskStatus::Completed);
         assert_eq!(state.session.as_deref(), Some("scripted-session"));
-        assert_eq!(state.updates, vec![message("one"), message("two")]);
+        assert_eq!(state.updates, [] as [mokmok_control::AgentUpdate; 0]);
+        assert_eq!(state.update_count, 0);
         assert_eq!(state.outcome.as_deref(), Some("all done"));
+        assert_eq!(
+            journal
+                .tail(id.as_str(), 200)?
+                .entries
+                .into_iter()
+                .map(|entry| entry.event)
+                .collect::<Vec<_>>(),
+            vec![message("one"), message("two")]
+        );
         assert_eq!(supervisor.run_pending()?, 0);
         Ok(())
     }
@@ -127,7 +145,12 @@ mod tests {
     #[test]
     fn a_failing_run_fails_the_task() -> Result<(), Box<dyn std::error::Error>> {
         let system = system();
-        let supervisor = Supervisor::new(system.clone(), Arc::new(FailingRunner::new("boom")), 1);
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(FailingRunner::new("boom")),
+            empty_journal(),
+            1,
+        );
 
         let id = supervisor.submit(new_task("scripted"))?;
         assert_eq!(supervisor.run_pending()?, 1);
@@ -146,7 +169,7 @@ mod tests {
             starts: Arc::clone(&starts),
             hold: Duration::from_millis(5),
         });
-        let supervisor = Supervisor::new(system.clone(), runner, 1);
+        let supervisor = Supervisor::new(system.clone(), runner, empty_journal(), 1);
 
         let id = supervisor.submit(new_task("scripted"))?;
         supervisor.cancel(&id, "stop")?;
@@ -168,7 +191,7 @@ mod tests {
             starts: Arc::clone(&starts),
             observed: Arc::clone(&observed),
         });
-        let supervisor = Supervisor::new(system.clone(), runner, 1);
+        let supervisor = Supervisor::new(system.clone(), runner, empty_journal(), 1);
 
         let id = supervisor.submit(new_task("scripted"))?;
         supervisor.start();
@@ -203,6 +226,7 @@ mod tests {
                 starts: Arc::clone(&starts),
                 observed: Arc::clone(&observed),
             }),
+            empty_journal(),
             1,
         );
         let id = supervisor.submit(new_task("scripted"))?;
@@ -233,6 +257,7 @@ mod tests {
                 starts: Arc::clone(&starts),
                 hold: Duration::from_millis(200),
             }),
+            empty_journal(),
             1,
         );
         let id = supervisor.submit(new_task("scripted"))?;
@@ -253,6 +278,7 @@ mod tests {
         let supervisor = Supervisor::new(
             system.clone(),
             Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
             1,
         );
         let id = supervisor.submit(new_task("scripted"))?;
@@ -284,8 +310,8 @@ mod tests {
             starts: Arc::clone(&starts),
             hold: Duration::from_millis(50),
         });
-        let first = Supervisor::new(system.clone(), runner.clone(), 1);
-        let second = Supervisor::new(system.clone(), runner, 1);
+        let first = Supervisor::new(system.clone(), runner.clone(), empty_journal(), 1);
+        let second = Supervisor::new(system.clone(), runner, empty_journal(), 1);
         let id = first.submit(new_task("scripted"))?;
 
         let (one, two) = thread::scope(|scope| {
@@ -317,6 +343,7 @@ mod tests {
                 starts: Arc::clone(&starts),
                 hold: Duration::from_millis(10),
             }),
+            empty_journal(),
             2,
         );
         let ids: Vec<TaskId> = (0..3)
@@ -340,6 +367,7 @@ mod tests {
         let supervisor = Supervisor::new(
             system.clone(),
             Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
             1,
         );
         let first = supervisor.submit(new_task("scripted"))?;
@@ -378,7 +406,12 @@ mod tests {
     fn a_restart_after_shutdown_runs_without_a_cancel_mark()
     -> Result<(), Box<dyn std::error::Error>> {
         let system = system();
-        let supervisor = Supervisor::new(system.clone(), Arc::new(UncancelledRunner), 1);
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(UncancelledRunner),
+            empty_journal(),
+            1,
+        );
 
         let first = supervisor.submit(new_task("scripted"))?;
         supervisor.start();
@@ -402,8 +435,12 @@ mod tests {
             let store: Arc<JsonlEventStore<TaskId, ControlEvent>> =
                 Arc::new(JsonlEventStore::open(&root)?);
             let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
-            let supervisor =
-                Supervisor::new(system, Arc::new(ScriptedRunner::new(Vec::new(), "done")), 1);
+            let supervisor = Supervisor::new(
+                system,
+                Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+                empty_journal(),
+                1,
+            );
             // Submitting without starting leaves the durable `Submitted` record behind.
             supervisor.submit(new_task("scripted"))?
         };
@@ -414,6 +451,7 @@ mod tests {
         let supervisor = Supervisor::new(
             system.clone(),
             Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
             1,
         );
         assert_eq!(system.state(&left)?.status, TaskStatus::Submitted);
@@ -433,8 +471,12 @@ mod tests {
             let store: Arc<JsonlEventStore<TaskId, ControlEvent>> =
                 Arc::new(JsonlEventStore::open(&root)?);
             let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
-            let supervisor =
-                Supervisor::new(system, Arc::new(ScriptedRunner::new(Vec::new(), "done")), 1);
+            let supervisor = Supervisor::new(
+                system,
+                Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+                empty_journal(),
+                1,
+            );
             let finished = supervisor.submit(new_task("scripted"))?;
             assert_eq!(supervisor.run_pending()?, 1);
             let left = supervisor.submit(new_task("scripted"))?;
@@ -457,6 +499,7 @@ mod tests {
         let supervisor = Supervisor::new(
             system.clone(),
             Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
             1,
         );
         supervisor.start();

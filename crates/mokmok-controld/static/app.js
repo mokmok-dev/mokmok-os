@@ -11,7 +11,8 @@ const STATUS_LABELS = {
 const KIND_LABELS = {
   message: 'Message',
   thought: 'Thought',
-  tool_call: 'Tool call'
+  tool_call: 'Tool call',
+  permission: 'Permission'
 };
 const LIVE_UPDATES_OFF = 'live updates are off; polling';
 
@@ -50,11 +51,15 @@ const state = {
   cancelRequestedId: null,
   listSignature: '',
   transcriptKey: '',
+  lastTranscript: null,
+  // The banner text this page wrote for a journal failure, so recovery hides only that.
+  journalErrorText: null,
   listSeq: 0,
   detailSeq: 0
 };
 
 let eventSource = null;
+let journalSource = null;
 let refreshTimer = null;
 
 function textOr(value, fallback) {
@@ -148,11 +153,23 @@ function showError(error) {
 
   setText(errorMessage, text);
   errorBanner.hidden = false;
+  return text;
 }
 
 function hideError() {
   errorBanner.hidden = true;
   setText(errorMessage, '');
+}
+
+// A journal failure is this page's to clear only while the banner still shows its text,
+// so another request's message is never dismissed on its behalf.
+function clearJournalError() {
+  if (state.journalErrorText !== null
+    && !errorBanner.hidden
+    && errorMessage.textContent === state.journalErrorText) {
+    hideError();
+  }
+  state.journalErrorText = null;
 }
 
 function buildTaskRow(task) {
@@ -258,7 +275,8 @@ function buildEntry(value) {
   label.textContent = kindLabel(kind);
   head.appendChild(label);
 
-  if (kind === 'tool_call') {
+  const hasStatus = kind === 'tool_call' || kind === 'permission';
+  if (hasStatus) {
     const status = document.createElement('span');
     status.className = 'entry-status';
     status.textContent = textOr(update.status, 'unknown');
@@ -266,10 +284,13 @@ function buildEntry(value) {
   }
   entry.appendChild(head);
 
-  if (kind === 'tool_call') {
+  if (hasStatus) {
     const title = document.createElement('p');
     title.className = 'entry-title';
-    title.textContent = textOr(update.title, 'Untitled tool call');
+    title.textContent = textOr(
+      update.title,
+      kind === 'permission' ? 'Untitled permission' : 'Untitled tool call'
+    );
     entry.appendChild(title);
   }
 
@@ -318,14 +339,14 @@ function updateCancelButton() {
   setText(cancelStatus, state.cancelling ? 'Cancelling...' : '');
 }
 
-function renderDetail(payload) {
+function renderDetail(payload, entries, total) {
   const taskState = payload && typeof payload.state === 'object' && payload.state !== null
     ? payload.state
     : {};
   const spec = typeof taskState.spec === 'object' && taskState.spec !== null ? taskState.spec : {};
   const status = normalizedStatus(taskState.status);
-  const updates = Array.isArray(taskState.updates) ? taskState.updates : [];
-  const total = Number.isInteger(taskState.update_count) ? taskState.update_count : updates.length;
+  const updates = Array.isArray(entries) ? entries : [];
+  const transcriptTotal = Number.isInteger(total) ? total : updates.length;
 
   state.detail = taskState;
   if (TERMINAL_STATUSES.has(status)) state.cancelRequestedId = null;
@@ -338,10 +359,10 @@ function renderDetail(payload) {
   setText(detailWorkspace, textOr(spec.workspace, 'none'));
   setText(detailOutcome, textOr(taskState.outcome, 'None yet.'));
 
-  const transcriptKey = [state.selectedId, total, updates.length].join('|');
+  const transcriptKey = [state.selectedId, transcriptTotal, updates.length].join('|');
   if (transcriptKey !== state.transcriptKey) {
     state.transcriptKey = transcriptKey;
-    renderTranscript(updates, total);
+    renderTranscript(updates, transcriptTotal);
   }
 
   detailEmpty.hidden = true;
@@ -375,14 +396,20 @@ async function refreshSelected() {
   if (id === null) return;
 
   const seq = ++state.detailSeq;
-  let payload;
-  try {
-    // The page renders from `state`; asking for no events keeps a long log off the wire.
-    payload = await api('/api/tasks/' + encodeURIComponent(id) + '?events=none');
-  } catch (error) {
+  // The page renders the status from the domain state, so asking for no events keeps a
+  // long domain log off the wire; the transcript comes from the journal endpoint.
+  const [detail, journal] = await Promise.allSettled([
+    api('/api/tasks/' + encodeURIComponent(id) + '?events=none'),
+    api('/api/tasks/' + encodeURIComponent(id) + '/journal?limit=200')
+  ]);
+
+  if (detail.status === 'rejected') {
+    const error = detail.reason;
     if (error && error.status === 404) {
       if (seq === state.detailSeq && state.selectedId === id) {
         state.selectedId = null;
+        state.lastTranscript = null;
+        clearJournalError();
         renderDetailEmpty();
         renderList();
         refreshList().catch(showError);
@@ -393,7 +420,32 @@ async function refreshSelected() {
   }
 
   if (seq !== state.detailSeq || state.selectedId !== id) return;
-  renderDetail(payload);
+
+  // A journal failure keeps the last transcript this page rendered for the task, so a
+  // transient 500 does not look like data loss; a first failure shows the empty
+  // transcript and the banner.
+  let entries = [];
+  let total = 0;
+  let failure = null;
+  if (journal.status === 'fulfilled' && journal.value && Array.isArray(journal.value.entries)) {
+    entries = journal.value.entries;
+    total = Number.isInteger(journal.value.total) ? journal.value.total : entries.length;
+    state.lastTranscript = { entries: entries, total: total };
+    clearJournalError();
+  } else {
+    failure = journal.reason || new Error('The journal could not be read.');
+    if (state.lastTranscript !== null) {
+      entries = state.lastTranscript.entries;
+      total = state.lastTranscript.total;
+    }
+  }
+  renderDetail(detail.value, entries, total);
+  // The stored text stands in for "already reported", so a dismissed failure stays
+  // dismissed on the next poll, while a failure that first appears under another
+  // banner stores nothing and still surfaces once that banner is gone.
+  if (failure !== null && state.journalErrorText === null && errorBanner.hidden) {
+    state.journalErrorText = showError(failure);
+  }
 }
 
 async function refresh() {
@@ -413,6 +465,8 @@ async function selectTask(id) {
   state.selectedId = nextId;
   state.detail = null;
   state.transcriptKey = '';
+  state.lastTranscript = null;
+  clearJournalError();
   state.cancelRequestedId = null;
   transcript.replaceChildren();
   transcript.hidden = true;
@@ -585,16 +639,19 @@ function scheduleRefresh() {
 function connectEvents() {
   if (typeof EventSource !== 'function') return;
   eventSource = new EventSource('/api/events');
+  journalSource = new EventSource('/api/journal/events');
   // EventSource reconnects by itself; a custom retry loop would duplicate it.
-  eventSource.addEventListener('message', () => {
-    if (errorMessage.textContent === LIVE_UPDATES_OFF) hideError();
-    scheduleRefresh();
-  });
-  // A token-protected feed answers 401 to EventSource, which cannot send the header.
-  // Only fill an empty banner, so a live-feed notice never masks an API error.
-  eventSource.addEventListener('error', () => {
-    if (errorBanner.hidden) showError(new Error(LIVE_UPDATES_OFF));
-  });
+  for (const source of [eventSource, journalSource]) {
+    source.addEventListener('message', () => {
+      if (errorMessage.textContent === LIVE_UPDATES_OFF) hideError();
+      scheduleRefresh();
+    });
+    // A token-protected feed answers 401 to EventSource, which cannot send the header.
+    // Only fill an empty banner, so a live-feed notice never masks an API error.
+    source.addEventListener('error', () => {
+      if (errorBanner.hidden) showError(new Error(LIVE_UPDATES_OFF));
+    });
+  }
 }
 
 function startPolling() {
@@ -612,6 +669,7 @@ function bindEvents() {
   errorDismiss.addEventListener('click', hideError);
   window.addEventListener('pagehide', () => {
     if (eventSource !== null) eventSource.close();
+    if (journalSource !== null) journalSource.close();
   });
 }
 

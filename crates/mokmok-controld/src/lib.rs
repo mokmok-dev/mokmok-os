@@ -20,10 +20,12 @@ use futures_util::StreamExt;
 use mokmok_control::{
     CloudEvent, ControlError, ControlEvent, ControlPublisher, ControlSystem, EnumerableStore,
     Error as SystemError, NewTask, Runner, Supervisor, TaskId, TaskState, TaskStatus,
+    journal_event,
 };
+use mokmok_journal::{Journal, JournalEntry, JournalError, JournalEvent, JournalTail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -37,15 +39,32 @@ const DEFAULT_CANCEL_REASON: &str = "cancelled from the control plane";
 /// How many recent events a detail request returns unless it asks otherwise.
 const DETAIL_EVENT_TAIL: usize = 200;
 
+/// How many recent journal entries a journal request returns unless it asks otherwise.
+const DEFAULT_JOURNAL_TAIL: usize = 200;
+
+/// The largest journal tail a request may ask for.
+const MAX_JOURNAL_TAIL: usize = 1000;
+
+/// Concurrent journal reads the daemon will run.
+///
+/// One read decodes a task's whole readable journal, so concurrent requests multiply the
+/// memory a loopback client or a cross-origin `no-cors` GET can commit; the UI reads one
+/// task at a time, so two leaves a spare.
+const JOURNAL_READ_PERMITS: usize = 2;
+
 /// The answer to an `events` value outside `tail`, `all`, and `none`.
 const EVENTS_QUERY: &str = "the events query must be one of: tail, all, none";
 
-/// Everything the handlers share: the task actors, the workers, and the live feed.
+/// The answer to a `limit` outside `1..=1000`.
+const JOURNAL_QUERY: &str = "the journal query limit must be an integer between 1 and 1000";
+
+/// Everything the handlers share: the task actors, the workers, and the live feeds.
 #[derive(Clone)]
 pub struct AppState {
     pub system: ControlSystem,
     pub supervisor: Arc<Supervisor>,
     pub store: Arc<dyn EnumerableStore<TaskId, ControlEvent>>,
+    pub journal: Arc<dyn Journal>,
     pub agents: Vec<String>,
     pub default_agent: String,
     // Names the agent table's `hosts` map accepts as transport overrides.
@@ -55,6 +74,9 @@ pub struct AppState {
     pub allowed_hosts: Vec<String>,
     pub token: Option<String>,
     pub events: broadcast::Sender<String>,
+    pub journal_events: broadcast::Sender<String>,
+    // Bounds the reads a client can start at once; see `JOURNAL_READ_PERMITS`.
+    pub journal_reads: Arc<Semaphore>,
     // An `Sse` body over this state's own broadcast sender never ends, which is what
     // holds `axum::serve` open forever; flipping this watch is how a shutdown ends it.
     pub shutdown: watch::Sender<bool>,
@@ -120,6 +142,7 @@ pub struct ControlConfig {
 #[must_use]
 pub fn build_state(
     store: Arc<dyn EnumerableStore<TaskId, ControlEvent>>,
+    journal: Arc<dyn Journal>,
     runner: Arc<dyn Runner>,
     config: ControlConfig,
 ) -> AppState {
@@ -132,22 +155,35 @@ pub fn build_state(
         token,
     } = config;
     let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    let (journal_events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     let (shutdown, _) = watch::channel(false);
     let publisher: Arc<dyn ControlPublisher> = Arc::new(BroadcastPublisher {
         events: events.clone(),
     });
+    let journal: Arc<dyn Journal> = Arc::new(BroadcastJournal {
+        inner: journal,
+        events: journal_events.clone(),
+    });
     let system = ControlSystem::new(Arc::clone(&store), publisher);
-    let supervisor = Arc::new(Supervisor::new(system.clone(), runner, workers));
+    let supervisor = Arc::new(Supervisor::new(
+        system.clone(),
+        runner,
+        Arc::clone(&journal),
+        workers,
+    ));
     AppState {
         system,
         supervisor,
         store,
+        journal,
         agents,
         default_agent,
         transport_hosts,
         allowed_hosts,
         token,
         events,
+        journal_events,
+        journal_reads: Arc::new(Semaphore::new(JOURNAL_READ_PERMITS)),
         shutdown,
     }
 }
@@ -158,8 +194,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/agents", get(agents))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/tasks/{id}", get(task_detail))
+        .route("/api/tasks/{id}/journal", get(task_journal))
         .route("/api/tasks/{id}/cancel", post(cancel_task))
         .route("/api/events", get(event_stream))
+        .route("/api/journal/events", get(journal_stream))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
@@ -187,6 +225,44 @@ impl ControlPublisher for BroadcastPublisher {
                 let _ = self.events.send(line);
             }
         }
+    }
+}
+
+// The live journal feed publishes the stamped entry beside the task, so a browser can
+// tell which transcript a line belongs to without another request.
+struct BroadcastJournal {
+    inner: Arc<dyn Journal>,
+    events: broadcast::Sender<String>,
+}
+
+impl Journal for BroadcastJournal {
+    fn append(
+        &self,
+        task: &str,
+        events: &[JournalEvent],
+    ) -> Result<Vec<JournalEntry>, JournalError> {
+        let entries = self.inner.append(task, events)?;
+        for entry in &entries {
+            if let Ok(line) = serde_json::to_string(&json!({"task": task, "entry": entry})) {
+                let _ = self.events.send(line);
+            }
+        }
+        Ok(entries)
+    }
+
+    fn tail(
+        &self,
+        task: &str,
+        limit: usize,
+    ) -> Result<JournalTail, JournalError> {
+        self.inner.tail(task, limit)
+    }
+
+    fn count(
+        &self,
+        task: &str,
+    ) -> Result<u64, JournalError> {
+        self.inner.count(task)
     }
 }
 
@@ -236,7 +312,19 @@ async fn agents(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let tasks = state.system.list().map_err(ApiError::from_system)?;
+    let mut tasks = state.system.list().map_err(ApiError::from_system)?;
+    for task in &mut tasks {
+        // A task logged before the split has no journal, so the domain count stays.
+        match state.journal.count(task.id.as_str()) {
+            Ok(count) if count > 0 => task.updates = count,
+            Ok(_) => {},
+            // A failed count is retried on the next request, so a warning per poll would
+            // bury the log for as long as the cause lasts.
+            Err(error) => {
+                tracing::debug!(task = task.id.as_str(), %error, "cannot count the journal");
+            },
+        }
+    }
     Ok(Json(json!({"tasks": tasks})))
 }
 
@@ -294,6 +382,81 @@ struct DetailQuery {
     events: EventMode,
 }
 
+#[derive(Deserialize)]
+struct JournalQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn task_journal(
+    State(state): State<AppState>,
+    Path(raw): Path<String>,
+    query: Result<Query<JournalQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::bad_request(JOURNAL_QUERY))?;
+    let limit = query.limit.unwrap_or(DEFAULT_JOURNAL_TAIL);
+    if !(1..=MAX_JOURNAL_TAIL).contains(&limit) {
+        return Err(ApiError::bad_request(JOURNAL_QUERY));
+    }
+    let id = parse_id(raw)?;
+    let events = state
+        .store
+        .load(&id)
+        .map_err(|_| ApiError::internal(STORE_FAILED))?;
+    let task = TaskState::replay(&events)
+        .map_err(|error| ApiError::from_system(SystemError::Control(error)))?;
+    if task.spec.is_none() {
+        return Err(ApiError::not_found("no such task"));
+    }
+    // A tail reads and decodes a task's segments, so it must not run on a worker that
+    // other requests need, and a permit bounds how many such reads a client can start
+    // at once.
+    let journal = Arc::clone(&state.journal);
+    let permit = Arc::clone(&state.journal_reads)
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal(JOURNAL_FAILED))?;
+    let tail = tokio::task::spawn_blocking(move || {
+        // The permit is held by the read, not by this request's frame: a client that
+        // disconnects drops the frame while the read keeps running to completion.
+        let _permit = permit;
+        journal.tail(id.as_str(), limit)
+    })
+    .await
+    .map_err(|error| {
+        tracing::debug!(%error, "the journal read task failed");
+        ApiError::internal(JOURNAL_FAILED)
+    })?
+    .map_err(|_| ApiError::internal(JOURNAL_FAILED))?;
+    // The journal wins once it has entries. A task logged before the split has none,
+    // so its transcript is still in the domain log; reading it out must not write it
+    // back, and a task with both shows only its journal.
+    if tail.entries.is_empty() {
+        return Ok(Json(project_updates(&events, limit)));
+    }
+    Ok(Json(json!({"entries": tail.entries, "total": tail.total})))
+}
+
+fn project_updates(
+    events: &[CloudEvent<ControlEvent>],
+    limit: usize,
+) -> Value {
+    let mut entries = Vec::new();
+    for event in events {
+        let ControlEvent::UpdateRecorded { update } = &event.data else {
+            continue;
+        };
+        entries.push(JournalEntry {
+            seq: event.version.get(),
+            time: event.time.clone().unwrap_or_default(),
+            event: journal_event(update).clipped(),
+        });
+    }
+    let total = entries.len();
+    entries.drain(..total.saturating_sub(limit));
+    json!({"entries": entries, "total": total})
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 enum EventMode {
@@ -339,8 +502,19 @@ async fn cancel_task(
 async fn event_stream(
     State(state): State<AppState>
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let receiver = state.events.subscribe();
-    let mut shutdown = state.shutdown.subscribe();
+    stream_lines(state.events.subscribe(), state.shutdown.subscribe())
+}
+
+async fn journal_stream(
+    State(state): State<AppState>
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    stream_lines(state.journal_events.subscribe(), state.shutdown.subscribe())
+}
+
+fn stream_lines(
+    receiver: broadcast::Receiver<String>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(receiver)
         .take_until(async move {
             let _ = shutdown.changed().await;
@@ -438,6 +612,7 @@ fn constant_time_eq(
 }
 
 const STORE_FAILED: &str = "the event store failed";
+const JOURNAL_FAILED: &str = "the journal could not be read";
 
 struct ApiError {
     status: StatusCode,

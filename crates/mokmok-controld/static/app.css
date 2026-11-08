@@ -549,6 +549,10 @@ button.primary:hover:not(:disabled) {
   font-style: italic;
 }
 
+.entry-permission {
+  border-left: 3px solid var(--border-strong);
+}
+
 @media (max-width: 800px) {
   .columns {
     grid-template-columns: minmax(0, 1fr);
