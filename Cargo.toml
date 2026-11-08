@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/mokmok-acp",
   "crates/mokmok-jobs",
   "crates/mokmok-jobs-core",
   "crates/mokmok-jobs-jsonl",
@@ -8,15 +9,24 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
+agent-client-protocol-schema = { version = "0.10", features = ["unstable"] }
+mokmok-acp = { path = "crates/mokmok-acp" }
 mokmok-jobs = { path = "crates/mokmok-jobs" }
 mokmok-jobs-core = { path = "crates/mokmok-jobs-core" }
 mokmok-jobs-jsonl = { path = "crates/mokmok-jobs-jsonl" }
 mokmok-jobs-memory = { path = "crates/mokmok-jobs-memory" }
 proptest = "1.12.0"
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 stateright = "0.31.0"
 tempfile = "3"
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+url = "2"
 uuid = { version = "1", features = ["v7"] }
 
 [workspace.lints.clippy]
