@@ -20,6 +20,9 @@ use tracing_subscriber::EnvFilter;
 const AGENT_TIMEOUT: Duration = Duration::from_secs(600);
 const SCRIPTED_SUMMARY: &str = "the scripted run completed";
 
+// A connection that outlives the shutdown watch must not hold the process open.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Parser)]
 #[command(name = "mokmok-controld", about = "Serve the mokmok control plane")]
 #[command(group(ArgGroup::new("source").required(true).args(["agents", "scripted"])))]
@@ -95,9 +98,27 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%address, data_dir = %args.data_dir.display(), "control plane listening");
     println!("mokmok-controld listening on http://{address}");
     let router = build_router(state.clone());
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    let shutdown_state = state.clone();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received");
+        let _ = shutdown_state.shutdown.send(true);
+        // Tokio drops the signal future that already fired, so a second interrupt is only
+        // seen by a fresh watcher; a stuck connection must not make the process killable
+        // only by SIGKILL.
+        tokio::spawn(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("mokmok-controld: second interrupt, exiting now");
+                std::process::exit(130);
+            }
+        });
+    });
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, server)
+        .await
+        .is_err()
+    {
+        tracing::warn!("graceful shutdown timed out; dropping connections");
+    }
     state.supervisor.shutdown();
     Ok(())
 }
@@ -123,7 +144,7 @@ fn control_token(
 
 // A failed watcher must not stop the server at once: the process still ends on SIGTERM,
 // so waiting forever is the honest behaviour.
-async fn shutdown() {
+async fn shutdown_signal() {
     #[cfg(unix)]
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut terminate) => {

@@ -154,4 +154,56 @@ mod tests {
         assert_eq!(updates[1]["title"], "inspect the workspace");
         assert_eq!(detail["state"]["outcome"], "the scripted run completed");
     }
+
+    // An `Sse` body over the daemon's own broadcast sender never ends, so this is the
+    // connection the graceful shutdown used to wait for forever.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_event_stream_does_not_hold_the_daemon_open() {
+        let dir = TempDir::new().expect("a temp dir");
+        let (mut daemon, address) = Daemon::spawn(&dir);
+
+        let mut stream = TcpStream::connect(address).expect("the daemon listens");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("the socket takes a read timeout");
+        write!(
+            stream,
+            "GET /api/events HTTP/1.1\r\nHost: {address}\r\n\r\n"
+        )
+        .expect("the request is written");
+        let mut reader = BufReader::new(stream.try_clone().expect("the socket clones"));
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).expect("the headers are read");
+            assert!(read > 0, "the daemon closed before the headers ended");
+            if line == "\r\n" {
+                break;
+            }
+            head.push_str(&line);
+        }
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+        let pid = daemon.child.id().to_string();
+        let sent = Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "SIGINT reached the daemon");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match daemon.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {},
+                Err(error) => panic!("cannot wait for the daemon: {error}"),
+            }
+            if Instant::now() >= deadline {
+                let _ = daemon.child.kill();
+                panic!("the daemon ignored SIGINT while /api/events was open");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

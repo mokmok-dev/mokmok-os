@@ -190,6 +190,37 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_reaches_a_running_runner_as_a_cancel() -> Result<(), Box<dyn std::error::Error>> {
+        let system = system();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicBool::new(false));
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(PollingRunner {
+                starts: Arc::clone(&starts),
+                observed: Arc::clone(&observed),
+            }),
+            1,
+        );
+        let id = supervisor.submit(new_task("scripted"))?;
+        supervisor.start();
+        wait_for(&system, &id, TaskStatus::Running);
+
+        let started = Instant::now();
+        supervisor.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited out its grace instead of joining the worker"
+        );
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the runner saw the shutdown"
+        );
+        assert_eq!(system.state(&id)?.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
+    #[test]
     fn shutdown_waits_for_the_run_and_stops_the_worker() -> Result<(), Box<dyn std::error::Error>> {
         let system = system();
         let starts = Arc::new(AtomicUsize::new(0));
@@ -318,6 +349,45 @@ mod tests {
         wait_for(&system, &second, TaskStatus::Completed);
         supervisor.shutdown();
         assert_eq!(system.state(&second)?.outcome.as_deref(), Some("done"));
+        Ok(())
+    }
+
+    struct UncancelledRunner;
+
+    impl Runner for UncancelledRunner {
+        fn run(
+            &self,
+            _spec: &TaskSpec,
+            reporter: &dyn Reporter,
+        ) -> RunOutcome {
+            if reporter.cancelled() {
+                return RunOutcome::Failed {
+                    reason: "the run started cancelled".to_owned(),
+                };
+            }
+            RunOutcome::Completed {
+                summary: "ran".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_restart_after_shutdown_runs_without_a_cancel_mark()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let system = system();
+        let supervisor = Supervisor::new(system.clone(), Arc::new(UncancelledRunner), 1);
+
+        let first = supervisor.submit(new_task("scripted"))?;
+        supervisor.start();
+        wait_for(&system, &first, TaskStatus::Completed);
+        assert_eq!(system.state(&first)?.outcome.as_deref(), Some("ran"));
+        supervisor.shutdown();
+
+        let second = supervisor.submit(new_task("scripted"))?;
+        supervisor.start();
+        wait_for(&system, &second, TaskStatus::Completed);
+        supervisor.shutdown();
+        assert_eq!(system.state(&second)?.outcome.as_deref(), Some("ran"));
         Ok(())
     }
 

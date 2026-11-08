@@ -604,6 +604,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_event_stream_ends_when_the_daemon_shuts_down() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+
+        let request = Request::builder()
+            .uri("/api/events")
+            .header(header::HOST, "localhost")
+            .body(Body::empty())
+            .expect("the request builds");
+        let response = build_router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("the stream opens");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state
+            .shutdown
+            .send(true)
+            .expect("the open stream holds a receiver");
+        let collected =
+            tokio::time::timeout(Duration::from_secs(1), response.into_body().collect())
+                .await
+                .expect("the stream ends at once")
+                .expect("the body collects");
+        assert!(
+            collected.to_bytes().is_empty(),
+            "nothing was published before the shutdown"
+        );
+    }
+
+    #[tokio::test]
     async fn an_unexpected_host_is_forbidden() {
         let dir = TempDir::new().expect("a temp dir");
         let state = scripted_state(&dir, None);

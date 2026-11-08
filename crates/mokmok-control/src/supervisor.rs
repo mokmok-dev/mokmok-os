@@ -3,14 +3,19 @@
 use std::collections::{HashSet, VecDeque};
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use mokmok_control_core::{
     AgentUpdate, ControlCommand, ControlError, TaskId, TaskSpec, TaskStatus,
 };
 
 use crate::system::{ControlSystem, Error, NewTask};
+
+/// How long [`Supervisor::shutdown`] waits for a worker to return before leaving it.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Runs one task and reports what the agent does while it works.
 pub trait Runner: Send + Sync {
@@ -75,6 +80,8 @@ struct Work {
     system: ControlSystem,
     runner: Arc<dyn Runner>,
     cancelled: Mutex<HashSet<TaskId>>,
+    // A shutdown cancels like a human does, but without a task id to mark.
+    shutting_down: Arc<AtomicBool>,
     queue: Queue,
 }
 
@@ -147,6 +154,7 @@ impl Supervisor {
                 system,
                 runner,
                 cancelled: Mutex::new(HashSet::new()),
+                shutting_down: Arc::new(AtomicBool::new(false)),
                 queue: Queue::new(),
             }),
             workers: workers.max(1),
@@ -223,6 +231,9 @@ impl Supervisor {
             return;
         }
         self.work.queue.resume();
+        // The cancel mark a previous shutdown raised would make every runner return at
+        // once, so a restart clears it with the queue flag.
+        self.work.shutting_down.store(false, Ordering::SeqCst);
         self.work.enqueue_submitted();
         let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..self.workers {
@@ -239,21 +250,52 @@ impl Supervisor {
         }
     }
 
-    /// Stops the workers and joins them.
+    /// Stops the workers and joins them, waiting at most five seconds for all of them.
     ///
-    /// A run already in progress finishes first. Tasks still queued stay submitted, and
-    /// [`Supervisor::start`] queues every submitted task it finds in the store, so a
-    /// restarted supervisor picks them up.
+    /// A run in progress sees [`Reporter::cancelled`] turn true, so a runner that polls
+    /// it stops without waiting out its own timeout. A runner blocked elsewhere keeps
+    /// its thread, which is left detached once the grace runs out so the process can
+    /// exit. Tasks still queued stay submitted, and [`Supervisor::start`] queues every
+    /// submitted task it finds in the store, so a restarted supervisor picks them up.
     pub fn shutdown(&self) {
+        self.work.shutting_down.store(true, Ordering::SeqCst);
         self.work.queue.stop();
         let handles: Vec<JoinHandle<()>> = {
             let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
             mem::take(&mut *threads)
         };
-        for handle in handles {
-            let _ = handle.join();
-        }
+        join_with_grace(handles);
         self.started.store(false, Ordering::SeqCst);
+    }
+}
+
+// A worker blocked inside its runner cannot be joined here without holding up the
+// caller for as long as the runner takes, so each join runs on its own thread and this
+// one only waits out the grace.
+fn join_with_grace(handles: Vec<JoinHandle<()>>) {
+    let (done, finished) = mpsc::channel::<()>();
+    let mut pending = 0_usize;
+    for handle in handles {
+        let done = done.clone();
+        let spawned = thread::Builder::new()
+            .name("control-join".to_owned())
+            .spawn(move || {
+                let _ = handle.join();
+                let _ = done.send(());
+            });
+        // A join thread that cannot spawn drops its handle, which detaches that worker
+        // instead of making this call wait out the grace for it.
+        if spawned.is_ok() {
+            pending += 1;
+        }
+    }
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
+    for _ in 0..pending {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if finished.recv_timeout(left).is_err() {
+            tracing::warn!("a control worker did not stop within the grace; detaching it");
+            return;
+        }
     }
 }
 
@@ -332,6 +374,7 @@ impl Work {
         let reporter = SystemReporter {
             work: self,
             id: id.clone(),
+            shutting_down: Arc::clone(&self.shutting_down),
         };
         // `Start` is already committed, so a panicking runner must still settle the task
         // or the worker would leave it Running forever and lose itself.
@@ -369,6 +412,7 @@ impl Work {
 struct SystemReporter<'a> {
     work: &'a Work,
     id: TaskId,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl Reporter for SystemReporter<'_> {
@@ -389,7 +433,7 @@ impl Reporter for SystemReporter<'_> {
     }
 
     fn cancelled(&self) -> bool {
-        self.work.is_cancelled(&self.id)
+        self.work.is_cancelled(&self.id) || self.shutting_down.load(Ordering::SeqCst)
     }
 }
 

@@ -23,7 +23,7 @@ use mokmok_control::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -55,6 +55,9 @@ pub struct AppState {
     pub allowed_hosts: Vec<String>,
     pub token: Option<String>,
     pub events: broadcast::Sender<String>,
+    // An `Sse` body over this state's own broadcast sender never ends, which is what
+    // holds `axum::serve` open forever; flipping this watch is how a shutdown ends it.
+    pub shutdown: watch::Sender<bool>,
 }
 
 /// Every `Host` header value the daemon answers for a bound `address`.
@@ -129,6 +132,7 @@ pub fn build_state(
         token,
     } = config;
     let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    let (shutdown, _) = watch::channel(false);
     let publisher: Arc<dyn ControlPublisher> = Arc::new(BroadcastPublisher {
         events: events.clone(),
     });
@@ -144,6 +148,7 @@ pub fn build_state(
         allowed_hosts,
         token,
         events,
+        shutdown,
     }
 }
 
@@ -335,9 +340,14 @@ async fn event_stream(
     State(state): State<AppState>
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let receiver = state.events.subscribe();
-    let stream = BroadcastStream::new(receiver).filter_map(|message| async move {
-        message.ok().map(|line| Ok(Event::default().data(line)))
-    });
+    let mut shutdown = state.shutdown.subscribe();
+    let stream = BroadcastStream::new(receiver)
+        .take_until(async move {
+            let _ = shutdown.changed().await;
+        })
+        .filter_map(
+            |message| async move { message.ok().map(|line| Ok(Event::default().data(line))) },
+        );
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
