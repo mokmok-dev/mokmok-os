@@ -23,6 +23,12 @@ use serde_json::{Value, json};
 /// The session this agent reports from `session/new`.
 pub const SESSION_ID: &str = "fake-session";
 
+/// The exact text `--stream` spells one character at a time.
+pub const STREAM_SENTENCE: &str = "The agent streamed its answer in tiny chunks so the runner could prove that many pieces collapse into one transcript entry, that the summary keeps the whole answer, and that the dashboard displays it.";
+
+/// The exact text `--stream-thoughts` spells one character at a time.
+pub const STREAM_THOUGHT: &str = "The thought buffer coalesces the same way, keeping its own order after the message and before any tool call.";
+
 /// What an integration test returns.
 pub type TestError = Box<dyn Error + Send + Sync>;
 pub type TestResult = Result<(), TestError>;
@@ -101,6 +107,10 @@ pub struct Script {
     pub rich: bool,
     /// Offer only an `allow_always` permission option.
     pub allow_always_only: bool,
+    /// Stream [`STREAM_SENTENCE`] one character per message chunk.
+    pub stream: bool,
+    /// Stream a message, a thought, and one tool call, all in single-character chunks.
+    pub stream_thoughts: bool,
 }
 
 impl Script {
@@ -151,17 +161,7 @@ pub fn run_agent(
                 if script.silent {
                     continue;
                 }
-                notify(
-                    link,
-                    "session/update",
-                    &json!({
-                        "sessionId":SESSION_ID,
-                        "update":{
-                            "sessionUpdate":"agent_message_chunk",
-                            "content":{"type":"text","text":"working"}
-                        }
-                    }),
-                );
+                stream_opening(link, script);
                 if script.rich {
                     stream_rich_updates(link);
                 }
@@ -186,6 +186,63 @@ fn prompt_text(message: &Value) -> &str {
     message["params"]["prompt"][0]["text"]
         .as_str()
         .unwrap_or_default()
+}
+
+fn stream_opening(
+    link: &mut dyn Link,
+    script: &Script,
+) {
+    if script.stream {
+        stream_text(link, "agent_message_chunk", STREAM_SENTENCE);
+    } else if script.stream_thoughts {
+        stream_text(link, "agent_message_chunk", STREAM_SENTENCE);
+        stream_text(link, "agent_thought_chunk", STREAM_THOUGHT);
+        notify(
+            link,
+            "session/update",
+            &json!({
+                "sessionId":SESSION_ID,
+                "update":{
+                    "sessionUpdate":"tool_call",
+                    "toolCallId":"stream-call",
+                    "title":"stream tool",
+                    "status":"pending"
+                }
+            }),
+        );
+    } else {
+        notify(
+            link,
+            "session/update",
+            &json!({
+                "sessionId":SESSION_ID,
+                "update":{
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":"working"}
+                }
+            }),
+        );
+    }
+}
+
+fn stream_text(
+    link: &mut dyn Link,
+    session_update: &str,
+    text: &str,
+) {
+    for character in text.chars() {
+        notify(
+            link,
+            "session/update",
+            &json!({
+                "sessionId":SESSION_ID,
+                "update":{
+                    "sessionUpdate":session_update,
+                    "content":{"type":"text","text":character.to_string()}
+                }
+            }),
+        );
+    }
 }
 
 fn stream_rich_updates(link: &mut dyn Link) {

@@ -48,6 +48,10 @@ fn parse_args() -> Result<Script, String> {
             script.silent = true;
         } else if argument == "--rich" {
             script.rich = true;
+        } else if argument == "--stream" {
+            script.stream = true;
+        } else if argument == "--stream-thoughts" {
+            script.stream_thoughts = true;
         } else if argument == "--allow-always-only" {
             script.allow_always_only = true;
         } else if let Some(value) = argument.strip_prefix("--tool-kind=") {

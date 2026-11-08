@@ -1,5 +1,7 @@
 //! The ACP runner against the scripted agent binary.
 
+mod common;
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -14,6 +16,8 @@ mod tests {
         Supervisor, TaskId, TaskSpec, TaskStatus,
     };
     use mokmok_jobs_memory::MemoryEventStore;
+
+    use crate::common;
 
     const AGENT: &str = "fake";
     const SESSION: &str = "fake-session";
@@ -440,6 +444,79 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    fn recorded_updates(events: &[ControlEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, ControlEvent::UpdateRecorded { .. }))
+            .count()
+    }
+
+    fn message_text(updates: &[AgentUpdate]) -> String {
+        updates
+            .iter()
+            .filter_map(|update| match update {
+                AgentUpdate::Message { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_streamed_turn_coalesces_its_chunks() -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let (store, system, id) = run_task(
+            vec!["--stream".to_owned()],
+            new_task(workspace.path(), AGENT),
+        )?;
+
+        let recorded = recorded_updates(&events(&store, &id)?);
+        assert!(
+            recorded < 20,
+            "200 tiny chunks must coalesce, but {recorded} updates were recorded"
+        );
+
+        let state = system.state(&id)?;
+        assert_eq!(state.status, TaskStatus::Completed);
+        assert_eq!(message_text(&state.updates), common::STREAM_SENTENCE);
+        assert_eq!(state.outcome.as_deref(), Some(common::STREAM_SENTENCE));
+        assert_eq!(state.update_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_streamed_thought_and_tool_call_keep_their_order() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let workspace = tempfile::tempdir()?;
+        let (store, system, id) = run_task(
+            vec!["--stream-thoughts".to_owned()],
+            new_task(workspace.path(), AGENT),
+        )?;
+
+        let recorded = recorded_updates(&events(&store, &id)?);
+        assert!(
+            recorded < 20,
+            "streamed thoughts and tool calls must coalesce, but {recorded} were recorded"
+        );
+
+        let state = system.state(&id)?;
+        assert_eq!(
+            state.updates,
+            vec![
+                message(common::STREAM_SENTENCE),
+                AgentUpdate::Thought {
+                    text: common::STREAM_THOUGHT.to_owned()
+                },
+                AgentUpdate::ToolCall {
+                    title: "stream tool".to_owned(),
+                    status: "pending".to_owned()
+                },
+            ]
+        );
+        // The turn ended after the thought, so the last completed run is the thought.
+        assert_eq!(state.outcome.as_deref(), Some(common::STREAM_THOUGHT));
         Ok(())
     }
 

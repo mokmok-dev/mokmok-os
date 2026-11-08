@@ -13,7 +13,9 @@ use mokmok_acp::{
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StdioConfig, StopReason,
     ToolCallStatus, ToolKind, WebSocketConfig,
 };
-use mokmok_control_core::{AgentUpdate, MAX_PROMPT_BYTES, PromptInput, TaskSpec, compose_prompt};
+use mokmok_control_core::{
+    AgentUpdate, MAX_PROMPT_BYTES, PromptInput, TaskSpec, clip_to_char_boundary, compose_prompt,
+};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -28,6 +30,12 @@ const MAX_HOST_BYTES: usize = 64;
 
 /// How often the watcher checks whether a human cancelled the run.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// The buffered text length that makes a streamed message or thought durable.
+const FLUSH_BYTES: usize = 8 * 1024;
+
+/// The longest assistant text the completed summary carries.
+const SUMMARY_BYTES: usize = 4 * 1024;
 
 /// The summary used when the agent finishes without having streamed any text.
 const NO_SUMMARY: &str = "the agent finished without a summary";
@@ -557,9 +565,15 @@ impl Runner for AcpRunner {
             let mut handler = AcpHandler {
                 reporter,
                 cancel: cancel.clone(),
+                message: String::new(),
+                thought: String::new(),
+                final_message: String::new(),
                 last_message: None,
             };
             let turn = client.delegate_with(&session, &prompt, &mut handler, &cancel);
+            // A failed turn still owns whatever the agent streamed before it broke, so
+            // the transcript keeps the partial output.
+            handler.finish();
             drop(stop);
             (turn, handler.last_message)
         });
@@ -640,7 +654,42 @@ fn resolve_workspace(
 struct AcpHandler<'a> {
     reporter: &'a dyn Reporter,
     cancel: CancelToken,
+    message: String,
+    thought: String,
+    // The contiguous assistant message run, cleared at a thought or tool-call
+    // boundary.
+    final_message: String,
+    // The best available summary so far, kept for a run that ends on a thought or a
+    // tool call.
     last_message: Option<String>,
+}
+
+impl AcpHandler<'_> {
+    fn flush_message(&mut self) {
+        if self.message.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.message);
+        self.last_message = Some(clip_summary(&text));
+        let _ = self.reporter.update(AgentUpdate::Message { text });
+    }
+
+    fn flush_thought(&mut self) {
+        if self.thought.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.thought);
+        self.last_message = Some(clip_summary(&text));
+        let _ = self.reporter.update(AgentUpdate::Thought { text });
+    }
+
+    fn finish(&mut self) {
+        self.flush_message();
+        self.flush_thought();
+        if !self.final_message.is_empty() {
+            self.last_message = Some(clip_summary(&self.final_message));
+        }
+    }
 }
 
 impl Handler for AcpHandler<'_> {
@@ -651,34 +700,52 @@ impl Handler for AcpHandler<'_> {
         if self.reporter.cancelled() {
             self.cancel.cancel();
         }
-        let recorded = match notification.update {
-            SessionUpdate::AgentMessageChunk(chunk) => text_of(chunk.content).map(|text| {
-                self.last_message = Some(text.clone());
-                AgentUpdate::Message { text }
-            }),
-            SessionUpdate::AgentThoughtChunk(chunk) => {
-                text_of(chunk.content).map(|text| AgentUpdate::Thought { text })
-            },
-            SessionUpdate::ToolCall(call) => Some(AgentUpdate::ToolCall {
-                title: call.title,
-                status: tool_status(call.status).to_owned(),
-            }),
-            SessionUpdate::ToolCallUpdate(update) => {
-                let title = update.fields.title;
-                let status = update.fields.status;
-                if title.is_none() && status.is_none() {
-                    None
-                } else {
-                    Some(AgentUpdate::ToolCall {
-                        title: title.unwrap_or_else(|| UNTITLED_TOOL_CALL.to_owned()),
-                        status: status.map_or("pending", tool_status).to_owned(),
-                    })
+        match notification.update {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                // A thought that is still buffered belongs before this message, so the
+                // transcript keeps the order the agent sent.
+                self.flush_thought();
+                if let Some(text) = text_of(chunk.content) {
+                    self.message.push_str(&text);
+                    self.final_message.push_str(&text);
+                    if self.message.len() >= FLUSH_BYTES {
+                        self.flush_message();
+                    }
                 }
             },
-            _ => None,
-        };
-        if let Some(update) = recorded {
-            let _ = self.reporter.update(update);
+            SessionUpdate::AgentThoughtChunk(chunk) => {
+                self.flush_message();
+                self.final_message.clear();
+                if let Some(text) = text_of(chunk.content) {
+                    self.thought.push_str(&text);
+                    if self.thought.len() >= FLUSH_BYTES {
+                        self.flush_thought();
+                    }
+                }
+            },
+            SessionUpdate::ToolCall(call) => {
+                self.flush_message();
+                self.flush_thought();
+                self.final_message.clear();
+                let _ = self.reporter.update(AgentUpdate::ToolCall {
+                    title: call.title,
+                    status: tool_status(call.status).to_owned(),
+                });
+            },
+            SessionUpdate::ToolCallUpdate(update) => {
+                self.flush_message();
+                self.flush_thought();
+                self.final_message.clear();
+                let title = update.fields.title;
+                let status = update.fields.status;
+                if title.is_some() || status.is_some() {
+                    let _ = self.reporter.update(AgentUpdate::ToolCall {
+                        title: title.unwrap_or_else(|| UNTITLED_TOOL_CALL.to_owned()),
+                        status: status.map_or("pending", tool_status).to_owned(),
+                    });
+                }
+            },
+            _ => {},
         }
     }
 
@@ -720,6 +787,11 @@ fn text_of(content: ContentBlock) -> Option<String> {
     }
 }
 
+// The flushed transcript keeps every byte; only the Completed payload is clipped.
+fn clip_summary(text: &str) -> String {
+    clip_to_char_boundary(text, SUMMARY_BYTES).to_owned()
+}
+
 const fn tool_status(status: ToolCallStatus) -> &'static str {
     match status {
         ToolCallStatus::Pending => "pending",
@@ -727,5 +799,241 @@ const fn tool_status(status: ToolCallStatus) -> &'static str {
         ToolCallStatus::Completed => "completed",
         ToolCallStatus::Failed => "failed",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Capture {
+        updates: Mutex<Vec<AgentUpdate>>,
+    }
+
+    impl Reporter for Capture {
+        fn started(
+            &self,
+            _session: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn update(
+            &self,
+            update: AgentUpdate,
+        ) -> Result<(), String> {
+            self.updates
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .push(update);
+            Ok(())
+        }
+
+        fn cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn handler(capture: &Capture) -> AcpHandler<'_> {
+        AcpHandler {
+            reporter: capture,
+            cancel: CancelToken::new(),
+            message: String::new(),
+            thought: String::new(),
+            final_message: String::new(),
+            last_message: None,
+        }
+    }
+
+    fn notification(update: &serde_json::Value) -> SessionNotification {
+        serde_json::from_value(json!({"sessionId": "session-1", "update": update}))
+            .expect("the notification decodes")
+    }
+
+    fn text(
+        session_update: &str,
+        text: &str,
+    ) -> SessionNotification {
+        notification(&json!({
+            "sessionUpdate": session_update,
+            "content": {"type": "text", "text": text},
+        }))
+    }
+
+    fn tool_call(
+        title: &str,
+        status: &str,
+    ) -> SessionNotification {
+        notification(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-1",
+            "title": title,
+            "status": status,
+        }))
+    }
+
+    fn empty_tool_update() -> SessionNotification {
+        notification(&json!({"sessionUpdate": "tool_call_update", "toolCallId": "call-1"}))
+    }
+
+    fn updates(capture: &Capture) -> Vec<AgentUpdate> {
+        capture
+            .updates
+            .lock()
+            .expect("the capture lock is not poisoned")
+            .clone()
+    }
+
+    fn messages(capture: &Capture) -> Vec<String> {
+        updates(capture)
+            .into_iter()
+            .filter_map(|update| match update {
+                AgentUpdate::Message { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_thought_before_a_message_keeps_the_streamed_order() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        handler.session_update(text("agent_thought_chunk", "thinking"));
+        handler.session_update(text("agent_message_chunk", "answering"));
+        handler.session_update(tool_call("read", "pending"));
+        handler.finish();
+        assert_eq!(
+            updates(&capture),
+            vec![
+                AgentUpdate::Thought {
+                    text: "thinking".to_owned()
+                },
+                AgentUpdate::Message {
+                    text: "answering".to_owned()
+                },
+                AgentUpdate::ToolCall {
+                    title: "read".to_owned(),
+                    status: "pending".to_owned()
+                },
+            ]
+        );
+        assert_eq!(handler.last_message.as_deref(), Some("answering"));
+    }
+
+    #[test]
+    fn the_summary_is_the_final_message_run() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        handler.session_update(text("agent_message_chunk", "first answer"));
+        handler.session_update(text("agent_thought_chunk", "a thought"));
+        handler.session_update(text("agent_message_chunk", "second answer"));
+        handler.finish();
+        assert_eq!(handler.last_message.as_deref(), Some("second answer"));
+    }
+
+    #[test]
+    fn a_turn_that_ends_on_a_thought_summarizes_the_thought() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        handler.session_update(text("agent_thought_chunk", "a thought"));
+        handler.finish();
+        assert_eq!(handler.last_message.as_deref(), Some("a thought"));
+    }
+
+    #[test]
+    fn a_tool_call_without_fields_is_still_a_boundary() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        handler.session_update(text("agent_message_chunk", "answer"));
+        handler.session_update(empty_tool_update());
+        handler.session_update(text("agent_message_chunk", "more"));
+        handler.finish();
+        assert_eq!(messages(&capture), vec!["answer", "more"]);
+        assert_eq!(handler.last_message.as_deref(), Some("more"));
+    }
+
+    #[test]
+    fn an_empty_chunk_records_nothing() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        handler.session_update(text("agent_message_chunk", ""));
+        handler.session_update(text("agent_thought_chunk", ""));
+        handler.finish();
+        assert_eq!(updates(&capture), Vec::<AgentUpdate>::new());
+        assert_eq!(handler.last_message, None);
+    }
+
+    #[test]
+    fn the_message_buffer_flushes_at_its_size() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        let exact = "a".repeat(FLUSH_BYTES);
+        handler.session_update(text("agent_message_chunk", &exact));
+        assert_eq!(messages(&capture), vec![exact]);
+    }
+
+    #[test]
+    fn a_chunk_past_the_message_budget_flushes_too() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        let over = "a".repeat(FLUSH_BYTES + 1);
+        handler.session_update(text("agent_message_chunk", &over));
+        assert_eq!(messages(&capture), vec![over]);
+    }
+
+    #[test]
+    fn the_thought_buffer_flushes_at_its_size() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        let exact = "t".repeat(FLUSH_BYTES);
+        handler.session_update(text("agent_thought_chunk", &exact));
+        assert_eq!(
+            updates(&capture),
+            vec![AgentUpdate::Thought { text: exact }]
+        );
+    }
+
+    #[test]
+    fn the_summary_spans_every_flushed_chunk_of_the_final_run() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        let first = "a".repeat(FLUSH_BYTES);
+        let second = "b".repeat(FLUSH_BYTES);
+        let third = "c".repeat(100);
+        handler.session_update(text("agent_message_chunk", &first));
+        handler.session_update(text("agent_message_chunk", &second));
+        handler.session_update(text("agent_message_chunk", &third));
+        handler.finish();
+        assert_eq!(
+            messages(&capture).concat(),
+            format!("{first}{second}{third}")
+        );
+        let expected = &format!("{first}{second}")[..SUMMARY_BYTES];
+        assert_eq!(handler.last_message.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn the_summary_is_clipped_but_the_transcript_is_not() {
+        let capture = Capture::default();
+        let mut handler = handler(&capture);
+        let long = "b".repeat(SUMMARY_BYTES + 100);
+        handler.session_update(text("agent_message_chunk", &long));
+        handler.finish();
+        assert_eq!(messages(&capture), vec![long]);
+        assert_eq!(
+            handler.last_message.as_deref().map(str::len),
+            Some(SUMMARY_BYTES)
+        );
+    }
+
+    #[test]
+    fn the_buffers_are_the_documented_sizes() {
+        assert_eq!(FLUSH_BYTES, 8 * 1024);
+        assert_eq!(SUMMARY_BYTES, 4 * 1024);
     }
 }

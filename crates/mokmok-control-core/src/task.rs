@@ -9,7 +9,7 @@ use uuid::Uuid;
 use mokmok_events::{CloudEvent, EventType, StoreError, StreamKey, validate_history};
 
 /// How many of a task's most recent updates its state keeps.
-pub const MAX_UPDATES: usize = 256;
+pub const MAX_UPDATES: usize = 4096;
 
 const MAX_TITLE_BYTES: usize = 200;
 const MAX_INSTRUCTION_BYTES: usize = 65_536;
@@ -1029,6 +1029,11 @@ mod tests {
             ));
             assert_eq!(state, before);
         }
+    }
+
+    #[test]
+    fn the_update_cap_is_four_thousand_ninety_six() {
+        assert_eq!(MAX_UPDATES, 4096);
     }
 
     #[test]
