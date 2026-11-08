@@ -25,7 +25,15 @@ mod tests {
 
     impl Daemon {
         fn spawn(dir: &TempDir) -> (Self, SocketAddr) {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_mokmok-controld"))
+            Self::spawn_with(dir, &[])
+        }
+
+        fn spawn_with(
+            dir: &TempDir,
+            extra: &[&str],
+        ) -> (Self, SocketAddr) {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_mokmok-controld"));
+            command
                 .arg("--scripted")
                 .arg("--bind")
                 .arg("127.0.0.1:0")
@@ -33,6 +41,8 @@ mod tests {
                 .arg(dir.path())
                 .arg("--workers")
                 .arg("1")
+                .args(extra);
+            let mut child = command
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -49,7 +59,10 @@ mod tests {
                 }
             });
 
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // Every wait in this file only has to stay under cargo-mutants' per-mutant
+            // timeout: under `nix flake check` the machine is busy, and a real hang still
+            // fails here rather than passing.
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let line = received
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -85,7 +98,7 @@ mod tests {
             .expect("kill runs");
         assert!(sent.success(), "SIGINT reached the daemon");
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match daemon.child.try_wait() {
                 Ok(Some(_)) => return,
@@ -108,7 +121,7 @@ mod tests {
     ) -> (u16, String) {
         let mut stream = TcpStream::connect(address).expect("the daemon listens");
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("the socket takes a read timeout");
         let payload = body.unwrap_or("");
         let request = format!(
@@ -145,6 +158,69 @@ mod tests {
         (status, body.get(..length).unwrap_or(body).to_owned())
     }
 
+    fn submit_scripted(address: SocketAddr) -> String {
+        let (status, body) = request(
+            address,
+            "POST",
+            "/api/tasks",
+            Some(
+                r#"{"title":"Fix the build","instruction":"Make the tests pass.","agent":"scripted"}"#,
+            ),
+        );
+        assert_eq!(status, 201);
+        let created: Value = serde_json::from_str(&body).expect("the answer is JSON");
+        created["id"]
+            .as_str()
+            .expect("the answer carries an id")
+            .to_owned()
+    }
+
+    fn wait_for_journal_total(
+        address: SocketAddr,
+        id: &str,
+        total: usize,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) = request(address, "GET", &format!("/api/tasks/{id}/journal"), None);
+            assert_eq!(status, 200);
+            let journal: Value = serde_json::from_str(&body).expect("the journal is JSON");
+            if journal["entries"].as_array().map(Vec::len) == Some(total) {
+                return journal;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the journal never reached {total} entries: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_journal_seq(
+        address: SocketAddr,
+        id: &str,
+        seq: u64,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) = request(address, "GET", &format!("/api/tasks/{id}/journal"), None);
+            assert_eq!(status, 200);
+            let journal: Value = serde_json::from_str(&body).expect("the journal is JSON");
+            let last = journal["entries"]
+                .as_array()
+                .and_then(|entries| entries.last())
+                .and_then(|entry| entry["seq"].as_u64());
+            if last == Some(seq) {
+                return journal;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the journal never reached seq {seq}: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn the_daemon_serves_a_scripted_task_end_to_end() {
         let dir = TempDir::new().expect("a temp dir");
@@ -169,7 +245,7 @@ mod tests {
             .expect("the answer carries an id")
             .to_owned();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let detail = loop {
             let (status, body) = request(address, "GET", &format!("/api/tasks/{id}"), None);
             assert_eq!(status, 200);
@@ -186,13 +262,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
 
-        let updates = detail["state"]["updates"]
+        assert_eq!(detail["state"]["update_count"], 0);
+        assert_eq!(detail["state"]["outcome"], "the scripted run completed");
+
+        let (status, body) = request(address, "GET", &format!("/api/tasks/{id}/journal"), None);
+        assert_eq!(status, 200);
+        let journal: Value = serde_json::from_str(&body).expect("the journal is JSON");
+        let entries = journal["entries"]
             .as_array()
             .expect("the transcript is a list");
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0]["text"], "the scripted agent received the task");
-        assert_eq!(updates[1]["title"], "inspect the workspace");
-        assert_eq!(detail["state"]["outcome"], "the scripted run completed");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["text"], "the scripted agent received the task");
+        assert_eq!(entries[1]["title"], "inspect the workspace");
     }
 
     // An `Sse` body over the daemon's own broadcast sender never ends, so this is the
@@ -205,7 +286,7 @@ mod tests {
 
         let mut stream = TcpStream::connect(address).expect("the daemon listens");
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("the socket takes a read timeout");
         write!(
             stream,
@@ -247,5 +328,51 @@ mod tests {
         assert_eq!(request(address, "GET", "/healthz", None).0, 200);
 
         interrupt_and_wait(&mut daemon, "the daemon ignored SIGINT after staying up");
+    }
+
+    #[test]
+    fn the_journal_flags_shape_the_segments_on_disk() {
+        let dir = TempDir::new().expect("a temp dir");
+        let (_daemon, address) = Daemon::spawn_with(
+            &dir,
+            &["--journal-max-bytes", "1", "--journal-segments", "2"],
+        );
+        let id = submit_scripted(address);
+        let journal = wait_for_journal_total(address, &id, 2);
+        assert_eq!(journal["total"], 2);
+
+        let journal_dir = dir.path().join("journal").join(&id);
+        assert!(
+            journal_dir.join("0.jsonl").exists(),
+            "the first entry rotated into its own segment"
+        );
+        assert!(
+            journal_dir.join("1.jsonl").exists(),
+            "the second entry rotated into its own segment"
+        );
+        assert!(!journal_dir.join("2.jsonl").exists());
+    }
+
+    #[test]
+    fn a_one_segment_journal_prunes_the_rotated_file() {
+        let dir = TempDir::new().expect("a temp dir");
+        let (_daemon, address) = Daemon::spawn_with(
+            &dir,
+            &["--journal-max-bytes", "1", "--journal-segments", "1"],
+        );
+        let id = submit_scripted(address);
+        let journal = wait_for_journal_seq(address, &id, 2);
+        assert_eq!(journal["total"], 1);
+        assert_eq!(journal["entries"][0]["seq"], 2);
+
+        let journal_dir = dir.path().join("journal").join(&id);
+        assert!(
+            journal_dir.join("1.jsonl").exists(),
+            "the active segment survives"
+        );
+        assert!(
+            !journal_dir.join("0.jsonl").exists(),
+            "the rotated segment is pruned"
+        );
     }
 }

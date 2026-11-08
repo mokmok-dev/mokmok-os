@@ -9,11 +9,14 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Parser};
 use mokmok_control::{
-    AcpRunner, AgentTable, AgentUpdate, ControlEvent, EnumerableStore, Runner, ScriptedRunner,
-    TaskId,
+    AcpRunner, AgentTable, ControlEvent, EnumerableStore, Runner, ScriptedRunner, TaskId,
 };
 use mokmok_controld::{ControlConfig, allowed_hosts, build_router, build_state};
 use mokmok_jobs_jsonl::JsonlEventStore;
+use mokmok_journal::{
+    DEFAULT_KEEP_SEGMENTS, DEFAULT_MAX_AGE, DEFAULT_MAX_BYTES, FileJournal, Journal, JournalConfig,
+    JournalEvent,
+};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -48,6 +51,18 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 2)]
     workers: usize,
 
+    /// Size in bytes at which a task's active journal segment rotates.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_BYTES)]
+    journal_max_bytes: u64,
+
+    /// Newest journal segments a task keeps, including the active one.
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_KEEP_SEGMENTS)]
+    journal_segments: usize,
+
+    /// Age in seconds after which a rotated journal segment is dropped; 0 keeps them.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_MAX_AGE.as_secs())]
+    journal_max_age_secs: u64,
+
     /// Root every ACP task's workspace must live under.
     #[arg(long, value_name = "PATH")]
     workspace_root: Option<PathBuf>,
@@ -77,14 +92,19 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let token = control_token(std::env::var("MOKMOK_CONTROL_TOKEN"), args.bind)
         .map_err(|reason| -> Box<dyn std::error::Error> { reason.into() })?;
+    let journal_config =
+        journal_config(&args).map_err(|reason| -> Box<dyn std::error::Error> { reason.into() })?;
     let (runner, agents, default_agent, transport_hosts) = pick_runner(&args)?;
     let store = JsonlEventStore::<TaskId, ControlEvent>::open(args.data_dir.join("tasks"))?;
     let store: Arc<dyn EnumerableStore<TaskId, ControlEvent>> = Arc::new(store);
+    let journal = FileJournal::open(args.data_dir.join("journal"), journal_config)?;
+    let journal: Arc<dyn Journal> = Arc::new(journal);
     let listener = TcpListener::bind(args.bind).await?;
     let address = listener.local_addr()?;
     let allowed_hosts = allowed_hosts(address, &args.allowed_host);
     let state = build_state(
         store,
+        journal,
         runner,
         ControlConfig {
             agents,
@@ -169,6 +189,20 @@ fn control_token(
     }
 }
 
+fn journal_config(args: &Args) -> Result<JournalConfig, String> {
+    if args.journal_max_bytes == 0 {
+        return Err("--journal-max-bytes must be at least 1".to_owned());
+    }
+    if args.journal_segments == 0 {
+        return Err("--journal-segments must be at least 1".to_owned());
+    }
+    Ok(JournalConfig {
+        max_bytes: args.journal_max_bytes,
+        keep_segments: args.journal_segments,
+        max_age: Duration::from_secs(args.journal_max_age_secs),
+    })
+}
+
 // A failed watcher must not stop the server at once: the process still ends on SIGTERM,
 // so waiting forever is the honest behaviour.
 async fn shutdown_signal() {
@@ -201,16 +235,16 @@ type Selected = (Arc<dyn Runner>, Vec<String>, String, Vec<String>);
 
 fn pick_runner(args: &Args) -> Result<Selected, Box<dyn std::error::Error>> {
     if args.scripted {
-        let updates = vec![
-            AgentUpdate::Message {
+        let events = vec![
+            JournalEvent::Message {
                 text: "the scripted agent received the task".to_owned(),
             },
-            AgentUpdate::ToolCall {
+            JournalEvent::ToolCall {
                 title: "inspect the workspace".to_owned(),
                 status: "completed".to_owned(),
             },
         ];
-        let runner: Arc<dyn Runner> = Arc::new(ScriptedRunner::new(updates, SCRIPTED_SUMMARY));
+        let runner: Arc<dyn Runner> = Arc::new(ScriptedRunner::new(events, SCRIPTED_SUMMARY));
         return Ok((
             runner,
             vec!["scripted".to_owned()],
@@ -246,6 +280,42 @@ mod tests {
 
     fn public() -> SocketAddr {
         "192.0.2.10:8787".parse().expect("a non-loopback address")
+    }
+
+    fn args() -> Args {
+        Args::parse_from(["mokmok-controld", "--scripted", "--data-dir", "/tmp/mokmok"])
+    }
+
+    #[test]
+    fn a_zero_journal_budget_is_refused() {
+        let mut args = args();
+        args.journal_max_bytes = 0;
+        assert_eq!(
+            journal_config(&args),
+            Err("--journal-max-bytes must be at least 1".to_owned())
+        );
+    }
+
+    #[test]
+    fn zero_journal_segments_are_refused() {
+        let mut args = args();
+        args.journal_segments = 0;
+        assert_eq!(
+            journal_config(&args),
+            Err("--journal-segments must be at least 1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_zero_journal_age_disables_pruning() {
+        let mut args = args();
+        args.journal_max_age_secs = 0;
+        assert_eq!(
+            journal_config(&args)
+                .expect("zero seconds is valid")
+                .max_age,
+            Duration::ZERO
+        );
     }
 
     #[test]

@@ -11,11 +11,12 @@ mod tests {
     use std::time::Duration;
 
     use mokmok_control::{
-        AcpRunner, AgentConfig, AgentTable, AgentTransport, AgentUpdate, ControlEvent,
-        ControlSystem, EventStore, NewTask, NoopPublisher, Reporter, RunOutcome, Runner,
+        AcpRunner, AgentConfig, AgentTable, AgentTransport, ControlEvent, ControlSystem,
+        EventStore, Journal, JournalEvent, NewTask, NoopPublisher, Reporter, RunOutcome, Runner,
         Supervisor, TaskId, TaskSpec, TaskStatus,
     };
     use mokmok_jobs_memory::MemoryEventStore;
+    use mokmok_journal::MemoryJournal;
 
     use crate::common;
 
@@ -59,6 +60,7 @@ mod tests {
     }
 
     type Store = Arc<MemoryEventStore<TaskId, ControlEvent>>;
+    type JournalHandle = Arc<MemoryJournal>;
 
     fn spec(workspace: &Path) -> TaskSpec {
         TaskSpec {
@@ -74,7 +76,7 @@ mod tests {
     fn run_task(
         args: Vec<String>,
         task: NewTask,
-    ) -> Result<(Store, ControlSystem, TaskId), Box<dyn std::error::Error>> {
+    ) -> Result<(Store, ControlSystem, JournalHandle, TaskId), Box<dyn std::error::Error>> {
         run_task_with_timeout(args, task, TIMEOUT)
     }
 
@@ -82,14 +84,15 @@ mod tests {
         args: Vec<String>,
         task: NewTask,
         timeout: Duration,
-    ) -> Result<(Store, ControlSystem, TaskId), Box<dyn std::error::Error>> {
+    ) -> Result<(Store, ControlSystem, JournalHandle, TaskId), Box<dyn std::error::Error>> {
         let store: Store = Arc::new(MemoryEventStore::new());
         let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
         let runner = Arc::new(AcpRunner::new(table(args), timeout));
-        let supervisor = Supervisor::new(system.clone(), runner, 1);
+        let journal: JournalHandle = Arc::new(MemoryJournal::new());
+        let supervisor = Supervisor::new(system.clone(), runner, journal.clone(), 1);
         let id = supervisor.submit(task)?;
         assert_eq!(supervisor.run_pending()?, 1);
-        Ok((store, system, id))
+        Ok((store, system, journal, id))
     }
 
     fn events(
@@ -115,17 +118,40 @@ mod tests {
         format!("--record={}", path.display())
     }
 
-    fn message(text: &str) -> AgentUpdate {
-        AgentUpdate::Message {
+    fn message(text: &str) -> JournalEvent {
+        JournalEvent::Message {
             text: text.to_owned(),
         }
+    }
+
+    fn permission(
+        title: &str,
+        status: &str,
+    ) -> JournalEvent {
+        JournalEvent::Permission {
+            title: title.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    fn journal_events(
+        journal: &MemoryJournal,
+        id: &TaskId,
+    ) -> Vec<JournalEvent> {
+        journal
+            .tail(id.as_str(), 10_000)
+            .expect("the journal reads")
+            .entries
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect()
     }
 
     #[test]
     fn a_delegated_task_records_the_transcript() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (store, system, id) = run_task(
+        let (store, system, journal, id) = run_task(
             vec!["--tool-kind=read".to_owned(), record_arg(&record)],
             new_task(workspace.path(), AGENT),
         )?;
@@ -134,9 +160,13 @@ mod tests {
         let state = system.state(&id)?;
         assert_eq!(state.status, TaskStatus::Completed);
         assert_eq!(state.session.as_deref(), Some(SESSION));
-        assert_eq!(state.updates, vec![message("working")]);
-        assert_eq!(state.update_count, 1);
+        assert_eq!(state.updates, [] as [mokmok_control::AgentUpdate; 0]);
+        assert_eq!(state.update_count, 0);
         assert_eq!(state.outcome.as_deref(), Some("working"));
+        assert_eq!(
+            journal_events(&journal, &id),
+            vec![message("working"), permission("tool call", "allowed"),]
+        );
 
         let spec = state.spec.expect("the task carries its spec");
         assert_eq!(
@@ -146,9 +176,6 @@ mod tests {
                 ControlEvent::Started,
                 ControlEvent::SessionOpened {
                     session_id: SESSION.to_owned()
-                },
-                ControlEvent::UpdateRecorded {
-                    update: message("working")
                 },
                 ControlEvent::Completed {
                     summary: "working".to_owned()
@@ -168,7 +195,7 @@ mod tests {
     #[test]
     fn a_failing_agent_fails_the_task() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
-        let (store, system, id) =
+        let (store, system, _, id) =
             run_task(vec!["--fail".to_owned()], new_task(workspace.path(), AGENT))?;
 
         let state = system.state(&id)?;
@@ -188,7 +215,7 @@ mod tests {
     #[test]
     fn a_silent_agent_times_out() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
-        let (store, system, id) = run_task_with_timeout(
+        let (store, system, _, id) = run_task_with_timeout(
             vec!["--silent".to_owned()],
             new_task(workspace.path(), AGENT),
             Duration::from_millis(500),
@@ -212,7 +239,7 @@ mod tests {
     fn a_read_tool_call_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (_, system, id) = run_task(
+        let (_, system, _, id) = run_task(
             vec!["--tool-kind=read".to_owned(), record_arg(&record)],
             new_task(workspace.path(), AGENT),
         )?;
@@ -230,7 +257,7 @@ mod tests {
     fn a_write_tool_call_is_refused() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (_, system, id) = run_task(
+        let (_, system, _, id) = run_task(
             vec!["--tool-kind=edit".to_owned(), record_arg(&record)],
             new_task(workspace.path(), AGENT),
         )?;
@@ -248,7 +275,7 @@ mod tests {
     fn a_tool_call_without_a_kind_is_refused() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (_, system, id) =
+        let (_, system, _, id) =
             run_task(vec![record_arg(&record)], new_task(workspace.path(), AGENT))?;
 
         assert_eq!(system.state(&id)?.status, TaskStatus::Completed);
@@ -264,7 +291,7 @@ mod tests {
     fn an_unknown_agent_fails_without_starting_one() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (_, system, id) = run_task(
+        let (_, system, _, id) = run_task(
             vec![record_arg(&record)],
             new_task(workspace.path(), "missing"),
         )?;
@@ -294,7 +321,7 @@ mod tests {
 
             fn update(
                 &self,
-                _update: AgentUpdate,
+                _event: JournalEvent,
             ) -> Result<(), String> {
                 Ok(())
             }
@@ -328,7 +355,7 @@ mod tests {
 
             fn update(
                 &self,
-                _update: AgentUpdate,
+                _event: JournalEvent,
             ) -> Result<(), String> {
                 Ok(())
             }
@@ -361,7 +388,7 @@ mod tests {
     fn an_allow_always_only_option_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (_, system, id) = run_task(
+        let (_, system, _, id) = run_task(
             vec![
                 "--tool-kind=read".to_owned(),
                 "--allow-always-only".to_owned(),
@@ -383,7 +410,7 @@ mod tests {
     fn a_fetch_tool_call_is_refused() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
         let record = record_path(workspace.path());
-        let (_, system, id) = run_task(
+        let (_, system, _, id) = run_task(
             vec!["--tool-kind=fetch".to_owned(), record_arg(&record)],
             new_task(workspace.path(), AGENT),
         )?;
@@ -400,7 +427,7 @@ mod tests {
     #[test]
     fn a_rich_agent_records_thoughts_and_tool_calls() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
-        let (_, system, id) = run_task(
+        let (_, system, journal, id) = run_task(
             vec!["--rich".to_owned(), "--tool-kind=read".to_owned()],
             new_task(workspace.path(), AGENT),
         )?;
@@ -408,57 +435,51 @@ mod tests {
         let state = system.state(&id)?;
         assert_eq!(state.status, TaskStatus::Completed);
         assert_eq!(
-            state.updates,
+            journal_events(&journal, &id),
             vec![
                 message("working"),
-                AgentUpdate::Thought {
+                JournalEvent::Thought {
                     text: "considering".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "tool pending".to_owned(),
                     status: "pending".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "tool in_progress".to_owned(),
                     status: "in_progress".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "tool completed".to_owned(),
                     status: "completed".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "tool failed".to_owned(),
                     status: "failed".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "updated title".to_owned(),
                     status: "completed".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "tool call".to_owned(),
                     status: "failed".to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "title only".to_owned(),
                     status: "pending".to_owned()
                 },
+                permission("tool call", "allowed"),
             ]
         );
         Ok(())
     }
 
-    fn recorded_updates(events: &[ControlEvent]) -> usize {
+    fn message_text(events: &[JournalEvent]) -> String {
         events
             .iter()
-            .filter(|event| matches!(event, ControlEvent::UpdateRecorded { .. }))
-            .count()
-    }
-
-    fn message_text(updates: &[AgentUpdate]) -> String {
-        updates
-            .iter()
-            .filter_map(|update| match update {
-                AgentUpdate::Message { text } => Some(text.as_str()),
+            .filter_map(|event| match event {
+                JournalEvent::Message { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -467,22 +488,31 @@ mod tests {
     #[test]
     fn a_streamed_turn_coalesces_its_chunks() -> Result<(), Box<dyn std::error::Error>> {
         let workspace = tempfile::tempdir()?;
-        let (store, system, id) = run_task(
+        let (store, system, journal, id) = run_task(
             vec!["--stream".to_owned()],
             new_task(workspace.path(), AGENT),
         )?;
 
-        let recorded = recorded_updates(&events(&store, &id)?);
+        let recorded = journal_events(&journal, &id).len();
         assert!(
             recorded < 20,
-            "200 tiny chunks must coalesce, but {recorded} updates were recorded"
+            "200 tiny chunks must coalesce, but {recorded} entries were recorded"
         );
+
+        let records = events(&store, &id)?;
+        assert_eq!(records.len(), 4, "the domain log stays bounded");
+        assert!(matches!(&records[0], ControlEvent::Submitted { .. }));
+        assert!(matches!(&records[1], ControlEvent::Started));
+        assert!(matches!(&records[2], ControlEvent::SessionOpened { .. }));
+        assert!(matches!(&records[3], ControlEvent::Completed { .. }));
 
         let state = system.state(&id)?;
         assert_eq!(state.status, TaskStatus::Completed);
-        assert_eq!(message_text(&state.updates), common::STREAM_SENTENCE);
+        assert_eq!(
+            message_text(&journal_events(&journal, &id)),
+            common::STREAM_SENTENCE
+        );
         assert_eq!(state.outcome.as_deref(), Some(common::STREAM_SENTENCE));
-        assert_eq!(state.update_count, 1);
         Ok(())
     }
 
@@ -490,12 +520,12 @@ mod tests {
     fn a_streamed_thought_and_tool_call_keep_their_order() -> Result<(), Box<dyn std::error::Error>>
     {
         let workspace = tempfile::tempdir()?;
-        let (store, system, id) = run_task(
+        let (_, system, journal, id) = run_task(
             vec!["--stream-thoughts".to_owned()],
             new_task(workspace.path(), AGENT),
         )?;
 
-        let recorded = recorded_updates(&events(&store, &id)?);
+        let recorded = journal_events(&journal, &id).len();
         assert!(
             recorded < 20,
             "streamed thoughts and tool calls must coalesce, but {recorded} were recorded"
@@ -503,16 +533,17 @@ mod tests {
 
         let state = system.state(&id)?;
         assert_eq!(
-            state.updates,
+            journal_events(&journal, &id),
             vec![
                 message(common::STREAM_SENTENCE),
-                AgentUpdate::Thought {
+                JournalEvent::Thought {
                     text: common::STREAM_THOUGHT.to_owned()
                 },
-                AgentUpdate::ToolCall {
+                JournalEvent::ToolCall {
                     title: "stream tool".to_owned(),
                     status: "pending".to_owned()
                 },
+                permission("tool call", "refused"),
             ]
         );
         // The turn ended after the thought, so the last completed run is the thought.
@@ -532,7 +563,7 @@ mod tests {
 
         fn update(
             &self,
-            _update: AgentUpdate,
+            _event: JournalEvent,
         ) -> Result<(), String> {
             Ok(())
         }
@@ -610,7 +641,7 @@ mod tests {
             AcpRunner::new(table(vec![record_arg(&record)]), TIMEOUT)
                 .with_workspace_root(root.path()),
         );
-        let supervisor = Supervisor::new(system.clone(), runner, 1);
+        let supervisor = Supervisor::new(system.clone(), runner, Arc::new(MemoryJournal::new()), 1);
         let id = supervisor.submit(new_task(&workspace, AGENT))?;
         assert_eq!(supervisor.run_pending()?, 1);
         assert_eq!(system.state(&id)?.status, TaskStatus::Completed);
@@ -668,7 +699,7 @@ mod tests {
 
         fn update(
             &self,
-            _update: AgentUpdate,
+            _event: JournalEvent,
         ) -> Result<(), String> {
             Ok(())
         }

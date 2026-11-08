@@ -8,14 +8,16 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mokmok_control_core::{
-    AgentUpdate, ControlCommand, ControlError, TaskId, TaskSpec, TaskStatus,
-};
+use mokmok_control_core::{ControlCommand, ControlError, TaskId, TaskSpec, TaskStatus};
+use mokmok_journal::{Journal, JournalEvent};
 
 use crate::system::{ControlSystem, Error, NewTask};
 
 /// How long [`Supervisor::shutdown`] waits for a worker to return before leaving it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// The generic answer a journal failure produces.
+const JOURNAL_FAILED: &str = "the control plane could not record the transcript";
 
 /// Runs one task and reports what the agent does while it works.
 pub trait Runner: Send + Sync {
@@ -43,15 +45,14 @@ pub trait Reporter: Send + Sync {
         session: &str,
     ) -> Result<(), String>;
 
-    /// Records one transcript step.
+    /// Records one transcript step in the task's journal.
     ///
     /// # Errors
     ///
-    /// Returns the message of the error the control plane reported, usually because
-    /// the task is already terminal.
+    /// Returns the message of the error the journal reported.
     fn update(
         &self,
-        update: AgentUpdate,
+        event: JournalEvent,
     ) -> Result<(), String>;
 
     /// Whether a human cancelled the task.
@@ -79,6 +80,7 @@ pub struct Supervisor {
 struct Work {
     system: ControlSystem,
     runner: Arc<dyn Runner>,
+    journal: Arc<dyn Journal>,
     cancelled: Mutex<HashSet<TaskId>>,
     // A shutdown cancels like a human does, but without a task id to mark.
     shutting_down: Arc<AtomicBool>,
@@ -139,7 +141,8 @@ impl Queue {
 }
 
 impl Supervisor {
-    /// Builds a supervisor over `system` that runs tasks on `runner`.
+    /// Builds a supervisor over `system` that runs tasks on `runner` and journals
+    /// their transcripts through `journal`.
     ///
     /// `workers` is clamped to at least one. A worker is only spawned by
     /// [`Supervisor::start`]; [`Supervisor::run_pending`] runs in the caller's thread.
@@ -147,12 +150,14 @@ impl Supervisor {
     pub fn new(
         system: ControlSystem,
         runner: Arc<dyn Runner>,
+        journal: Arc<dyn Journal>,
         workers: usize,
     ) -> Self {
         Self {
             work: Arc::new(Work {
                 system,
                 runner,
+                journal,
                 cancelled: Mutex::new(HashSet::new()),
                 shutting_down: Arc::new(AtomicBool::new(false)),
                 queue: Queue::new(),
@@ -427,9 +432,19 @@ impl Reporter for SystemReporter<'_> {
 
     fn update(
         &self,
-        update: AgentUpdate,
+        event: JournalEvent,
     ) -> Result<(), String> {
-        self.send(ControlCommand::Update { update })
+        self.work
+            .journal
+            .append(self.id.as_str(), std::slice::from_ref(&event))
+            .map(|_| ())
+            .map_err(|error| {
+                // A journal error carries the data directory, so the message a caller
+                // may surface must not include it; the detail stays in the debug log.
+                tracing::warn!(task = self.id.as_str(), "the journal append failed");
+                tracing::debug!(task = self.id.as_str(), %error, "the journal append error");
+                JOURNAL_FAILED.to_owned()
+            })
     }
 
     fn cancelled(&self) -> bool {
@@ -465,6 +480,7 @@ mod tests {
 
     use mokmok_control_core::ControlEvent;
     use mokmok_jobs_memory::MemoryEventStore;
+    use mokmok_journal::{JournalEntry, JournalError, JournalTail, MemoryJournal};
 
     use super::*;
     use crate::system::{ControlSystem, NewTask, NoopPublisher};
@@ -491,6 +507,7 @@ mod tests {
         let supervisor = Supervisor::new(
             system.clone(),
             Arc::new(crate::runner::ScriptedRunner::new(Vec::new(), "done")),
+            Arc::new(MemoryJournal::new()),
             1,
         );
         (system, supervisor)
@@ -552,13 +569,100 @@ mod tests {
     #[test]
     fn a_panicking_runner_fails_the_task() -> Result<(), Box<dyn std::error::Error>> {
         let system = system();
-        let supervisor = Supervisor::new(system.clone(), Arc::new(PanickingRunner), 1);
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(PanickingRunner),
+            Arc::new(MemoryJournal::new()),
+            1,
+        );
         let id = supervisor.submit(new_task())?;
         assert_eq!(supervisor.run_pending()?, 1);
 
         let state = system.state(&id)?;
         assert_eq!(state.status, TaskStatus::Failed);
         assert_eq!(state.outcome.as_deref(), Some("the runner panicked"));
+        Ok(())
+    }
+
+    struct RefusingJournal;
+
+    impl Journal for RefusingJournal {
+        fn append(
+            &self,
+            _task: &str,
+            _events: &[JournalEvent],
+        ) -> Result<Vec<JournalEntry>, JournalError> {
+            Err(JournalError::Io(
+                "/tmp/mokmok/journal/x/0.jsonl: the disk is full".to_owned(),
+            ))
+        }
+
+        fn tail(
+            &self,
+            _task: &str,
+            _limit: usize,
+        ) -> Result<JournalTail, JournalError> {
+            Ok(JournalTail {
+                entries: Vec::new(),
+                total: 0,
+            })
+        }
+
+        fn count(
+            &self,
+            _task: &str,
+        ) -> Result<u64, JournalError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_journal_failure_does_not_fail_the_task() -> Result<(), Box<dyn std::error::Error>> {
+        let system = system();
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(crate::runner::ScriptedRunner::new(
+                vec![JournalEvent::Message {
+                    text: "one".to_owned(),
+                }],
+                "done",
+            )),
+            Arc::new(RefusingJournal),
+            1,
+        );
+        let id = supervisor.submit(new_task())?;
+        assert_eq!(supervisor.run_pending()?, 1);
+
+        let state = system.state(&id)?;
+        assert_eq!(state.status, TaskStatus::Completed);
+        assert_eq!(state.outcome.as_deref(), Some("done"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_journal_error_message_never_carries_the_data_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let system = system();
+        let supervisor = Supervisor::new(
+            system,
+            Arc::new(crate::runner::ScriptedRunner::new(Vec::new(), "done")),
+            Arc::new(RefusingJournal),
+            1,
+        );
+        let id = supervisor.submit(new_task())?;
+        let reporter = SystemReporter {
+            work: &supervisor.work,
+            id,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        };
+
+        let message = reporter
+            .update(JournalEvent::Message {
+                text: "one".to_owned(),
+            })
+            .expect_err("the journal refuses the append");
+        assert_eq!(message, JOURNAL_FAILED);
+        assert!(!message.contains("/tmp"), "{message}");
         Ok(())
     }
 }

@@ -909,6 +909,7 @@ dependencies = [
  "mokmok-control-core",
  "mokmok-jobs-jsonl",
  "mokmok-jobs-memory",
+ "mokmok-journal",
  "serde",
  "serde_json",
  "tempfile",
@@ -939,6 +940,7 @@ dependencies = [
  "http-body-util",
  "mokmok-control",
  "mokmok-jobs-jsonl",
+ "mokmok-journal",
  "serde",
  "serde_json",
  "tempfile",
@@ -997,6 +999,15 @@ version = "2026.11.1"
 dependencies = [
  "mokmok-events",
  "mokmok-jobs-core",
+]
+
+[[package]]
+name = "mokmok-journal"
+version = "2026.11.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

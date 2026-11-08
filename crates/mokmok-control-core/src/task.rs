@@ -209,13 +209,15 @@ pub enum ControlCommand {
     Submit(TaskSpec),
     Start,
     OpenSession { session_id: String },
-    Update { update: AgentUpdate },
     Complete { summary: String },
     Fail { reason: String },
     Cancel { reason: String },
 }
 
 /// One committed fact about a task.
+///
+/// [`UpdateRecorded`](Self::UpdateRecorded) survives only so a task logged before the
+/// execution journal existed still replays; no command produces one now.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlEvent {
@@ -357,7 +359,6 @@ pub fn decide(
             },
             ControlCommand::Start
             | ControlCommand::OpenSession { .. }
-            | ControlCommand::Update { .. }
             | ControlCommand::Complete { .. }
             | ControlCommand::Fail { .. }
             | ControlCommand::Cancel { .. } => Err(ControlError::NotSubmitted),
@@ -367,7 +368,6 @@ pub fn decide(
             ControlCommand::Cancel { reason } => Ok(vec![ControlEvent::Cancelled { reason }]),
             ControlCommand::Submit(_) => Err(ControlError::AlreadySubmitted),
             ControlCommand::OpenSession { .. }
-            | ControlCommand::Update { .. }
             | ControlCommand::Complete { .. }
             | ControlCommand::Fail { .. } => Err(ControlError::NotRunning),
         },
@@ -379,7 +379,6 @@ pub fn decide(
                     Ok(vec![ControlEvent::SessionOpened { session_id }])
                 }
             },
-            ControlCommand::Update { update } => Ok(vec![ControlEvent::UpdateRecorded { update }]),
             ControlCommand::Complete { summary } => Ok(vec![ControlEvent::Completed { summary }]),
             ControlCommand::Fail { reason } => Ok(vec![ControlEvent::Failed { reason }]),
             ControlCommand::Cancel { reason } => Ok(vec![ControlEvent::Cancelled { reason }]),
@@ -544,7 +543,6 @@ mod tests {
             ControlCommand::OpenSession {
                 session_id: "session-1".to_owned(),
             },
-            ControlCommand::Update { update: message() },
             ControlCommand::Complete {
                 summary: "done".to_owned(),
             },
@@ -797,7 +795,6 @@ mod tests {
             ControlCommand::OpenSession {
                 session_id: "session-1".to_owned(),
             },
-            ControlCommand::Update { update: message() },
             ControlCommand::Complete {
                 summary: "done".to_owned(),
             },
@@ -823,28 +820,6 @@ mod tests {
                 session_id: "session-1".to_owned(),
             }])
         );
-        for update in [
-            AgentUpdate::Message {
-                text: "looking".to_owned(),
-            },
-            AgentUpdate::Thought {
-                text: "thinking".to_owned(),
-            },
-            AgentUpdate::ToolCall {
-                title: "read".to_owned(),
-                status: "ok".to_owned(),
-            },
-        ] {
-            assert_eq!(
-                decide(
-                    &state,
-                    ControlCommand::Update {
-                        update: update.clone()
-                    }
-                ),
-                Ok(vec![ControlEvent::UpdateRecorded { update }])
-            );
-        }
         assert_eq!(
             decide(
                 &state,
@@ -1059,6 +1034,55 @@ mod tests {
                 text: "u5".to_owned()
             })
         );
+        assert_eq!(
+            state.updates.last(),
+            Some(&AgentUpdate::Message {
+                text: format!("u{}", total - 1),
+            })
+        );
+    }
+
+    #[test]
+    fn replay_rebuilds_a_legacy_log_with_updates() {
+        let id = TaskId::from_u128(3);
+        let total = MAX_UPDATES + 5;
+        let mut events = vec![
+            CloudEvent::new(id.as_str(), Version::new(1), submitted()),
+            CloudEvent::new(id.as_str(), Version::new(2), ControlEvent::Started),
+            CloudEvent::new(
+                id.as_str(),
+                Version::new(3),
+                ControlEvent::SessionOpened {
+                    session_id: "session-1".to_owned(),
+                },
+            ),
+        ];
+        for index in 0..total {
+            let position = u64::try_from(events.len()).expect("log length fits in u64");
+            events.push(CloudEvent::new(
+                id.as_str(),
+                Version::new(position + 1),
+                ControlEvent::UpdateRecorded {
+                    update: AgentUpdate::Message {
+                        text: format!("u{index}"),
+                    },
+                },
+            ));
+        }
+        let position = u64::try_from(events.len()).expect("log length fits in u64");
+        events.push(CloudEvent::new(
+            id.as_str(),
+            Version::new(position + 1),
+            ControlEvent::Completed {
+                summary: "done".to_owned(),
+            },
+        ));
+
+        let state = TaskState::replay(&events).expect("the legacy log replays");
+        assert_eq!(state.status, TaskStatus::Completed);
+        assert_eq!(state.session.as_deref(), Some("session-1"));
+        assert_eq!(state.update_count, total as u64);
+        assert_eq!(state.updates.len(), MAX_UPDATES);
         assert_eq!(
             state.updates.last(),
             Some(&AgentUpdate::Message {

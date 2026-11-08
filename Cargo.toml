@@ -9,6 +9,7 @@ members = [
   "crates/mokmok-jobs-core",
   "crates/mokmok-jobs-jsonl",
   "crates/mokmok-jobs-memory",
+  "crates/mokmok-journal",
   "crates/mokmok-proofs",
 ]
 resolver = "3"
@@ -28,6 +29,7 @@ mokmok-jobs = { path = "crates/mokmok-jobs" }
 mokmok-jobs-core = { path = "crates/mokmok-jobs-core" }
 mokmok-jobs-jsonl = { path = "crates/mokmok-jobs-jsonl" }
 mokmok-jobs-memory = { path = "crates/mokmok-jobs-memory" }
+mokmok-journal = { path = "crates/mokmok-journal" }
 mokmok-proofs = { path = "crates/mokmok-proofs" }
 proptest = "1.12.0"
 rustls = { version = "0.23", default-features = false, features = [

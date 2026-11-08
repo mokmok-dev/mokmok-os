@@ -4,8 +4,8 @@
 mod tests {
     use mokmok_control_core::{
         AgentUpdate, CloudEvent, ControlCommand, ControlError, ControlEvent, MAX_PROMPT_BYTES,
-        MAX_UPDATES, PromptInput, TaskId, TaskSpec, TaskState, TaskStatus, Version, compose_prompt,
-        decide, evolve,
+        PromptInput, TaskId, TaskSpec, TaskState, TaskStatus, Version, compose_prompt, decide,
+        evolve,
     };
     use proptest::prelude::*;
 
@@ -31,12 +31,15 @@ mod tests {
             })
     }
 
-    fn update() -> impl Strategy<Value = AgentUpdate> {
-        prop_oneof![
-            text().prop_map(|text| AgentUpdate::Message { text }),
-            text().prop_map(|text| AgentUpdate::Thought { text }),
-            (text(), text()).prop_map(|(title, status)| AgentUpdate::ToolCall { title, status }),
-        ]
+    fn valid_spec() -> TaskSpec {
+        TaskSpec {
+            task_id: TaskId::from_u128(2),
+            title: "Fix the build".to_owned(),
+            instruction: "Make the tests pass.".to_owned(),
+            agent: "scripted".to_owned(),
+            host: None,
+            workspace: None,
+        }
     }
 
     fn command() -> impl Strategy<Value = ControlCommand> {
@@ -44,7 +47,6 @@ mod tests {
             3 => spec().prop_map(ControlCommand::Submit),
             3 => Just(ControlCommand::Start),
             2 => text().prop_map(|session_id| ControlCommand::OpenSession { session_id }),
-            4 => update().prop_map(|update| ControlCommand::Update { update }),
             2 => text().prop_map(|summary| ControlCommand::Complete { summary }),
             2 => text().prop_map(|reason| ControlCommand::Fail { reason }),
             2 => text().prop_map(|reason| ControlCommand::Cancel { reason }),
@@ -56,11 +58,6 @@ mod tests {
             ControlCommand::Start,
             ControlCommand::OpenSession {
                 session_id: "session-1".to_owned(),
-            },
-            ControlCommand::Update {
-                update: AgentUpdate::Message {
-                    text: "looking".to_owned(),
-                },
             },
             ControlCommand::Complete {
                 summary: "done".to_owned(),
@@ -92,7 +89,6 @@ mod tests {
                         CloudEvent::new(subject.as_str(), Version::new(position + 1), event.clone());
                     evolve(&mut state, &event).expect("decide produced a legal event");
                     log.push(record);
-                    prop_assert!(state.updates.len() <= MAX_UPDATES);
                     if matches!(
                         state.status,
                         TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
@@ -105,6 +101,47 @@ mod tests {
             }
             let replayed = TaskState::replay(&log).expect("decide built a well formed log");
             prop_assert_eq!(&replayed, &state);
+        }
+
+        #[test]
+        fn a_legacy_log_with_updates_replays_and_keeps_its_cap(
+            updates in prop::collection::vec(text(), 0..64),
+        ) {
+            let subject = TaskId::from_u128(2).as_str().to_owned();
+            let mut log = vec![
+                CloudEvent::new(
+                    &subject,
+                    Version::new(1),
+                    ControlEvent::Submitted { spec: valid_spec() },
+                ),
+                CloudEvent::new(&subject, Version::new(2), ControlEvent::Started),
+            ];
+            for text in &updates {
+                let position = u64::try_from(log.len()).expect("log length fits in u64");
+                log.push(CloudEvent::new(
+                    &subject,
+                    Version::new(position + 1),
+                    ControlEvent::UpdateRecorded {
+                        update: AgentUpdate::Message { text: text.clone() },
+                    },
+                ));
+            }
+            let position = u64::try_from(log.len()).expect("log length fits in u64");
+            log.push(CloudEvent::new(
+                &subject,
+                Version::new(position + 1),
+                ControlEvent::Completed {
+                    summary: "done".to_owned(),
+                },
+            ));
+
+            let state = TaskState::replay(&log).expect("the legacy log replays");
+            prop_assert_eq!(state.status, TaskStatus::Completed);
+            prop_assert_eq!(state.update_count, u64::try_from(updates.len()).expect("fits"));
+            let expected_last = updates.last().map(|text| AgentUpdate::Message {
+                text: text.clone(),
+            });
+            prop_assert_eq!(state.updates.last(), expected_last.as_ref());
         }
 
         #[test]

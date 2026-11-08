@@ -8,9 +8,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use mokmok_control::{
-        AgentUpdate, CloudEvent, ControlCommand, ControlError, ControlEvent, ControlPublisher,
-        ControlSystem, EnumerableStore, Error, EventStore, NewTask, NoopPublisher, StoreError,
-        TaskId, TaskSpec, TaskStatus, Version,
+        CloudEvent, ControlCommand, ControlError, ControlEvent, ControlPublisher, ControlSystem,
+        EnumerableStore, Error, EventStore, NewTask, NoopPublisher, StoreError, TaskId, TaskSpec,
+        TaskStatus, Version,
     };
     use mokmok_jobs_jsonl::JsonlEventStore;
     use mokmok_jobs_memory::MemoryEventStore;
@@ -33,12 +33,6 @@ mod tests {
             agent: "scripted".to_owned(),
             host: None,
             workspace: Some("/work/mokmok".to_owned()),
-        }
-    }
-
-    fn message(text: &str) -> AgentUpdate {
-        AgentUpdate::Message {
-            text: text.to_owned(),
         }
     }
 
@@ -190,12 +184,6 @@ mod tests {
             )?;
             system.ask(
                 &id,
-                ControlCommand::Update {
-                    update: message("working"),
-                },
-            )?;
-            system.ask(
-                &id,
                 ControlCommand::Complete {
                     summary: "done".to_owned(),
                 },
@@ -210,57 +198,74 @@ mod tests {
         assert_eq!(state.status, TaskStatus::Completed);
         assert_eq!(state.outcome.as_deref(), Some("done"));
         assert_eq!(state.session.as_deref(), Some("session-1"));
-        assert_eq!(state.updates, vec![message("working")]);
-        assert_eq!(state.update_count, 1);
+        assert_eq!(state.updates, [] as [mokmok_control::AgentUpdate; 0]);
+        assert_eq!(state.update_count, 0);
 
         let summaries = system.list()?;
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].id, id);
         assert_eq!(summaries[0].status, TaskStatus::Completed);
-        assert_eq!(summaries[0].updates, 1);
+        assert_eq!(summaries[0].updates, 0);
         Ok(())
     }
 
     #[test]
-    fn two_threads_append_one_contiguous_stream() -> Result<(), Box<dyn std::error::Error>> {
-        const PER_THREAD: usize = 20;
+    fn two_threads_race_one_terminal_command_into_one_contiguous_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
         let store = memory();
         let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
         let id = system.submit(new_task("scripted"))?;
         system.ask(&id, ControlCommand::Start)?;
 
-        let mut handles = Vec::new();
-        for worker in 0..2 {
-            let system = system.clone();
-            let id = id.clone();
-            handles.push(thread::spawn(move || -> Result<(), Error> {
-                for index in 0..PER_THREAD {
+        let (first, second) = thread::scope(|scope| {
+            let one = {
+                let system = system.clone();
+                let id = id.clone();
+                scope.spawn(move || {
                     system.ask(
                         &id,
-                        ControlCommand::Update {
-                            update: message(&format!("{worker}-{index}")),
+                        ControlCommand::Complete {
+                            summary: "done".to_owned(),
                         },
-                    )?;
-                }
-                Ok(())
-            }));
-        }
-        for handle in handles {
-            handle.join().expect("the asking thread did not panic")?;
-        }
+                    )
+                })
+            };
+            let two = {
+                let system = system.clone();
+                let id = id.clone();
+                scope.spawn(move || {
+                    system.ask(
+                        &id,
+                        ControlCommand::Cancel {
+                            reason: "stop".to_owned(),
+                        },
+                    )
+                })
+            };
+            (
+                one.join().expect("the first asking thread did not panic"),
+                two.join().expect("the second asking thread did not panic"),
+            )
+        });
 
-        let state = system.state(&id)?;
-        assert_eq!(state.updates.len(), 2 * PER_THREAD);
-        assert_eq!(state.update_count, u64::try_from(2 * PER_THREAD)?);
-
+        assert!(
+            first.is_ok() ^ second.is_ok(),
+            "exactly one terminal command may commit"
+        );
         let records = store.load(&id)?;
-        assert_eq!(records.len(), 2 + 2 * PER_THREAD);
+        assert_eq!(records.len(), 3);
         let mut version = Version::ZERO;
         for record in &records {
             version = version.next();
             assert_eq!(record.version, version);
             assert_eq!(record.subject, id.as_str());
         }
+        let state = system.state(&id)?;
+        assert!(
+            matches!(state.status, TaskStatus::Completed | TaskStatus::Cancelled),
+            "{:?}",
+            state.status
+        );
         Ok(())
     }
 
@@ -278,12 +283,6 @@ mod tests {
             },
         )?;
         system.ask(&running, ControlCommand::Start)?;
-        system.ask(
-            &running,
-            ControlCommand::Update {
-                update: message("one"),
-            },
-        )?;
 
         let summaries = system.list()?;
         assert_eq!(summaries.len(), 3);
@@ -309,7 +308,7 @@ mod tests {
         );
         assert_eq!(
             status(&running),
-            Some((TaskStatus::Running, "other".to_owned(), 1))
+            Some((TaskStatus::Running, "other".to_owned(), 0))
         );
         Ok(())
     }
@@ -326,15 +325,17 @@ mod tests {
         let id = system.submit(new_task("scripted"))?;
         system.ask(&id, ControlCommand::Start)?;
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // A busy host stretches the retirement well past 5 s; the bound stays under
+        // cargo-mutants' 60 s, so a real hang still fails here.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let session = ControlCommand::OpenSession {
+            session_id: "session-1".to_owned(),
+        };
         loop {
             thread::sleep(Duration::from_millis(5));
-            system.ask(
-                &id,
-                ControlCommand::Update {
-                    update: message("tick"),
-                },
-            )?;
+            // The first ask opens the session; later asks are refused by the fresh
+            // actor, and a load count above one is what proves it replayed.
+            let _ = system.ask(&id, session.clone());
             if store.loads() > 1 {
                 break;
             }
@@ -342,6 +343,7 @@ mod tests {
         }
 
         assert_eq!(system.state(&id)?.status, TaskStatus::Running);
+        assert_eq!(system.state(&id)?.session.as_deref(), Some("session-1"));
         let appended = system.ask(
             &id,
             ControlCommand::Complete {

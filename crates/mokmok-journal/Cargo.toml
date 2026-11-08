@@ -1,0 +1,14 @@
+[package]
+edition.workspace = true
+name = "mokmok-journal"
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

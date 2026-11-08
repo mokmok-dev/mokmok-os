@@ -7,12 +7,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use mokmok_control_core::{
     CloudEvent, ControlCommand, ControlError, ControlEvent, EnumerableStore, StoreError, TaskId,
     TaskSpec, TaskState, TaskStatus, Version, decide, evolve,
 };
+use mokmok_journal::timestamp;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -636,43 +637,6 @@ fn handle(
     })
 }
 
-// RFC 3339 needs a civil date, and the workspace carries no date crate for one
-// format string.
-fn timestamp(time: SystemTime) -> String {
-    let elapsed = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-    let seconds = elapsed.as_secs();
-    let millis = elapsed.subsec_millis();
-    let days = seconds / 86_400;
-    let clock = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = clock / 3_600;
-    let minute = (clock % 3_600) / 60;
-    let second = clock % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
-}
-
-// Howard Hinnant's days-to-civil conversion, with 1970-01-01 as day zero.
-const fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let shifted = days + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    if month <= 2 {
-        year += 1;
-    }
-    (year, month, day)
-}
-
 // A replay failure in one stream has to name the stream, or a listing of many tasks
 // cannot say which log is bad.
 fn corrupt(
@@ -731,37 +695,6 @@ mod tests {
     #[test]
     fn the_default_idle_timeout_is_sixty_seconds() {
         assert_eq!(DEFAULT_IDLE_TIMEOUT, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn the_clock_formats_rfc3339_utc_with_milliseconds() {
-        assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
-        assert_eq!(
-            timestamp(UNIX_EPOCH + Duration::from_hours(24)),
-            "1970-01-02T00:00:00.000Z"
-        );
-        assert_eq!(
-            timestamp(UNIX_EPOCH + Duration::from_millis(1_794_118_748_123)),
-            "2026-11-08T06:19:08.123Z"
-        );
-        assert_eq!(
-            timestamp(UNIX_EPOCH + Duration::from_hours(474_768)),
-            "2024-02-29T00:00:00.000Z"
-        );
-        // The day before a March and the last day of a 400-year era pin the
-        // century and leap-year corrections in the civil conversion.
-        assert_eq!(
-            timestamp(UNIX_EPOCH + Duration::from_hours(59 * 24)),
-            "1970-03-01T00:00:00.000Z"
-        );
-        assert_eq!(
-            timestamp(UNIX_EPOCH + Duration::from_hours(11_016 * 24)),
-            "2000-02-29T00:00:00.000Z"
-        );
-        assert_eq!(
-            timestamp(UNIX_EPOCH - Duration::from_hours(24)),
-            "1970-01-01T00:00:00.000Z"
-        );
     }
 
     #[test]

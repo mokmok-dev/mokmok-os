@@ -6,8 +6,8 @@
 #[cfg(test)]
 mod tests {
     use mokmok_control_core::{
-        AgentUpdate, CloudEvent, ControlCommand, ControlEvent, MAX_UPDATES, TaskId, TaskSpec,
-        TaskState, TaskStatus, Version, decide, evolve,
+        CloudEvent, ControlCommand, ControlEvent, TaskId, TaskSpec, TaskState, TaskStatus, Version,
+        decide, evolve,
     };
     use stateright::{Checker, Model, Property};
 
@@ -22,9 +22,6 @@ mod tests {
         Submit,
         Start,
         OpenSession,
-        Message,
-        Thought,
-        ToolCall,
         Complete,
         Fail,
         Cancel,
@@ -63,22 +60,6 @@ mod tests {
                 Action::Start => ControlCommand::Start,
                 Action::OpenSession => ControlCommand::OpenSession {
                     session_id: "session-1".to_owned(),
-                },
-                Action::Message => ControlCommand::Update {
-                    update: AgentUpdate::Message {
-                        text: "looking".to_owned(),
-                    },
-                },
-                Action::Thought => ControlCommand::Update {
-                    update: AgentUpdate::Thought {
-                        text: "thinking".to_owned(),
-                    },
-                },
-                Action::ToolCall => ControlCommand::Update {
-                    update: AgentUpdate::ToolCall {
-                        title: "read".to_owned(),
-                        status: "ok".to_owned(),
-                    },
                 },
                 Action::Complete => ControlCommand::Complete {
                     summary: "done".to_owned(),
@@ -120,9 +101,6 @@ mod tests {
                 Action::Submit,
                 Action::Start,
                 Action::OpenSession,
-                Action::Message,
-                Action::Thought,
-                Action::ToolCall,
                 Action::Complete,
                 Action::Fail,
                 Action::Cancel,
@@ -158,10 +136,9 @@ mod tests {
                     },
                 ),
                 Property::always(
-                    "nothing is recorded before a start",
+                    "nothing opens a session before a start",
                     |_: &Self, state: &ModelState| {
-                        Self::started(state)
-                            || (state.state.session.is_none() && state.state.updates.is_empty())
+                        Self::started(state) || state.state.session.is_none()
                     },
                 ),
                 Property::always("at most one session id", |_: &Self, state: &ModelState| {
@@ -172,23 +149,6 @@ mod tests {
                         .count();
                     opened <= 1 && state.state.session.is_some() == (opened == 1)
                 }),
-                // `MAX_LOG` is 8, far below `MAX_UPDATES` (256), so the eviction branch is
-                // unreachable here; the unit test `evolve_caps_the_updates_and_counts_every_one`
-                // covers it. This property checks the count and the (vacuous) cap.
-                Property::always(
-                    "update_count matches the recorded updates and the state keeps at most MAX_UPDATES",
-                    |_: &Self, state: &ModelState| {
-                        let recorded = state
-                            .log
-                            .iter()
-                            .filter(|event| matches!(event, ControlEvent::UpdateRecorded { .. }))
-                            .count();
-                        state.state.updates.len() <= MAX_UPDATES
-                            && state.state.update_count
-                                == u64::try_from(recorded).expect("log length fits in u64")
-                            && state.state.updates.len() == recorded.min(MAX_UPDATES)
-                    },
-                ),
                 Property::always(
                     "replay rebuilds the same state",
                     |model: &Self, state: &ModelState| {
