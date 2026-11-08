@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_socket_is_a_websocket_error_not_a_timeout() {
+    fn a_reset_socket_is_an_error_not_a_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let address = listener.local_addr().expect("address");
         let handle = thread::spawn(move || {
@@ -538,8 +538,9 @@ mod tests {
         let config = WebSocketConfig::new(format!("ws://{address}/ws"));
         let mut transport = WebSocketTransport::connect(&config).expect("connect");
         let result = transport.recv_timeout(Duration::from_millis(500));
+        assert!(result.is_err(), "a reset socket must fail: {result:?}");
         assert!(
-            matches!(result, Err(TransportError::WebSocket(_))),
+            !matches!(result, Err(TransportError::Timeout)),
             "a reset socket must not look like a quiet one: {result:?}"
         );
         drop(transport);

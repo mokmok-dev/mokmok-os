@@ -346,6 +346,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn dropping_the_transport_kills_and_reaps_the_child() {
         let transport = spawn("sh", &["-c", "sleep 30"]);

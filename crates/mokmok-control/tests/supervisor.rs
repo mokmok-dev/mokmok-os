@@ -49,7 +49,10 @@ mod tests {
             if system.state(id).is_ok_and(|state| state.status == status) {
                 return;
             }
-            assert!(Instant::now() < deadline, "{id:?} never reached {status:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the task never reached {status:?}"
+            );
             thread::sleep(Duration::from_millis(2));
         }
     }
