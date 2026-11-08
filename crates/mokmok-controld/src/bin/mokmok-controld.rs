@@ -20,7 +20,8 @@ use tracing_subscriber::EnvFilter;
 const AGENT_TIMEOUT: Duration = Duration::from_secs(600);
 const SCRIPTED_SUMMARY: &str = "the scripted run completed";
 
-// A connection that outlives the shutdown watch must not hold the process open.
+// A connection that outlives the shutdown watch must not hold the process open, but the
+// bound starts with the signal: a daemon that never receives one runs until it does.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
@@ -98,11 +99,13 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%address, data_dir = %args.data_dir.display(), "control plane listening");
     println!("mokmok-controld listening on http://{address}");
     let router = build_router(state.clone());
+    let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
     let shutdown_state = state.clone();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {
         shutdown_signal().await;
         tracing::info!("shutdown signal received");
         let _ = shutdown_state.shutdown.send(true);
+        let _ = signal.send(());
         // Tokio drops the signal future that already fired, so a second interrupt is only
         // seen by a fresh watcher; a stuck connection must not make the process killable
         // only by SIGKILL.
@@ -113,14 +116,38 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     });
-    if tokio::time::timeout(SHUTDOWN_TIMEOUT, server)
-        .await
-        .is_err()
-    {
-        tracing::warn!("graceful shutdown timed out; dropping connections");
-    }
+    serve_until_signalled(server, signalled, SHUTDOWN_TIMEOUT).await?;
     state.supervisor.shutdown();
     Ok(())
+}
+
+// The grace has to start with the signal. Wrapping the whole server future instead would
+// end a daemon that never received one, which is how a five-second timeout around every
+// `serve` turned into a daemon that stopped itself.
+async fn serve_until_signalled<S>(
+    server: S,
+    signalled: tokio::sync::oneshot::Receiver<()>,
+    grace: Duration,
+) -> std::io::Result<()>
+where
+    S: std::future::IntoFuture<Output = std::io::Result<()>>,
+{
+    let server = server.into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        // Polled first, so a server that has already returned is never awaited again.
+        biased;
+        result = &mut server => result,
+        signalled = signalled => {
+            // `Err` means the server ended and took the sender with it.
+            if signalled.is_ok()
+                && tokio::time::timeout(grace, &mut server).await.is_err()
+            {
+                tracing::warn!("graceful shutdown timed out; dropping connections");
+            }
+            Ok(())
+        },
+    }
 }
 
 // The token is the only thing separating the API from any local process, so an empty
@@ -244,6 +271,61 @@ mod tests {
         assert_eq!(
             control_token(Ok("secret".to_owned()), public()),
             Ok(Some("secret".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_grace_starts_with_the_signal_not_the_server() {
+        // The sender is held, so no signal arrives while the server runs.
+        let (_signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let server = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        };
+
+        let started = tokio::time::Instant::now();
+        serve_until_signalled(server, signalled, Duration::from_millis(50))
+            .await
+            .expect("the finished server is not an error");
+        assert!(
+            started.elapsed() >= Duration::from_millis(190),
+            "the daemon gave up before its server finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signalled_drain_is_bounded_by_the_grace() {
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        let server = std::future::pending::<std::io::Result<()>>();
+        signal.send(()).expect("the receiver is held");
+
+        let started = tokio::time::Instant::now();
+        serve_until_signalled(server, signalled, Duration::from_millis(50))
+            .await
+            .expect("a drain that times out is not an error");
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "the grace was not applied to the drain"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the drain outlived its grace"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vanished_signal_sender_waits_for_no_drain() {
+        let (signal, signalled) = tokio::sync::oneshot::channel::<()>();
+        drop(signal);
+        let server = std::future::pending::<std::io::Result<()>>();
+
+        let started = tokio::time::Instant::now();
+        serve_until_signalled(server, signalled, Duration::from_secs(2))
+            .await
+            .expect("nothing left to drain is not an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a drain ran for a signal that was never sent"
         );
     }
 }

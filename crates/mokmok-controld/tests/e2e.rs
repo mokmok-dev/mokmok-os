@@ -4,7 +4,7 @@
 mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpStream};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStderr, Command, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ mod tests {
 
     struct Daemon {
         child: Child,
+        stderr: Option<ChildStderr>,
     }
 
     impl Drop for Daemon {
@@ -24,7 +25,7 @@ mod tests {
 
     impl Daemon {
         fn spawn(dir: &TempDir) -> (Self, SocketAddr) {
-            let child = Command::new(env!("CARGO_BIN_EXE_mokmok-controld"))
+            let mut child = Command::new(env!("CARGO_BIN_EXE_mokmok-controld"))
                 .arg("--scripted")
                 .arg("--bind")
                 .arg("127.0.0.1:0")
@@ -33,10 +34,11 @@ mod tests {
                 .arg("--workers")
                 .arg("1")
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("the daemon starts");
-            let mut daemon = Self { child };
+            let stderr = child.stderr.take();
+            let mut daemon = Self { child, stderr };
             let stdout = daemon.child.stdout.take().expect("the daemon has stdout");
             let (lines, received) = mpsc::channel();
             std::thread::spawn(move || {
@@ -57,6 +59,44 @@ mod tests {
                     return (daemon, address);
                 }
             }
+        }
+
+        // The pipe ends at EOF, which only an exited child gives, so read it after a
+        // `try_wait` that returned a status.
+        fn stderr_text(&mut self) -> String {
+            let Some(mut stderr) = self.stderr.take() else {
+                return String::new();
+            };
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        }
+    }
+
+    #[cfg(unix)]
+    fn interrupt_and_wait(
+        daemon: &mut Daemon,
+        failure: &str,
+    ) {
+        let pid = daemon.child.id().to_string();
+        let sent = Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success(), "SIGINT reached the daemon");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match daemon.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {},
+                Err(error) => panic!("cannot wait for the daemon: {error}"),
+            }
+            if Instant::now() >= deadline {
+                let _ = daemon.child.kill();
+                panic!("{failure}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -185,25 +225,27 @@ mod tests {
         }
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 
-        let pid = daemon.child.id().to_string();
-        let sent = Command::new("kill")
-            .args(["-INT", &pid])
-            .status()
-            .expect("kill runs");
-        assert!(sent.success(), "SIGINT reached the daemon");
+        interrupt_and_wait(
+            &mut daemon,
+            "the daemon ignored SIGINT while /api/events was open",
+        );
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            match daemon.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {},
-                Err(error) => panic!("cannot wait for the daemon: {error}"),
-            }
-            if Instant::now() >= deadline {
-                let _ = daemon.child.kill();
-                panic!("the daemon ignored SIGINT while /api/events was open");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    // The drain bound has to start with the signal. A timeout around the whole server
+    // future ended the daemon five seconds after startup instead.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_keeps_running_without_a_signal() {
+        let dir = TempDir::new().expect("a temp dir");
+        let (mut daemon, address) = Daemon::spawn(&dir);
+
+        std::thread::sleep(Duration::from_secs(6));
+        if let Some(status) = daemon.child.try_wait().expect("the daemon is waitable") {
+            let stderr = daemon.stderr_text();
+            panic!("the daemon exited after {status} without a signal: {stderr}");
         }
+        assert_eq!(request(address, "GET", "/healthz", None).0, 200);
+
+        interrupt_and_wait(&mut daemon, "the daemon ignored SIGINT after staying up");
     }
 }
