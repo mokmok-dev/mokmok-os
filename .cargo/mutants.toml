@@ -1,2 +1,3 @@
+exclude_globs = ["crates/mokmok-acp/tests/**"]
 minimum_test_timeout = 60
 test_tool = "nextest"

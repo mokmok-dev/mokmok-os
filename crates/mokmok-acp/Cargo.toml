@@ -1,0 +1,33 @@
+[package]
+autotests = false
+edition.workspace = true
+name = "mokmok-acp"
+version.workspace = true
+
+[[bin]]
+name = "mokmok-acp-test-agent"
+path = "tests/fake_agent.rs"
+test = false
+
+[[test]]
+name = "stdio"
+path = "tests/stdio.rs"
+
+[[test]]
+name = "websocket"
+path = "tests/websocket.rs"
+
+[[test]]
+name = "delegation"
+path = "tests/delegation.rs"
+
+[dependencies]
+agent-client-protocol-schema.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tungstenite.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
