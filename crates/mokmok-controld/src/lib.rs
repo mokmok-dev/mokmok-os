@@ -8,7 +8,8 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -32,6 +33,12 @@ const APP_CSS: &str = include_str!("../static/app.css");
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_CANCEL_REASON: &str = "cancelled from the control plane";
+
+/// How many recent events a detail request returns unless it asks otherwise.
+const DETAIL_EVENT_TAIL: usize = 200;
+
+/// The answer to an `events` value outside `tail`, `all`, and `none`.
+const EVENTS_QUERY: &str = "the events query must be one of: tail, all, none";
 
 /// Everything the handlers share: the task actors, the workers, and the live feed.
 #[derive(Clone)]
@@ -249,7 +256,9 @@ async fn create_task(
 async fn task_detail(
     State(state): State<AppState>,
     Path(raw): Path<String>,
+    query: Result<Query<DetailQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::bad_request(EVENTS_QUERY))?;
     let id = parse_id(raw)?;
     let events = state
         .store
@@ -260,7 +269,33 @@ async fn task_detail(
     if task.spec.is_none() {
         return Err(ApiError::not_found("no such task"));
     }
-    Ok(Json(json!({"state": task, "events": events})))
+    let event_count = events.len();
+    let selected: Vec<_> = match query.events {
+        EventMode::Tail => {
+            let start = event_count.saturating_sub(DETAIL_EVENT_TAIL);
+            events[start..].to_vec()
+        },
+        EventMode::All => events,
+        EventMode::None => Vec::new(),
+    };
+    Ok(Json(
+        json!({"state": task, "events": selected, "event_count": event_count}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct DetailQuery {
+    #[serde(default)]
+    events: EventMode,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum EventMode {
+    #[default]
+    Tail,
+    All,
+    None,
 }
 
 #[derive(Deserialize)]

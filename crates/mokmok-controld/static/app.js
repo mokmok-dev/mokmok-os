@@ -377,7 +377,8 @@ async function refreshSelected() {
   const seq = ++state.detailSeq;
   let payload;
   try {
-    payload = await api('/api/tasks/' + encodeURIComponent(id));
+    // The page renders from `state`; asking for no events keeps a long log off the wire.
+    payload = await api('/api/tasks/' + encodeURIComponent(id) + '?events=none');
   } catch (error) {
     if (error && error.status === 404) {
       if (seq === state.detailSeq && state.selectedId === id) {

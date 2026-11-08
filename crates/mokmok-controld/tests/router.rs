@@ -8,7 +8,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{HeaderMap, Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use mokmok_control::{AgentUpdate, ControlEvent, EnumerableStore, ScriptedRunner, TaskId};
+    use mokmok_control::{
+        AgentUpdate, ControlEvent, EnumerableStore, Runner, ScriptedRunner, TaskId,
+    };
     use mokmok_controld::{AppState, ControlConfig, allowed_hosts, build_router, build_state};
     use mokmok_jobs_jsonl::JsonlEventStore;
     use serde_json::{Value, json};
@@ -32,10 +34,6 @@ mod tests {
         token: Option<&str>,
         transport_hosts: Vec<String>,
     ) -> AppState {
-        let store: Arc<dyn EnumerableStore<TaskId, ControlEvent>> = Arc::new(
-            JsonlEventStore::<TaskId, ControlEvent>::open(dir.path().join("tasks"))
-                .expect("the store opens"),
-        );
         let runner = ScriptedRunner::new(
             vec![
                 AgentUpdate::Message {
@@ -48,9 +46,35 @@ mod tests {
             ],
             SCRIPTED_SUMMARY,
         );
+        state_with(dir, token, transport_hosts, Arc::new(runner))
+    }
+
+    fn many_update_state(
+        dir: &TempDir,
+        count: usize,
+    ) -> AppState {
+        let updates = (0..count)
+            .map(|index| AgentUpdate::Message {
+                text: format!("u{index}"),
+            })
+            .collect();
+        let runner = ScriptedRunner::new(updates, SCRIPTED_SUMMARY);
+        state_with(dir, None, Vec::new(), Arc::new(runner))
+    }
+
+    fn state_with(
+        dir: &TempDir,
+        token: Option<&str>,
+        transport_hosts: Vec<String>,
+        runner: Arc<dyn Runner>,
+    ) -> AppState {
+        let store: Arc<dyn EnumerableStore<TaskId, ControlEvent>> = Arc::new(
+            JsonlEventStore::<TaskId, ControlEvent>::open(dir.path().join("tasks"))
+                .expect("the store opens"),
+        );
         build_state(
             store,
-            Arc::new(runner),
+            runner,
             ControlConfig {
                 agents: vec!["scripted".to_owned()],
                 default_agent: "scripted".to_owned(),
@@ -265,6 +289,7 @@ mod tests {
         assert_eq!(task["outcome"], json!(SCRIPTED_SUMMARY));
 
         let events = payload["events"].as_array().expect("events are a list");
+        assert_eq!(payload["event_count"], json!(6));
         assert_eq!(events.len(), 6);
         assert_eq!(events[0]["type"], json!("dev.mokmok.control.submitted"));
         assert_eq!(events[1]["type"], json!("dev.mokmok.control.started"));
@@ -273,6 +298,82 @@ mod tests {
             json!("dev.mokmok.control.session_opened")
         );
         assert_eq!(events[5]["type"], json!("dev.mokmok.control.completed"));
+    }
+
+    async fn completed_task(state: &AppState) -> String {
+        let created = post_json(state, "/api/tasks", &new_task("scripted")).await;
+        assert_eq!(created.status, StatusCode::CREATED);
+        let id = created_id(&created);
+        assert_eq!(state.supervisor.run_pending().expect("the task runs"), 1);
+        id
+    }
+
+    #[tokio::test]
+    async fn the_detail_event_tail_is_bounded_by_default() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = many_update_state(&dir, 250);
+        let id = completed_task(&state).await;
+
+        let reply = get(&state, &format!("/api/tasks/{id}")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let payload = reply.json();
+        assert_eq!(payload["event_count"], json!(254));
+        let events = payload["events"].as_array().expect("events are a list");
+        assert_eq!(events.len(), 200);
+        assert_eq!(
+            events.last().expect("the tail has an event")["type"],
+            json!("dev.mokmok.control.completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn events_none_still_replays_the_state() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = many_update_state(&dir, 250);
+        let id = completed_task(&state).await;
+
+        let reply = get(&state, &format!("/api/tasks/{id}?events=none")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let payload = reply.json();
+        assert_eq!(payload["event_count"], json!(254));
+        assert_eq!(payload["events"], json!([]));
+        assert_eq!(payload["state"]["status"], json!("completed"));
+        assert_eq!(payload["state"]["update_count"], json!(250));
+    }
+
+    #[tokio::test]
+    async fn events_all_returns_every_event() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = many_update_state(&dir, 250);
+        let id = completed_task(&state).await;
+
+        let reply = get(&state, &format!("/api/tasks/{id}?events=all")).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let payload = reply.json();
+        assert_eq!(payload["event_count"], json!(254));
+        let events = payload["events"].as_array().expect("events are a list");
+        assert_eq!(events.len(), 254);
+        assert_eq!(events[0]["type"], json!("dev.mokmok.control.submitted"));
+        assert_eq!(
+            events.last().expect("the log has an event")["type"],
+            json!("dev.mokmok.control.completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_events_value_is_rejected() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+
+        let reply = get(&state, &format!("/api/tasks/{UNKNOWN_TASK}?events=bad")).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(
+            reply.json()["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("events")),
+            "{}",
+            reply.body
+        );
     }
 
     #[tokio::test]
