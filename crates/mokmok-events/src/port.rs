@@ -4,19 +4,23 @@ use std::fmt;
 use std::hash::Hash;
 
 use crate::cloud_event::CloudEvent;
-use crate::job::JobEvent;
 use crate::stream::Version;
 
 /// A stable identity for one stored event stream.
 ///
 /// [`as_str`](Self::as_str) must be a non-empty, single path component of
-/// characters that are safe on every supported filesystem. [`JobId`] returns a
-/// canonical lowercase UUID, so an adapter uses it as the file stem without
-/// escaping.
-///
-/// [`JobId`]: crate::JobId
+/// characters that are safe on every supported filesystem, so an adapter uses it as
+/// a file stem without escaping. [`parse_key`](Self::parse_key) is the inverse, and
+/// an adapter that lists its streams needs it to recognise the stems it finds.
 pub trait StreamKey: Clone + Eq + Hash + Send + Sync + 'static {
     fn as_str(&self) -> &str;
+
+    /// Rebuilds a key from the text [`as_str`](Self::as_str) returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Invalid`] when `raw` is not the form this key writes.
+    fn parse_key(raw: &str) -> Result<Self, StoreError>;
 }
 
 /// A durable, append-only log of one event stream per key.
@@ -24,8 +28,8 @@ pub trait StreamKey: Clone + Eq + Hash + Send + Sync + 'static {
 /// Both adapters persist the same [`CloudEvent`] records; only the place they
 /// keep them differs.
 pub trait EventStore<K: StreamKey, E>: Send + Sync {
-    /// `JobSystem` calls this while it holds the stream's replay lock, so an
-    /// implementation must not send a command back to that same job.
+    /// The actor runtime calls this while it holds the stream's replay lock, so an
+    /// implementation must not send a command back to that same stream's actor.
     ///
     /// # Errors
     ///
@@ -54,16 +58,20 @@ pub trait EventStore<K: StreamKey, E>: Send + Sync {
     ) -> Result<Version, StoreError>;
 }
 
-/// The fan-out called after a successful append.
+/// An [`EventStore`] that can name every stream it holds.
 ///
-/// Delivery is at-least-once from the log, and an implementation must not panic.
-/// The committed job's actor blocks in this call, so an implementation must not
-/// send a command back to that same job.
-pub trait EventPublisher: Send + Sync {
-    fn publish(
-        &self,
-        events: &[CloudEvent<JobEvent>],
-    );
+/// A restart has to find the work an earlier process committed, and only the store
+/// knows which streams its log contains.
+pub trait EnumerableStore<K: StreamKey, E>: EventStore<K, E> {
+    /// Returns every stream key, sorted by [`StreamKey::as_str`].
+    ///
+    /// An adapter that recognises its files by name skips an entry whose name is not a
+    /// key, so one stray file cannot hide the healthy streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Io`] when the store cannot be listed.
+    fn keys(&self) -> Result<Vec<K>, StoreError>;
 }
 
 /// Checks that `events` continue `expected` in `subject`, returning the last version.
@@ -99,6 +107,22 @@ pub fn check_append<E>(
         version = next;
     }
     Ok(version)
+}
+
+/// Checks a whole stored stream: one subject, versions `1..=n`, returning the last.
+///
+/// A replay uses this to reject a log a writer would never have produced. An empty
+/// stream is well formed and stands at [`Version::ZERO`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Invalid`] when a record names another subject or the
+/// versions are not contiguous from one.
+pub fn validate_history<E>(
+    subject: &str,
+    events: &[CloudEvent<E>],
+) -> Result<Version, StoreError> {
+    check_append(subject, Version::ZERO, events)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +199,35 @@ mod tests {
         let events = [event("s", 2)];
         assert!(matches!(
             check_append("s", Version::ZERO, &events),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_history_of_an_empty_stream_is_zero() {
+        assert_eq!(validate_history::<Tick>("s", &[]), Ok(Version::ZERO));
+    }
+
+    #[test]
+    fn validate_history_accepts_a_contiguous_stream() {
+        let events = [event("s", 1), event("s", 2), event("s", 3)];
+        assert_eq!(validate_history("s", &events), Ok(Version::new(3)));
+    }
+
+    #[test]
+    fn validate_history_rejects_another_subject() {
+        let events = [event("s", 1), event("other", 2)];
+        assert!(matches!(
+            validate_history("s", &events),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_history_rejects_a_gap() {
+        let events = [event("s", 1), event("s", 3)];
+        assert!(matches!(
+            validate_history("s", &events),
             Err(StoreError::Invalid(_))
         ));
     }

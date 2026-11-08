@@ -1,0 +1,3 @@
+src/lib__*
+src/*.json
+src/liblib.rlib

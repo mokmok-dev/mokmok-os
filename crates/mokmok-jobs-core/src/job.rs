@@ -5,8 +5,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cloud_event::{CloudEvent, EventType};
-use crate::stream::Version;
+use mokmok_events::{CloudEvent, EventType, Version};
 
 /// Where one job stands, derived only from its event stream.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

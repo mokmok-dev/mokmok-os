@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use mokmok_jobs_core::{
-    CloudEvent, EventPublisher, EventStore, JobEvent, StoreError, StreamKey, Version, check_append,
+use mokmok_events::{
+    CloudEvent, EnumerableStore, EventStore, StoreError, StreamKey, Version, check_append,
 };
+use mokmok_jobs_core::{EventPublisher, JobEvent};
 
 #[derive(Debug)]
 pub struct MemoryEventStore<K, E> {
@@ -54,6 +55,17 @@ impl<K: StreamKey, E: Clone + Send + Sync> EventStore<K, E> for MemoryEventStore
         log.extend_from_slice(events);
         drop(streams);
         Ok(last)
+    }
+}
+
+impl<K: StreamKey, E: Clone + Send + Sync> EnumerableStore<K, E> for MemoryEventStore<K, E> {
+    fn keys(&self) -> Result<Vec<K>, StoreError> {
+        let mut keys: Vec<K> = {
+            let streams = self.streams.lock().map_err(|_| poisoned())?;
+            streams.keys().cloned().collect()
+        };
+        keys.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(keys)
     }
 }
 
@@ -196,5 +208,25 @@ mod tests {
         publisher.publish(std::slice::from_ref(&second));
         assert_eq!(publisher.published(), vec![first, second]);
         assert_eq!(publisher.len(), 2);
+    }
+
+    #[test]
+    fn keys_of_an_empty_store_is_empty() {
+        let store: MemoryEventStore<JobId, JobEvent> = MemoryEventStore::new();
+        assert_eq!(store.keys().expect("store lists"), Vec::<JobId>::new());
+    }
+
+    #[test]
+    fn keys_lists_every_stream_in_key_order() {
+        let store = MemoryEventStore::new();
+        let first = JobId::from_u128(1);
+        let second = JobId::from_u128(2);
+        store
+            .append(&second, Version::ZERO, &[at(&second, 1, submitted())])
+            .expect("second stream commits");
+        store
+            .append(&first, Version::ZERO, &[at(&first, 1, submitted())])
+            .expect("first stream commits");
+        assert_eq!(store.keys().expect("store lists"), vec![first, second]);
     }
 }

@@ -1,0 +1,43 @@
+[package]
+autotests = false
+edition.workspace = true
+name = "mokmok-control"
+version.workspace = true
+
+[[bin]]
+name = "mokmok-control-test-agent"
+path = "tests/fake_agent.rs"
+test = false
+
+[[test]]
+name = "acp_runner"
+path = "tests/acp_runner.rs"
+
+[[test]]
+name = "config"
+path = "tests/config.rs"
+
+[[test]]
+name = "supervisor"
+path = "tests/supervisor.rs"
+
+[[test]]
+name = "system"
+path = "tests/system.rs"
+
+[dependencies]
+mokmok-acp.workspace = true
+mokmok-control-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+mokmok-jobs-jsonl.workspace = true
+mokmok-jobs-memory.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
