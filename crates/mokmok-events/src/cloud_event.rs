@@ -9,8 +9,8 @@
 //! - `type` is the domain event's [`EventType`].
 //! - `id` is `<subject>:<sequence>`, unique within [`SOURCE`].
 //!
-//! `time` is optional and left absent: the core reads no clock, and the adapters
-//! add no data of their own.
+//! `time` is optional and absent unless an adapter that owns a clock stamps it with
+//! [`CloudEvent::with_time`]; the store's core reads no clock.
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -83,6 +83,16 @@ impl<E: EventType> CloudEvent<E> {
             data,
         }
     }
+
+    /// Stamps the record with a `CloudEvents` `time`, for adapters that own a clock.
+    #[must_use]
+    pub fn with_time(
+        mut self,
+        time: impl Into<String>,
+    ) -> Self {
+        self.time = Some(time.into());
+        self
+    }
 }
 
 // serde calls a `serialize_with` hook with a reference even for a `Copy` value.
@@ -143,6 +153,23 @@ mod tests {
         let json = serde_json::to_string(&record).expect("record encodes");
         let decoded: CloudEvent<Tick> = serde_json::from_str(&json).expect("record decodes");
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn with_time_serializes_a_time_and_new_leaves_it_absent() {
+        let stamped = CloudEvent::new("stream-1", Version::new(1), Tick { n: 1 })
+            .with_time("2026-11-08T06:00:00Z");
+        let json = serde_json::to_value(&stamped).expect("record encodes");
+        assert_eq!(json["time"], "2026-11-08T06:00:00Z");
+
+        let bare = CloudEvent::new("stream-1", Version::new(1), Tick { n: 1 });
+        let json = serde_json::to_value(&bare).expect("record encodes");
+        assert!(json.get("time").is_none());
+
+        let decoded: CloudEvent<Tick> =
+            serde_json::from_str(&serde_json::to_string(&stamped).expect("record encodes"))
+                .expect("record decodes");
+        assert_eq!(decoded, stamped);
     }
 
     #[test]
