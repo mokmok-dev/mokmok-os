@@ -632,6 +632,22 @@ mod tests {
                 "method":"session/update",
                 "params":{
                     "sessionId":"s-1",
+                    "update":{"sessionUpdate":"session_info_update","title":"live"}
+                }
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"session/update",
+                "params":{
+                    "sessionId":"s-1",
+                    "update":{"sessionUpdate":"usage_update","used":10,"size":100}
+                }
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"session/update",
+                "params":{
+                    "sessionId":"s-1",
                     "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}
                 }
             }),
@@ -653,7 +669,17 @@ mod tests {
             .delegate(&session, "do it", &mut handler)
             .expect("delegated");
         assert_eq!(turn.stop_reason, StopReason::EndTurn);
-        assert_eq!(handler.updates.len(), 1);
+        assert_eq!(handler.updates.len(), 3);
+        assert!(handler.updates.iter().any(|notification| matches!(
+            notification.update,
+            acp::SessionUpdate::SessionInfoUpdate(_)
+        )));
+        assert!(
+            handler.updates.iter().any(|notification| matches!(
+                notification.update,
+                acp::SessionUpdate::UsageUpdate(_)
+            ))
+        );
         assert_eq!(handler.permissions.len(), 1);
         let sent = sent(&recorded);
         let prompt = sent
