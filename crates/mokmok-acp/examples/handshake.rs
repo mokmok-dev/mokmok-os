@@ -33,10 +33,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => return Err("usage: handshake stdio [program] | ws <url> [secret]".into()),
     };
     let mut client = AcpClient::open(config)?;
-    let session = client.new_session(std::env::current_dir()?)?;
+    let _session = client.new_session(std::env::current_dir()?)?;
     let agent = client.agent();
     println!(
-        "acp={} agent={} version={} session={}",
+        "acp={} agent={} version={} session established",
         agent.protocol_version,
         agent
             .agent_info
@@ -46,7 +46,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             .agent_info
             .as_ref()
             .map_or("unknown", |info| info.version.as_str()),
-        session.id()
     );
     Ok(())
 }
