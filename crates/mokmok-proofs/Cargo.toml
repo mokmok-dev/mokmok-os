@@ -1,0 +1,7 @@
+[package]
+edition.workspace = true
+name = "mokmok-proofs"
+version.workspace = true
+
+[lints]
+workspace = true

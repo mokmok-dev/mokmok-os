@@ -21,6 +21,10 @@ path = "tests/websocket.rs"
 name = "delegation"
 path = "tests/delegation.rs"
 
+[[test]]
+name = "child_env"
+path = "tests/child_env.rs"
+
 [dependencies]
 agent-client-protocol-schema.workspace = true
 rustls.workspace = true
@@ -28,6 +32,10 @@ serde.workspace = true
 serde_json.workspace = true
 tungstenite.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+socket2.workspace = true
 
 [lints]
 workspace = true

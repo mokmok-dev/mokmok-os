@@ -4,11 +4,12 @@ name = "mokmok-jobs-jsonl"
 version.workspace = true
 
 [dependencies]
-mokmok-jobs-core.workspace = true
+mokmok-events.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+mokmok-jobs-core.workspace = true
 tempfile.workspace = true
 
 [lints]

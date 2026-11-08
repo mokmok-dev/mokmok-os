@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mokmok control plane</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="shell">
+    <header class="masthead">
+      <h1>mokmok control plane</h1>
+      <p>Delegate a coding instruction to an ACP agent and follow the transcript as it happens.</p>
+    </header>
+
+    <div id="error-region" class="error-region" aria-live="polite">
+      <div id="error-banner" class="error-banner" hidden>
+        <p id="error-message"></p>
+        <button id="error-dismiss" type="button">Dismiss</button>
+      </div>
+    </div>
+
+    <main id="main" tabindex="-1">
+      <noscript>
+        <p class="empty">This page needs JavaScript to submit tasks and show their transcripts.</p>
+      </noscript>
+
+      <section class="compose" aria-labelledby="compose-heading">
+        <h2 id="compose-heading">New task</h2>
+        <form id="submit-form">
+          <div class="form-grid">
+            <div class="field field-title">
+              <label for="task-title">Title</label>
+              <input id="task-title" name="title" type="text" required maxlength="200" autocomplete="off">
+            </div>
+            <div class="field field-agent">
+              <label for="task-agent">Agent</label>
+              <select id="task-agent" name="agent" required disabled>
+                <option value="" disabled selected>Loading agents...</option>
+              </select>
+            </div>
+            <div class="field field-wide">
+              <label for="task-instruction">Instruction</label>
+              <textarea id="task-instruction" name="instruction" rows="4" required maxlength="65536"></textarea>
+            </div>
+            <div class="field field-host">
+              <label for="task-host">Transport override <span class="optional">optional</span></label>
+              <input id="task-host" name="host" type="text" maxlength="64" pattern="[a-z0-9][a-z0-9.-]{0,63}" placeholder="agent default" list="host-options">
+              <datalist id="host-options"></datalist>
+            </div>
+            <div class="field field-workspace">
+              <label for="task-workspace">Workspace <span class="optional">required for real agents, optional for the scripted demo</span></label>
+              <input id="task-workspace" name="workspace" type="text" pattern="/.*" placeholder="/absolute/path">
+            </div>
+            <div class="actions">
+              <button id="submit-button" type="submit" class="primary">Delegate task</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <div class="columns">
+        <section class="column list-column" aria-labelledby="list-heading">
+          <h2 id="list-heading">Tasks</h2>
+          <ul id="task-list" class="task-list"></ul>
+          <p id="task-list-empty" class="empty" hidden>No tasks yet. Submit an instruction to delegate work.</p>
+        </section>
+
+        <section class="column detail-column" aria-labelledby="detail-heading">
+          <h2 id="detail-heading">Task detail</h2>
+          <p id="detail-empty" class="empty">Select a task to see its transcript.</p>
+          <article id="detail" class="detail" hidden>
+            <header class="detail-header">
+              <h3 id="detail-title"></h3>
+              <span id="detail-status" class="badge" aria-live="polite"></span>
+            </header>
+            <dl class="meta">
+              <div>
+                <dt>Agent</dt>
+                <dd id="detail-agent"></dd>
+              </div>
+              <div>
+                <dt>Transport override</dt>
+                <dd id="detail-host"></dd>
+              </div>
+              <div>
+                <dt>Workspace</dt>
+                <dd id="detail-workspace"></dd>
+              </div>
+            </dl>
+            <div class="outcome-block">
+              <span class="meta-label">Outcome</span>
+              <p id="detail-outcome" class="outcome" aria-live="polite"></p>
+            </div>
+            <div class="detail-actions">
+              <button id="cancel-button" type="button" disabled>Cancel task</button>
+              <span id="cancel-status" class="hint" aria-live="polite"></span>
+            </div>
+            <h4 id="transcript-heading">Transcript</h4>
+            <div id="transcript" class="transcript"></div>
+            <p id="transcript-empty" class="empty" hidden>No transcript entries yet.</p>
+          </article>
+        </section>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

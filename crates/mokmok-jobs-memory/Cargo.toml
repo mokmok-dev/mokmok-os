@@ -4,6 +4,7 @@ name = "mokmok-jobs-memory"
 version.workspace = true
 
 [dependencies]
+mokmok-events.workspace = true
 mokmok-jobs-core.workspace = true
 
 [lints]

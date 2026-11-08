@@ -1,28 +1,33 @@
-//! JSONL platform adapter for `mokmok-jobs`: one append-only file per stream.
+//! JSONL platform adapter for `mokmok-events`: one append-only file per stream.
 //!
-//! The file stem is the stream key. A `JobId` is a `UUIDv7`, so the file name is
-//! the id itself.
+//! The file stem is [`StreamKey::as_str`]. Any key that writes a single safe path
+//! component can use this adapter, and `UUID` keys (such as the jobs crate's
+//! `JobId`) are the common case.
 //!
-//! Each line is one `CloudEvents` 1.0 JSON record from `mokmok-jobs-core`. The file
+//! Each line is one `CloudEvents` 1.0 JSON record from `mokmok-events`. The file
 //! holds no header and nothing else, so the same record shape is what the in-memory
 //! adapter keeps.
 //!
 //! One store instance owns a root. The version cache lives in the instance, so
 //! opening the same root twice gives two writers with separate caches. One
 //! writer can then append a duplicate version after the other has moved on.
-//! Callers should share one `Arc<JsonlEventStore>` across `JobSystem`s.
+//! Callers should share one `Arc<JsonlEventStore>` across every actor system over
+//! that root.
 //!
 //! Correctness across processes is not claimed; the logical fence is the
 //! store's version check.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use mokmok_jobs_core::{CloudEvent, EventStore, StoreError, StreamKey, Version, check_append};
+use mokmok_events::{
+    CloudEvent, EnumerableStore, EventStore, EventType, StoreError, StreamKey, Version,
+    check_append,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -40,13 +45,13 @@ struct Locked<K> {
 
 impl<K, E> JsonlEventStore<K, E> {
     /// Opens or creates the root directory. No stream is read until it is
-    /// touched. A stream's file is named `<key>.jsonl`; a `JobId` key is a
-    /// canonical lowercase UUID.
+    /// touched. A stream's file is named `<key>.jsonl`, where `<key>` is
+    /// [`StreamKey::as_str`] (a canonical lowercase UUID for `JobId`).
     ///
     /// One instance owns a root. The version cache lives in the instance, so
     /// opening the same root twice gives two writers with separate caches. One
     /// writer can then append a duplicate version after the other has moved on.
-    /// Share one `Arc<JsonlEventStore>` across systems instead.
+    /// Share one `Arc<JsonlEventStore>` across every actor system instead.
     ///
     /// # Errors
     ///
@@ -85,7 +90,7 @@ fn ensure<E>(
     subject: &str,
 ) -> Result<(Version, File), StoreError>
 where
-    E: DeserializeOwned,
+    E: EventType + DeserializeOwned,
 {
     let mut file = OpenOptions::new()
         .read(true)
@@ -111,7 +116,7 @@ where
 impl<K, E> EventStore<K, E> for JsonlEventStore<K, E>
 where
     K: StreamKey,
-    E: Serialize + DeserializeOwned,
+    E: EventType + Serialize + DeserializeOwned,
 {
     fn load(
         &self,
@@ -188,13 +193,56 @@ where
     }
 }
 
+impl<K, E> EnumerableStore<K, E> for JsonlEventStore<K, E>
+where
+    K: StreamKey,
+    E: EventType + Serialize + DeserializeOwned,
+{
+    /// Lists the stems that round-trip through [`StreamKey::parse_key`], skipping any
+    /// other entry in the directory.
+    fn keys(&self) -> Result<Vec<K>, StoreError> {
+        let mut keys = Vec::new();
+        // A stray or hand-renamed file must not hide every healthy stream, so an entry
+        // whose stem is not exactly the key it parses to is ignored.
+        let mut seen = HashSet::new();
+        let entries = fs::read_dir(&self.root).map_err(|error| error_at(&self.root, &error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error_at(&self.root, &error))?;
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|error| error_at(&path, &error))?
+                .is_file()
+            {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            let Ok(key) = K::parse_key(stem) else {
+                continue;
+            };
+            if key.as_str() != stem {
+                continue;
+            }
+            if seen.insert(key.as_str().to_owned()) {
+                keys.push(key);
+            }
+        }
+        keys.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(keys)
+    }
+}
+
 fn parse_stream<E>(
     path: &Path,
     bytes: &[u8],
     subject: &str,
 ) -> Result<(Version, Vec<CloudEvent<E>>), StoreError>
 where
-    E: DeserializeOwned,
+    E: EventType + DeserializeOwned,
 {
     if bytes.is_empty() {
         return Ok((Version::ZERO, Vec::new()));
@@ -221,6 +269,25 @@ where
                 path.display(),
                 index + 1,
                 expected.get()
+            )));
+        }
+        // `CloudEvent::new` keeps the envelope and the data in step, so a line where
+        // they disagree was not written by this store.
+        if event.event_type != event.data.event_type() {
+            return Err(StoreError::Corrupt(format!(
+                "{}:{}: type {:?} does not match the record",
+                path.display(),
+                index + 1,
+                event.event_type
+            )));
+        }
+        let expected_id = format!("{subject}:{}", event.version.get());
+        if event.id != expected_id {
+            return Err(StoreError::Corrupt(format!(
+                "{}:{}: id {:?} is not {expected_id:?}",
+                path.display(),
+                index + 1,
+                event.id
             )));
         }
         version = event.version;
@@ -254,7 +321,8 @@ fn error_at(
 mod tests {
     use std::num::NonZeroU32;
 
-    use mokmok_jobs_core::{CloudEvent, EventType, JobEvent, JobId};
+    use mokmok_events::{CloudEvent, EventType};
+    use mokmok_jobs_core::{JobEvent, JobId};
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -499,6 +567,34 @@ mod tests {
     }
 
     #[test]
+    fn an_envelope_type_that_disagrees_with_the_data_is_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(16);
+        let mut value = serde_json::to_value(first(&id))?;
+        value["type"] = serde_json::Value::String("dev.mokmok.job.failed".to_owned());
+        fs::write(store.path(&id), format!("{value}\n"))?;
+        let error = store.load(&id).expect_err("a mismatched type is refused");
+        assert!(matches!(error, StoreError::Corrupt(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn an_id_that_is_not_the_stream_and_version_is_corrupt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(17);
+        let mut value = serde_json::to_value(first(&id))?;
+        value["id"] = serde_json::Value::String("another-stream:1".to_owned());
+        fs::write(store.path(&id), format!("{value}\n"))?;
+        let error = store.load(&id).expect_err("a mismatched id is refused");
+        assert!(matches!(error, StoreError::Corrupt(_)));
+        Ok(())
+    }
+
+    #[test]
     fn a_stored_line_is_a_cloud_event() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
@@ -553,6 +649,10 @@ mod tests {
         impl StreamKey for NoteId {
             fn as_str(&self) -> &str {
                 self.0.as_str()
+            }
+
+            fn parse_key(raw: &str) -> Result<Self, StoreError> {
+                Ok(Self(raw.to_owned()))
             }
         }
 
@@ -664,5 +764,61 @@ mod tests {
                 serde_json::from_str(&encoded).expect("record decodes");
             assert_eq!(decoded, record);
         }
+    }
+
+    #[test]
+    fn keys_of_an_empty_root_is_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        assert_eq!(store.keys()?, Vec::<JobId>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn keys_lists_every_stream_in_key_order() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let low = id(31);
+        let high = id(32);
+        store.append(&high, Version::ZERO, &[first(&high)])?;
+        store.append(&low, Version::ZERO, &[first(&low)])?;
+        assert_eq!(store.keys()?, vec![low, high]);
+        Ok(())
+    }
+
+    #[test]
+    fn keys_ignores_an_entry_that_is_not_a_stream_file() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(33);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
+        fs::write(store.root.join("notes.txt"), b"not a stream")?;
+        fs::create_dir(store.root.join("archive.jsonl"))?;
+        assert_eq!(store.keys()?, vec![id]);
+        Ok(())
+    }
+
+    #[test]
+    fn keys_skips_a_stream_file_whose_stem_is_not_a_key() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(33);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
+        fs::write(store.root.join("not-a-uuid.jsonl"), b"")?;
+        assert_eq!(store.keys()?, vec![id]);
+        Ok(())
+    }
+
+    #[test]
+    fn keys_skips_a_stem_that_is_not_canonical() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(34);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
+        let uppercase = id.as_str().to_uppercase();
+        fs::write(store.root.join(format!("{uppercase}.jsonl")), b"")?;
+        assert_eq!(store.keys()?, vec![id]);
+        Ok(())
     }
 }

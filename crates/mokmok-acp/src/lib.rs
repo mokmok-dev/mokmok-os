@@ -6,7 +6,8 @@
 //!
 //! One task runs through [`AcpClient::delegate`]: open a connection, create a session, send a
 //! prompt, stream the agent's updates to a [`Handler`], and read the stop reason. [`delegate_task`]
-//! does the whole sequence for a single [`Task`].
+//! does the whole sequence for a single [`Task`]. [`AcpClient::delegate_with`] takes a
+//! [`CancelToken`] and [`AcpClient::open_with_timeout`] bounds a stalled agent.
 //!
 //! # Example
 //!
@@ -29,11 +30,13 @@ mod jsonrpc;
 mod transport;
 
 pub use agent_client_protocol_schema::{
-    ContentBlock, InitializeResponse, PromptResponse, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TextContent,
+    ContentBlock, InitializeResponse, PermissionOptionKind, PromptResponse, ProtocolVersion,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+    TextContent, ToolCallStatus, ToolKind,
 };
 pub use client::{
-    AcpClient, AcpError, ConnectionConfig, Handler, NoopHandler, Session, Task, Turn, delegate_task,
+    AcpClient, AcpError, CancelToken, ConnectionConfig, Handler, NoopHandler, Session, Task, Turn,
+    delegate_task, delegate_task_with,
 };
-pub use transport::{StdioConfig, Transport, TransportError, WebSocketConfig};
+pub use transport::{StdioConfig, StdioTransport, Transport, TransportError, WebSocketConfig};

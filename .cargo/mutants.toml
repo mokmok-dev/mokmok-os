@@ -1,3 +1,36 @@
-exclude_globs = ["crates/mokmok-acp/tests/**"]
+# The scripted agents and the test helpers are not production code.
+exclude_globs = [
+  "crates/mokmok-acp/tests/**",
+  "crates/mokmok-control/tests/**",
+  "crates/mokmok-controld/tests/**",
+  # The proofs crate's harnesses run under `checks.kani`, not `cargo test`, so this
+  # sweep would report every harness body as missed even when Kani rejects it.
+  "crates/mokmok-proofs/**",
+]
 minimum_test_timeout = 60
 test_tool = "nextest"
+
+exclude_re = [
+  # When `max_bytes == len` both arms of the `if` return `len`, so this mutant is
+  # equivalent; `clip_len_at_the_exact_budget_keeps_everything` pins that boundary.
+  "crates/mokmok-control-core/src/prompt.rs:[0-9]+:.*replace < with <= in clip_len",
+  # Dropping either type only joins threads. The actors and workers exit when their
+  # senders close either way, and a test can observe the join only as a hang.
+  "crates/mokmok-control/src/supervisor.rs:[0-9]+:.*replace <impl Drop for Supervisor>::drop with \\(\\)",
+  "crates/mokmok-control/src/system.rs:[0-9]+:.*replace <impl Drop for Inner>::drop with \\(\\)",
+  # The suite has no TLS endpoint, so the rustls arm of `set_read_timeout` is only
+  # compile-checked; a `wss://` server would be needed to exercise it.
+  "crates/mokmok-acp/src/transport/websocket.rs:[0-9]+:.*delete match arm MaybeTlsStream::Rustls",
+  # These mutations make every deadline infinite. The bounded 100 ms timeout tests
+  # pin the real path; the mutants can only be seen as a hang, not a failure.
+  "crates/mokmok-acp/src/client.rs:[0-9]+:.*replace deadline_after -> Option<Instant> with None",
+  "crates/mokmok-acp/src/client.rs:[0-9]+:.*replace deadline_passed -> bool with false",
+  # A silent WebSocket agent would hang rather than fail; the suite has no such endpoint.
+  "crates/mokmok-acp/src/transport/websocket.rs:[0-9]+:.*replace WebSocketTransport::set_read_timeout -> Result<\\(\\), TransportError> with Ok\\(\\(\\)\\)",
+  # Same scope limit as the rustls arm: no plain-text WebSocket endpoint stalls in a test.
+  "crates/mokmok-acp/src/transport/websocket.rs:[0-9]+:.*delete match arm MaybeTlsStream::Plain",
+  # A worker that is never woken can only be observed as a hung join.
+  "crates/mokmok-control/src/supervisor.rs:[0-9]+:.*replace Queue::stop with \\(\\)",
+  # The loop never advances; a hang, not a failure.
+  "crates/mokmok-control-core/src/prompt.rs:[0-9]+:.*replace -= with /= in clip_len",
+]

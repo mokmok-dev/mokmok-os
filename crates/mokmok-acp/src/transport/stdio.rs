@@ -4,15 +4,18 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use super::{Transport, TransportError};
 
 /// How to launch an ACP agent as a subprocess.
 ///
 /// ACP messages are newline-delimited JSON on the child's standard input and output. The child's
-/// standard error is inherited, so an agent's own logging reaches the caller's terminal.
+/// standard error is inherited, so an agent's own logging reaches the caller's terminal. The
+/// child otherwise inherits the parent's environment, except `MOKMOK_CONTROL_TOKEN`, which is
+/// removed before the spawn so the daemon's own bearer token cannot reach an agent.
 #[derive(Clone, Debug)]
 pub struct StdioConfig {
     program: OsString,
@@ -126,6 +129,9 @@ impl StdioTransport {
         for (key, value) in config.environment() {
             command.env(key, value);
         }
+        // A task's text steers this process, so the daemon's own bearer token must not
+        // be readable from its environment.
+        command.env_remove("MOKMOK_CONTROL_TOKEN");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -148,6 +154,20 @@ impl StdioTransport {
             reader: Some(reader),
             closed: false,
         })
+    }
+
+    /// The child's process id.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        // The child outlives `stdin` closing on its own, so a dropped transport must
+        // kill and reap it rather than leave it behind.
+        let _ = self.close();
     }
 }
 
@@ -174,6 +194,17 @@ impl Transport for StdioTransport {
 
     fn recv(&mut self) -> Result<Option<String>, TransportError> {
         Ok(self.lines.recv().ok())
+    }
+
+    fn recv_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<String>, TransportError> {
+        match self.lines.recv_timeout(timeout) {
+            Ok(line) => Ok(Some(line)),
+            Err(RecvTimeoutError::Timeout) => Err(TransportError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Ok(None),
+        }
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -230,6 +261,28 @@ mod tests {
             Some(r#"{"jsonrpc":"2.0","id":1}"#.to_owned())
         );
         assert_eq!(transport.recv().expect("end"), None);
+    }
+
+    #[test]
+    fn recv_timeout_reports_a_quiet_child_and_still_reads_a_line() {
+        let mut quiet = spawn("cat", &[]);
+        assert!(matches!(
+            quiet.recv_timeout(Duration::from_millis(50)),
+            Err(TransportError::Timeout)
+        ));
+        quiet.close().expect("close");
+
+        let mut transport = spawn("echo", &[r#"{"jsonrpc":"2.0","id":3}"#]);
+        assert_eq!(
+            transport
+                .recv_timeout(Duration::from_secs(2))
+                .expect("line"),
+            Some(r#"{"jsonrpc":"2.0","id":3}"#.to_owned())
+        );
+        assert_eq!(
+            transport.recv_timeout(Duration::from_secs(2)).expect("end"),
+            None
+        );
     }
 
     #[test]
@@ -291,6 +344,23 @@ mod tests {
             config.environment(),
             [(OsString::from("KEY"), OsString::from("VALUE"))]
         );
+    }
+
+    #[test]
+    fn dropping_the_transport_kills_and_reaps_the_child() {
+        let transport = spawn("sh", &["-c", "sleep 30"]);
+        let pid = transport.pid();
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        drop(transport);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child {pid} was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

@@ -148,6 +148,7 @@ pub fn error_response(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -236,5 +237,29 @@ mod tests {
     #[test]
     fn malformed_json_is_refused() {
         assert!(parse("{").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_input_never_panics(line in ".{0,200}") {
+            let _ = parse(&line);
+        }
+
+        #[test]
+        fn a_parsed_message_reserializes(line in ".{0,200}") {
+            let Ok(message) = parse(&line) else {
+                return Ok(());
+            };
+            let encoded = match message {
+                Message::Request { id, method, params } => {
+                    request(&id, &method, params.as_ref())
+                },
+                Message::Notification { method, params } => {
+                    notification(&method, params.as_ref())
+                },
+                Message::Response { .. } => return Ok(()),
+            };
+            prop_assert!(encoded.is_ok());
+        }
     }
 }

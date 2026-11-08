@@ -4,6 +4,7 @@ name = "mokmok-jobs-core"
 version.workspace = true
 
 [dependencies]
+mokmok-events.workspace = true
 serde.workspace = true
 uuid.workspace = true
 

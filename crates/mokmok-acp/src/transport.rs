@@ -31,6 +31,23 @@ pub trait Transport: Send {
     /// Returns [`TransportError::Io`] or [`TransportError::WebSocket`] when reading fails.
     fn recv(&mut self) -> Result<Option<String>, TransportError>;
 
+    /// Receives one JSON-RPC message, waiting at most `timeout`.
+    ///
+    /// The default ignores the timeout and blocks, so a transport that cannot bound a read
+    /// still compiles and behaves as before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Timeout`] when no message arrived in time, and the same
+    /// errors as [`Transport::recv`] otherwise.
+    fn recv_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<String>, TransportError> {
+        let _ = timeout;
+        self.recv()
+    }
+
     /// Closes the channel. Calling it more than once is harmless.
     ///
     /// # Errors
@@ -49,6 +66,8 @@ pub enum TransportError {
     InvalidRequest(String),
     /// The channel is closed, or the child process is gone.
     Closed,
+    /// No message arrived before the read deadline.
+    Timeout,
     /// Reading or writing the channel failed.
     Io(std::io::Error),
     /// The WebSocket handshake or frame exchange failed.
@@ -66,6 +85,7 @@ impl fmt::Display for TransportError {
             },
             Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
             Self::Closed => formatter.write_str("transport is closed"),
+            Self::Timeout => formatter.write_str("the transport timed out"),
             Self::Io(error) => write!(formatter, "transport I/O failed: {error}"),
             Self::WebSocket(message) => write!(formatter, "WebSocket failed: {message}"),
         }
@@ -79,6 +99,7 @@ impl std::error::Error for TransportError {
             Self::UnsupportedScheme(_)
             | Self::InvalidRequest(_)
             | Self::Closed
+            | Self::Timeout
             | Self::WebSocket(_) => None,
         }
     }
@@ -99,6 +120,7 @@ mod tests {
         let io = TransportError::Io(std::io::Error::other("x"));
         assert!(std::error::Error::source(&io).is_some());
         assert!(std::error::Error::source(&TransportError::Closed).is_none());
+        assert!(std::error::Error::source(&TransportError::Timeout).is_none());
         assert!(std::error::Error::source(&TransportError::WebSocket("x".to_owned())).is_none());
         assert!(
             std::error::Error::source(&TransportError::InvalidRequest("x".to_owned())).is_none()
