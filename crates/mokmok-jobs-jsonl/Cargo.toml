@@ -6,10 +6,10 @@ version.workspace = true
 [dependencies]
 mokmok-events.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
 mokmok-jobs-core.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
