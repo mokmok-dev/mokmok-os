@@ -1,3 +1,10 @@
+# About a fifth of the mutants are unviable, and that is expected. cargo-mutants
+# rewrites a returned value as `Default::default()`, and the ids, errors, handles, and
+# required-field configs here have no sound default. A sweep on 2026-11-09 classified
+# every one: the only fixable ones were value records whose empty value is real. A
+# `Default` impl added to lower the count would let a value exist that the type's
+# parser or constructor refuses.
+
 # The scripted agents and the test helpers are not production code.
 exclude_globs = [
   "crates/mokmok-acp/tests/**",
