@@ -27,7 +27,6 @@ http-body-util = "0.1"
 mokmok-acp = { path = "crates/mokmok-acp" }
 mokmok-control = { path = "crates/mokmok-control" }
 mokmok-control-core = { path = "crates/mokmok-control-core" }
-mokmok-controld = { path = "apps/mokmok-controld" }
 mokmok-events = { path = "crates/mokmok-events" }
 mokmok-jobs = { path = "crates/mokmok-jobs" }
 mokmok-jobs-core = { path = "crates/mokmok-jobs-core" }
