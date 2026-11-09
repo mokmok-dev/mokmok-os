@@ -76,10 +76,19 @@ impl S3Credentials {
     /// Returns [`StoreError::Invalid`] when a required variable is missing or is not
     /// valid Unicode.
     pub fn from_env() -> Result<Self, StoreError> {
-        let access_key = required_env("AWS_ACCESS_KEY_ID")?;
-        let secret_key = required_env("AWS_SECRET_ACCESS_KEY")?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        Ok(Self::new(access_key, secret_key, session_token))
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// The environment read takes a lookup, so the policy around a missing variable is
+    /// testable without touching the process environment other tests share.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, StoreError> {
+        let access_key = required(&lookup, "AWS_ACCESS_KEY_ID")?;
+        let secret_key = required(&lookup, "AWS_SECRET_ACCESS_KEY")?;
+        Ok(Self::new(
+            access_key,
+            secret_key,
+            lookup("AWS_SESSION_TOKEN"),
+        ))
     }
 
     pub(crate) fn access_key(&self) -> &str {
@@ -111,9 +120,11 @@ impl fmt::Debug for S3Credentials {
     }
 }
 
-fn required_env(name: &str) -> Result<String, StoreError> {
-    std::env::var(name)
-        .map_err(|error| StoreError::Invalid(format!("{name} is not usable: {error}")))
+fn required(
+    lookup: &impl Fn(&str) -> Option<String>,
+    name: &str,
+) -> Result<String, StoreError> {
+    lookup(name).ok_or_else(|| StoreError::Invalid(format!("{name} is not set")))
 }
 
 /// An [`EventStore`] whose streams are objects in an `S3`-compatible bucket.
@@ -297,5 +308,57 @@ impl<K: StreamKey, E: EventType + DeserializeOwned> S3EventStore<K, E> {
                 Ok(version)
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    #[test]
+    fn from_lookup_reads_the_pair_and_an_optional_token() {
+        let credentials = S3Credentials::from_lookup(lookup(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("AWS_SESSION_TOKEN", "token"),
+        ]))
+        .expect("both keys are present");
+        assert_eq!(credentials.access_key(), "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(credentials.secret_key(), "secret");
+        assert_eq!(credentials.session_token(), Some("token"));
+
+        let without = S3Credentials::from_lookup(lookup(&[
+            ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ]))
+        .expect("the token is optional");
+        assert_eq!(without.session_token(), None);
+    }
+
+    #[test]
+    fn a_missing_access_key_names_the_variable() {
+        let error = S3Credentials::from_lookup(lookup(&[("AWS_SECRET_ACCESS_KEY", "secret")]))
+            .expect_err("the access key is required");
+        assert!(error.to_string().contains("AWS_ACCESS_KEY_ID"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_secret_names_the_variable() {
+        let error =
+            S3Credentials::from_lookup(lookup(&[("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")]))
+                .expect_err("the secret is required");
+        assert!(
+            error.to_string().contains("AWS_SECRET_ACCESS_KEY"),
+            "{error}"
+        );
     }
 }

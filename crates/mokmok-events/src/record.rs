@@ -197,6 +197,15 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_record_names_its_one_based_position() {
+        let record = CloudEvent::new("other", Version::new(1), Tick(1));
+        let mut bytes = Vec::new();
+        encode_records(&[record], &mut bytes).expect("records encode");
+        let error = parse_records::<Tick>("s.jsonl", "s", &bytes).expect_err("the subject differs");
+        assert!(error.to_string().contains("s.jsonl:1:"), "{error}");
+    }
+
+    #[test]
     fn an_object_name_carries_the_suffix() {
         assert_eq!(object_name("s"), "s.jsonl");
     }

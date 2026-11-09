@@ -336,6 +336,8 @@ fn a_server_error_is_reported_as_io() {
     let error = store.load(&id).expect_err("a 500 is an error");
     assert!(matches!(error, StoreError::Io(_)));
     assert!(error.to_string().contains("500"), "{error}");
+    assert!(error.to_string().contains("InternalError"), "{error}");
+    assert!(error.to_string().contains(&path(&id)), "{error}");
 }
 
 #[test]
@@ -362,6 +364,16 @@ fn credentials_debug_redacts_the_secret_and_token() {
     assert!(!debug.contains("EXAMPLE"), "{debug}");
     assert!(!debug.contains("secret-key-value"), "{debug}");
     assert!(!debug.contains("session-token-value"), "{debug}");
+}
+
+#[test]
+fn store_debug_names_the_store_and_never_prints_the_secret() {
+    let fake = FakeS3::start();
+    let store = store(&fake);
+    let debug = format!("{store:?}");
+    assert!(debug.contains("S3EventStore"), "{debug}");
+    assert!(debug.contains(BUCKET), "{debug}");
+    assert!(!debug.contains(SECRET_KEY), "{debug}");
 }
 
 #[test]
@@ -396,6 +408,7 @@ fn a_listing_that_repeats_a_token_is_refused() {
     let error = store.keys().expect_err("a repeated token is refused");
     assert!(matches!(error, StoreError::Io(_)));
     assert!(error.to_string().contains("repeated"), "{error}");
+    assert!(error.to_string().contains(BUCKET), "{error}");
 }
 
 #[test]
@@ -457,6 +470,14 @@ fn open_rejects_a_malformed_config() {
             {
                 let mut config = valid.clone();
                 config.endpoint = "http://host/path".to_owned();
+                config
+            },
+            "endpoint",
+        ),
+        (
+            {
+                let mut config = valid.clone();
+                config.endpoint = "http://user:pass@host".to_owned();
                 config
             },
             "endpoint",
