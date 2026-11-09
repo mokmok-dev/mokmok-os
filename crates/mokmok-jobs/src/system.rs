@@ -91,7 +91,7 @@ enum Dispatch {
 }
 
 /// The events a command committed, with the stream version they closed at.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Appended {
     pub version: Version,
     pub events: Vec<CloudEvent<JobEvent>>,
