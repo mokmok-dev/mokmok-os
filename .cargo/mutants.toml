@@ -33,4 +33,7 @@ exclude_re = [
   "crates/mokmok-control/src/supervisor.rs:[0-9]+:.*replace Queue::stop with \\(\\)",
   # The loop never advances; a hang, not a failure.
   "crates/mokmok-control-core/src/prompt.rs:[0-9]+:.*replace -= with /= in clip_len",
+  # Without the EOF arm the reader loop cannot advance, so the mutant is only ever seen
+  # as a timeout and no test can distinguish it from a hang.
+  "crates/mokmok-jobs-s3/src/listing.rs:[0-9]+:.*delete match arm Event::Eof in parse_page",
 ]

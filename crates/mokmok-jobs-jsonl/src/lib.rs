@@ -17,7 +17,7 @@
 //! Correctness across processes is not claimed; the logical fence is the
 //! store's version check.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, EventType, StoreError, StreamKey, Version,
-    check_append,
+    canonical_keys, check_append, complete_prefix, encode_records, object_name, parse_records,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -81,7 +81,7 @@ impl<K, E> JsonlEventStore<K, E> {
     where
         K: StreamKey,
     {
-        self.root.join(format!("{}.jsonl", key.as_str()))
+        self.root.join(object_name(key.as_str()))
     }
 }
 
@@ -109,7 +109,8 @@ where
         // The truncation must survive a crash before the next append, or the torn tail returns.
         file.sync_data().map_err(|error| error_at(path, &error))?;
     }
-    let (version, _) = parse_stream::<E>(path, &bytes[..committed], subject)?;
+    let (version, _) =
+        parse_records::<E>(&path.display().to_string(), subject, &bytes[..committed])?;
     Ok((version, file))
 }
 
@@ -128,7 +129,11 @@ where
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error_at(&path, &error)),
         };
-        let (_, events) = parse_stream(&path, complete_prefix(&bytes), key.as_str())?;
+        let (_, events) = parse_records(
+            &path.display().to_string(),
+            key.as_str(),
+            complete_prefix(&bytes),
+        )?;
         Ok(events)
     }
 
@@ -145,7 +150,14 @@ where
             let current = match state.versions.get(key) {
                 Some(version) => *version,
                 None => match fs::read(&path) {
-                    Ok(bytes) => parse_stream::<E>(&path, complete_prefix(&bytes), key.as_str())?.0,
+                    Ok(bytes) => {
+                        parse_records::<E>(
+                            &path.display().to_string(),
+                            key.as_str(),
+                            complete_prefix(&bytes),
+                        )?
+                        .0
+                    },
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Version::ZERO,
                     Err(error) => return Err(error_at(&path, &error)),
                 },
@@ -180,11 +192,7 @@ where
         }
         let last = check_append(key.as_str(), expected, events)?;
         let mut buffer = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut buffer, event)
-                .map_err(|error| StoreError::Io(error.to_string()))?;
-            buffer.push(b'\n');
-        }
+        encode_records(events, &mut buffer)?;
         file.write_all(&buffer)
             .map_err(|error| error_at(&path, &error))?;
         file.sync_data().map_err(|error| error_at(&path, &error))?;
@@ -198,13 +206,10 @@ where
     K: StreamKey,
     E: EventType + Serialize + DeserializeOwned,
 {
-    /// Lists the stems that round-trip through [`StreamKey::parse_key`], skipping any
+    /// Lists the names that round-trip through [`StreamKey::parse_key`], skipping any
     /// other entry in the directory.
     fn keys(&self) -> Result<Vec<K>, StoreError> {
-        let mut keys = Vec::new();
-        // A stray or hand-renamed file must not hide every healthy stream, so an entry
-        // whose stem is not exactly the key it parses to is ignored.
-        let mut seen = HashSet::new();
+        let mut names = Vec::new();
         let entries = fs::read_dir(&self.root).map_err(|error| error_at(&self.root, &error))?;
         for entry in entries {
             let entry = entry.map_err(|error| error_at(&self.root, &error))?;
@@ -216,98 +221,10 @@ where
             {
                 continue;
             }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(stem) = name.strip_suffix(".jsonl") else {
-                continue;
-            };
-            let Ok(key) = K::parse_key(stem) else {
-                continue;
-            };
-            if key.as_str() != stem {
-                continue;
-            }
-            if seen.insert(key.as_str().to_owned()) {
-                keys.push(key);
-            }
+            names.push(entry.file_name().to_string_lossy().into_owned());
         }
-        keys.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        Ok(keys)
+        Ok(canonical_keys(names))
     }
-}
-
-fn parse_stream<E>(
-    path: &Path,
-    bytes: &[u8],
-    subject: &str,
-) -> Result<(Version, Vec<CloudEvent<E>>), StoreError>
-where
-    E: EventType + DeserializeOwned,
-{
-    if bytes.is_empty() {
-        return Ok((Version::ZERO, Vec::new()));
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|error| StoreError::Corrupt(format!("{}: {error}", path.display())))?;
-    let mut version = Version::ZERO;
-    let mut events = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let event: CloudEvent<E> =
-            serde_json::from_str(line).map_err(|error| corrupt(path, &error))?;
-        let expected = version.next();
-        if event.subject != subject {
-            return Err(StoreError::Corrupt(format!(
-                "{}:{}: record names stream {} instead of {subject}",
-                path.display(),
-                index + 1,
-                event.subject
-            )));
-        }
-        if event.version != expected {
-            return Err(StoreError::Corrupt(format!(
-                "{}:{}: expected version {}",
-                path.display(),
-                index + 1,
-                expected.get()
-            )));
-        }
-        // `CloudEvent::new` keeps the envelope and the data in step, so a line where
-        // they disagree was not written by this store.
-        if event.event_type != event.data.event_type() {
-            return Err(StoreError::Corrupt(format!(
-                "{}:{}: type {:?} does not match the record",
-                path.display(),
-                index + 1,
-                event.event_type
-            )));
-        }
-        let expected_id = format!("{subject}:{}", event.version.get());
-        if event.id != expected_id {
-            return Err(StoreError::Corrupt(format!(
-                "{}:{}: id {:?} is not {expected_id:?}",
-                path.display(),
-                index + 1,
-                event.id
-            )));
-        }
-        version = event.version;
-        events.push(event);
-    }
-    Ok((version, events))
-}
-
-fn complete_prefix(bytes: &[u8]) -> &[u8] {
-    match bytes.iter().rposition(|byte| *byte == b'\n') {
-        Some(index) => &bytes[..=index],
-        None => &[],
-    }
-}
-
-fn corrupt(
-    path: &Path,
-    error: &serde_json::Error,
-) -> StoreError {
-    StoreError::Corrupt(format!("{}: {error}", path.display()))
 }
 
 fn error_at(

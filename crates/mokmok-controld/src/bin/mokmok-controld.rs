@@ -7,12 +7,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueEnum};
 use mokmok_control::{
     AcpRunner, AgentTable, ControlEvent, EnumerableStore, Runner, ScriptedRunner, TaskId,
 };
 use mokmok_controld::{ControlConfig, allowed_hosts, build_router, build_state};
 use mokmok_jobs_jsonl::JsonlEventStore;
+use mokmok_jobs_s3::{S3Config, S3Credentials, S3EventStore};
 use mokmok_journal::{
     DEFAULT_KEEP_SEGMENTS, DEFAULT_MAX_AGE, DEFAULT_MAX_BYTES, FileJournal, Journal, JournalConfig,
     JournalEvent,
@@ -27,13 +28,45 @@ const SCRIPTED_SUMMARY: &str = "the scripted run completed";
 // bound starts with the signal: a daemon that never receives one runs until it does.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum StoreKind {
+    File,
+    S3,
+}
+
 #[derive(Parser)]
 #[command(name = "mokmok-controld", about = "Serve the mokmok control plane")]
 #[command(group(ArgGroup::new("source").required(true).args(["agents", "scripted"])))]
 struct Args {
-    /// Root of the JSONL store; the task streams live in `<data-dir>/tasks`.
+    /// Root of the local data; the journal lives in `<data-dir>/journal`, and with
+    /// `--store file` the task streams live in `<data-dir>/tasks`.
     #[arg(long, value_name = "PATH")]
     data_dir: PathBuf,
+
+    /// The backend that holds each task's domain stream.
+    #[arg(long, value_enum, default_value_t = StoreKind::File)]
+    store: StoreKind,
+
+    /// Base URL of the S3-compatible endpoint, such as `http://127.0.0.1:9000`;
+    /// required with `--store s3`.
+    #[arg(long, value_name = "URL")]
+    s3_endpoint: Option<String>,
+
+    /// Bucket that holds the task streams; required with `--store s3`.
+    #[arg(long, value_name = "NAME")]
+    s3_bucket: Option<String>,
+
+    /// Path inside the bucket under which the stream objects live.
+    #[arg(long, value_name = "PATH", default_value = "tasks")]
+    s3_prefix: String,
+
+    /// Region every request is signed for.
+    #[arg(long, value_name = "REGION", default_value = "us-east-1")]
+    s3_region: String,
+
+    /// Whole-request deadline for one S3 call. It must be at least 1.
+    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    s3_timeout_secs: u64,
 
     /// Address the HTTP server binds.
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8787")]
@@ -95,8 +128,7 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let journal_config =
         journal_config(&args).map_err(|reason| -> Box<dyn std::error::Error> { reason.into() })?;
     let (runner, agents, default_agent, transport_hosts) = pick_runner(&args)?;
-    let store = JsonlEventStore::<TaskId, ControlEvent>::open(args.data_dir.join("tasks"))?;
-    let store: Arc<dyn EnumerableStore<TaskId, ControlEvent>> = Arc::new(store);
+    let store = pick_store(&args)?;
     let journal = FileJournal::open(args.data_dir.join("journal"), journal_config)?;
     let journal: Arc<dyn Journal> = Arc::new(journal);
     let listener = TcpListener::bind(args.bind).await?;
@@ -201,6 +233,68 @@ fn journal_config(args: &Args) -> Result<JournalConfig, String> {
         keep_segments: args.journal_segments,
         max_age: Duration::from_secs(args.journal_max_age_secs),
     })
+}
+
+/// The endpoint and object layout the `--s3-*` flags select.
+#[derive(Debug, PartialEq, Eq)]
+struct S3Settings {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    prefix: String,
+    timeout: Duration,
+}
+
+fn store_settings(args: &Args) -> Result<Option<S3Settings>, String> {
+    if args.store == StoreKind::File {
+        // An alias that carries the three defaulted `--s3-*` flags must still run against
+        // a local store, so only the two flags that have no default are refused here.
+        if args.s3_endpoint.is_some() {
+            return Err("--s3-endpoint is only valid with --store s3".to_owned());
+        }
+        if args.s3_bucket.is_some() {
+            return Err("--s3-bucket is only valid with --store s3".to_owned());
+        }
+        return Ok(None);
+    }
+    let endpoint = args
+        .s3_endpoint
+        .as_ref()
+        .ok_or("--s3-endpoint is required with --store s3")?;
+    let bucket = args
+        .s3_bucket
+        .as_ref()
+        .ok_or("--s3-bucket is required with --store s3")?;
+    if args.s3_timeout_secs == 0 {
+        return Err("--s3-timeout-secs must be at least 1".to_owned());
+    }
+    Ok(Some(S3Settings {
+        endpoint: endpoint.clone(),
+        bucket: bucket.clone(),
+        region: args.s3_region.clone(),
+        prefix: args.s3_prefix.clone(),
+        timeout: Duration::from_secs(args.s3_timeout_secs),
+    }))
+}
+
+fn pick_store(
+    args: &Args
+) -> Result<Arc<dyn EnumerableStore<TaskId, ControlEvent>>, Box<dyn std::error::Error>> {
+    let settings =
+        store_settings(args).map_err(|reason| -> Box<dyn std::error::Error> { reason.into() })?;
+    let Some(settings) = settings else {
+        let store = JsonlEventStore::<TaskId, ControlEvent>::open(args.data_dir.join("tasks"))?;
+        return Ok(Arc::new(store));
+    };
+    let store = S3EventStore::<TaskId, ControlEvent>::open(S3Config {
+        endpoint: settings.endpoint,
+        bucket: settings.bucket,
+        region: settings.region,
+        prefix: settings.prefix,
+        credentials: S3Credentials::from_env()?,
+        timeout: settings.timeout,
+    })?;
+    Ok(Arc::new(store))
 }
 
 // A failed watcher must not stop the server at once: the process still ends on SIGTERM,
@@ -316,6 +410,100 @@ mod tests {
                 .max_age,
             Duration::ZERO
         );
+    }
+
+    fn store_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["mokmok-controld", "--scripted", "--data-dir", "/tmp/mokmok"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("the flags parse")
+    }
+
+    fn s3_args(extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-bucket",
+            "mokmok",
+        ];
+        argv.extend_from_slice(extra);
+        store_args(&argv)
+    }
+
+    #[test]
+    fn a_local_store_selects_no_s3_settings() {
+        assert_eq!(
+            store_settings(&store_args(&[])),
+            Ok(None),
+            "the default store is the filesystem"
+        );
+    }
+
+    #[test]
+    fn s3_defaults_fill_the_prefix_the_region_and_the_timeout() {
+        let settings = store_settings(&s3_args(&[]))
+            .expect("an endpoint and a bucket are enough")
+            .expect("the s3 store is selected");
+        assert_eq!(settings.prefix, "tasks");
+        assert_eq!(settings.region, "us-east-1");
+        assert_eq!(settings.timeout, Duration::from_secs(30));
+        assert_eq!(settings.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(settings.bucket, "mokmok");
+    }
+
+    #[test]
+    fn s3_overrides_replace_the_defaults() {
+        let settings = store_settings(&s3_args(&[
+            "--s3-prefix",
+            "control",
+            "--s3-region",
+            "eu-central-1",
+            "--s3-timeout-secs",
+            "5",
+        ]))
+        .expect("the overrides are valid")
+        .expect("the s3 store is selected");
+        assert_eq!(settings.prefix, "control");
+        assert_eq!(settings.region, "eu-central-1");
+        assert_eq!(settings.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn s3_without_an_endpoint_names_the_flag() {
+        let error = store_settings(&store_args(&["--store", "s3", "--s3-bucket", "mokmok"]))
+            .expect_err("the endpoint is missing");
+        assert!(error.contains("--s3-endpoint"), "{error}");
+    }
+
+    #[test]
+    fn s3_without_a_bucket_names_the_flag() {
+        let error = store_settings(&store_args(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+        ]))
+        .expect_err("the bucket is missing");
+        assert!(error.contains("--s3-bucket"), "{error}");
+    }
+
+    #[test]
+    fn a_zero_s3_timeout_names_the_flag() {
+        let error = store_settings(&s3_args(&["--s3-timeout-secs", "0"]))
+            .expect_err("a zero deadline is refused");
+        assert!(error.contains("--s3-timeout-secs"), "{error}");
+    }
+
+    #[test]
+    fn an_s3_flag_with_the_file_store_names_the_s3_store() {
+        for flag in [
+            &["--s3-endpoint", "http://127.0.0.1:9000"][..],
+            &["--s3-bucket", "mokmok"][..],
+        ] {
+            let error = store_settings(&store_args(flag)).expect_err("the flag needs the s3 store");
+            assert!(error.contains("--store s3"), "{error}");
+        }
     }
 
     #[test]

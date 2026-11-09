@@ -48,9 +48,19 @@ names are listed in `/api/agents` and offered by the form.
 
 Flags:
 
-- `--data-dir PATH` (required): the store root; task streams live in `<data-dir>/tasks`,
-  one JSONL file per task, and their journals in `<data-dir>/journal`. One daemon per
-  directory.
+- `--data-dir PATH` (required): the local data root. The journal always lives in
+  `<data-dir>/journal`; with `--store file` the task streams live in `<data-dir>/tasks`,
+  one JSONL file per task. One daemon per data directory.
+- `--store file|s3` (default `file`): where each task's domain stream is kept.
+- `--s3-endpoint URL` (required with `--store s3`): the S3-compatible base URL, such as
+  `http://127.0.0.1:9000` for MinIO or `https://s3.eu-central-1.amazonaws.com`.
+- `--s3-bucket NAME` (required with `--store s3`): the bucket that holds the streams.
+  Passing it or `--s3-endpoint` with `--store file` is refused.
+- `--s3-prefix PATH` (default `tasks`): the path inside the bucket that holds the
+  stream objects.
+- `--s3-region REGION` (default `us-east-1`): the region every request is signed for.
+- `--s3-timeout-secs SECS` (default 30): the deadline for one S3 call. It must be at
+  least 1.
 - `--bind ADDR` (default `127.0.0.1:8787`): the HTTP listener.
 - `--agents FILE` or `--scripted`: exactly one is required.
 - `--workspace-root PATH`: every task workspace must resolve under this directory.
@@ -70,14 +80,31 @@ Flags:
   Requests whose `Host` is not listed get `403`; loopback names and the bound address
   are always allowed.
 
+With `--store s3` a task's domain stream is the object
+`s3://<bucket>/<prefix>/<task-id>.jsonl`, holding the same JSONL records the file store
+writes. Credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and the
+optional `AWS_SESSION_TOKEN`; a missing variable stops the daemon at startup and names
+the variable. The execution journal stays on local disk under `<data-dir>/journal` in
+both modes.
+
+The daemon refuses to start against a store that does not honor `If-Match` and
+`If-None-Match`. Opening the store writes a throwaway probe object and requires the
+store to refuse an `If-Match` it cannot satisfy, because a store that accepts it would
+silently drop a concurrent append instead of reporting a conflict. One daemon per
+prefix is the supported deployment: the conditional write turns a racing append into a
+conflict, but two daemons that each retry keep colliding instead of coordinating.
+Listing tasks over S3 costs one list request per page plus one object read per task,
+since a summary is replayed from its stream.
+
 ## Domain events and the execution journal
 
 A task is stored twice, with different lifetimes:
 
-- `<data-dir>/tasks/<id>.jsonl` is the domain CloudEvent stream: `Submitted`,
-  `Started`, `SessionOpened`, `Completed`, `Failed`, `Cancelled`, and bounded facts
-  such as the completed summary. It is the source of truth for the task's state, so
-  replay and listing stay fast however long the transcript grows.
+- `<data-dir>/tasks/<id>.jsonl` with `--store file`, or
+  `s3://<bucket>/<prefix>/<id>.jsonl` with `--store s3`, is the domain CloudEvent
+  stream: `Submitted`, `Started`, `SessionOpened`, `Completed`, `Failed`, `Cancelled`,
+  and bounded facts such as the completed summary. It is the source of truth for the
+  task's state, so replay and listing stay fast however long the transcript grows.
 - `<data-dir>/journal/<id>/<generation>.jsonl` is the execution journal: one compact
   JSON object per line with `seq`, `time`, and a `message`, `thought`, `tool_call`, or
   `permission` record. It is operational telemetry, is never replayed into the domain

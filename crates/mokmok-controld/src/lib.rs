@@ -52,6 +52,14 @@ const MAX_JOURNAL_TAIL: usize = 1000;
 /// task at a time, so two leaves a spare.
 const JOURNAL_READ_PERMITS: usize = 2;
 
+/// Concurrent store reads the daemon will run.
+///
+/// The same limit covers both backends: a filesystem read is cheap, while an
+/// object-storage read is a network round trip, and one read of a listing is one round
+/// trip per task. Four lets a few pages and detail views overlap without queueing an
+/// unbounded number of those round trips.
+const STORE_READ_PERMITS: usize = 4;
+
 /// The answer to an `events` value outside `tail`, `all`, and `none`.
 const EVENTS_QUERY: &str = "the events query must be one of: tail, all, none";
 
@@ -77,9 +85,39 @@ pub struct AppState {
     pub journal_events: broadcast::Sender<String>,
     // Bounds the reads a client can start at once; see `JOURNAL_READ_PERMITS`.
     pub journal_reads: Arc<Semaphore>,
+    // Bounds the store reads a client can start at once; see `STORE_READ_PERMITS`.
+    pub store_reads: Arc<Semaphore>,
     // An `Sse` body over this state's own broadcast sender never ends, which is what
     // holds `axum::serve` open forever; flipping this watch is how a shutdown ends it.
     pub shutdown: watch::Sender<bool>,
+}
+
+impl AppState {
+    // A store read is a filesystem read or an object-storage round trip, so it must run
+    // off the worker threads other requests share. The permit sits inside the blocking
+    // closure, so a client that disconnects cannot free it while its read still runs.
+    async fn store_read<T, F>(
+        &self,
+        read: F,
+    ) -> Result<T, ApiError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = Arc::clone(&self.store_reads)
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::internal(STORE_FAILED))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            read()
+        })
+        .await
+        .map_err(|error| {
+            tracing::debug!(%error, "the store read task failed");
+            ApiError::internal(STORE_FAILED)
+        })
+    }
 }
 
 /// Every `Host` header value the daemon answers for a bound `address`.
@@ -184,6 +222,7 @@ pub fn build_state(
         events,
         journal_events,
         journal_reads: Arc::new(Semaphore::new(JOURNAL_READ_PERMITS)),
+        store_reads: Arc::new(Semaphore::new(STORE_READ_PERMITS)),
         shutdown,
     }
 }
@@ -312,19 +351,31 @@ async fn agents(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn list_tasks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let mut tasks = state.system.list().map_err(ApiError::from_system)?;
-    for task in &mut tasks {
-        // A task logged before the split has no journal, so the domain count stays.
-        match state.journal.count(task.id.as_str()) {
-            Ok(count) if count > 0 => task.updates = count,
-            Ok(_) => {},
-            // A failed count is retried on the next request, so a warning per poll would
-            // bury the log for as long as the cause lasts.
-            Err(error) => {
-                tracing::debug!(task = task.id.as_str(), %error, "cannot count the journal");
-            },
-        }
-    }
+    let system = state.system.clone();
+    let journal = Arc::clone(&state.journal);
+    let tasks = state
+        .store_read(move || {
+            let mut tasks = system.list()?;
+            for task in &mut tasks {
+                // A task logged before the split has no journal, so the domain count stays.
+                match journal.count(task.id.as_str()) {
+                    Ok(count) if count > 0 => task.updates = count,
+                    Ok(_) => {},
+                    // A failed count is retried on the next request, so a warning per poll
+                    // would bury the log for as long as the cause lasts.
+                    Err(error) => {
+                        tracing::debug!(
+                            task = task.id.as_str(),
+                            %error,
+                            "cannot count the journal"
+                        );
+                    },
+                }
+            }
+            Ok(tasks)
+        })
+        .await?
+        .map_err(ApiError::from_system)?;
     Ok(Json(json!({"tasks": tasks})))
 }
 
@@ -353,9 +404,10 @@ async fn task_detail(
 ) -> Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(|_| ApiError::bad_request(EVENTS_QUERY))?;
     let id = parse_id(raw)?;
+    let store = Arc::clone(&state.store);
     let events = state
-        .store
-        .load(&id)
+        .store_read(move || store.load(&id))
+        .await?
         .map_err(|_| ApiError::internal(STORE_FAILED))?;
     let task = TaskState::replay(&events)
         .map_err(|error| ApiError::from_system(SystemError::Control(error)))?;
@@ -399,9 +451,11 @@ async fn task_journal(
         return Err(ApiError::bad_request(JOURNAL_QUERY));
     }
     let id = parse_id(raw)?;
+    let store = Arc::clone(&state.store);
+    let stream = id.clone();
     let events = state
-        .store
-        .load(&id)
+        .store_read(move || store.load(&stream))
+        .await?
         .map_err(|_| ApiError::internal(STORE_FAILED))?;
     let task = TaskState::replay(&events)
         .map_err(|error| ApiError::from_system(SystemError::Control(error)))?;
@@ -478,7 +532,12 @@ async fn cancel_task(
     Json(body): Json<CancelBody>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(raw)?;
-    let task = state.system.state(&id).map_err(ApiError::from_system)?;
+    let system = state.system.clone();
+    let stream = id.clone();
+    let task = state
+        .store_read(move || system.state(&stream))
+        .await?
+        .map_err(ApiError::from_system)?;
     if task.spec.is_none() {
         return Err(ApiError::not_found("no such task"));
     }

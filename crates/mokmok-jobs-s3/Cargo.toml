@@ -1,0 +1,26 @@
+[package]
+edition.workspace = true
+name = "mokmok-jobs-s3"
+version.workspace = true
+
+[dependencies]
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-runtime-api.workspace = true
+mokmok-events.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+hex = "0.4"
+hmac = "0.12"
+mokmok-jobs-core.workspace = true
+mokmok-jobs-jsonl.workspace = true
+sha2 = "0.10"
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
