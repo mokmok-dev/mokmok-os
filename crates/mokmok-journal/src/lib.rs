@@ -92,7 +92,7 @@ pub struct JournalEntry {
 /// `total` is the count at the snapshot the read started from, raised to at least
 /// `entries.len()`; the entries are the newest at read time, so a concurrent append or
 /// prune can still leave the two disagreeing above that floor.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JournalTail {
     pub entries: Vec<JournalEntry>,
     pub total: u64,
@@ -1421,12 +1421,14 @@ mod tests {
         let JournalEvent::Message { text } = JournalEvent::Message { text }.clipped() else {
             panic!("the event stays a message");
         };
+        // The subtraction is saturating so the case still compiles, and fails, when a
+        // mutation lowers the cap to zero.
         assert_eq!(
             text,
-            format!("a{}", "é".repeat((MAX_RECORD_BYTES - 1) / 2)),
+            format!("a{}", "é".repeat(MAX_RECORD_BYTES.saturating_sub(1) / 2)),
             "the kept prefix stops before the character straddling the cap"
         );
-        assert_eq!(text.len(), MAX_RECORD_BYTES - 1);
+        assert_eq!(text.len(), MAX_RECORD_BYTES.saturating_sub(1));
     }
 
     #[test]
