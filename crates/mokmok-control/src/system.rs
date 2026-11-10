@@ -744,10 +744,7 @@ mod tests {
         let input = "a".repeat(LISTING_INSTRUCTION_BYTES + 1);
         let (text, truncated) = listing_instruction(&input);
         assert!(truncated);
-        assert_eq!(
-            text,
-            format!("{}…", "a".repeat(LISTING_INSTRUCTION_BYTES))
-        );
+        assert_eq!(text, format!("{}…", "a".repeat(LISTING_INSTRUCTION_BYTES)));
     }
 
     #[test]
