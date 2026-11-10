@@ -725,6 +725,45 @@ mod tests {
     }
 
     #[test]
+    fn a_short_instruction_is_a_listing_preview_without_a_marker() {
+        let (text, truncated) = listing_instruction("fix the build");
+        assert_eq!(text, "fix the build");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn an_instruction_at_the_limit_is_not_truncated() {
+        let input = "a".repeat(LISTING_INSTRUCTION_BYTES);
+        let (text, truncated) = listing_instruction(&input);
+        assert_eq!(text, input);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_is_truncated_with_a_marker() {
+        let input = "a".repeat(LISTING_INSTRUCTION_BYTES + 1);
+        let (text, truncated) = listing_instruction(&input);
+        assert!(truncated);
+        assert_eq!(
+            text,
+            format!("{}…", "a".repeat(LISTING_INSTRUCTION_BYTES))
+        );
+    }
+
+    #[test]
+    fn a_multibyte_character_at_the_limit_is_not_split() {
+        let mut input = "a".repeat(LISTING_INSTRUCTION_BYTES - 1);
+        input.push('é');
+        input.push_str("tail");
+        let (text, truncated) = listing_instruction(&input);
+        assert!(truncated);
+        assert_eq!(
+            text,
+            format!("{}…", "a".repeat(LISTING_INSTRUCTION_BYTES - 1))
+        );
+    }
+
+    #[test]
     fn a_committed_record_carries_the_current_time() {
         let store = Arc::new(MemoryEventStore::<TaskId, ControlEvent>::new());
         let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));

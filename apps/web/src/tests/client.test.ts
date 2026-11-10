@@ -229,9 +229,13 @@ test('client: removes a legacy plain token without using it', () => {
 });
 
 test('client: removes a JSON-string token without using it', () => {
-  window.sessionStorage.setItem(TOKEN_KEY, JSON.stringify('legacy-secret'));
-  expect(readToken(window.sessionStorage, '')).toBeNull();
-  expect(window.sessionStorage.getItem(TOKEN_KEY)).toBeNull();
+  const removeItem = vi.fn();
+  const storage = {
+    getItem: () => '"legacy-secret"',
+    removeItem,
+  } as unknown as Storage;
+  expect(readToken(storage, '')).toBeNull();
+  expect(removeItem).toHaveBeenCalledWith(TOKEN_KEY);
 });
 
 test('client: does not touch storage when no token is stored', () => {
