@@ -49,6 +49,53 @@
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
           '';
           kani = pkgs.callPackage ./nix/kani.nix { };
+          webPnpmDeps = pkgs.fetchPnpmDeps {
+            pname = "mokmok-web";
+            version = "2026.11.1";
+            src = ./.;
+            pnpm = pkgs.pnpm_10;
+            fetcherVersion = 3;
+            hash = "sha256-d11fg1mISnHtHEv4u+FF0XVktFSk+ZzmJ2I1FmvAOpI=";
+          };
+          mkWebJob =
+            {
+              pname,
+              buildPhase,
+              installPhase,
+              extraInputs ? [ ],
+            }:
+            pkgs.stdenv.mkDerivation {
+              inherit
+                pname
+                buildPhase
+                installPhase
+                ;
+              version = "2026.11.1";
+              src = ./.;
+              pnpmDeps = webPnpmDeps;
+              nativeBuildInputs = [
+                pkgs.nodejs_22
+                pkgs.pnpm_10
+                pkgs.pnpmConfigHook
+              ]
+              ++ extraInputs;
+            };
+          web = mkWebJob {
+            pname = "mokmok-web";
+            buildPhase = ''
+              runHook preBuild
+              pnpm --filter @mokmok/web run typecheck
+              pnpm --filter @mokmok/web run test
+              pnpm --filter @mokmok/web run build
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              cp -r apps/web/dist/. $out/
+              runHook postInstall
+            '';
+          };
         in
         {
           _module.args = {
@@ -59,6 +106,7 @@
           };
 
           checks = {
+            inherit web;
             clippy = craneLib.cargoClippy (
               commonArgs
               // {
@@ -80,6 +128,20 @@
             );
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            webMutants = mkWebJob {
+              pname = "mokmok-web-mutants";
+              extraInputs = [ pkgs.procps ];
+              buildPhase = ''
+                runHook preBuild
+                pnpm --filter @mokmok/web run mutate
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out
+                runHook postInstall
+              '';
+            };
             mutants = craneLib.mkCargoDerivation (
               commonArgs
               // {
@@ -123,6 +185,8 @@
             }
           );
 
+          packages.web = web;
+
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
 
@@ -130,6 +194,8 @@
               cargo-mutants
               cargo-nextest
               linkerPackages
+              nodejs_22
+              pnpm_10
               rustToolchain
               sccache
             ];
@@ -152,6 +218,14 @@
             projectRootFile = "flake.nix";
             programs = {
               nixfmt.enable = true;
+              prettier = {
+                enable = true;
+                includes = [
+                  "apps/web/**/*.{ts,tsx,css,html,json}"
+                  "package.json"
+                  "pnpm-workspace.yaml"
+                ];
+              };
               rustfmt.enable = true;
               rustfmt.package = rustToolchain;
               taplo.enable = true;

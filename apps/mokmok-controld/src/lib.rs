@@ -1,8 +1,8 @@
-//! The HTTP API and the embedded UI of the control plane.
+//! The HTTP API of the control plane.
 //!
-//! [`build_router`] serves the same JSON API and single-page UI the
-//! `mokmok-controld` binary runs, so a test drives the whole surface with
-//! `tower::ServiceExt::oneshot` instead of a socket.
+//! [`build_router`] serves the same JSON API the `mokmok-controld` binary runs, so a
+//! test drives the whole surface with `tower::ServiceExt::oneshot` instead of a
+//! socket. The browser UI is a separate app under `apps/web`.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -28,10 +28,6 @@ use serde_json::{Value, json};
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
 
-const INDEX_HTML: &str = include_str!("../static/index.html");
-const APP_JS: &str = include_str!("../static/app.js");
-const APP_CSS: &str = include_str!("../static/app.css");
-
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_CANCEL_REASON: &str = "cancelled from the control plane";
@@ -48,16 +44,18 @@ const MAX_JOURNAL_TAIL: usize = 1000;
 /// Concurrent journal reads the daemon will run.
 ///
 /// One read decodes a task's whole readable journal, so concurrent requests multiply the
-/// memory a loopback client or a cross-origin `no-cors` GET can commit; the UI reads one
-/// task at a time, so two leaves a spare.
+/// memory a loopback client or a cross-origin `no-cors` GET can commit. The UI reads the
+/// journals of one workspace and follows one live run, so two permits let a live poll
+/// proceed while a page opens.
 const JOURNAL_READ_PERMITS: usize = 2;
 
 /// Concurrent store reads the daemon will run.
 ///
 /// The same limit covers both backends: a filesystem read is cheap, while an
 /// object-storage read is a network round trip, and one read of a listing is one round
-/// trip per task. Four lets a few pages and detail views overlap without queueing an
-/// unbounded number of those round trips.
+/// trip per task. The UI lists tasks every two seconds and reads one running task's
+/// detail per poll, so four permits let those overlap without queueing an unbounded
+/// number of round trips.
 const STORE_READ_PERMITS: usize = 4;
 
 /// The answer to an `events` value outside `tail`, `all`, and `none`.
@@ -242,9 +240,6 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state.clone());
 
     Router::new()
-        .route("/", get(index))
-        .route("/app.js", get(app_js))
-        .route("/app.css", get(app_css))
         .route("/healthz", get(healthz))
         .merge(api)
         .layer(middleware::from_fn_with_state(state, require_allowed_host))
@@ -303,34 +298,6 @@ impl Journal for BroadcastJournal {
     ) -> Result<u64, JournalError> {
         self.inner.count(task)
     }
-}
-
-async fn index() -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // A cached page would keep loading the assets of a previous deploy.
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        INDEX_HTML,
-    )
-        .into_response()
-}
-
-async fn app_js() -> Response {
-    static_asset(APP_JS, "text/javascript; charset=utf-8")
-}
-
-async fn app_css() -> Response {
-    static_asset(APP_CSS, "text/css; charset=utf-8")
-}
-
-fn static_asset(
-    body: &'static str,
-    content_type: &'static str,
-) -> Response {
-    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
 async fn healthz() -> Response {

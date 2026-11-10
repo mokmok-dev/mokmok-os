@@ -226,10 +226,6 @@ mod tests {
         let dir = TempDir::new().expect("a temp dir");
         let (_daemon, address) = Daemon::spawn(&dir);
 
-        let (status, body) = request(address, "GET", "/", None);
-        assert_eq!(status, 200);
-        assert!(body.contains("mokmok control plane"));
-
         let (status, body) = request(
             address,
             "POST",
