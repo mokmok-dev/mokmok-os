@@ -403,49 +403,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_page_is_served_uncached() {
-        let dir = TempDir::new().expect("a temp dir");
-        let state = scripted_state(&dir, None);
-        let reply = get(&state, "/").await;
-
-        assert_eq!(reply.status, StatusCode::OK);
-        assert_eq!(content_type(&reply), "text/html; charset=utf-8");
-        assert_eq!(
-            reply
-                .headers
-                .get(header::CACHE_CONTROL)
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store")
-        );
-        assert!(reply.body.contains("mokmok control plane"));
-    }
-
-    #[tokio::test]
-    async fn the_javascript_and_stylesheet_are_served() {
+    async fn the_daemon_serves_no_ui() {
         let dir = TempDir::new().expect("a temp dir");
         let state = scripted_state(&dir, None);
 
-        let javascript = get(&state, "/app.js").await;
-        assert_eq!(javascript.status, StatusCode::OK);
-        assert_eq!(content_type(&javascript), "text/javascript; charset=utf-8");
-        for needle in [
-            "function connectEvents",
-            "/journal?limit=",
-            "/api/journal/events",
-            "permission: 'Permission'",
-            "state.lastTranscript",
-            "journalErrorText",
-            "function clearJournalError",
-        ] {
-            assert!(javascript.body.contains(needle), "{needle} is missing");
+        for path in ["/", "/app.js", "/app.css"] {
+            let reply = get(&state, path).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
         }
-
-        let stylesheet = get(&state, "/app.css").await;
-        assert_eq!(stylesheet.status, StatusCode::OK);
-        assert_eq!(content_type(&stylesheet), "text/css; charset=utf-8");
-        for needle in [".task-row", ".entry-permission"] {
-            assert!(stylesheet.body.contains(needle), "{needle} is missing");
-        }
+        assert_eq!(get(&state, "/healthz").await.status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -498,6 +464,15 @@ mod tests {
         assert_eq!(tasks.as_array().map(Vec::len), Some(1));
         assert_eq!(tasks[0]["id"], json!(id));
         assert_eq!(tasks[0]["status"], json!("completed"));
+        assert_eq!(tasks[0]["title"], json!("Fix the build"));
+        assert_eq!(tasks[0]["instruction"], json!("Make the tests pass."));
+        assert_eq!(tasks[0]["instruction_truncated"], json!(false));
+        assert_eq!(tasks[0]["agent"], json!("scripted"));
+        assert_eq!(tasks[0]["outcome"], json!(SCRIPTED_SUMMARY));
+        assert!(
+            tasks[0].get("workspace").is_none(),
+            "a task without a workspace omits the field"
+        );
 
         let detail = get(&state, &format!("/api/tasks/{}", id.as_str())).await;
         assert_eq!(detail.status, StatusCode::OK);
@@ -897,6 +872,80 @@ mod tests {
         let tasks = listed.json()["tasks"].clone();
         assert_eq!(tasks[0]["id"], json!(id));
         assert_eq!(tasks[0]["updates"], json!(3));
+        assert_eq!(tasks[0]["instruction"], json!("Make the tests pass."));
+    }
+
+    #[tokio::test]
+    async fn the_task_list_names_the_workspace_and_outcome() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let created = post_json(
+            &state,
+            "/api/tasks",
+            &json!({
+                "title": "Fix the build",
+                "instruction": "Make the tests pass.",
+                "agent": "scripted",
+                "workspace": "/work/demo",
+            }),
+        )
+        .await;
+        let id = created_id(&created);
+        assert_eq!(state.supervisor.run_pending().expect("the task runs"), 1);
+
+        let listed = get(&state, "/api/tasks").await;
+        assert_eq!(listed.status, StatusCode::OK);
+        let task = &listed.json()["tasks"][0];
+        assert_eq!(task["id"], json!(id));
+        assert_eq!(task["workspace"], json!("/work/demo"));
+        assert_eq!(task["instruction"], json!("Make the tests pass."));
+        assert_eq!(task["outcome"], json!(SCRIPTED_SUMMARY));
+    }
+
+    #[tokio::test]
+    async fn the_task_list_caps_the_instruction_preview() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let instruction = "漢".repeat(2000);
+        let created = post_json(
+            &state,
+            "/api/tasks",
+            &json!({
+                "title": "A huge task",
+                "instruction": instruction.clone(),
+                "agent": "scripted",
+            }),
+        )
+        .await;
+        let id = created_id(&created);
+        assert_eq!(state.supervisor.run_pending().expect("the task runs"), 1);
+
+        let listed = get(&state, "/api/tasks").await;
+        assert_eq!(listed.status, StatusCode::OK);
+        let task = &listed.json()["tasks"][0];
+        let preview = task["instruction"].as_str().expect("a preview");
+        assert!(
+            preview.ends_with('…'),
+            "a clipped preview carries the marker: {preview:?}"
+        );
+        assert!(
+            preview.len() <= 4096 + '…'.len_utf8(),
+            "the preview stays near the cap: {} bytes",
+            preview.len()
+        );
+        assert!(
+            preview.len() > 4000,
+            "the preview keeps most of the instruction: {} bytes",
+            preview.len()
+        );
+        assert_eq!(task["instruction_truncated"], json!(true));
+
+        let detail = get(&state, &format!("/api/tasks/{}?events=none", id.as_str())).await;
+        assert_eq!(detail.status, StatusCode::OK);
+        assert_eq!(
+            detail.json()["state"]["spec"]["instruction"],
+            json!(instruction)
+        );
     }
 
     #[tokio::test]
@@ -1286,8 +1335,8 @@ mod tests {
         let task_journal = get(&state, &format!("/api/tasks/{UNKNOWN_TASK}/journal")).await;
         assert_eq!(task_journal.status, StatusCode::UNAUTHORIZED);
 
-        assert_eq!(get(&state, "/").await.status, StatusCode::OK);
-        assert_eq!(get(&state, "/app.js").await.status, StatusCode::OK);
+        assert_eq!(get(&state, "/").await.status, StatusCode::NOT_FOUND);
+        assert_eq!(get(&state, "/app.js").await.status, StatusCode::NOT_FOUND);
         assert_eq!(get(&state, "/healthz").await.status, StatusCode::OK);
     }
 

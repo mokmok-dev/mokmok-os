@@ -35,15 +35,37 @@ pub struct NewTask {
 }
 
 /// One row of a task listing.
+///
+/// The row carries enough to place the task in a workspace and to seed its first
+/// user turn, so a browser does not need to replay each task's stream to render it.
+/// The instruction is a preview clipped to [`LISTING_INSTRUCTION_BYTES`] on a character
+/// boundary plus an ellipsis; the task detail endpoint carries the full instruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: TaskId,
     pub title: String,
+    pub instruction: String,
+    pub instruction_truncated: bool,
     pub status: TaskStatus,
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     pub updates: u64,
+}
+
+/// How much of a task's instruction a listing row carries before it is a preview.
+const LISTING_INSTRUCTION_BYTES: usize = 4096;
+
+fn listing_instruction(instruction: &str) -> (String, bool) {
+    if instruction.len() <= LISTING_INSTRUCTION_BYTES {
+        return (instruction.to_owned(), false);
+    }
+    let cut = instruction.floor_char_boundary(LISTING_INSTRUCTION_BYTES);
+    (format!("{}…", &instruction[..cut]), true)
 }
 
 /// What gets every committed batch, so a live feed can follow the log.
@@ -325,12 +347,17 @@ impl ControlSystem {
             let Some(spec) = state.spec else {
                 continue;
             };
+            let (instruction, instruction_truncated) = listing_instruction(&spec.instruction);
             summaries.push(TaskSummary {
                 id,
                 title: spec.title,
+                instruction,
+                instruction_truncated,
                 status: state.status,
                 agent: spec.agent,
                 host: spec.host,
+                workspace: spec.workspace,
+                outcome: state.outcome,
                 updates: state.update_count,
             });
         }
@@ -695,6 +722,42 @@ mod tests {
     #[test]
     fn the_default_idle_timeout_is_sixty_seconds() {
         assert_eq!(DEFAULT_IDLE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_short_instruction_is_a_listing_preview_without_a_marker() {
+        let (text, truncated) = listing_instruction("fix the build");
+        assert_eq!(text, "fix the build");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn an_instruction_at_the_limit_is_not_truncated() {
+        let input = "a".repeat(LISTING_INSTRUCTION_BYTES);
+        let (text, truncated) = listing_instruction(&input);
+        assert_eq!(text, input);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_is_truncated_with_a_marker() {
+        let input = "a".repeat(LISTING_INSTRUCTION_BYTES + 1);
+        let (text, truncated) = listing_instruction(&input);
+        assert!(truncated);
+        assert_eq!(text, format!("{}…", "a".repeat(LISTING_INSTRUCTION_BYTES)));
+    }
+
+    #[test]
+    fn a_multibyte_character_at_the_limit_is_not_split() {
+        let mut input = "a".repeat(LISTING_INSTRUCTION_BYTES - 1);
+        input.push('é');
+        input.push_str("tail");
+        let (text, truncated) = listing_instruction(&input);
+        assert!(truncated);
+        assert_eq!(
+            text,
+            format!("{}…", "a".repeat(LISTING_INSTRUCTION_BYTES - 1))
+        );
     }
 
     #[test]
