@@ -1,0 +1,27 @@
+{
+  "name": "@mokmok/plugin-sdk",
+  "version": "2026.11.1",
+  "private": true,
+  "type": "module",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts"
+    }
+  },
+  "files": [
+    "index.d.ts",
+    "types.gen.d.ts"
+  ],
+  "scripts": {
+    "gen": "napi build --manifest-path ../../crates/mokmok-plugin-addon/Cargo.toml --platform --release --output-dir .addon --dts ../types.gen.d.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.10.12",
+    "@types/node": "22.9.4",
+    "typescript": "6.0.3",
+    "vitest": "5.1.0"
+  }
+}

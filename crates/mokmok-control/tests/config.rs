@@ -378,10 +378,117 @@ mod tests {
             ),
             (ConfigError::UnknownAgent("two".to_owned()), "two"),
             (ConfigError::UnknownHost("far".to_owned()), "far"),
+            (
+                ConfigError::RelativeEntry {
+                    agent: "one".to_owned(),
+                    entry: "plugin.ts".to_owned(),
+                },
+                "absolute",
+            ),
+            (ConfigError::ZeroTimeout("one".to_owned()), "at least 1"),
             (ConfigError::NoDefaultAgent, "default"),
         ];
         for (error, expected) in cases {
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn a_plugin_entry_parses_with_its_optional_timeout() {
+        let table = parse(
+            r#"{
+                "agents": {
+                    "hello": { "transport": "plugin", "entry": "/srv/plugins/hello.ts",
+                               "timeout_secs": 120 }
+                }
+            }"#,
+        )
+        .expect("the table is valid");
+        let hello = table.resolve("hello").expect("hello exists");
+        assert!(matches!(
+            &hello.transport,
+            AgentTransport::Plugin { entry, timeout_secs }
+                if entry == &PathBuf::from("/srv/plugins/hello.ts") && *timeout_secs == Some(120)
+        ));
+    }
+
+    #[test]
+    fn a_plugin_entry_without_a_timeout_is_valid() {
+        let table =
+            parse(r#"{"agents": {"hello": {"transport": "plugin", "entry": "/srv/hello.ts"}}}"#)
+                .expect("the table is valid");
+        let hello = table.resolve("hello").expect("hello exists");
+        assert!(matches!(
+            &hello.transport,
+            AgentTransport::Plugin {
+                timeout_secs: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_relative_plugin_entry_is_refused() {
+        // The daemon must not resolve a plugin path against its own cwd.
+        assert!(matches!(
+            error(r#"{"agents": {"hello": {"transport": "plugin", "entry": "hello.ts"}}}"#),
+            ConfigError::RelativeEntry { agent, entry }
+                if agent == "hello" && entry == "hello.ts"
+        ));
+    }
+
+    #[test]
+    fn a_zero_plugin_timeout_is_refused() {
+        assert!(matches!(
+            error(
+                r#"{"agents": {"hello": {"transport": "plugin", "entry": "/srv/hello.ts",
+                    "timeout_secs": 0}}}"#
+            ),
+            ConfigError::ZeroTimeout(agent) if agent == "hello"
+        ));
+    }
+
+    #[test]
+    fn a_plugin_entry_is_serialized_back_with_its_transport_tag() {
+        // The round trip matters because the daemon rewrites a table it was handed.
+        let text = r#"{"agents": {"hello": {"transport": "plugin", "entry": "/srv/hello.ts",
+            "timeout_secs": 5}}}"#;
+        let table = parse(text).expect("the table is valid");
+        let encoded = serde_json::to_value(&table).expect("the table encodes");
+        assert_eq!(encoded["agents"]["hello"]["transport"], "plugin");
+        assert_eq!(encoded["agents"]["hello"]["entry"], "/srv/hello.ts");
+        assert_eq!(encoded["agents"]["hello"]["timeout_secs"], 5);
+    }
+
+    #[test]
+    fn a_plugin_can_be_the_host_override_for_a_task() {
+        // `hosts` maps a task's host to a transport, so a plugin has to be legal there.
+        let table = parse(
+            r#"{
+                "agents": {"one": {"transport": "stdio", "program": "/bin/one"}},
+                "hosts": {"local-plugin": {"transport": "plugin", "entry": "/srv/one.ts"}}
+            }"#,
+        )
+        .expect("the table is valid");
+        assert!(matches!(
+            table.hosts.get("local-plugin"),
+            Some(AgentTransport::Plugin { .. })
+        ));
+    }
+
+    #[test]
+    fn a_mixed_table_lists_both_kinds_of_agent() {
+        let table = parse(
+            r#"{
+                "agents": {
+                    "hello": {"transport": "plugin", "entry": "/srv/hello.ts"},
+                    "local": {"transport": "stdio", "program": "/usr/bin/agent"}
+                },
+                "default": "hello"
+            }"#,
+        )
+        .expect("the table is valid");
+        assert_eq!(table.names(), vec!["hello", "local"]);
+        assert_eq!(table.default_name(), Some("hello"));
     }
 }

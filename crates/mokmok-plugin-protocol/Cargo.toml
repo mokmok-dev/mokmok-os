@@ -1,0 +1,19 @@
+[package]
+edition.workspace = true
+name = "mokmok-plugin-protocol"
+version.workspace = true
+
+[features]
+# Off by default, so the daemon and everything above it compile no napi and no unsafe.
+# Only the addon turns this on, and only to generate the SDK's `index.d.ts`.
+napi = ["dep:napi", "dep:napi-derive"]
+
+[dependencies]
+mokmok-journal.workspace = true
+napi = { workspace = true, optional = true }
+napi-derive = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

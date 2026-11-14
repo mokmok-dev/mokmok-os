@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Parser, ValueEnum};
 use mokmok_control::{
-    AcpRunner, AgentTable, ControlEvent, EnumerableStore, Runner, ScriptedRunner, TaskId,
+    AcpRunner, AgentRunner, AgentTable, ControlEvent, EnumerableStore, PluginHost, PluginRunner,
+    Runner, ScriptedRunner, TaskId,
 };
 use mokmok_controld::{ControlConfig, allowed_hosts, build_router, build_state};
 use mokmok_jobs_jsonl::JsonlEventStore;
@@ -99,6 +100,10 @@ struct Args {
     /// Root every ACP task's workspace must live under.
     #[arg(long, value_name = "PATH")]
     workspace_root: Option<PathBuf>,
+
+    /// Node executable that runs TypeScript plugins; defaults to `node` on PATH.
+    #[arg(long, value_name = "PATH", default_value = "node")]
+    node: PathBuf,
 
     /// Another `Host` header value the server answers; repeatable.
     #[arg(long, value_name = "NAME")]
@@ -356,11 +361,13 @@ fn pick_runner(args: &Args) -> Result<Selected, Box<dyn std::error::Error>> {
     let agents = table.names().into_iter().map(str::to_owned).collect();
     let default_agent = table.default_name().map(str::to_owned).unwrap_or_default();
     let transport_hosts = table.hosts.keys().cloned().collect();
-    let mut runner = AcpRunner::new(table, AGENT_TIMEOUT);
+    let mut acp = AcpRunner::new(table.clone(), AGENT_TIMEOUT);
+    let mut plugins = PluginRunner::new(table.clone(), PluginHost::new(&args.node));
     if let Some(root) = &args.workspace_root {
-        runner = runner.with_workspace_root(root);
+        acp = acp.with_workspace_root(root);
+        plugins = plugins.with_workspace_root(root);
     }
-    let runner: Arc<dyn Runner> = Arc::new(runner);
+    let runner: Arc<dyn Runner> = Arc::new(AgentRunner::new(table, acp, plugins));
     Ok((runner, agents, default_agent, transport_hosts))
 }
 

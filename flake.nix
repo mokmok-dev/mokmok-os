@@ -36,6 +36,9 @@
             strictDeps = true;
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # The same vendored crates the Rust checks resolve against, exposed so the SDK
+          # check can regenerate the TypeScript types with no network.
+          vendoredCrates = craneLib.vendorCargoDeps { src = ./.; };
           linkerPackages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
             with pkgs;
             [
@@ -55,7 +58,7 @@
             src = ./.;
             pnpm = pkgs.pnpm_10;
             fetcherVersion = 3;
-            hash = "sha256-d11fg1mISnHtHEv4u+FF0XVktFSk+ZzmJ2I1FmvAOpI=";
+            hash = "sha256-+nlUjzuV8PuyQjzM7YZoUe8WtP1zCwaK/MklwZt4ycM=";
           };
           mkWebJob =
             {
@@ -96,6 +99,46 @@
               runHook postInstall
             '';
           };
+          # The SDK's generated types come from Rust, so the check regenerates them and
+          # compares against the committed file. A hand edit to types.gen.d.ts, or a Rust
+          # type change without a regeneration, fails here rather than in a plugin author's
+          # editor.
+          pluginSdk = mkWebJob {
+            pname = "mokmok-plugin-sdk";
+            # The regeneration runs cargo, which the web job's inputs do not include.
+            # `cargoArtifacts` is where crane put the vendored crates, so the build needs
+            # no network.
+            extraInputs = [
+              cargoArtifacts
+              vendoredCrates
+              rustToolchain
+              pkgs.cargo
+            ]
+            ++ linkerPackages;
+            buildPhase = ''
+              runHook preBuild
+              export RUSTC_WRAPPER=
+              export CARGO_NET_OFFLINE=true
+              # Crane's vendor directory carries the cargo config that points every
+              # crates.io source at the store copy, so the regeneration resolves the lock
+              # file with no network.
+              export CARGO_HOME=$TMPDIR/cargo-home
+              mkdir -p "$CARGO_HOME"
+              cp ${vendoredCrates}/config.toml "$CARGO_HOME/config.toml"
+              ${linkerEnv}
+              cp packages/plugin-sdk/types.gen.d.ts "$TMPDIR/committed.d.ts"
+              pnpm --filter @mokmok/plugin-sdk run gen
+              diff -u "$TMPDIR/committed.d.ts" packages/plugin-sdk/types.gen.d.ts
+              pnpm --filter @mokmok/plugin-sdk run typecheck
+              pnpm --filter @mokmok/plugin-sdk run test
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              runHook postInstall
+            '';
+          };
         in
         {
           _module.args = {
@@ -106,7 +149,7 @@
           };
 
           checks = {
-            inherit web;
+            inherit pluginSdk web;
             clippy = craneLib.cargoClippy (
               commonArgs
               // {
@@ -124,6 +167,8 @@
                   src
                   cargoArtifacts
                   ;
+                # The plugin runner tests drive real TypeScript plugins through real Node.
+                nativeBuildInputs = [ pkgs.nodejs_22 ];
               }
             );
           }
@@ -154,6 +199,9 @@
                 nativeBuildInputs = [
                   pkgs.cargo-mutants
                   pkgs.cargo-nextest
+                  # The plugin runner tests drive real plugins through real Node, so the
+                  # baseline run needs it before any mutant is tried.
+                  pkgs.nodejs_22
                 ];
                 buildPhaseCargoCommand = "cargo mutants --workspace --jobs 4 --timeout 60 --no-shuffle";
                 doInstallCargoArtifacts = false;
@@ -222,9 +270,13 @@
                 enable = true;
                 includes = [
                   "apps/web/**/*.{ts,tsx,css,html,json}"
+                  "packages/plugin-sdk/**/*.{ts,js,mjs,json}"
                   "package.json"
                   "pnpm-workspace.yaml"
                 ];
+                # This fixture does not parse on purpose: the host test proves a plugin
+                # with a syntax error fails with a reason.
+                excludes = [ "packages/plugin-sdk/test/broken/*.ts" ];
               };
               rustfmt.enable = true;
               rustfmt.package = rustToolchain;

@@ -43,4 +43,8 @@ exclude_re = [
   # Without the EOF arm the reader loop cannot advance, so the mutant is only ever seen
   # as a timeout and no test can distinguish it from a hang.
   "crates/mokmok-jobs-s3/src/listing.rs:[0-9]+:.*delete match arm Event::Eof in parse_page",
+  # The child is killed a few lines above, so the wait window is measured from an instant
+  # the child has already exited at. Adding or subtracting the grace changes nothing a
+  # caller can observe: both give a deadline the first `try_wait` passes.
+  "crates/mokmok-control/src/plugin.rs:[0-9]+:.*replace \\+ with - in Spawned::finish",
 ]

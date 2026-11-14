@@ -33,8 +33,12 @@ mod tests {
             extra: &[&str],
         ) -> (Self, SocketAddr) {
             let mut command = Command::new(env!("CARGO_BIN_EXE_mokmok-controld"));
+            // `--scripted` and `--agents` are mutually exclusive, so a caller that names
+            // its own agent table must not also get the scripted one.
+            if !extra.contains(&"--agents") {
+                command.arg("--scripted");
+            }
             command
-                .arg("--scripted")
                 .arg("--bind")
                 .arg("127.0.0.1:0")
                 .arg("--data-dir")
@@ -270,6 +274,167 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["text"], "the scripted agent received the task");
         assert_eq!(entries[1]["title"], "inspect the workspace");
+    }
+
+    #[test]
+    fn the_daemon_runs_a_typescript_plugin_end_to_end() {
+        // The whole feature on the real artifact: a table naming a `.ts` plugin, a task
+        // submitted over HTTP, and the daemon's journal holding what the plugin emitted.
+        let dir = TempDir::new().expect("a temp dir");
+        let workspace = TempDir::new().expect("a workspace");
+        let plugin = dir.path().join("greeting.ts");
+        std::fs::write(
+            &plugin,
+            "import type { Plugin } from '@mokmok/plugin-sdk';\n\
+             const plugin: Plugin = async (context) => {\n\
+               context.emit({ kind: 'message', text: `greeting ${context.task.title}` });\n\
+               context.emit({ kind: 'tool_call', title: 'look around', status: 'completed' });\n\
+               return { kind: 'completed', summary: 'the plugin said hello' };\n\
+             };\n\
+             export default plugin;\n",
+        )
+        .expect("the plugin is written");
+        let table = dir.path().join("agents.json");
+        std::fs::write(
+            &table,
+            format!(
+                r#"{{"agents": {{"hello": {{"transport": "plugin", "entry": {}}}}},
+                    "default": "hello"}}"#,
+                serde_json::to_string(&plugin.display().to_string()).expect("the path encodes")
+            ),
+        )
+        .expect("the table is written");
+
+        let (_daemon, address) = Daemon::spawn_with(
+            &dir,
+            &[
+                "--agents",
+                &table.display().to_string(),
+                "--workspace-root",
+                &workspace.path().display().to_string(),
+            ],
+        );
+
+        // The plugin appears in the agent listing because it is an entry in the table.
+        let (status, body) = request(address, "GET", "/api/agents", None);
+        assert_eq!(status, 200);
+        let listing: Value = serde_json::from_str(&body).expect("the listing is JSON");
+        assert_eq!(listing["agents"], serde_json::json!(["hello"]));
+        assert_eq!(listing["default"], "hello");
+
+        let (status, body) = request(
+            address,
+            "POST",
+            "/api/tasks",
+            Some(&format!(
+                r#"{{"title":"Say hello","instruction":"Greet the user.","agent":"hello",
+                    "workspace":{}}}"#,
+                serde_json::to_string(&workspace.path().display().to_string())
+                    .expect("the path encodes")
+            )),
+        );
+        assert_eq!(status, 201, "{body}");
+        let created: Value = serde_json::from_str(&body).expect("the answer is JSON");
+        let id = created["id"]
+            .as_str()
+            .expect("the answer carries an id")
+            .to_owned();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let detail = loop {
+            let (status, body) = request(address, "GET", &format!("/api/tasks/{id}"), None);
+            assert_eq!(status, 200);
+            let detail: Value = serde_json::from_str(&body).expect("the detail is JSON");
+            if detail["state"]["status"] == "completed" {
+                break detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the plugin task never completed: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(detail["state"]["outcome"], "the plugin said hello");
+
+        let (status, body) = request(address, "GET", &format!("/api/tasks/{id}/journal"), None);
+        assert_eq!(status, 200);
+        let journal: Value = serde_json::from_str(&body).expect("the journal is JSON");
+        let entries = journal["entries"]
+            .as_array()
+            .expect("the transcript is a list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["kind"], "message");
+        assert_eq!(entries[0]["text"], "greeting Say hello");
+        assert_eq!(entries[1]["kind"], "tool_call");
+        assert_eq!(entries[1]["title"], "look around");
+    }
+
+    #[test]
+    fn a_plugin_task_that_throws_is_reported_failed_over_http() {
+        let dir = TempDir::new().expect("a temp dir");
+        let workspace = TempDir::new().expect("a workspace");
+        let plugin = dir.path().join("broken.ts");
+        std::fs::write(
+            &plugin,
+            "export default async function () {\n\
+               throw new Error('the plugin gave up');\n\
+             }\n",
+        )
+        .expect("the plugin is written");
+        let table = dir.path().join("agents.json");
+        std::fs::write(
+            &table,
+            format!(
+                r#"{{"agents": {{"broken": {{"transport": "plugin", "entry": {}}}}}}}"#,
+                serde_json::to_string(&plugin.display().to_string()).expect("the path encodes")
+            ),
+        )
+        .expect("the table is written");
+
+        let (_daemon, address) = Daemon::spawn_with(
+            &dir,
+            &[
+                "--agents",
+                &table.display().to_string(),
+                "--workspace-root",
+                &workspace.path().display().to_string(),
+            ],
+        );
+        let (status, body) = request(
+            address,
+            "POST",
+            "/api/tasks",
+            Some(&format!(
+                r#"{{"title":"Break","instruction":"Fail.","agent":"broken","workspace":{}}}"#,
+                serde_json::to_string(&workspace.path().display().to_string())
+                    .expect("the path encodes")
+            )),
+        );
+        assert_eq!(status, 201);
+        let created: Value = serde_json::from_str(&body).expect("the answer is JSON");
+        let id = created["id"]
+            .as_str()
+            .expect("the answer carries an id")
+            .to_owned();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) = request(address, "GET", &format!("/api/tasks/{id}"), None);
+            assert_eq!(status, 200);
+            let detail: Value = serde_json::from_str(&body).expect("the detail is JSON");
+            if detail["state"]["status"] == "failed" {
+                let outcome = detail["state"]["outcome"]
+                    .as_str()
+                    .expect("a failed task carries its reason");
+                assert!(outcome.contains("the plugin gave up"), "{outcome}");
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the plugin task never failed: {body}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     // An `Sse` body over the daemon's own broadcast sender never ends, so this is the
