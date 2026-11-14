@@ -10,10 +10,13 @@
 //! journal port and its event type are re-exported from [`mokmok_journal`] because
 //! this crate's API exposes them. The rest of the journal crate is used directly.
 
+mod dispatch;
+mod plugin;
 mod runner;
 mod supervisor;
 mod system;
 
+pub use dispatch::AgentRunner;
 pub use mokmok_control_core::{
     AgentUpdate, CloudEvent, ControlCommand, ControlError, ControlEvent, DEFAULT_PROMPT_BYTES,
     EnumerableStore, EventStore, EventType, MAX_PROMPT_BYTES, MAX_UPDATES, PromptInput, SOURCE,
@@ -21,6 +24,7 @@ pub use mokmok_control_core::{
     Version, check_append, compose_prompt, decide, evolve, validate_history,
 };
 pub use mokmok_journal::{Journal, JournalEvent};
+pub use plugin::{DEFAULT_PLUGIN_TIMEOUT, PluginHost, PluginRunner};
 pub use runner::{
     AcpRunner, AgentConfig, AgentTable, AgentTransport, ConfigError, FailingRunner, ScriptedRunner,
 };

@@ -11,6 +11,8 @@ members = [
   "crates/mokmok-jobs-memory",
   "crates/mokmok-jobs-s3",
   "crates/mokmok-journal",
+  "crates/mokmok-plugin-addon",
+  "crates/mokmok-plugin-protocol",
   "crates/mokmok-proofs",
 ]
 resolver = "3"
@@ -34,7 +36,12 @@ mokmok-jobs-jsonl = { path = "crates/mokmok-jobs-jsonl" }
 mokmok-jobs-memory = { path = "crates/mokmok-jobs-memory" }
 mokmok-jobs-s3 = { path = "crates/mokmok-jobs-s3" }
 mokmok-journal = { path = "crates/mokmok-journal" }
+mokmok-plugin-addon = { path = "crates/mokmok-plugin-addon" }
+mokmok-plugin-protocol = { path = "crates/mokmok-plugin-protocol" }
 mokmok-proofs = { path = "crates/mokmok-proofs" }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-build = "2"
+napi-derive = "3"
 proptest = "1.12.0"
 quick-xml = "0.41.0"
 rustls = { version = "0.23", default-features = false, features = [
