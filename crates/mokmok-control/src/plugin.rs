@@ -215,6 +215,9 @@ struct Spawned {
     // Kept alive for the whole run: the child reads this file as it starts.
     _host_file: HostFile,
     timeout: Duration,
+    // How long a cancelled host may run before it is killed. A field so a test can
+    // shorten it: the real value is five seconds, which no test should have to wait.
+    grace: Duration,
     end: Option<PluginOutcome>,
     broken: Option<String>,
     timed_out: bool,
@@ -264,6 +267,7 @@ impl Spawned {
             reader: Some(reader),
             _host_file: host_file,
             timeout,
+            grace: CANCEL_GRACE,
             end: None,
             broken: None,
             timed_out: false,
@@ -304,7 +308,13 @@ impl Spawned {
         let mut cancelled_at: Option<Instant> = None;
         loop {
             let now = Instant::now();
-            match next_step(deadline, cancelled_at, now, reporter.cancelled()) {
+            match next_step(
+                deadline,
+                cancelled_at,
+                now,
+                reporter.cancelled(),
+                self.grace,
+            ) {
                 Step::TimedOut => {
                     self.timed_out = true;
                     self.kill();
@@ -408,7 +418,7 @@ impl Spawned {
         if self.end.is_none() {
             self.kill();
         }
-        let status = self.wait_until(Instant::now() + CANCEL_GRACE);
+        let status = self.wait_until(Instant::now() + self.grace);
         // The reader ends when the child's stdout closes. A child that outlived the kill
         // still holds it open, so joining would block for as long as that child runs; the
         // run is already reported broken, and the thread dies with the process.
@@ -509,6 +519,7 @@ fn next_step(
     cancelled_at: Option<Instant>,
     now: Instant,
     human_cancelled: bool,
+    grace: Duration,
 ) -> Step {
     if now >= deadline {
         return Step::TimedOut;
@@ -520,7 +531,7 @@ fn next_step(
             Step::Wait((deadline - now).min(CANCEL_POLL))
         };
     }
-    if cancelled_at.is_some_and(|at| now.saturating_duration_since(at) >= CANCEL_GRACE) {
+    if cancelled_at.is_some_and(|at| now.saturating_duration_since(at) >= grace) {
         return Step::Kill;
     }
     Step::KeepGoing
@@ -777,6 +788,11 @@ mod process_tests {
     use super::*;
     use crate::supervisor::Reporter;
 
+    /// A grace short enough that the suite, and every mutant run of it, stays fast.
+    ///
+    /// The production five seconds is the same code path; only the length changes.
+    const FAST_GRACE: Duration = Duration::from_millis(100);
+
     /// Records what the runner told it, and reports a cancel on demand.
     struct Watcher {
         cancelled: std::sync::atomic::AtomicBool,
@@ -862,6 +878,7 @@ mod process_tests {
             reader: Some(reader),
             _host_file: host_file,
             timeout,
+            grace: CANCEL_GRACE,
             end: None,
             broken: None,
             timed_out: false,
@@ -909,6 +926,7 @@ mod process_tests {
     #[test]
     fn a_cancelled_run_is_reported_cancelled() {
         let mut run = spawned("read line; sleep 30", Duration::from_secs(10));
+        run.grace = FAST_GRACE;
         let watcher = Watcher::new();
         watcher.stop();
         assert!(matches!(
@@ -922,12 +940,13 @@ mod process_tests {
         // The script never reads stdin and never exits, so only the grace can end it.
         let started = Instant::now();
         let mut run = spawned("trap '' TERM INT; sleep 300", Duration::from_secs(120));
+        run.grace = FAST_GRACE;
         let watcher = Watcher::new();
         watcher.stop();
         let settled = finish_within(&mut run, &watcher, Duration::from_secs(30));
         assert!(matches!(settled, Settled::Cancelled), "{settled:?}");
         assert!(
-            started.elapsed() < CANCEL_GRACE + Duration::from_secs(10),
+            started.elapsed() < FAST_GRACE + Duration::from_secs(10),
             "the grace bounded the run, took {:?}",
             started.elapsed()
         );
@@ -995,7 +1014,7 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, Duration::from_secs(60));
         assert_eq!(
-            next_step(deadline, None, start, false),
+            next_step(deadline, None, start, false, CANCEL_GRACE),
             Step::Wait(CANCEL_POLL)
         );
     }
@@ -1005,7 +1024,7 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, Duration::from_millis(10));
         assert_eq!(
-            next_step(deadline, None, start, false),
+            next_step(deadline, None, start, false, CANCEL_GRACE),
             Step::Wait(Duration::from_millis(10))
         );
     }
@@ -1015,10 +1034,19 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, CANCEL_GRACE);
         assert_eq!(
-            next_step(deadline, None, at(deadline, Duration::from_nanos(1)), false),
+            next_step(
+                deadline,
+                None,
+                at(deadline, Duration::from_nanos(1)),
+                false,
+                CANCEL_GRACE
+            ),
             Step::TimedOut
         );
-        assert_eq!(next_step(deadline, None, deadline, false), Step::TimedOut);
+        assert_eq!(
+            next_step(deadline, None, deadline, false, CANCEL_GRACE),
+            Step::TimedOut
+        );
     }
 
     #[test]
@@ -1029,7 +1057,13 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, CANCEL_GRACE);
         assert_eq!(
-            next_step(deadline, Some(at(start, CANCEL_GRACE)), deadline, true),
+            next_step(
+                deadline,
+                Some(at(start, CANCEL_GRACE)),
+                deadline,
+                true,
+                CANCEL_GRACE
+            ),
             Step::TimedOut
         );
     }
@@ -1039,12 +1073,18 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, Duration::from_secs(60));
         assert_eq!(
-            next_step(deadline, None, start, true),
+            next_step(deadline, None, start, true, CANCEL_GRACE),
             Step::CancelNow,
             "the first turn after a cancel sends the frame"
         );
         assert_eq!(
-            next_step(deadline, Some(start), at(start, CANCEL_POLL), true),
+            next_step(
+                deadline,
+                Some(start),
+                at(start, CANCEL_POLL),
+                true,
+                CANCEL_GRACE
+            ),
             Step::KeepGoing,
             "a second turn does not resend it"
         );
@@ -1059,11 +1099,23 @@ mod timing_tests {
             .checked_sub(Duration::from_millis(1))
             .expect("the grace is longer than a millisecond");
         assert_eq!(
-            next_step(deadline, cancelled, at(start, just_under), true),
+            next_step(
+                deadline,
+                cancelled,
+                at(start, just_under),
+                true,
+                CANCEL_GRACE
+            ),
             Step::KeepGoing
         );
         assert_eq!(
-            next_step(deadline, cancelled, at(start, CANCEL_GRACE), true),
+            next_step(
+                deadline,
+                cancelled,
+                at(start, CANCEL_GRACE),
+                true,
+                CANCEL_GRACE
+            ),
             Step::Kill
         );
     }
@@ -1075,7 +1127,13 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, Duration::from_secs(60));
         assert_eq!(
-            next_step(deadline, Some(start), at(start, CANCEL_GRACE), false),
+            next_step(
+                deadline,
+                Some(start),
+                at(start, CANCEL_GRACE),
+                false,
+                CANCEL_GRACE
+            ),
             Step::Kill
         );
     }
@@ -1085,7 +1143,7 @@ mod timing_tests {
         let start = Instant::now();
         let deadline = at(start, Duration::from_secs(60));
         assert_eq!(
-            next_step(deadline, Some(start), deadline, false),
+            next_step(deadline, Some(start), deadline, false, CANCEL_GRACE),
             Step::TimedOut
         );
     }
@@ -1131,6 +1189,7 @@ mod child_tests {
             reader: Some(reader),
             _host_file: host_file,
             timeout: Duration::from_secs(30),
+            grace: CANCEL_GRACE,
             end: None,
             broken: None,
             timed_out: false,
@@ -1257,6 +1316,7 @@ mod reap_tests {
             reader: Some(reader),
             _host_file: host_file,
             timeout: Duration::from_secs(30),
+            grace: CANCEL_GRACE,
             end: None,
             broken: None,
             timed_out: false,
