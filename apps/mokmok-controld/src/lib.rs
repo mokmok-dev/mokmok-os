@@ -1,8 +1,10 @@
 //! The HTTP API of the control plane.
 //!
-//! [`build_router`] serves the same JSON API the `mokmok-controld` binary runs, so a
-//! test drives the whole surface with `tower::ServiceExt::oneshot` instead of a
-//! socket. The browser UI is a separate app under `apps/web`.
+//! [`build_router`] serves the same JSON API the `mokmok-controld` binary runs, and the
+//! pages of [`mokmok_web`] as the fallback, so a test drives the whole surface with
+//! `tower::ServiceExt::oneshot` instead of a socket.
+
+mod web;
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -23,10 +25,13 @@ use mokmok_control::{
     journal_event,
 };
 use mokmok_journal::{Journal, JournalEntry, JournalError, JournalEvent, JournalTail};
+use mokmok_web::port::ControlPlane;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
+
+use crate::web::Plane;
 
 const MAX_BODY_BYTES: usize = 128 * 1024;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -226,6 +231,10 @@ pub fn build_state(
 }
 
 /// Builds the router, its host check, its auth middleware, and the body limit over `state`.
+///
+/// The pages serve every path the JSON API does not, and the `Host` layer wraps both. A
+/// token-protected daemon serves no pages: a browser cannot put the bearer on a form
+/// post, so the page would have to reach the port around the check the API enforces.
 pub fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/agents", get(agents))
@@ -239,10 +248,16 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
 
-    Router::new()
-        .route("/healthz", get(healthz))
-        .merge(api)
-        .layer(middleware::from_fn_with_state(state, require_allowed_host))
+    let router = Router::new().route("/healthz", get(healthz)).merge(api);
+    let served = if state.token.is_some() {
+        router
+    } else {
+        let plane: Arc<dyn ControlPlane> = Arc::new(Plane::new(state.clone()));
+        router.fallback_service(topcoat::router::tower::TowerService::new(
+            mokmok_web::router(plane),
+        ))
+    };
+    served.layer(middleware::from_fn_with_state(state, require_allowed_host))
 }
 
 struct BroadcastPublisher {
@@ -453,15 +468,20 @@ async fn task_journal(
     // so its transcript is still in the domain log; reading it out must not write it
     // back, and a task with both shows only its journal.
     if tail.entries.is_empty() {
-        return Ok(Json(project_updates(&events, limit)));
+        let (entries, total) = project_updates(&events, limit);
+        return Ok(Json(json!({"entries": entries, "total": total})));
     }
     Ok(Json(json!({"entries": tail.entries, "total": tail.total})))
 }
 
+/// The transcript a pre-split log still holds, with the count before the window is cut.
+///
+/// The JSON route formats this and a page reads the entries, so the projection lives here
+/// once instead of twice.
 fn project_updates(
     events: &[CloudEvent<ControlEvent>],
     limit: usize,
-) -> Value {
+) -> (Vec<JournalEntry>, u64) {
     let mut entries = Vec::new();
     for event in events {
         let ControlEvent::UpdateRecorded { update } = &event.data else {
@@ -473,9 +493,9 @@ fn project_updates(
             event: journal_event(update).clipped(),
         });
     }
-    let total = entries.len();
-    entries.drain(..total.saturating_sub(limit));
-    json!({"entries": entries, "total": total})
+    let total = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    entries.drain(..entries.len().saturating_sub(limit));
+    (entries, total)
 }
 
 #[derive(Deserialize, Default)]
