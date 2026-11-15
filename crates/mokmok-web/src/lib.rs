@@ -131,11 +131,7 @@ async fn submit(
             Some("The instruction is empty."),
         ));
     }
-    let agent = form
-        .agent
-        .clone()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| plane.agents().default);
+    let agent = resolve_agent(form.agent.as_deref(), &plane.agents().default).to_owned();
     let session = NewSession::from_form(&instruction, &agent, Some(&workspace));
     match plane.submit(session).await {
         Ok(id) => Ok(redirect(&theme, &workspace, Some(id.as_str()), None)),
@@ -201,6 +197,22 @@ fn back_to(
     format!("/?{query}")
 }
 
+/// The agent a submitted form asks for, falling back to the daemon's default.
+///
+/// A browser submits every field it draws, so an empty string arrives whenever the form
+/// offers no agent at all. Treating it as a name would fail the submission against a table
+/// that has no empty entry.
+#[must_use]
+pub const fn resolve_agent<'a>(
+    asked: Option<&'a str>,
+    default: &'a str,
+) -> &'a str {
+    match asked {
+        Some(name) if !name.is_empty() => name,
+        _ => default,
+    }
+}
+
 /// The status a port failure answers with, for a page that cannot render.
 #[must_use]
 pub const fn status_for(error: &port::PortError) -> StatusCode {
@@ -244,5 +256,181 @@ mod tests {
             status_for(&port::PortError::Unavailable),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn an_agent_name_wins_and_anything_else_takes_the_default() {
+        assert_eq!(resolve_agent(Some("alpha"), "fallback"), "alpha");
+        assert_eq!(resolve_agent(Some(""), "fallback"), "fallback");
+        assert_eq!(resolve_agent(None, "fallback"), "fallback");
+    }
+
+    #[test]
+    fn a_header_map_carries_the_one_entry_it_was_given() {
+        let map = headers("content-type", "text/css; charset=utf-8");
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map.get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/css; charset=utf-8")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stylesheet_request_answers_with_css() {
+        use std::sync::Arc;
+
+        use topcoat::router::{Method, request::Request, tower::TowerService};
+        use tower::util::ServiceExt;
+
+        let plane: Arc<dyn ControlPlane> = Arc::new(NoSessions);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/app.css")
+            .body(topcoat::router::Body::empty());
+        let Ok(request) = request else {
+            panic!("the request builds");
+        };
+        let response = TowerService::new(router(plane))
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|never| match never {});
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/css; charset=utf-8")
+        );
+    }
+
+    /// A control plane with no tasks, so a route test needs no daemon.
+    struct NoSessions;
+
+    impl ControlPlane for NoSessions {
+        fn sessions(&self) -> port::Read<'_, Vec<port::Session>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn session_state(
+            &self,
+            _id: mokmok_control_core::TaskId,
+        ) -> port::Read<'_, port::SessionState> {
+            Box::pin(async { Err(port::PortError::NotFound) })
+        }
+
+        fn transcript(
+            &self,
+            _id: mokmok_control_core::TaskId,
+            _limit: usize,
+        ) -> port::Read<'_, port::Transcript> {
+            Box::pin(async { Err(port::PortError::NotFound) })
+        }
+
+        fn agents(&self) -> port::Agents {
+            port::Agents {
+                names: vec!["local".to_owned()],
+                default: "local".to_owned(),
+            }
+        }
+
+        fn submit(
+            &self,
+            _spec: port::NewSession,
+        ) -> port::Read<'_, mokmok_control_core::TaskId> {
+            Box::pin(async { Ok(mokmok_control_core::TaskId::from_u128(1)) })
+        }
+
+        fn cancel(
+            &self,
+            _id: mokmok_control_core::TaskId,
+            _reason: String,
+        ) -> port::Read<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_agent_field_falls_back_to_the_default_agent() {
+        use std::sync::{Arc, Mutex};
+
+        use topcoat::router::{Method, request::Request, tower::TowerService};
+        use tower::util::ServiceExt;
+
+        #[derive(Default)]
+        struct Recording {
+            submitted: Mutex<Vec<String>>,
+        }
+
+        impl ControlPlane for Recording {
+            fn sessions(&self) -> port::Read<'_, Vec<port::Session>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn session_state(
+                &self,
+                _id: mokmok_control_core::TaskId,
+            ) -> port::Read<'_, port::SessionState> {
+                Box::pin(async { Err(port::PortError::NotFound) })
+            }
+
+            fn transcript(
+                &self,
+                _id: mokmok_control_core::TaskId,
+                _limit: usize,
+            ) -> port::Read<'_, port::Transcript> {
+                Box::pin(async { Err(port::PortError::NotFound) })
+            }
+
+            fn agents(&self) -> port::Agents {
+                port::Agents {
+                    names: vec!["local".to_owned(), "fallback".to_owned()],
+                    default: "fallback".to_owned(),
+                }
+            }
+
+            fn submit(
+                &self,
+                spec: port::NewSession,
+            ) -> port::Read<'_, mokmok_control_core::TaskId> {
+                if let Ok(mut held) = self.submitted.lock() {
+                    held.push(spec.agent);
+                }
+                Box::pin(async { Ok(mokmok_control_core::TaskId::from_u128(1)) })
+            }
+
+            fn cancel(
+                &self,
+                _id: mokmok_control_core::TaskId,
+                _reason: String,
+            ) -> port::Read<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let plane = Arc::new(Recording::default());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/sessions")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(topcoat::router::Body::from(
+                "instruction=do+it&agent=&workspace=%2Fw&theme=dark".to_owned(),
+            ));
+        let Ok(request) = request else {
+            panic!("the request builds");
+        };
+        let response = TowerService::new(router(Arc::clone(&plane) as Arc<dyn ControlPlane>))
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|never| match never {});
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let submitted = plane
+            .submitted
+            .lock()
+            .map(|held| held.clone())
+            .unwrap_or_default();
+        assert_eq!(submitted, vec!["fallback".to_owned()]);
     }
 }

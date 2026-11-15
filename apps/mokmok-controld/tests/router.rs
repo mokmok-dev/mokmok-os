@@ -530,6 +530,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_page_offers_every_agent_and_selects_the_default() {
+        let dir = TempDir::new().expect("a temp dir");
+        let runner = ScriptedRunner::new(Vec::new(), SCRIPTED_SUMMARY);
+        let store: Arc<dyn EnumerableStore<TaskId, ControlEvent>> = Arc::new(
+            JsonlEventStore::<TaskId, ControlEvent>::open(dir.path().join("tasks"))
+                .expect("the store opens"),
+        );
+        let state = build_state(
+            store,
+            Arc::new(MemoryJournal::new()),
+            Arc::new(runner),
+            ControlConfig {
+                agents: vec!["alpha".to_owned(), "scripted".to_owned()],
+                default_agent: "scripted".to_owned(),
+                transport_hosts: Vec::new(),
+                allowed_hosts: allowed_hosts(
+                    "127.0.0.1:8787".parse().expect("a loopback address"),
+                    &[],
+                ),
+                workers: 1,
+                token: None,
+            },
+        );
+
+        let reply = get(&state, "/").await;
+
+        // The composer's options come from the port, so a page that reports its own default
+        // instead of the table would offer one agent and preselect the wrong one.
+        assert!(reply.body.contains("value=\"alpha\""), "{}", reply.body);
+        assert!(
+            reply
+                .body
+                .contains("<option value=\"scripted\" selected=\"selected\">"),
+            "{}",
+            reply.body
+        );
+    }
+
+    #[tokio::test]
     async fn the_page_form_refuses_an_unlisted_agent() {
         let dir = TempDir::new().expect("a temp dir");
         let state = scripted_state(&dir, None);

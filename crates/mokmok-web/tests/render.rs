@@ -57,6 +57,53 @@ impl Fake {
             .map_or_else(|| TaskId::from_u128(1), |session| session.id.clone())
     }
 
+    /// Two tasks in one workspace, so a test can tell a marked row from an unmarked one.
+    fn with_two_sessions() -> Self {
+        let mut fake = Self::with_session(TaskStatus::Completed);
+        fake.sessions.push(Session {
+            id: TaskId::from_u128(2),
+            title: "second instruction".to_owned(),
+            instruction: "second instruction".to_owned(),
+            instruction_truncated: false,
+            status: TaskStatus::Completed,
+            agent: "local".to_owned(),
+            workspace: Some("/srv/one".to_owned()),
+            outcome: None,
+            updates: Some(1),
+        });
+        fake
+    }
+
+    /// Two tasks in two workspaces, so a test can tell which group the page picks.
+    fn with_two_workspaces() -> Self {
+        let mut fake = Self::with_session(TaskStatus::Completed);
+        fake.sessions = vec![
+            Session {
+                id: TaskId::from_u128(1),
+                title: "alpha task".to_owned(),
+                instruction: "alpha task".to_owned(),
+                instruction_truncated: false,
+                status: TaskStatus::Completed,
+                agent: "local".to_owned(),
+                workspace: Some("/srv/alpha".to_owned()),
+                outcome: None,
+                updates: Some(1),
+            },
+            Session {
+                id: TaskId::from_u128(2),
+                title: "beta task".to_owned(),
+                instruction: "beta task".to_owned(),
+                instruction_truncated: false,
+                status: TaskStatus::Completed,
+                agent: "local".to_owned(),
+                workspace: Some("/srv/beta".to_owned()),
+                outcome: None,
+                updates: Some(1),
+            },
+        ];
+        fake
+    }
+
     fn submitted(&self) -> Vec<NewSession> {
         self.submitted
             .lock()
@@ -374,4 +421,81 @@ async fn a_request_without_a_workspace_shows_the_first_group() {
 
     assert!(body.contains("the agent answered"), "{body}");
     assert!(body.contains("workspace-path\">/srv/one"), "{body}");
+}
+
+#[tokio::test]
+async fn the_asked_workspace_wins_over_the_first_group() {
+    let (_, _, body) = send(
+        Arc::new(Fake::with_two_workspaces()),
+        Method::GET,
+        "/?workspace=/srv/beta",
+        None,
+    )
+    .await;
+
+    assert!(body.contains("workspace-path\">/srv/beta"), "{body}");
+    assert!(body.contains("session-heading\">beta task"), "{body}");
+    // The composer posts the shown workspace, so its field is the path, not an empty one
+    // that would create the next task outside the workspace on screen.
+    assert!(body.contains("value=\"/srv/beta\""), "{body}");
+    assert!(!body.contains("value=\"/srv/alpha\""), "{body}");
+}
+
+#[tokio::test]
+async fn a_query_for_an_unknown_workspace_still_shows_a_group() {
+    let (_, _, body) = send(
+        Arc::new(Fake::with_two_workspaces()),
+        Method::GET,
+        "/?workspace=/srv/nowhere",
+        None,
+    )
+    .await;
+
+    // The fallback is the first group, so the pane is never blank while a task exists.
+    assert!(body.contains("workspace-path\">/srv/alpha"), "{body}");
+}
+
+#[tokio::test]
+async fn only_the_selected_session_carries_the_marker() {
+    let selected = "00000000-0000-0000-0000-000000000001";
+    let (_, _, body) = send(
+        Arc::new(Fake::with_two_sessions()),
+        Method::GET,
+        &format!("/?workspace=/srv/one&session={selected}"),
+        None,
+    )
+    .await;
+
+    // Two rows, and the marker sits on the asked one rather than on a neighbour, so a
+    // marker that lands on the wrong row fails here.
+    assert_eq!(body.matches("class=\"session-item\"").count(), 2, "{body}");
+    assert_eq!(body.matches("aria-current=\"page\"").count(), 1, "{body}");
+    let marked = format!("session={selected}&amp;theme=dark\" aria-current=\"page\"");
+    assert!(body.contains(&marked), "{body}");
+    assert_eq!(body.matches("data-selected=\"true\"").count(), 1, "{body}");
+}
+
+#[tokio::test]
+async fn the_theme_toggle_offers_the_other_theme() {
+    let dark = send(
+        Arc::new(Fake::with_session(TaskStatus::Completed)),
+        Method::GET,
+        "/",
+        None,
+    )
+    .await
+    .2;
+    assert!(dark.contains("href=\"/?theme=light\""), "{dark}");
+    assert!(dark.contains(">Light</a>"), "{dark}");
+
+    let light = send(
+        Arc::new(Fake::with_session(TaskStatus::Completed)),
+        Method::GET,
+        "/?theme=light",
+        None,
+    )
+    .await
+    .2;
+    assert!(light.contains("href=\"/?theme=dark\""), "{light}");
+    assert!(light.contains(">Dark</a>"), "{light}");
 }
