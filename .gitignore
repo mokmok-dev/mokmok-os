@@ -10,4 +10,3 @@ apps/web/coverage/
 apps/web/.stryker-tmp/
 apps/web/reports/
 apps/web/*.tsbuildinfo
-packages/*/.addon/
