@@ -66,7 +66,7 @@ with the header when a token is set.
 Checks for the page:
 
 ```
-cargo nextest run -p mokmok-web
+cargo test -p mokmok-web
 cargo clippy -p mokmok-web --all-targets -- --deny warnings
 ```
 
