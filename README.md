@@ -35,111 +35,35 @@ where the task runs, and it must be an absolute path the daemon accepts.
 
 The pages read `ControlPlane`, a small port in `crates/mokmok-web/src/port.rs`, and
 `apps/mokmok-controld/src/web.rs` implements it over the daemon's state with the same read
-permits and blocking threads the JSON API uses. A token-protected daemon serves no pages:
-a browser cannot put a bearer token on a form post, so the page would otherwise reach the
-port around the check the API enforces. Start the daemon on loopback without a token, or
-reach the API directly when one is set.
+permits and blocking threads the JSON API uses.
 
 [topcoat]: https://github.com/tokio-rs/topcoat
 
-## React app
+## Deployment
 
-`apps/web` is the earlier pnpm-workspace app (React, Vite, Effect, TanStack Query and
-TanStack AI, with Kumo components). It talks to the same API. Node 22 and pnpm 10 come from
-the dev shell:
-
-```
-nix develop
-pnpm install
-pnpm --filter @mokmok/web dev
-```
-
-Run the daemon beside it:
-
-```
-nix run .#default -- --scripted --data-dir "$(mktemp -d)"
-```
-
-Then open `http://127.0.0.1:5173`. Vite proxies `/api` to
-`MOKMOK_CONTROL_URL` (default `http://127.0.0.1:8787`), both while developing and from
-`vite preview`, so the browser talks to one origin.
-
-For production, build the static bundle and serve `apps/web/dist` behind a reverse
-proxy that forwards `/api` to the daemon on the same origin:
-
-```
-pnpm --filter @mokmok/web build
-```
+The daemon serves the page and `/api` from one origin, so a reverse proxy forwards both
+and needs no separate static root:
 
 ```nginx
 server {
   listen 8080;
-  root /srv/mokmok-web; # apps/web/dist
 
   location / {
-    try_files $uri /index.html;
-  }
-
-  location /api/ {
     proxy_pass http://127.0.0.1:8787;
     proxy_set_header Host 127.0.0.1:8787;
   }
 }
 ```
 
-The proxy must pass a `Host` value the daemon allows. The loopback form above always
-is; a proxy that forwards the public name instead needs `--allowed-host control.example`.
-A `--bind` address that is not loopback requires `MOKMOK_CONTROL_TOKEN`; set the same
-token in the UI's Connection settings.
+The proxy must pass a `Host` value the daemon allows. The loopback form above always is;
+a proxy that forwards the public name instead needs `--allowed-host control.example`.
 
-The daemon has no CORS layer, so the React app and `/api` must share an origin, either
-directly or through the proxy above. `VITE_CONTROL_PLANE_URL` is the build-time fallback
-for the API origin when no runtime setting is stored; it must point at that same origin
-(or a proxy), not at a separate daemon host. An invalid runtime or build-time URL is
-reported in a configuration banner instead of being used silently. The runtime setting in
-Connection settings wins over the build-time default.
+A `--bind` address that is not loopback requires `MOKMOK_CONTROL_TOKEN`, and a daemon with
+a token serves the API only: a browser cannot put a bearer on a form post, so the page
+would otherwise reach the port around the check the API enforces. Reach the API directly
+with the header when a token is set.
 
-A bearer token is kept in `sessionStorage` (`mokmok.control.token`) as
-`{origin, token}` and sent as an `Authorization: Bearer` header; it is never written to
-`localStorage`, a URL, or a log. A token whose origin does not match the loaded base URL
-is ignored and cleared, and changing the origin in the dialog clears it on blur or Save,
-so it is never sent to a new host. The base URL setting lives in `localStorage` under
-`mokmok.connection.v1`, and saved workspaces under `mokmok.workspaces.v1`.
-
-Control-plane requests use a request timeout, 30 s by default. A timed-out submission
-may still have been accepted by the daemon, so check the sidebar before resending: the
-React app's 2 s task poll is how the workspace reconciles the listing with the daemon.
-
-The React app follows a Codex/Claude-style layout: a sidebar groups sessions by workspace,
-and the chat pane streams the selected workspace's transcript. One session is one
-delegated task. A follow-up message starts a new session in the same workspace, and the
-sidebar keeps every turn of that workspace together. The agent receives only the new
-instruction; earlier turns are workspace context for you, not a continuation of the
-agent's conversation. A failed or cancelled session renders its outcome under the
-assistant turn.
-
-The listing row carries the id, title, instruction preview, status, workspace, and
-outcome, so grouping and the user turn need no detail read. The instruction preview is
-capped at 4096 bytes on a character boundary plus an ellipsis; the task detail endpoint
-carries the full instruction, and the UI derives the preview and its note from the text
-itself. The daemon also reports the agent, transport host, journal count, and
-`instruction_truncated` for other clients, which the UI ignores. The UI reads one journal
-per session in the visible workspace, polls it only while that session is submitted or
-running and is not the task the live fetcher is streaming, and lets that fetcher be the
-single journal poller for the live task. Finishing a run invalidates the persisted
-journal. A failed transcript read keeps the session listed, shows a per-session error
-with a retry action, and keeps the last successful data.
-
-Checks for the app:
-
-```
-pnpm --filter @mokmok/web test
-pnpm --filter @mokmok/web typecheck
-pnpm --filter @mokmok/web build
-pnpm --filter @mokmok/web mutate
-```
-
-Checks for the server-rendered page:
+Checks for the page:
 
 ```
 cargo nextest run -p mokmok-web
@@ -150,13 +74,11 @@ cargo clippy -p mokmok-web --all-targets -- --deny warnings
 markup a browser receives: the listing, the selected transcript, the empty state, the
 failure banner, the form redirects, and the refusal of a cross-origin post.
 
-The React app lives in `apps/web`, and the Nix flake builds it as `packages.web` with the
-same typecheck, test, and build steps. `checks.webMutants` runs the Stryker gate on
-Linux. Mutation testing covers `src/domain`, `src/api`, `src/format.ts`, and
-`src/theme.ts`; it uses `vitest.mutation.config.ts`, which runs the unit tests only and
-takes about three minutes instead of replaying the app flows for every mutant. The
-components and `App.tsx` are covered by the app-level flows in
-`src/tests/app.test.tsx` instead.
+The page renders what the listing and the journal already carry. The instruction preview
+is capped at 4096 bytes on a character boundary plus an ellipsis, and the page notes when
+it shows a preview. A session that is queued or running carries a two-second refresh, and
+a finished one does not. A failed transcript read keeps the session in the sidebar and
+reports the reason in the page's banner.
 
 To run real agents, pass a JSON table with `--agents FILE`:
 
