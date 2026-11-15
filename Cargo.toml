@@ -12,6 +12,7 @@ members = [
   "crates/mokmok-jobs-s3",
   "crates/mokmok-journal",
   "crates/mokmok-proofs",
+  "crates/mokmok-web",
 ]
 resolver = "3"
 
@@ -35,6 +36,7 @@ mokmok-jobs-memory = { path = "crates/mokmok-jobs-memory" }
 mokmok-jobs-s3 = { path = "crates/mokmok-jobs-s3" }
 mokmok-journal = { path = "crates/mokmok-journal" }
 mokmok-proofs = { path = "crates/mokmok-proofs" }
+mokmok-web = { path = "crates/mokmok-web" }
 proptest = "1.12.0"
 quick-xml = "0.41.0"
 rustls = { version = "0.23", default-features = false, features = [
@@ -58,6 +60,11 @@ tokio = { version = "1", features = [
   "time",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+topcoat = { version = "0.12.1", default-features = false, features = [
+  "router",
+  "tower",
+  "view",
+] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
