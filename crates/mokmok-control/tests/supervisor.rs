@@ -49,9 +49,11 @@ mod tests {
         id: &TaskId,
         status: TaskStatus,
     ) {
-        // A busy host stretches a run well past 10 s; the bound stays under cargo-mutants'
-        // 60 s, so a real hang still fails here.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // The longest run these tests ask for holds the runner 200 ms, and the whole
+        // binary finishes in 0.3 s on one busy core. Eight tests reach this deadline
+        // together when a mutant stops the worker, so a longer bound overruns the 60 s
+        // cargo-mutants allows a mutant and the gate reports a timeout it cannot judge.
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if system.state(id).is_ok_and(|state| state.status == status) {
                 return;
