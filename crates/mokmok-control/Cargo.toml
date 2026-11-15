@@ -18,10 +18,6 @@ name = "config"
 path = "tests/config.rs"
 
 [[test]]
-name = "plugin_runner"
-path = "tests/plugin_runner.rs"
-
-[[test]]
 name = "supervisor"
 path = "tests/supervisor.rs"
 
@@ -33,7 +29,6 @@ path = "tests/system.rs"
 mokmok-acp.workspace = true
 mokmok-control-core.workspace = true
 mokmok-journal.workspace = true
-mokmok-plugin-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

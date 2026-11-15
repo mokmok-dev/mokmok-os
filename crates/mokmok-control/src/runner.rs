@@ -36,10 +36,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(50);
 const FLUSH_BYTES: usize = 8 * 1024;
 
 /// The longest assistant text the completed summary carries.
-///
-/// The same bound the plugin contract uses, so one summary length holds whichever runner
-/// produced the task.
-const SUMMARY_BYTES: usize = mokmok_plugin_protocol::MAX_SUMMARY_BYTES;
+const SUMMARY_BYTES: usize = 4 * 1024;
 
 /// The summary used when the agent finishes without having streamed any text.
 const NO_SUMMARY: &str = "the agent finished without a summary";
@@ -54,9 +51,6 @@ const MISSING_WORKSPACE: &str = "the task workspace does not exist";
 const WORKSPACE_NOT_DIRECTORY: &str = "the task workspace is not a directory";
 const WORKSPACE_OUTSIDE_ROOT: &str = "the task workspace is outside the allowed root";
 const BAD_WORKSPACE_ROOT: &str = "the workspace root does not exist";
-
-/// Why an ACP run was asked for a plugin transport.
-const NOT_AN_ACP_TRANSPORT: &str = "the agent table routes this task to a plugin";
 
 /// Runs a fixed transcript and completes at once, for tests and the demo mode.
 #[derive(Clone, Debug)]
@@ -143,15 +137,6 @@ pub enum AgentTransport {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bearer: Option<String>,
     },
-    /// A TypeScript plugin the daemon runs in its own Node process.
-    ///
-    /// `entry` is the plugin's `.ts` file, absolute for the same reason a stdio
-    /// `program` is: the daemon must not resolve it against its own cwd.
-    Plugin {
-        entry: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout_secs: Option<u64>,
-    },
 }
 
 impl fmt::Debug for AgentTransport {
@@ -174,14 +159,6 @@ impl fmt::Debug for AgentTransport {
                 .field("url", &redacted_url(url))
                 .field("secret", &secret.as_ref().map(|_| "<redacted>"))
                 .field("bearer", &bearer.as_ref().map(|_| "<redacted>"))
-                .finish(),
-            Self::Plugin {
-                entry,
-                timeout_secs,
-            } => formatter
-                .debug_struct("Plugin")
-                .field("entry", entry)
-                .field("timeout_secs", timeout_secs)
                 .finish(),
         }
     }
@@ -376,20 +353,6 @@ fn validate_transport(
                 },
             }
         },
-        AgentTransport::Plugin {
-            entry,
-            timeout_secs,
-        } => {
-            if !entry.is_absolute() {
-                return Err(ConfigError::RelativeEntry {
-                    agent: name.to_owned(),
-                    entry: entry.display().to_string(),
-                });
-            }
-            if *timeout_secs == Some(0) {
-                return Err(ConfigError::ZeroTimeout(name.to_owned()));
-            }
-        },
     }
     Ok(())
 }
@@ -434,8 +397,6 @@ pub enum ConfigError {
     InvalidName(String),
     InvalidHost(String),
     RelativeProgram { agent: String, program: String },
-    RelativeEntry { agent: String, entry: String },
-    ZeroTimeout(String),
     InvalidUrl { agent: String },
     InsecureUrl { agent: String },
     UnknownAgent(String),
@@ -469,15 +430,6 @@ impl fmt::Display for ConfigError {
                 formatter,
                 "agent {agent:?} url must start with wss:// (or ws:// on loopback)"
             ),
-            Self::RelativeEntry { agent, entry } => {
-                write!(
-                    formatter,
-                    "agent {agent:?} plugin entry {entry:?} must be absolute"
-                )
-            },
-            Self::ZeroTimeout(agent) => {
-                write!(formatter, "agent {agent:?} timeout_secs must be at least 1")
-            },
             Self::InsecureUrl { agent } => write!(
                 formatter,
                 "agent {agent:?} url must use wss:// unless the host is loopback"
@@ -532,8 +484,19 @@ impl AcpRunner {
         &self,
         spec: &TaskSpec,
     ) -> Result<ConnectionConfig, String> {
-        let transport = resolve_transport(&self.table, spec)?;
-        connection(transport).ok_or_else(|| NOT_AN_ACP_TRANSPORT.to_owned())
+        let config = self
+            .table
+            .resolve(&spec.agent)
+            .map_err(|error| error.to_string())?;
+        let transport = match spec.host.as_deref() {
+            Some(host) => self
+                .table
+                .hosts
+                .get(host)
+                .ok_or_else(|| ConfigError::UnknownHost(host.to_owned()).to_string())?,
+            None => &config.transport,
+        };
+        Ok(connection(transport))
     }
 }
 
@@ -641,36 +604,11 @@ impl Runner for AcpRunner {
     }
 }
 
-// A task's `host`, when it names one, replaces the agent entry's transport; a host the
-// table does not name is an error rather than a silent fallback. Both runners share this
-// so the override rules cannot drift between them.
-pub fn resolve_transport<'a>(
-    table: &'a AgentTable,
-    spec: &TaskSpec,
-) -> Result<&'a AgentTransport, String> {
-    let config = table
-        .resolve(&spec.agent)
-        .map_err(|error| error.to_string())?;
-    spec.host.as_deref().map_or_else(
-        || Ok(&config.transport),
-        |host| {
-            table
-                .hosts
-                .get(host)
-                .ok_or_else(|| ConfigError::UnknownHost(host.to_owned()).to_string())
-        },
-    )
-}
-
-/// The connection an ACP transport describes, or nothing for a plugin transport.
-///
-/// The `Option` is the boundary, not a fallback: a plugin has no ACP connection, and the
-/// caller turns that into the error instead of inventing one.
-fn connection(transport: &AgentTransport) -> Option<ConnectionConfig> {
+fn connection(transport: &AgentTransport) -> ConnectionConfig {
     match transport {
-        AgentTransport::Stdio { program, args } => Some(ConnectionConfig::Stdio(
-            StdioConfig::new(program).args(args),
-        )),
+        AgentTransport::Stdio { program, args } => {
+            ConnectionConfig::Stdio(StdioConfig::new(program).args(args))
+        },
         AgentTransport::WebSocket {
             url,
             secret,
@@ -683,15 +621,14 @@ fn connection(transport: &AgentTransport) -> Option<ConnectionConfig> {
             if let Some(bearer) = bearer {
                 config = config.bearer(bearer);
             }
-            Some(ConnectionConfig::WebSocket(config))
+            ConnectionConfig::WebSocket(config)
         },
-        AgentTransport::Plugin { .. } => None,
     }
 }
 
 // A coding agent works in a real directory on this host, so the workspace is resolved
 // before the session exists and never silently falls back to the daemon's cwd.
-pub fn resolve_workspace(
+fn resolve_workspace(
     workspace: Option<&str>,
     root: Option<&Path>,
 ) -> Result<PathBuf, String> {
