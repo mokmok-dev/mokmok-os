@@ -144,7 +144,6 @@ pub async fn main_header(
 pub async fn chat(
     cx: &Cx,
     turns: Vec<Turn>,
-    has_sessions: bool,
     live_task: Option<String>,
 ) -> Result<impl View> {
     let empty = turns.is_empty();
@@ -153,13 +152,11 @@ pub async fn chat(
             <div class="chat-scroll">
                 <p class="thread-label">"Workspace thread"</p>
                 if empty {
+                    // A group with sessions always selects one, so an empty pane means the
+                    // workspace has no session yet.
                     <div class="empty-state">
                         <h2>"No sessions yet"</h2>
-                        if has_sessions {
-                            <p>"Pick a session on the left, or send an instruction to start one."</p>
-                        } else {
-                            <p>"Send an instruction to start a session in this workspace."</p>
-                        }
+                        <p>"Send an instruction to start a session in this workspace."</p>
                     </div>
                 }
                 <div class="turn-list">
