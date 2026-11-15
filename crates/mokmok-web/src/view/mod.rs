@@ -72,4 +72,20 @@ mod tests {
         assert!(STYLESHEET.contains("html[data-mode='light']"));
         assert!(STYLESHEET.contains("--brand"));
     }
+
+    #[test]
+    fn every_styled_tone_has_a_dot_and_a_badge_rule() {
+        // A status dot and badge carry `tone-<name>`. `Tone::Idle` is absent because
+        // `TaskStatus::New` never reaches a listing row, so no element carries it.
+        for tone in ["active", "success", "danger", "warning"] {
+            assert!(
+                STYLESHEET.contains(&format!(".status-dot.tone-{tone}")),
+                "a dot with tone-{tone} has no rule"
+            );
+            assert!(
+                STYLESHEET.contains(&format!(".badge.tone-{tone}")),
+                "a badge with tone-{tone} has no rule"
+            );
+        }
+    }
 }

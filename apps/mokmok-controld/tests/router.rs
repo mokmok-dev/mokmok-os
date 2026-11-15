@@ -9,8 +9,8 @@ mod tests {
     use axum::http::{HeaderMap, Request, StatusCode, header};
     use http_body_util::BodyExt;
     use mokmok_control::{
-        AgentUpdate, CloudEvent, ControlEvent, EnumerableStore, JournalEvent, Runner,
-        ScriptedRunner, TaskId, TaskSpec, Version,
+        AgentUpdate, CloudEvent, ControlCommand, ControlEvent, EnumerableStore, JournalEvent,
+        Runner, ScriptedRunner, TaskId, TaskSpec, Version,
     };
     use mokmok_controld::{AppState, ControlConfig, allowed_hosts, build_router, build_state};
     use mokmok_jobs_jsonl::JsonlEventStore;
@@ -527,6 +527,89 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("the redirect names a location");
         assert!(location.contains(listed[0].id.as_str()), "{location}");
+    }
+
+    #[tokio::test]
+    async fn the_page_form_carries_its_request_id_into_the_store() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let request_id = "01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60";
+        let form = format!(
+            "instruction=Fix+the+build&agent=scripted&workspace=%2Fwork%2Fdemo\
+             &request_id={request_id}&theme=dark"
+        );
+
+        let first = send(&state, page_post(&form)).await;
+        let second = send(&state, page_post(&form)).await;
+
+        assert_eq!(first.status, StatusCode::SEE_OTHER);
+        assert_eq!(second.status, StatusCode::SEE_OTHER);
+        let listed = state.system.list().expect("the list reads");
+        assert_eq!(listed.len(), 1, "one request id names one task");
+        let location = |reply: &Reply| {
+            reply
+                .headers
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(location(&first).contains(listed[0].id.as_str()));
+        assert_eq!(
+            location(&first),
+            location(&second),
+            "both sends land on the same task"
+        );
+    }
+
+    fn page_post(body: &str) -> Request<Body> {
+        page_post_to("/sessions", body)
+    }
+
+    fn page_post_to(
+        uri: &str,
+        body: &str,
+    ) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_owned()))
+            .expect("the request builds")
+    }
+
+    #[tokio::test]
+    async fn the_page_does_not_cancel_a_finished_task() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let created = post_json(&state, "/api/tasks", &new_task("scripted")).await;
+        let id = created_id(&created);
+        assert_eq!(state.supervisor.run_pending().expect("the task runs"), 1);
+
+        let reply = send(
+            &state,
+            page_post_to(
+                "/sessions/cancel",
+                &format!("task={id}&workspace=%2Fwork&theme=dark"),
+            ),
+        )
+        .await;
+
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        let location = reply
+            .headers
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            location.contains("error=the%20task%20has%20already%20finished"),
+            "the page reports the refusal: {location}"
+        );
+        let detail = get(&state, &format!("/api/tasks/{}", id.as_str())).await;
+        assert_eq!(detail.json()["state"]["status"], json!("completed"));
+        assert_eq!(detail.json()["state"]["outcome"], json!(SCRIPTED_SUMMARY));
     }
 
     #[tokio::test]
@@ -1072,6 +1155,17 @@ mod tests {
         assert_eq!(task["workspace"], json!("/work/demo"));
         assert_eq!(task["instruction"], json!("Make the tests pass."));
         assert_eq!(task["outcome"], json!(SCRIPTED_SUMMARY));
+        let stamp = task["submitted_at"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the listing carries the first record's stamp: {task}"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        assert!(
+            stamp.abs_diff(now) < 86_400,
+            "the stamp is the submission time, not zero or another field: {stamp} against {now}"
+        );
     }
 
     #[tokio::test]
@@ -1387,6 +1481,114 @@ mod tests {
                 .is_some_and(|error| error.contains("title"))
         );
         assert_eq!(state.system.list().expect("the list reads").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_request_id_answers_200_with_the_same_task() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let mut body = new_task("scripted");
+        body["request_id"] = json!("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60");
+
+        let created = post_json(&state, "/api/tasks", &body).await;
+        assert_eq!(created.status, StatusCode::CREATED);
+        let repeated = post_json(&state, "/api/tasks", &body).await;
+
+        assert_eq!(repeated.status, StatusCode::OK);
+        assert_eq!(created_id(&repeated), created_id(&created));
+        assert_eq!(
+            state.system.list().expect("the list reads").len(),
+            1,
+            "a repeat commits no second task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_request_id_answers_200_after_the_task_finished() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let mut body = new_task("scripted");
+        body["request_id"] = json!("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60");
+        let created = post_json(&state, "/api/tasks", &body).await;
+        assert_eq!(created.status, StatusCode::CREATED);
+        assert_eq!(state.supervisor.run_pending().expect("the task runs"), 1);
+
+        // The refusal reason here is `Terminal`, not `AlreadySubmitted`.
+        let repeated = post_json(&state, "/api/tasks", &body).await;
+        assert_eq!(repeated.status, StatusCode::OK);
+        assert_eq!(created_id(&repeated), created_id(&created));
+    }
+
+    #[tokio::test]
+    async fn a_repeated_request_id_answers_200_while_the_task_runs() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let mut body = new_task("scripted");
+        body["request_id"] = json!("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60");
+        let created = post_json(&state, "/api/tasks", &body).await;
+        let id = created_id(&created);
+        let task = TaskId::parse(id.clone()).expect("the id is a uuid");
+        state
+            .system
+            .ask(&task, ControlCommand::Start)
+            .expect("the task starts");
+
+        let repeated = post_json(&state, "/api/tasks", &body).await;
+        assert_eq!(repeated.status, StatusCode::OK);
+        assert_eq!(created_id(&repeated), id);
+        assert_eq!(
+            state.system.state(&task).expect("the task reads").status,
+            mokmok_control::TaskStatus::Running,
+            "the repeat did not move the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_request_id_with_other_content_conflicts() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let mut body = new_task("scripted");
+        body["request_id"] = json!("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60");
+        assert_eq!(
+            post_json(&state, "/api/tasks", &body).await.status,
+            StatusCode::CREATED
+        );
+
+        body["instruction"] = json!("Do something else.");
+        let reply = post_json(&state, "/api/tasks", &body).await;
+
+        assert_eq!(reply.status, StatusCode::CONFLICT);
+        assert_eq!(
+            reply.json()["error"],
+            json!("the request id names a task with different content")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_id_that_is_not_a_uuid_is_rejected() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let mut body = new_task("scripted");
+        body["request_id"] = json!("not-a-uuid");
+
+        let reply = post_json(&state, "/api/tasks", &body).await;
+
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.json()["error"], json!("the request id is not a UUID"));
+        assert_eq!(state.system.list().expect("the list reads").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_submission_without_a_request_id_gets_two_tasks() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+
+        let first = post_json(&state, "/api/tasks", &new_task("scripted")).await;
+        let second = post_json(&state, "/api/tasks", &new_task("scripted")).await;
+
+        assert_eq!(first.status, StatusCode::CREATED);
+        assert_eq!(second.status, StatusCode::CREATED);
+        assert_ne!(created_id(&first), created_id(&second));
     }
 
     #[tokio::test]

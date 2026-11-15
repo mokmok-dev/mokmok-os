@@ -13,7 +13,7 @@ use mokmok_control_core::{
     CloudEvent, ControlCommand, ControlError, ControlEvent, EnumerableStore, StoreError, TaskId,
     TaskSpec, TaskState, TaskStatus, Version, decide, evolve,
 };
-use mokmok_journal::timestamp;
+use mokmok_journal::{parse_timestamp, timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -32,6 +32,23 @@ pub struct NewTask {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// What a submission did: the task's id, and whether this call created it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub id: TaskId,
+    pub created: bool,
+}
+
+/// What a startup scan found: the runs a previous process left open, and the
+/// submissions it committed but never started.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recovery {
+    pub interrupted: Vec<TaskId>,
+    pub submitted: Vec<TaskId>,
 }
 
 /// One row of a task listing.
@@ -54,6 +71,12 @@ pub struct TaskSummary {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// When the first record committed, in epoch seconds, when the store stamped it.
+    ///
+    /// A task named by a client request id is not a `UUIDv7`, so a listing cannot read
+    /// its age from the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<u64>,
     pub updates: u64,
 }
 
@@ -173,6 +196,8 @@ pub enum Error {
     Store(StoreError),
     ActorUnavailable,
     Spawn(String),
+    /// The request id already names a task whose spec differs from this one.
+    RequestConflict(TaskId),
 }
 
 impl fmt::Display for Error {
@@ -185,6 +210,11 @@ impl fmt::Display for Error {
             Self::Store(error) => write!(formatter, "store: {error}"),
             Self::ActorUnavailable => formatter.write_str("task actor is unavailable"),
             Self::Spawn(message) => write!(formatter, "cannot spawn task actor: {message}"),
+            Self::RequestConflict(id) => write!(
+                formatter,
+                "request id already names task {} with different content",
+                id.as_str()
+            ),
         }
     }
 }
@@ -194,7 +224,7 @@ impl std::error::Error for Error {
         match self {
             Self::Control(error) => Some(error),
             Self::Store(error) => Some(error),
-            Self::ActorUnavailable | Self::Spawn(_) => None,
+            Self::ActorUnavailable | Self::Spawn(_) | Self::RequestConflict(_) => None,
         }
     }
 }
@@ -268,20 +298,27 @@ impl ControlSystem {
         }
     }
 
-    /// Creates a task with a fresh `UUIDv7` id and submits it.
+    /// Submits a task, reusing the task a request id already names.
     ///
-    /// The id is returned only after the [`ControlEvent::Submitted`] record is
-    /// durable, so an id a caller holds always names a stream a restart can find.
+    /// The id is returned only after the [`ControlEvent::Submitted`] record is durable,
+    /// so an id a caller holds always names a stream a restart can find. A request id
+    /// that already names a task returns that task with `created` false when its spec
+    /// matches; the same id comes back whether the task is submitted, running, or
+    /// finished.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Control`] when the spec fails validation, and every error
-    /// [`ControlSystem::ask`] reports.
+    /// Returns [`Error::Control`] when the spec fails validation or the request id is not
+    /// a UUID, [`Error::RequestConflict`] when the request id names a task with different
+    /// content, and every error [`ControlSystem::ask`] reports.
     pub fn submit(
         &self,
         new: NewTask,
-    ) -> Result<TaskId, Error> {
-        let id = TaskId::from_uuid(Uuid::now_v7());
+    ) -> Result<Submission, Error> {
+        let id = match new.request_id {
+            Some(request_id) => TaskId::from_request(&request_id)?,
+            None => TaskId::from_uuid(Uuid::now_v7()),
+        };
         let spec = TaskSpec {
             task_id: id.clone(),
             title: new.title,
@@ -290,8 +327,28 @@ impl ControlSystem {
             host: new.host,
             workspace: new.workspace,
         };
-        self.ask(&id, ControlCommand::Submit(spec))?;
-        Ok(id)
+        // Two attempts at most. A conflict means another writer won this stream between
+        // this call's replay and its append, and the retry replays the log, so it lands on
+        // the winner's state and answers from it.
+        let mut retried = false;
+        loop {
+            match self.ask(&id, ControlCommand::Submit(spec.clone())) {
+                Ok(_) => return Ok(Submission { id, created: true }),
+                Err(Error::Store(StoreError::Conflict { .. })) if !retried => retried = true,
+                // The append was refused, so the log is the only witness of what
+                // committed. Reading here and not before keeps a resend from racing the
+                // writer that won.
+                Err(Error::Control(ControlError::AlreadySubmitted | ControlError::Terminal)) => {
+                    let state = self.state(&id)?;
+                    return if state.spec.as_ref() == Some(&spec) {
+                        Ok(Submission { id, created: false })
+                    } else {
+                        Err(Error::RequestConflict(id))
+                    };
+                },
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Sends one command to the task's actor and waits for its reply.
@@ -329,9 +386,11 @@ impl ControlSystem {
         TaskState::replay(&records).map_err(Error::Control)
     }
 
-    /// Summarises every task the store holds, sorted by task id.
+    /// Summarises every task the store holds, newest first.
     ///
-    /// A stream that holds no records has no submission to describe and is skipped.
+    /// A task with no stamp sorts after every stamped one, and the task id breaks any tie in
+    /// ascending order. A stream that holds no records has no submission to describe and is
+    /// skipped.
     ///
     /// # Errors
     ///
@@ -348,6 +407,10 @@ impl ControlSystem {
                 continue;
             };
             let (instruction, instruction_truncated) = listing_instruction(&spec.instruction);
+            let submitted_at = records
+                .first()
+                .and_then(|record| record.time.as_deref())
+                .and_then(parse_timestamp);
             summaries.push(TaskSummary {
                 id,
                 title: spec.title,
@@ -358,26 +421,36 @@ impl ControlSystem {
                 host: spec.host,
                 workspace: spec.workspace,
                 outcome: state.outcome,
+                submitted_at,
                 updates: state.update_count,
             });
         }
+        // This comparator owns the newest-first order; a consumer renders the list in the
+        // order it arrives.
+        summaries.sort_by(|left, right| {
+            right
+                .submitted_at
+                .cmp(&left.submitted_at)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
         Ok(summaries)
     }
 
-    /// Returns every task that is still submitted, skipping a stream that cannot be read
-    /// or replayed.
+    /// Scans the store for the work a previous process left open, skipping a stream that
+    /// cannot be read or replayed.
     ///
-    /// Restart recovery uses this so one damaged stream does not hide the healthy work a
-    /// previous process left behind; [`ControlSystem::list`] stays strict for callers
-    /// that must know the whole store is readable.
+    /// A `Running` task is a run whose process died before it settled; a `Submitted` task
+    /// never started. Restart recovery uses this so one damaged stream does not hide the
+    /// healthy work a previous process left behind; [`ControlSystem::list`] stays strict
+    /// for callers that must know the whole store is readable.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Store`] when the store cannot be enumerated.
-    pub fn submitted(&self) -> Result<Vec<TaskId>, Error> {
+    pub fn recover(&self) -> Result<Recovery, Error> {
         let mut keys = self.inner.store.keys().map_err(Error::Store)?;
         keys.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        let mut submitted = Vec::new();
+        let mut recovery = Recovery::default();
         for id in keys {
             let records = match self.inner.store.load(&id) {
                 Ok(records) => records,
@@ -387,8 +460,16 @@ impl ControlSystem {
                 },
             };
             match TaskState::replay(&records) {
-                Ok(state) if state.status == TaskStatus::Submitted => submitted.push(id),
-                Ok(_) => {},
+                Ok(state) => match state.status {
+                    TaskStatus::Running => recovery.interrupted.push(id),
+                    TaskStatus::Submitted => recovery.submitted.push(id),
+                    // A status a future variant adds has to be listed here to be recovered.
+                    TaskStatus::New
+                    | TaskStatus::Completed
+                    | TaskStatus::Failed
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Interrupted => {},
+                },
                 Err(error) => {
                     tracing::error!(
                         task = id.as_str(),
@@ -398,7 +479,7 @@ impl ControlSystem {
                 },
             }
         }
-        Ok(submitted)
+        Ok(recovery)
     }
 
     // The entries guard orders a command send against retirement's final check: a send
@@ -771,8 +852,10 @@ mod tests {
                 agent: "scripted".to_owned(),
                 host: None,
                 workspace: None,
+                request_id: None,
             })
-            .expect("submit commits");
+            .expect("submit commits")
+            .id;
         let records = store.load(&id).expect("the stream reads");
         let time = records[0].time.as_deref().expect("the record is stamped");
         assert!(time.ends_with('Z'), "{time}");
@@ -794,8 +877,10 @@ mod tests {
                 agent: "scripted".to_owned(),
                 host: None,
                 workspace: None,
+                request_id: None,
             })
-            .expect("submit commits");
+            .expect("submit commits")
+            .id;
         let loads = store.loads.load(Ordering::SeqCst);
 
         system
@@ -856,6 +941,7 @@ mod tests {
             Error::Store(StoreError::Io("the disk is full".to_owned())),
             Error::ActorUnavailable,
             Error::Spawn("thread limit".to_owned()),
+            Error::RequestConflict(TaskId::from_u128(3)),
         ];
         for error in &cases {
             assert!(!error.to_string().is_empty(), "{error:?}");
@@ -864,6 +950,7 @@ mod tests {
         assert!(std::error::Error::source(&cases[1]).is_some());
         assert!(std::error::Error::source(&cases[2]).is_none());
         assert!(std::error::Error::source(&cases[3]).is_none());
+        assert!(std::error::Error::source(&cases[4]).is_none());
     }
 
     #[test]
@@ -881,8 +968,10 @@ mod tests {
                 agent: "scripted".to_owned(),
                 host: None,
                 workspace: None,
+                request_id: None,
             })
-            .expect("submit commits");
+            .expect("submit commits")
+            .id;
         assert_eq!(store.loads.load(Ordering::SeqCst), 1);
 
         let deadline = Instant::now() + Duration::from_secs(5);

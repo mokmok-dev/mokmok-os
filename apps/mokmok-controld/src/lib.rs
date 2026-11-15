@@ -21,8 +21,7 @@ use axum::{Json, Router};
 use futures_util::StreamExt;
 use mokmok_control::{
     CloudEvent, ControlError, ControlEvent, ControlPublisher, ControlSystem, EnumerableStore,
-    Error as SystemError, NewTask, Runner, Supervisor, TaskId, TaskState, TaskStatus,
-    journal_event,
+    Error as SystemError, NewTask, Runner, Supervisor, TaskId, TaskState, journal_event,
 };
 use mokmok_journal::{Journal, JournalEntry, JournalError, JournalEvent, JournalTail};
 use mokmok_web::port::ControlPlane;
@@ -371,12 +370,19 @@ async fn create_task(
             new.agent
         )));
     }
-    let id = state
+    let submitted = state
         .supervisor
         .submit(new)
         .map_err(ApiError::from_system)?;
-    tracing::info!(task = id.as_str(), "task submitted");
-    Ok((StatusCode::CREATED, Json(json!({"id": id}))).into_response())
+    let id = submitted.id;
+    let status = if submitted.created {
+        tracing::info!(task = id.as_str(), "task submitted");
+        StatusCode::CREATED
+    } else {
+        tracing::info!(task = id.as_str(), "task resubmitted");
+        StatusCode::OK
+    };
+    Ok((status, Json(json!({"id": id}))).into_response())
 }
 
 async fn task_detail(
@@ -528,10 +534,7 @@ async fn cancel_task(
     if task.spec.is_none() {
         return Err(ApiError::not_found("no such task"));
     }
-    if matches!(
-        task.status,
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-    ) {
+    if task.status.is_terminal() {
         return Err(ApiError::conflict("the task has already finished"));
     }
     let reason = body
@@ -709,9 +712,15 @@ impl ApiError {
             SystemError::Control(ControlError::InvalidTaskId(_)) => {
                 Self::bad_request("the task id is not a canonical UUID")
             },
+            SystemError::Control(ControlError::InvalidRequestId(_)) => {
+                Self::bad_request("the request id is not a UUID")
+            },
             SystemError::Control(ControlError::NotSubmitted) => Self::not_found("no such task"),
             SystemError::Control(ControlError::Terminal) => {
                 Self::conflict("the task has already finished")
+            },
+            SystemError::RequestConflict(_) => {
+                Self::conflict("the request id names a task with different content")
             },
             SystemError::Store(_) => Self::internal(STORE_FAILED),
             SystemError::Control(_) | SystemError::ActorUnavailable | SystemError::Spawn(_) => {

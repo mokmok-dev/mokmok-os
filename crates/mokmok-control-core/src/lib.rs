@@ -19,6 +19,6 @@ pub use prompt::{
     DEFAULT_PROMPT_BYTES, MAX_PROMPT_BYTES, PromptInput, clip_to_char_boundary, compose_prompt,
 };
 pub use task::{
-    AgentUpdate, ControlCommand, ControlError, ControlEvent, MAX_UPDATES, TaskId, TaskSpec,
-    TaskState, TaskStatus, decide, evolve,
+    AgentUpdate, ControlCommand, ControlError, ControlEvent, INTERRUPTED_REASON, MAX_UPDATES,
+    TaskId, TaskSpec, TaskState, TaskStatus, decide, evolve,
 };

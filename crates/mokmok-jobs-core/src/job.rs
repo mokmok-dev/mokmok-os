@@ -18,6 +18,11 @@ pub enum JobState {
         attempt: u32,
         max_attempts: NonZeroU32,
     },
+    /// A worker holds the input for the attempt in flight.
+    ///
+    /// This crate owns no process, so a `Running` job holds no lease anyone can leak or
+    /// renew. A caller that wants to resume the work after a crash creates a new job with a
+    /// new id.
     Running {
         input: Vec<u8>,
         attempt: u32,

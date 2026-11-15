@@ -193,9 +193,11 @@ where
         let last = check_append(key.as_str(), expected, events)?;
         let mut buffer = Vec::new();
         encode_records(events, &mut buffer)?;
-        file.write_all(&buffer)
-            .map_err(|error| error_at(&path, &error))?;
-        file.sync_data().map_err(|error| error_at(&path, &error))?;
+        // The cache cannot be trusted once this stream's write has failed.
+        if let Err(error) = file.write_all(&buffer).and_then(|()| file.sync_data()) {
+            state.versions.remove(key);
+            return Err(error_at(&path, &error));
+        }
         state.versions.insert(key.clone(), last);
         Ok(last)
     }

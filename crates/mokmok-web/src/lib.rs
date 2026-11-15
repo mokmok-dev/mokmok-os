@@ -52,6 +52,8 @@ pub struct SubmitForm {
     pub instruction: Option<String>,
     pub agent: Option<String>,
     pub workspace: Option<String>,
+    /// The value the composer minted and posted back with the instruction.
+    pub request_id: Option<String>,
     pub theme: Option<String>,
 }
 
@@ -136,7 +138,12 @@ async fn submit(
         .clone()
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| plane.agents().default);
-    let session = NewSession::from_form(&instruction, &agent, Some(&workspace));
+    let session = NewSession::from_form(
+        &instruction,
+        &agent,
+        Some(&workspace),
+        form.request_id.as_deref(),
+    );
     match plane.submit(session).await {
         Ok(id) => Ok(redirect(&theme, &workspace, Some(id.as_str()), None)),
         Err(error) => Ok(redirect(&theme, &workspace, None, Some(&error.to_string()))),

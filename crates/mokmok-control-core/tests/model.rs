@@ -25,6 +25,7 @@ mod tests {
         Complete,
         Fail,
         Cancel,
+        Interrupt,
     }
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -70,6 +71,7 @@ mod tests {
                 Action::Cancel => ControlCommand::Cancel {
                     reason: "stop".to_owned(),
                 },
+                Action::Interrupt => ControlCommand::Interrupt,
             }
         }
 
@@ -104,6 +106,7 @@ mod tests {
                 Action::Complete,
                 Action::Fail,
                 Action::Cancel,
+                Action::Interrupt,
             ] {
                 actions.push(action);
             }
@@ -169,19 +172,27 @@ mod tests {
                     },
                 ),
                 Property::always(
+                    "an interrupted task was started",
+                    |_: &Self, state: &ModelState| {
+                        state.state.status != TaskStatus::Interrupted || Self::started(state)
+                    },
+                ),
+                Property::always(
                     "terminal states have no successor",
                     |model: &Self, state: &ModelState| {
-                        let terminal = matches!(
-                            state.state.status,
-                            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-                        );
-                        !terminal || model.next_states(state).is_empty()
+                        !state.state.status.is_terminal() || model.next_states(state).is_empty()
                     },
                 ),
                 Property::sometimes(
                     "a completed task is reachable",
                     |_: &Self, state: &ModelState| {
                         matches!(state.state.status, TaskStatus::Completed)
+                    },
+                ),
+                Property::sometimes(
+                    "an interrupted task is reachable",
+                    |_: &Self, state: &ModelState| {
+                        matches!(state.state.status, TaskStatus::Interrupted)
                     },
                 ),
             ]

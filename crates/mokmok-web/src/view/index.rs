@@ -184,7 +184,7 @@ pub async fn turn_view(
     turn: Turn,
 ) -> Result<impl View> {
     let parts = turn.parts.clone();
-    let shows_outcome = matches!(turn.status, TaskStatus::Failed | TaskStatus::Cancelled);
+    let shows_outcome = turn.status.is_terminal() && turn.status != TaskStatus::Completed;
     Ok(view! {
         <article
             class="turn"
@@ -225,7 +225,7 @@ pub async fn turn_view(
                 }
                 if shows_outcome {
                     if let Some(outcome) = turn.outcome.clone() {
-                        <p class=(class!("outcome-note", "outcome-warning" if turn.status == TaskStatus::Cancelled))>
+                        <p class=(class!("outcome-note", "outcome-warning" if status_label(turn.status).1 == Tone::Warning))>
                             (outcome)
                         </p>
                     }
@@ -265,10 +265,14 @@ pub async fn composer(
 ) -> Result<impl View> {
     let default = agents.default.clone();
     let theme_value = theme;
+    // Minted per render, so a resubmitted form or a double Send addresses the same task
+    // instead of starting a second one.
+    let request_id = uuid::Uuid::now_v7().to_string();
     Ok(view! {
         <form method="post" action="/sessions" class="composer">
             <div class="composer-inner">
                 <input type="hidden" name="theme" value=(theme_value)>
+                <input type="hidden" name="request_id" value=(request_id)>
                 <label class="visually-hidden" for="composer-input">"Instruction"</label>
                 <textarea
                     id="composer-input"

@@ -121,10 +121,14 @@ pub const fn status_label(status: TaskStatus) -> (&'static str, Tone) {
         TaskStatus::Completed => ("Completed", Tone::Success),
         TaskStatus::Failed => ("Failed", Tone::Danger),
         TaskStatus::Cancelled => ("Cancelled", Tone::Warning),
+        TaskStatus::Interrupted => ("Interrupted", Tone::Warning),
     }
 }
 
 /// Whether a task is queued or running, so a page keeps watching it.
+///
+/// A status this does not name is not active, which is the safe answer for one a page
+/// would otherwise poll forever.
 #[must_use]
 pub const fn is_active(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Submitted | TaskStatus::Running)
@@ -182,6 +186,8 @@ pub fn validate_workspace(path: &str) -> Option<String> {
 ///
 /// Saved paths keep the order the caller lists them in, and a discovered path follows
 /// them sorted, which is what makes a newly used workspace appear in a stable place.
+/// Sessions keep the order the port delivered them in, which is newest first; a sort is
+/// stable, so a port that delivers them oldest first shows its own age order instead.
 #[must_use]
 pub fn group_sessions(
     sessions: Vec<Session>,
@@ -249,22 +255,9 @@ fn session_row(
             session.title.clone()
         },
         status: session.status,
-        age: relative_time(created_at(session.id.as_str()), now),
+        age: relative_time(session.submitted_at, now),
         selected: false,
     }
-}
-
-/// Reads the submission time of a UUID version 7 task id as epoch seconds.
-///
-/// A task id that is not a v7 UUID has no readable time, so it shows `unknown`.
-#[must_use]
-fn created_at(id: &str) -> Option<u64> {
-    let uuid = uuid::Uuid::parse_str(id).ok()?;
-    if uuid.get_version_num() != 7 {
-        return None;
-    }
-    let (seconds, _) = uuid.get_timestamp()?.to_unix();
-    Some(seconds)
 }
 
 /// How long ago a task was submitted, in the coarsest unit that fits.
@@ -368,6 +361,7 @@ mod tests {
             agent: "local".to_owned(),
             workspace: workspace.map(str::to_owned),
             outcome: None,
+            submitted_at: None,
             updates: None,
         }
     }
@@ -436,6 +430,10 @@ mod tests {
     fn a_status_has_a_label_and_a_tone() {
         assert_eq!(status_label(TaskStatus::Running), ("Running", Tone::Active));
         assert_eq!(status_label(TaskStatus::Failed).1, Tone::Danger);
+        assert_eq!(
+            status_label(TaskStatus::Interrupted),
+            ("Interrupted", Tone::Warning)
+        );
         assert_eq!(Tone::Warning.css(), "warning");
     }
 
@@ -445,6 +443,52 @@ mod tests {
         assert!(is_active(TaskStatus::Running));
         assert!(!is_active(TaskStatus::Completed));
         assert!(!is_active(TaskStatus::New));
+        assert!(
+            !is_active(TaskStatus::Interrupted),
+            "a leftover run stopped"
+        );
+    }
+
+    #[test]
+    fn a_group_keeps_the_order_the_port_delivered() {
+        let older = session("00000000-0000-0000-0000-00000000000a", Some("/w"));
+        let newer = session("00000000-0000-0000-0000-00000000000b", Some("/w"));
+        let groups = group_sessions(
+            vec![
+                Session {
+                    submitted_at: Some(1_700_000_100),
+                    ..newer
+                },
+                Session {
+                    submitted_at: Some(1_700_000_000),
+                    ..older
+                },
+            ],
+            &[],
+            now(),
+        );
+        let listed: Vec<&str> = groups[0]
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "00000000-0000-0000-0000-00000000000b",
+                "00000000-0000-0000-0000-00000000000a"
+            ],
+            "the port's newest-first order is what a group shows"
+        );
+    }
+
+    #[test]
+    fn a_session_age_comes_from_the_first_record_not_the_id() {
+        // A client-named task is a v5, which carries no readable time of its own.
+        let mut row = session("041ed7ad-db63-5e84-8d95-23b4dea3e462", Some("/w"));
+        row.submitted_at = Some(now() - 120);
+        let groups = group_sessions(vec![row], &[], now());
+        assert_eq!(groups[0].sessions[0].age, "2m ago");
     }
 
     #[test]
@@ -455,13 +499,6 @@ mod tests {
         assert_eq!(relative_time(Some(base - 7_200), base), "2h ago");
         assert_eq!(relative_time(Some(base - 345_600), base), "4d ago");
         assert_eq!(relative_time(None, base), "unknown");
-    }
-
-    #[test]
-    fn a_task_id_that_is_not_v7_has_no_time() {
-        let v4 = TaskId::from_uuid(uuid::Uuid::from_u128(1));
-        assert_eq!(created_at(v4.as_str()), None);
-        assert_eq!(created_at("not-a-uuid"), None);
     }
 
     #[test]

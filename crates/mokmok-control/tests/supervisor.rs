@@ -3,15 +3,16 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use mokmok_control::{
-        ControlCommand, ControlError, ControlEvent, ControlSystem, Error, FailingRunner, Journal,
-        JournalEvent, NewTask, NoopPublisher, Reporter, RunOutcome, Runner, ScriptedRunner,
-        Supervisor, TaskId, TaskSpec, TaskStatus,
+        CloudEvent, ControlCommand, ControlError, ControlEvent, ControlSystem, EnumerableStore,
+        Error, EventStore, FailingRunner, INTERRUPTED_REASON, Journal, JournalEvent, NewTask,
+        NoopPublisher, Recovery, Reporter, RunOutcome, Runner, ScriptedRunner, StoreError,
+        Supervisor, TaskId, TaskSpec, TaskStatus, Version,
     };
     use mokmok_jobs_jsonl::JsonlEventStore;
     use mokmok_jobs_memory::MemoryEventStore;
@@ -34,6 +35,7 @@ mod tests {
             agent: agent.to_owned(),
             host: None,
             workspace: Some("/work/mokmok".to_owned()),
+            request_id: None,
         }
     }
 
@@ -120,7 +122,7 @@ mod tests {
         ));
         let supervisor = Supervisor::new(system.clone(), runner, journal.clone(), 1);
 
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         assert_eq!(supervisor.run_pending()?, 1);
 
         let state = system.state(&id)?;
@@ -152,7 +154,7 @@ mod tests {
             1,
         );
 
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         assert_eq!(supervisor.run_pending()?, 1);
 
         let state = system.state(&id)?;
@@ -171,7 +173,7 @@ mod tests {
         });
         let supervisor = Supervisor::new(system.clone(), runner, empty_journal(), 1);
 
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         supervisor.cancel(&id, "stop")?;
         assert_eq!(supervisor.run_pending()?, 0);
 
@@ -193,7 +195,7 @@ mod tests {
         });
         let supervisor = Supervisor::new(system.clone(), runner, empty_journal(), 1);
 
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &id, TaskStatus::Running);
         supervisor.cancel(&id, "stop")?;
@@ -229,7 +231,7 @@ mod tests {
             empty_journal(),
             1,
         );
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &id, TaskStatus::Running);
 
@@ -244,6 +246,11 @@ mod tests {
             "the runner saw the shutdown"
         );
         assert_eq!(system.state(&id)?.status, TaskStatus::Cancelled);
+        assert_eq!(
+            system.state(&id)?.outcome.as_deref(),
+            Some("the control plane shut down while this task was running"),
+            "a shutdown is not a human cancel, and the reason says which it was"
+        );
         Ok(())
     }
 
@@ -260,7 +267,7 @@ mod tests {
             empty_journal(),
             1,
         );
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &id, TaskStatus::Running);
         supervisor.shutdown();
@@ -281,7 +288,7 @@ mod tests {
             empty_journal(),
             1,
         );
-        let id = supervisor.submit(new_task("scripted"))?;
+        let id = supervisor.submit(new_task("scripted"))?.id;
         assert_eq!(supervisor.run_pending()?, 1);
 
         let late = system.ask(
@@ -312,7 +319,7 @@ mod tests {
         });
         let first = Supervisor::new(system.clone(), runner.clone(), empty_journal(), 1);
         let second = Supervisor::new(system.clone(), runner, empty_journal(), 1);
-        let id = first.submit(new_task("scripted"))?;
+        let id = first.submit(new_task("scripted"))?.id;
 
         let (one, two) = thread::scope(|scope| {
             let one = scope.spawn(|| first.run_pending());
@@ -347,7 +354,11 @@ mod tests {
             2,
         );
         let ids: Vec<TaskId> = (0..3)
-            .map(|_| supervisor.submit(new_task("scripted")))
+            .map(|_| {
+                supervisor
+                    .submit(new_task("scripted"))
+                    .map(|submitted| submitted.id)
+            })
             .collect::<Result<_, _>>()?;
 
         supervisor.start();
@@ -370,12 +381,12 @@ mod tests {
             empty_journal(),
             1,
         );
-        let first = supervisor.submit(new_task("scripted"))?;
+        let first = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &first, TaskStatus::Completed);
         supervisor.shutdown();
 
-        let second = supervisor.submit(new_task("scripted"))?;
+        let second = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &second, TaskStatus::Completed);
         supervisor.shutdown();
@@ -413,13 +424,13 @@ mod tests {
             1,
         );
 
-        let first = supervisor.submit(new_task("scripted"))?;
+        let first = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &first, TaskStatus::Completed);
         assert_eq!(system.state(&first)?.outcome.as_deref(), Some("ran"));
         supervisor.shutdown();
 
-        let second = supervisor.submit(new_task("scripted"))?;
+        let second = supervisor.submit(new_task("scripted"))?.id;
         supervisor.start();
         wait_for(&system, &second, TaskStatus::Completed);
         supervisor.shutdown();
@@ -442,7 +453,7 @@ mod tests {
                 1,
             );
             // Submitting without starting leaves the durable `Submitted` record behind.
-            supervisor.submit(new_task("scripted"))?
+            supervisor.submit(new_task("scripted"))?.id
         };
 
         let store: Arc<JsonlEventStore<TaskId, ControlEvent>> =
@@ -477,9 +488,9 @@ mod tests {
                 empty_journal(),
                 1,
             );
-            let finished = supervisor.submit(new_task("scripted"))?;
+            let finished = supervisor.submit(new_task("scripted"))?.id;
             assert_eq!(supervisor.run_pending()?, 1);
-            let left = supervisor.submit(new_task("scripted"))?;
+            let left = supervisor.submit(new_task("scripted"))?.id;
             (left, finished)
         };
         let corrupt = TaskId::from_u128(99);
@@ -492,8 +503,11 @@ mod tests {
             Arc::new(JsonlEventStore::open(&root)?);
         let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
         assert_eq!(
-            system.submitted()?,
-            vec![left.clone()],
+            system.recover()?,
+            Recovery {
+                interrupted: Vec::new(),
+                submitted: vec![left.clone()],
+            },
             "only the submitted task is queued; the corrupt stream is skipped"
         );
         let supervisor = Supervisor::new(
@@ -507,6 +521,307 @@ mod tests {
         supervisor.shutdown();
         assert_eq!(system.state(&left)?.outcome.as_deref(), Some("done"));
         assert_eq!(system.state(&finished)?.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    // Fails the append that carries a terminal event, so a run reaches `settle` and the
+    // store refuses its outcome. Every other append lands, which is what lets the task
+    // start at all.
+    struct RefusingOutcomeStore {
+        inner: MemoryEventStore<TaskId, ControlEvent>,
+        failure: StoreError,
+        remaining: AtomicUsize,
+    }
+
+    impl RefusingOutcomeStore {
+        fn new(
+            failure: StoreError,
+            failures: usize,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryEventStore::new(),
+                failure,
+                remaining: AtomicUsize::new(failures),
+            })
+        }
+    }
+
+    fn terminal(events: &[CloudEvent<ControlEvent>]) -> bool {
+        events.iter().any(|event| {
+            matches!(
+                event.data,
+                ControlEvent::Completed { .. }
+                    | ControlEvent::Failed { .. }
+                    | ControlEvent::Cancelled { .. }
+                    | ControlEvent::Interrupted { .. }
+            )
+        })
+    }
+
+    impl EventStore<TaskId, ControlEvent> for RefusingOutcomeStore {
+        fn load(
+            &self,
+            id: &TaskId,
+        ) -> Result<Vec<CloudEvent<ControlEvent>>, StoreError> {
+            self.inner.load(id)
+        }
+
+        fn append(
+            &self,
+            id: &TaskId,
+            expected: Version,
+            events: &[CloudEvent<ControlEvent>],
+        ) -> Result<Version, StoreError> {
+            if terminal(events) && self.remaining.load(Ordering::SeqCst) > 0 {
+                self.remaining.fetch_sub(1, Ordering::SeqCst);
+                return Err(self.failure.clone());
+            }
+            self.inner.append(id, expected, events)
+        }
+    }
+
+    impl EnumerableStore<TaskId, ControlEvent> for RefusingOutcomeStore {
+        fn keys(&self) -> Result<Vec<TaskId>, StoreError> {
+            self.inner.keys()
+        }
+    }
+
+    #[test]
+    fn a_leftover_run_is_interrupted_once_and_its_runner_never_starts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("tasks");
+        let left = {
+            let store: Arc<JsonlEventStore<TaskId, ControlEvent>> =
+                Arc::new(JsonlEventStore::open(&root)?);
+            let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
+            // Three leftovers, so a sweep that closes only the first is caught.
+            let mut ids = Vec::new();
+            for _ in 0..3 {
+                let id = system.submit(new_task("scripted"))?.id;
+                system.ask(&id, ControlCommand::Start)?;
+                ids.push(id);
+            }
+            ids
+        };
+
+        let store: Arc<JsonlEventStore<TaskId, ControlEvent>> =
+            Arc::new(JsonlEventStore::open(&root)?);
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(SlowRunner {
+                starts: Arc::clone(&starts),
+                hold: Duration::from_millis(5),
+            }),
+            empty_journal(),
+            1,
+        );
+        for id in &left {
+            assert_eq!(system.state(id)?.status, TaskStatus::Running);
+        }
+
+        supervisor.start();
+        for id in &left {
+            let state = system.state(id)?;
+            assert_eq!(state.status, TaskStatus::Interrupted, "{id:?}");
+            assert_eq!(state.outcome.as_deref(), Some(INTERRUPTED_REASON));
+            assert_eq!(store.load(id)?.len(), 3, "{id:?}");
+        }
+        supervisor.shutdown();
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "the sweep is not a run");
+
+        let settled: Vec<usize> = left
+            .iter()
+            .map(|id| store.load(id).map(|records| records.len()))
+            .collect::<Result<_, _>>()?;
+        supervisor.start();
+        let after: Vec<usize> = left
+            .iter()
+            .map(|id| store.load(id).map(|records| records.len()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            after, settled,
+            "a second start finds a terminal state and appends nothing"
+        );
+        supervisor.shutdown();
+        Ok(())
+    }
+
+    // Cancels its own task through the system before it reports an outcome, which is how a
+    // human cancel that lands mid-run looks to `settle`: its own `Complete` meets a
+    // terminal task.
+    struct SelfCancellingRunner {
+        system: ControlSystem,
+    }
+
+    impl Runner for SelfCancellingRunner {
+        fn run(
+            &self,
+            spec: &TaskSpec,
+            _reporter: &dyn Reporter,
+        ) -> RunOutcome {
+            // The spec comes from the task's own stream, so its id is the stream to cancel.
+            let _ = self.system.ask(
+                &spec.task_id,
+                ControlCommand::Cancel {
+                    reason: "stop".to_owned(),
+                },
+            );
+            RunOutcome::Completed {
+                summary: "done".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn settle_counts_a_terminal_refusal_as_success() -> Result<(), Box<dyn std::error::Error>> {
+        let system = system();
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(SelfCancellingRunner {
+                system: system.clone(),
+            }),
+            empty_journal(),
+            1,
+        );
+        let id = supervisor.submit(new_task("scripted"))?.id;
+
+        let ran = supervisor.run_pending();
+        assert_eq!(
+            ran?, 1,
+            "a terminal refusal from settle is a success, not an error"
+        );
+        let state = system.state(&id)?;
+        assert_eq!(state.status, TaskStatus::Cancelled);
+        assert_eq!(state.outcome.as_deref(), Some("stop"));
+        Ok(())
+    }
+
+    struct OrderRunner {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Runner for OrderRunner {
+        fn run(
+            &self,
+            spec: &TaskSpec,
+            _reporter: &dyn Reporter,
+        ) -> RunOutcome {
+            self.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(spec.title.clone());
+            RunOutcome::Completed {
+                summary: "done".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn run_pending_runs_a_same_second_burst_oldest_first() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Every stamp is one second, so only the id decides. The ids ascend with the
+        // submission order, so the oldest task has the lowest id and a reversal of the
+        // newest-first listing would run this backwards.
+        let store = Arc::new(MemoryEventStore::<TaskId, ControlEvent>::new());
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        for (id, title) in [
+            (TaskId::from_u128(1), "first"),
+            (TaskId::from_u128(2), "second"),
+            (TaskId::from_u128(3), "third"),
+        ] {
+            let spec = TaskSpec {
+                task_id: id.clone(),
+                title: title.to_owned(),
+                instruction: "Run it.".to_owned(),
+                agent: "scripted".to_owned(),
+                host: None,
+                workspace: None,
+            };
+            store.append(
+                &id,
+                Version::ZERO,
+                &[CloudEvent::new(
+                    id.as_str(),
+                    Version::new(1),
+                    ControlEvent::Submitted { spec },
+                )
+                .with_time("2026-11-01T00:00:00.000Z")],
+            )?;
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Supervisor::new(
+            system,
+            Arc::new(OrderRunner {
+                seen: Arc::clone(&seen),
+            }),
+            empty_journal(),
+            1,
+        );
+        assert_eq!(supervisor.run_pending()?, 3);
+
+        let order = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            order,
+            vec!["first", "second", "third"],
+            "the lowest id is the oldest when the stamps tie"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_request_id_names_one_task() -> Result<(), Box<dyn std::error::Error>> {
+        // The queue side of this is pinned in `supervisor.rs`, where the queue is visible;
+        // `run_pending` walks the store, so it cannot see a duplicate queue entry.
+        let system = system();
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
+            1,
+        );
+        let mut new = new_task("scripted");
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+        let first = supervisor.submit(new.clone())?;
+        let repeated = supervisor.submit(new)?;
+
+        assert!(first.created);
+        assert!(!repeated.created);
+        assert_eq!(first.id, repeated.id);
+        assert_eq!(
+            supervisor.run_pending()?,
+            1,
+            "one task, one run, however often it was submitted"
+        );
+        assert_eq!(system.state(&first.id)?.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_store_that_always_refuses_the_outcome_leaves_the_task_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = RefusingOutcomeStore::new(StoreError::Io("the disk is full".to_owned()), 99);
+        let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
+            1,
+        );
+        let id = supervisor.submit(new_task("scripted"))?.id;
+
+        let ran = supervisor.run_pending();
+        assert!(
+            matches!(ran, Err(Error::Store(StoreError::Io(_)))),
+            "the failed outcome must surface: {ran:?}"
+        );
+        assert_eq!(system.state(&id)?.status, TaskStatus::Running);
         Ok(())
     }
 }

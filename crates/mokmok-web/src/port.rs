@@ -26,6 +26,8 @@ pub struct Session {
     pub agent: String,
     pub workspace: Option<String>,
     pub outcome: Option<String>,
+    /// When the first record committed, in epoch seconds, when the store stamped it.
+    pub submitted_at: Option<u64>,
     /// Journal entry count, when the daemon could read it.
     pub updates: Option<u64>,
 }
@@ -76,7 +78,7 @@ impl std::error::Error for PortError {}
 
 /// The reads and commands the pages need.
 pub trait ControlPlane: Send + Sync {
-    /// Every task, as the listing sees it.
+    /// Every task, newest first.
     fn sessions(&self) -> Read<'_, Vec<Session>>;
 
     /// The status and outcome of one task.
@@ -130,6 +132,9 @@ pub struct NewSession {
     pub instruction: String,
     pub agent: String,
     pub workspace: Option<String>,
+    /// The value the composer minted, so a resent form names one task. A form that
+    /// carries none asks the daemon for a fresh id.
+    pub request_id: Option<String>,
 }
 
 impl NewSession {
@@ -139,6 +144,7 @@ impl NewSession {
         instruction: &str,
         agent: &str,
         workspace: Option<&str>,
+        request_id: Option<&str>,
     ) -> Self {
         Self {
             title: title_from_instruction(instruction),
@@ -147,6 +153,10 @@ impl NewSession {
             workspace: workspace
                 .map(str::trim)
                 .filter(|path| !path.is_empty())
+                .map(str::to_owned),
+            request_id: request_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
                 .map(str::to_owned),
         }
     }
@@ -215,9 +225,22 @@ mod tests {
 
     #[test]
     fn a_blank_workspace_field_means_no_workspace() {
-        let session = NewSession::from_form("do it", "local", Some("  "));
+        let session = NewSession::from_form("do it", "local", Some("  "), Some("request-1"));
         assert_eq!(session.workspace, None);
-        let session = NewSession::from_form("do it", "local", Some(" /w "));
+        assert_eq!(session.request_id.as_deref(), Some("request-1"));
+        let session = NewSession::from_form("do it", "local", Some(" /w "), Some("request-1"));
         assert_eq!(session.workspace.as_deref(), Some("/w"));
+    }
+
+    #[test]
+    fn a_blank_request_id_asks_for_a_fresh_task() {
+        assert_eq!(
+            NewSession::from_form("do it", "local", None, Some("  ")).request_id,
+            None
+        );
+        assert_eq!(
+            NewSession::from_form("do it", "local", None, None).request_id,
+            None
+        );
     }
 }
