@@ -403,15 +403,187 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_daemon_serves_no_ui() {
+    async fn the_daemon_serves_the_page_and_nothing_else_past_the_api() {
         let dir = TempDir::new().expect("a temp dir");
         let state = scripted_state(&dir, None);
 
-        for path in ["/", "/app.js", "/app.css"] {
+        let page = get(&state, "/").await;
+        assert_eq!(page.status, StatusCode::OK);
+        assert!(
+            content_type(&page).starts_with("text/html"),
+            "{}",
+            content_type(&page)
+        );
+        assert!(
+            page.body.contains("mokmok"),
+            "the page carries its brand text: {}",
+            page.body
+        );
+        assert!(
+            page.body.contains("aria-label=\"Sessions\""),
+            "the page carries its session landmark: {}",
+            page.body
+        );
+
+        for path in ["/app.js", "/nothing-here"] {
             let reply = get(&state, path).await;
             assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
         }
         assert_eq!(get(&state, "/healthz").await.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_unexpected_host_cannot_reach_the_page() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "attacker.example")
+            .body(Body::empty())
+            .expect("the request builds");
+        let reply = send(&state, request).await;
+
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert!(
+            !reply.body.contains("mokmok"),
+            "the refusal must not carry the page: {}",
+            reply.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_lists_a_task_in_the_sidebar() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let id = completed_task(&state).await;
+
+        let reply = get(&state, "/").await;
+
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            reply.body.contains("Fix the build"),
+            "the sidebar lists the task title: {}",
+            reply.body
+        );
+        assert!(
+            reply.body.contains(&id),
+            "the sidebar links the task id: {}",
+            reply.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_shows_the_selected_transcript() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let id = completed_task(&state).await;
+
+        let reply = get(&state, &format!("/?session={id}")).await;
+
+        assert_eq!(reply.status, StatusCode::OK);
+        assert!(
+            reply.body.contains(SCRIPTED_TEXT),
+            "the transcript carries the agent message: {}",
+            reply.body
+        );
+        assert!(
+            reply.body.contains(SCRIPTED_TOOL),
+            "the transcript carries the tool call: {}",
+            reply.body
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_form_submits_a_task_through_the_daemon() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+
+        let reply = send(
+            &state,
+            Request::builder()
+                .method("POST")
+                .uri("/sessions")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "instruction=Fix+the+build&agent=scripted&workspace=%2Fwork%2Fdemo&theme=dark",
+                ))
+                .expect("the request builds"),
+        )
+        .await;
+
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        let listed = state.system.list().expect("the list reads");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Fix the build");
+        assert_eq!(listed[0].workspace.as_deref(), Some("/work/demo"));
+
+        // The redirect lands on the new task, so the page the browser follows already
+        // selects it.
+        let location = reply
+            .headers
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("the redirect names a location");
+        assert!(location.contains(listed[0].id.as_str()), "{location}");
+    }
+
+    #[tokio::test]
+    async fn the_page_form_refuses_an_unlisted_agent() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+
+        let reply = send(
+            &state,
+            Request::builder()
+                .method("POST")
+                .uri("/sessions")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("instruction=Fix+it&agent=ghost&theme=dark"))
+                .expect("the request builds"),
+        )
+        .await;
+
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        let location = reply
+            .headers
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("the redirect names a location");
+        assert!(location.contains("error="), "{location}");
+        assert_eq!(state.system.list().expect("the list reads").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_page_form_cancels_a_queued_task() {
+        let dir = TempDir::new().expect("a temp dir");
+        let state = scripted_state(&dir, None);
+        let created = post_json(&state, "/api/tasks", &new_task("scripted")).await;
+        let id = created_id(&created);
+
+        let reply = send(
+            &state,
+            Request::builder()
+                .method("POST")
+                .uri("/sessions/cancel")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!("task={id}&theme=dark")))
+                .expect("the request builds"),
+        )
+        .await;
+
+        assert_eq!(reply.status, StatusCode::SEE_OTHER);
+        assert_eq!(
+            state
+                .system
+                .state(&TaskId::parse(id.as_str()).expect("a task id"))
+                .expect("the state reads")
+                .status,
+            mokmok_control::TaskStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -1335,6 +1507,8 @@ mod tests {
         let task_journal = get(&state, &format!("/api/tasks/{UNKNOWN_TASK}/journal")).await;
         assert_eq!(task_journal.status, StatusCode::UNAUTHORIZED);
 
+        // A token-protected daemon serves no pages, because a form post cannot carry the
+        // bearer the API requires.
         assert_eq!(get(&state, "/").await.status, StatusCode::NOT_FOUND);
         assert_eq!(get(&state, "/app.js").await.status, StatusCode::NOT_FOUND);
         assert_eq!(get(&state, "/healthz").await.status, StatusCode::OK);

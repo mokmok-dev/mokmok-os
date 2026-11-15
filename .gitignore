@@ -4,9 +4,3 @@
 /result
 /result-*
 /target
-node_modules/
-apps/web/dist/
-apps/web/coverage/
-apps/web/.stryker-tmp/
-apps/web/reports/
-apps/web/*.tsbuildinfo
