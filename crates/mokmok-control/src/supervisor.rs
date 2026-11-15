@@ -8,13 +8,19 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mokmok_control_core::{ControlCommand, ControlError, TaskId, TaskSpec, TaskStatus};
+use mokmok_control_core::{ControlCommand, ControlError, StoreError, TaskId, TaskSpec, TaskStatus};
 use mokmok_journal::{Journal, JournalEvent};
 
 use crate::system::{ControlSystem, Error, NewTask, Submission, TaskSummary};
 
 /// How long [`Supervisor::shutdown`] waits for a worker to return before leaving it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// How many times one outcome is offered to the log before the task is left for the
+/// next startup sweep to close.
+const SETTLE_ATTEMPTS: usize = SETTLE_BACKOFF.len() + 1;
+
+const SETTLE_BACKOFF: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(100)];
 
 /// The generic answer a journal failure produces.
 const JOURNAL_FAILED: &str = "the control plane could not record the transcript";
@@ -445,6 +451,9 @@ impl Work {
 
     // A human cancel can commit while the runner is still working, so the terminal error
     // its own outcome runs into is expected and must not be reported as a failure.
+    //
+    // A retry offers the same command again, so the append is checked at the same `expected`
+    // version rather than against a version read after the failure.
     fn settle(
         &self,
         id: &TaskId,
@@ -461,10 +470,39 @@ impl Work {
             },
             RunOutcome::Failed { reason } => ControlCommand::Fail { reason },
         };
-        match self.system.ask(id, command) {
-            Ok(_) | Err(Error::Control(ControlError::Terminal)) => Ok(()),
-            Err(error) => Err(error),
+        let mut attempt = 0;
+        loop {
+            match self.system.ask(id, command.clone()) {
+                Ok(_) | Err(Error::Control(ControlError::Terminal)) => return Ok(()),
+                Err(error) if retryable(&error) && attempt + 1 < SETTLE_ATTEMPTS => {
+                    thread::sleep(SETTLE_BACKOFF[attempt]);
+                    attempt += 1;
+                },
+                Err(error) => {
+                    tracing::error!(
+                        task = id.as_str(),
+                        attempts = attempt + 1,
+                        %error,
+                        "the outcome could not be recorded; the startup sweep closes the task"
+                    );
+                    return Err(error);
+                },
+            }
         }
+    }
+}
+
+// A conflict proves the write did not land, and an actor or spawn failure never reached the
+// store. An I/O failure is the ambiguous one: the record may or may not be committed, which is
+// why `EventStore::append` carries its retry obligation.
+const fn retryable(error: &Error) -> bool {
+    match error {
+        Error::Store(StoreError::Conflict { .. } | StoreError::Io(_))
+        | Error::ActorUnavailable
+        | Error::Spawn(_) => true,
+        Error::Store(StoreError::Invalid(_) | StoreError::Corrupt(_))
+        | Error::Control(_)
+        | Error::RequestConflict(_) => false,
     }
 }
 

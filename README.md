@@ -205,7 +205,9 @@ will not read or replay, or a sweep whose append itself fails, is logged and lef
 so a damaged log can hide its own task but never another's. A second start finds the task
 terminal and writes nothing, so the sweep is safe to repeat. A task reaches the sweep three
 ways: the process crashes, a run outlives the five second shutdown grace, or the outcome
-write fails.
+write fails three times. A refused or failed outcome write is retried, because the store
+re-reads the stream after a failed write, so a retry either lands once or reports that the
+record is already there; only a write that keeps failing is left for the next start's sweep.
 
 `/api/events` streams domain CloudEvents and `/api/journal/events` streams
 `{"task":"<uuid>","entry":{…}}` lines. Both feeds carry every task's records; neither

@@ -3,6 +3,9 @@
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -649,6 +652,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn settle_retries_after_one_conflict() -> Result<(), Box<dyn std::error::Error>> {
+        let conflicted = |failures| {
+            RefusingOutcomeStore::new(
+                StoreError::Conflict {
+                    expected: Version::new(2),
+                    actual: Version::new(3),
+                },
+                failures,
+            )
+        };
+        for failures in [1, 2] {
+            let store = conflicted(failures);
+            let system =
+                ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+            let supervisor = Supervisor::new(
+                system.clone(),
+                Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+                empty_journal(),
+                1,
+            );
+            let id = supervisor.submit(new_task("scripted"))?.id;
+
+            assert_eq!(supervisor.run_pending()?, 1, "{failures} conflicts");
+            let state = system.state(&id)?;
+            assert_eq!(state.status, TaskStatus::Completed, "{failures} conflicts");
+            assert_eq!(state.outcome.as_deref(), Some("done"));
+            assert_eq!(
+                store.load(&id)?.len(),
+                4,
+                "submitted, started, the session, and the settled outcome"
+            );
+        }
+        Ok(())
+    }
+
     // Cancels its own task through the system before it reports an outcome, which is how a
     // human cancel that lands mid-run looks to `settle`: its own `Complete` meets a
     // terminal task.
@@ -823,5 +862,189 @@ mod tests {
         );
         assert_eq!(system.state(&id)?.status, TaskStatus::Running);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Fault {
+        // The record reaches the file and the sync then fails, so the bytes are durable and
+        // both the adapter's cache and the actor's version still name the old version.
+        LandedThenSyncFailed,
+        // Only part of the record reaches the file, and the sync fails, so the stream ends on
+        // a line no writer committed.
+        Torn,
+    }
+
+    // Drives one terminal append through the real adapter with an injected fault, then undoes
+    // the fault so the same store instance keeps its cache across the retry.
+    #[cfg(unix)]
+    struct FaultOutcomeStore {
+        inner: JsonlEventStore<TaskId, ControlEvent>,
+        root: PathBuf,
+        fault: Fault,
+        fired: AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl FaultOutcomeStore {
+        fn open(
+            root: &Path,
+            fault: Fault,
+        ) -> Result<Arc<Self>, StoreError> {
+            Ok(Arc::new(Self {
+                inner: JsonlEventStore::open(root)?,
+                root: root.to_path_buf(),
+                fault,
+                fired: AtomicBool::new(false),
+            }))
+        }
+
+        // Moves the committed file aside, damages it the way the fault describes, and puts
+        // `/dev/null` in its place for one append, where `write_all` succeeds and `sync_data`
+        // fails with `EINVAL`. Returns the held file so the caller can restore it.
+        fn redirect(
+            &self,
+            id: &TaskId,
+            events: &[CloudEvent<ControlEvent>],
+        ) -> Result<PathBuf, StoreError> {
+            let path = self.root.join(format!("{}.jsonl", id.as_str()));
+            let held = self.root.join(format!("{}.held", id.as_str()));
+            fs::rename(&path, &held).map_err(|error| io_error(&path, &error))?;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&held)
+                .map_err(|error| io_error(&held, &error))?;
+            // One record per line, which is the format `encode_records` writes.
+            let mut buffer = Vec::new();
+            for event in events {
+                let line = serde_json::to_string(event)
+                    .map_err(|error| StoreError::Io(error.to_string()))?;
+                buffer.extend_from_slice(line.as_bytes());
+                buffer.push(b'\n');
+            }
+            match self.fault {
+                Fault::LandedThenSyncFailed => {
+                    file.write_all(&buffer)
+                        .map_err(|error| io_error(&held, &error))?;
+                },
+                Fault::Torn => {
+                    let torn = buffer.len().saturating_sub(1);
+                    file.write_all(&buffer[..torn])
+                        .map_err(|error| io_error(&held, &error))?;
+                },
+            }
+            std::os::unix::fs::symlink("/dev/null", &path)
+                .map_err(|error| io_error(&path, &error))?;
+            Ok(held)
+        }
+
+        fn restore(
+            &self,
+            id: &TaskId,
+            held: &Path,
+        ) {
+            let path = self.root.join(format!("{}.jsonl", id.as_str()));
+            let _ = fs::remove_file(&path);
+            let _ = fs::rename(held, &path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn io_error(
+        path: &Path,
+        error: &std::io::Error,
+    ) -> StoreError {
+        StoreError::Io(format!("{}: {error}", path.display()))
+    }
+
+    #[cfg(unix)]
+    impl EventStore<TaskId, ControlEvent> for FaultOutcomeStore {
+        fn load(
+            &self,
+            id: &TaskId,
+        ) -> Result<Vec<CloudEvent<ControlEvent>>, StoreError> {
+            self.inner.load(id)
+        }
+
+        fn append(
+            &self,
+            id: &TaskId,
+            expected: Version,
+            events: &[CloudEvent<ControlEvent>],
+        ) -> Result<Version, StoreError> {
+            if !terminal(events) || self.fired.swap(true, Ordering::SeqCst) {
+                return self.inner.append(id, expected, events);
+            }
+            let held = self.redirect(id, events)?;
+            let appended = self.inner.append(id, expected, events);
+            self.restore(id, &held);
+            appended
+        }
+    }
+
+    #[cfg(unix)]
+    impl EnumerableStore<TaskId, ControlEvent> for FaultOutcomeStore {
+        fn keys(&self) -> Result<Vec<TaskId>, StoreError> {
+            self.inner.keys()
+        }
+    }
+
+    #[cfg(unix)]
+    fn settle_after_a_fault(fault: Fault) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("tasks");
+        let store = FaultOutcomeStore::open(&root, fault)?;
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let supervisor = Supervisor::new(
+            system.clone(),
+            Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+            empty_journal(),
+            1,
+        );
+        let id = supervisor.submit(new_task("scripted"))?.id;
+
+        // The retry is what heals this: one attempt sees the I/O failure, the next reaches a
+        // store that dropped its cached version and re-read the file.
+        assert_eq!(
+            supervisor.run_pending()?,
+            1,
+            "a retried outcome write finishes the run"
+        );
+        let state = system.state(&id)?;
+        assert_eq!(state.status, TaskStatus::Completed);
+        assert_eq!(state.outcome.as_deref(), Some("done"));
+        assert_eq!(
+            system.list()?.len(),
+            1,
+            "the stream must replay, whatever the fault left behind"
+        );
+        let records = store.load(&id)?;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| terminal(std::slice::from_ref(record)))
+                .count(),
+            1,
+            "exactly one terminal record, written once"
+        );
+        let mut version = Version::ZERO;
+        for record in &records {
+            version = version.next();
+            assert_eq!(record.version, version, "the stream stays contiguous");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_landed_record_whose_sync_failed_is_retried_once() -> Result<(), Box<dyn std::error::Error>>
+    {
+        settle_after_a_fault(Fault::LandedThenSyncFailed)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_torn_outcome_write_is_rewritten_by_the_retry() -> Result<(), Box<dyn std::error::Error>> {
+        settle_after_a_fault(Fault::Torn)
     }
 }
