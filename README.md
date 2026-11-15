@@ -4,10 +4,9 @@ mokmok OS is an "Operating System" for AI productivity originally developed for 
 
 ## Control plane
 
-`mokmok-controld` serves the HTTP API that submits tasks to agents. The browser UI is a
-separate app under `apps/web`; the daemon serves no HTML. Each task is kept twice: a
-small CloudEvent stream with the facts that decide its status, and a compact execution
-journal with its transcript.
+`mokmok-controld` serves the HTTP API that submits tasks to agents, and the server-rendered
+pages of `crates/mokmok-web`. Each task is kept twice: a small CloudEvent stream with the
+facts that decide its status, and a compact execution journal with its transcript.
 
 A scripted smoke run needs no agent:
 
@@ -15,15 +14,39 @@ A scripted smoke run needs no agent:
 nix run .#default -- --scripted --data-dir "$(mktemp -d)"
 ```
 
-`GET /healthz` answers `ok`. The daemon serves the API only: `/`, `/app.js`, and
-`/app.css` are `404`, so start the web UI below. The journal is unredacted agent output
-(see below), so the data directory must stay private; a world-readable location such as
-a shared `/tmp/mokmok` exposes every transcript.
+`GET /healthz` answers `ok`, and `GET /` answers the page below. The journal is unredacted
+agent output (see below), so the data directory must stay private; a world-readable
+location such as a shared `/tmp/mokmok` exposes every transcript.
 
-## Web UI
+## Web page
 
-The UI is a pnpm-workspace app at `apps/web` (React, Vite, Effect, TanStack Query and
-TanStack AI, with Kumo components). Node 22 and pnpm 10 come from the dev shell:
+`crates/mokmok-web` renders the whole screen on the server with [Topcoat][topcoat], whose
+`view!` macro is a JSX-shaped template over Rust. The browser needs no build step and no
+client bundle: the page is HTML and forms, a session form answers `303` back to the page,
+and a running session carries a `2`-second meta refresh so the transcript advances.
+
+```
+cargo run -p mokmok-controld -- --scripted --data-dir "$(mktemp -d)"
+```
+
+Open `http://127.0.0.1:8787`. The sidebar groups sessions by workspace, the header shows the
+selected session, and the composer starts a new one. The workspace field in the composer is
+where the task runs, and it must be an absolute path the daemon accepts.
+
+The pages read `ControlPlane`, a small port in `crates/mokmok-web/src/port.rs`, and
+`apps/mokmok-controld/src/web.rs` implements it over the daemon's state with the same read
+permits and blocking threads the JSON API uses. A token-protected daemon serves no pages:
+a browser cannot put a bearer token on a form post, so the page would otherwise reach the
+port around the check the API enforces. Start the daemon on loopback without a token, or
+reach the API directly when one is set.
+
+[topcoat]: https://github.com/tokio-rs/topcoat
+
+## React app
+
+`apps/web` is the earlier pnpm-workspace app (React, Vite, Effect, TanStack Query and
+TanStack AI, with Kumo components). It talks to the same API. Node 22 and pnpm 10 come from
+the dev shell:
 
 ```
 nix develop
@@ -69,11 +92,11 @@ is; a proxy that forwards the public name instead needs `--allowed-host control.
 A `--bind` address that is not loopback requires `MOKMOK_CONTROL_TOKEN`; set the same
 token in the UI's Connection settings.
 
-The daemon has no CORS layer, so the UI and `/api` must share an origin, either directly
-or through the proxy above. `VITE_CONTROL_PLANE_URL` is the build-time fallback for the
-API origin when no runtime setting is stored; it must point at that same origin (or a
-proxy), not at a separate daemon host. An invalid runtime or build-time URL is reported
-in a configuration banner instead of being used silently. The runtime setting in
+The daemon has no CORS layer, so the React app and `/api` must share an origin, either
+directly or through the proxy above. `VITE_CONTROL_PLANE_URL` is the build-time fallback
+for the API origin when no runtime setting is stored; it must point at that same origin
+(or a proxy), not at a separate daemon host. An invalid runtime or build-time URL is
+reported in a configuration banner instead of being used silently. The runtime setting in
 Connection settings wins over the build-time default.
 
 A bearer token is kept in `sessionStorage` (`mokmok.control.token`) as
@@ -85,12 +108,12 @@ so it is never sent to a new host. The base URL setting lives in `localStorage` 
 
 Control-plane requests use a request timeout, 30 s by default. A timed-out submission
 may still have been accepted by the daemon, so check the sidebar before resending: the
-UI's 2 s task poll is how the workspace reconciles the listing with the daemon.
+React app's 2 s task poll is how the workspace reconciles the listing with the daemon.
 
-The UI follows a Codex/Claude-style layout: a sidebar groups sessions by workspace, and
-the chat pane streams the selected workspace's transcript. One session is one delegated
-task. A follow-up message starts a new session in the same workspace, and the sidebar
-keeps every turn of that workspace together. The agent receives only the new
+The React app follows a Codex/Claude-style layout: a sidebar groups sessions by workspace,
+and the chat pane streams the selected workspace's transcript. One session is one
+delegated task. A follow-up message starts a new session in the same workspace, and the
+sidebar keeps every turn of that workspace together. The agent receives only the new
 instruction; earlier turns are workspace context for you, not a continuation of the
 agent's conversation. A failed or cancelled session renders its outcome under the
 assistant turn.
@@ -116,7 +139,18 @@ pnpm --filter @mokmok/web build
 pnpm --filter @mokmok/web mutate
 ```
 
-The frontend lives in `apps/web`, and the Nix flake builds it as `packages.web` with the
+Checks for the server-rendered page:
+
+```
+cargo nextest run -p mokmok-web
+cargo clippy -p mokmok-web --all-targets -- --deny warnings
+```
+
+`crates/mokmok-web/tests/render.rs` drives the real router, so a page test asserts the
+markup a browser receives: the listing, the selected transcript, the empty state, the
+failure banner, the form redirects, and the refusal of a cross-origin post.
+
+The React app lives in `apps/web`, and the Nix flake builds it as `packages.web` with the
 same typecheck, test, and build steps. `checks.webMutants` runs the Stryker gate on
 Linux. Mutation testing covers `src/domain`, `src/api`, `src/format.ts`, and
 `src/theme.ts`; it uses `vitest.mutation.config.ts`, which runs the unit tests only and
