@@ -725,7 +725,11 @@ mod tests {
         ] {
             let id = TaskId::from_request(request).expect("the request id is a uuid");
             let uuid = Uuid::parse_str(id.as_str()).expect("the derived id is a uuid");
-            assert_eq!(uuid.get_version_num(), 5, "{request} -> {id:?}");
+            assert_eq!(
+                uuid.get_version_num(),
+                5,
+                "{request} must derive a v5 task id"
+            );
         }
     }
 
