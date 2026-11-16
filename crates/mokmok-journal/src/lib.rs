@@ -845,6 +845,107 @@ pub fn timestamp(time: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+/// Parses an RFC 3339 UTC stamp, the inverse of [`timestamp`], as epoch seconds.
+///
+/// A reader that asks how old a task is must not depend on a UUID that carries the
+/// time, because a task a client named does not have one.
+///
+/// # Examples
+///
+/// ```
+/// use mokmok_journal::parse_timestamp;
+///
+/// assert_eq!(parse_timestamp("1970-01-01T00:00:01.500Z"), Some(1));
+/// assert_eq!(parse_timestamp("2026-11-08"), None);
+/// ```
+#[must_use]
+pub fn parse_timestamp(raw: &str) -> Option<u64> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != "2026-11-08T06:19:08.123Z".len() {
+        return None;
+    }
+    let year = digits(raw, 0, 4)?;
+    let month = digits(raw, 5, 7)?;
+    let day = digits(raw, 8, 10)?;
+    let hour = digits(raw, 11, 13)?;
+    let minute = digits(raw, 14, 16)?;
+    let second = digits(raw, 17, 19)?;
+    digits(raw, 20, 23)?;
+    let separators = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    if !separators
+        .iter()
+        .all(|(index, expected)| bytes[*index] == *expected)
+    {
+        return None;
+    }
+    // `timestamp` clamps a time before the epoch to the epoch, so a stamp older than
+    // 1970 is not one this module wrote. No stamp carries a leap second either: it
+    // truncates to whole seconds and never emits 60.
+    if year < 1970
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+// `u64::from_str` accepts a leading `+`, which `timestamp` never writes, so the bytes
+// are checked before the parse.
+fn digits(
+    raw: &str,
+    start: usize,
+    end: usize,
+) -> Option<u64> {
+    let field = raw.get(start..end)?;
+    if !field.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
+}
+
+const fn is_leap(year: u64) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+const fn days_in_month(
+    year: u64,
+    month: u64,
+) -> u64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if is_leap(year) => 29,
+        _ => 28,
+    }
+}
+
+// Howard Hinnant's civil-to-days conversion, the inverse of `civil_from_days`.
+const fn days_from_civil(
+    year: u64,
+    month: u64,
+    day: u64,
+) -> u64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year / 400;
+    let year_of_era = year % 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 // Howard Hinnant's days-to-civil conversion, with 1970-01-01 as day zero.
 const fn civil_from_days(days: u64) -> (u64, u64, u64) {
     let shifted = days + 719_468;
@@ -2071,6 +2172,87 @@ mod tests {
         assert_eq!(
             timestamp(UNIX_EPOCH - Duration::from_hours(24)),
             "1970-01-01T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn a_stamp_round_trips_through_the_parser() {
+        for time in [
+            UNIX_EPOCH,
+            UNIX_EPOCH + Duration::from_millis(1_794_118_748_123),
+            UNIX_EPOCH + Duration::from_hours(474_768),
+            UNIX_EPOCH + Duration::from_hours(59 * 24),
+            UNIX_EPOCH + Duration::from_hours(11_016 * 24),
+            UNIX_EPOCH + Duration::from_hours(8_772 * 24),
+        ] {
+            let stamp = timestamp(time);
+            assert_eq!(
+                parse_timestamp(&stamp),
+                Some(
+                    time.duration_since(UNIX_EPOCH)
+                        .expect("after the epoch")
+                        .as_secs()
+                ),
+                "{stamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parser_refuses_what_it_did_not_write() {
+        for raw in [
+            "",
+            "2026-11-08",
+            "2026-11-08T06:19:08Z",
+            "2026-13-08T06:19:08.123Z",
+            "2026-02-30T06:19:08.123Z",
+            "2026-11-08T24:19:08.123Z",
+            "2026-11-08T06:19:60.123Z",
+            "2026-11-08T06:19:61.123Z",
+            "2026-11-08T06:19:08.123+00:00",
+            "1969-12-31T00:00:00.000Z",
+            "not a stamp at all..",
+            "2026-+1-08T06:19:08.123Z",
+            "2026-11-+8T06:19:08.123Z",
+            "2026-11-08T06:19:08.+23Z",
+            "2026-04-31T06:19:08.123Z",
+            "2026-06-31T06:19:08.123Z",
+            "2026-09-31T06:19:08.123Z",
+            "2026-11-31T06:19:08.123Z",
+        ] {
+            assert_eq!(parse_timestamp(raw), None, "{raw:?}");
+        }
+        assert_eq!(
+            parse_timestamp("2026-12-31T23:59:59.999Z"),
+            Some(1_798_761_599),
+            "the last second of a 31-day month still parses"
+        );
+        // The day a 30-day month does have must parse, or a reader that treated every
+        // month as February's length would reject a stamp it wrote.
+        for (raw, seconds) in [
+            ("2026-04-30T23:59:59.999Z", 1_777_593_599),
+            ("2026-06-30T23:59:59.999Z", 1_782_863_999),
+            ("2026-09-30T23:59:59.999Z", 1_790_812_799),
+            ("2026-11-30T23:59:59.999Z", 1_796_083_199),
+        ] {
+            assert_eq!(parse_timestamp(raw), Some(seconds), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_parser_keeps_the_century_leap_rule() {
+        // 2000 is a leap year because 400 divides it; 1900 and 2100 are not leap years
+        // because 100 divides them and 400 does not, which a bare `% 4` rule would miss.
+        for raw in ["1900-02-29T00:00:00.000Z", "2100-02-29T00:00:00.000Z"] {
+            assert_eq!(parse_timestamp(raw), None, "{raw:?}");
+        }
+        assert_eq!(
+            parse_timestamp("2000-02-29T00:00:00.000Z"),
+            Some(951_782_400)
+        );
+        assert_eq!(
+            parse_timestamp("9999-12-31T23:59:59.999Z"),
+            Some(253_402_300_799)
         );
     }
 }

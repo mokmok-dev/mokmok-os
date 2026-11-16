@@ -11,6 +11,14 @@ use mokmok_events::{CloudEvent, EventType, StoreError, StreamKey, validate_histo
 /// How many of a task's most recent updates its state keeps.
 pub const MAX_UPDATES: usize = 4096;
 
+/// Why a task that was running when the control plane stopped carries no outcome of its
+/// own.
+pub const INTERRUPTED_REASON: &str = "the control plane stopped while this task was running";
+
+// The namespace a client request id is hashed into. It is fixed for good: changing it
+// would make every resend address a different task.
+const TASK_NAMESPACE_NAME: &str = "https://mokmok.dev/control/task";
+
 const MAX_TITLE_BYTES: usize = 200;
 const MAX_INSTRUCTION_BYTES: usize = 65_536;
 const MAX_WORKSPACE_BYTES: usize = 4096;
@@ -46,6 +54,24 @@ impl TaskId {
     #[must_use]
     pub fn from_u128(value: u128) -> Self {
         Self::from_uuid(Uuid::from_u128(value))
+    }
+
+    /// Derives the stream a client's request id names, so a resend addresses the same task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlError::InvalidRequestId`] when the raw value is not a UUID.
+    pub fn from_request(raw: &str) -> Result<Self, ControlError> {
+        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, TASK_NAMESPACE_NAME.as_bytes());
+        Uuid::parse_str(raw).map_or_else(
+            |_| Err(ControlError::InvalidRequestId(raw.to_owned())),
+            |request| {
+                Ok(Self::from_uuid(Uuid::new_v5(
+                    &namespace,
+                    request.as_bytes(),
+                )))
+            },
+        )
     }
 
     #[must_use]
@@ -212,6 +238,7 @@ pub enum ControlCommand {
     Complete { summary: String },
     Fail { reason: String },
     Cancel { reason: String },
+    Interrupt,
 }
 
 /// One committed fact about a task.
@@ -228,6 +255,7 @@ pub enum ControlEvent {
     Completed { summary: String },
     Failed { reason: String },
     Cancelled { reason: String },
+    Interrupted { reason: String },
 }
 
 impl ControlEvent {
@@ -240,6 +268,7 @@ impl ControlEvent {
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
             Self::Cancelled { .. } => "cancelled",
+            Self::Interrupted { .. } => "interrupted",
         }
     }
 }
@@ -254,6 +283,7 @@ impl EventType for ControlEvent {
             Self::Completed { .. } => "dev.mokmok.control.completed",
             Self::Failed { .. } => "dev.mokmok.control.failed",
             Self::Cancelled { .. } => "dev.mokmok.control.cancelled",
+            Self::Interrupted { .. } => "dev.mokmok.control.interrupted",
         }
     }
 }
@@ -269,6 +299,7 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+    Interrupted,
 }
 
 impl TaskStatus {
@@ -280,6 +311,16 @@ impl TaskStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// Whether no command can move the task any further.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        match self {
+            Self::New | Self::Submitted | Self::Running => false,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted => true,
         }
     }
 }
@@ -303,6 +344,7 @@ pub struct TaskState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlError {
     InvalidTaskId(String),
+    InvalidRequestId(String),
     InvalidSpec { field: &'static str, reason: String },
     WrongTaskId { stream: String, spec: String },
     NotSubmitted,
@@ -321,6 +363,7 @@ impl fmt::Display for ControlError {
     ) -> fmt::Result {
         match self {
             Self::InvalidTaskId(raw) => write!(formatter, "invalid task id {raw:?}"),
+            Self::InvalidRequestId(raw) => write!(formatter, "invalid request id {raw:?}"),
             Self::InvalidSpec { field, reason } => {
                 write!(formatter, "task spec {field} {reason}")
             },
@@ -361,7 +404,8 @@ pub fn decide(
             | ControlCommand::OpenSession { .. }
             | ControlCommand::Complete { .. }
             | ControlCommand::Fail { .. }
-            | ControlCommand::Cancel { .. } => Err(ControlError::NotSubmitted),
+            | ControlCommand::Cancel { .. }
+            | ControlCommand::Interrupt => Err(ControlError::NotSubmitted),
         },
         TaskStatus::Submitted => match command {
             ControlCommand::Start => Ok(vec![ControlEvent::Started]),
@@ -369,7 +413,8 @@ pub fn decide(
             ControlCommand::Submit(_) => Err(ControlError::AlreadySubmitted),
             ControlCommand::OpenSession { .. }
             | ControlCommand::Complete { .. }
-            | ControlCommand::Fail { .. } => Err(ControlError::NotRunning),
+            | ControlCommand::Fail { .. }
+            | ControlCommand::Interrupt => Err(ControlError::NotRunning),
         },
         TaskStatus::Running => match command {
             ControlCommand::OpenSession { session_id } => {
@@ -382,12 +427,18 @@ pub fn decide(
             ControlCommand::Complete { summary } => Ok(vec![ControlEvent::Completed { summary }]),
             ControlCommand::Fail { reason } => Ok(vec![ControlEvent::Failed { reason }]),
             ControlCommand::Cancel { reason } => Ok(vec![ControlEvent::Cancelled { reason }]),
+            ControlCommand::Interrupt => Ok(vec![ControlEvent::Interrupted {
+                reason: INTERRUPTED_REASON.to_owned(),
+            }]),
             ControlCommand::Start => Err(ControlError::AlreadyStarted),
             ControlCommand::Submit(_) => Err(ControlError::AlreadySubmitted),
         },
-        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
-            Err(ControlError::Terminal)
-        },
+        // A guard on `is_terminal` cannot make this match exhaustive, so the finished
+        // states are named here and every consumer asks `is_terminal` instead.
+        TaskStatus::Completed
+        | TaskStatus::Failed
+        | TaskStatus::Cancelled
+        | TaskStatus::Interrupted => Err(ControlError::Terminal),
     }
 }
 
@@ -426,6 +477,10 @@ pub fn evolve(
         },
         (TaskStatus::Running, ControlEvent::Failed { reason }) => {
             state.status = TaskStatus::Failed;
+            state.outcome = Some(reason.clone());
+        },
+        (TaskStatus::Running, ControlEvent::Interrupted { reason }) => {
+            state.status = TaskStatus::Interrupted;
             state.outcome = Some(reason.clone());
         },
         (TaskStatus::Submitted | TaskStatus::Running, ControlEvent::Cancelled { reason }) => {
@@ -469,6 +524,16 @@ mod tests {
     use mokmok_events::Version;
 
     use super::*;
+
+    const ALL: [TaskStatus; 7] = [
+        TaskStatus::New,
+        TaskStatus::Submitted,
+        TaskStatus::Running,
+        TaskStatus::Completed,
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+        TaskStatus::Interrupted,
+    ];
 
     fn spec() -> TaskSpec {
         TaskSpec {
@@ -516,6 +581,13 @@ mod tests {
                     reason: "stop".to_owned(),
                 },
             ],
+            TaskStatus::Interrupted => vec![
+                submitted(),
+                ControlEvent::Started,
+                ControlEvent::Interrupted {
+                    reason: INTERRUPTED_REASON.to_owned(),
+                },
+            ],
         };
         let mut state = TaskState::default();
         for event in chain {
@@ -552,6 +624,7 @@ mod tests {
             ControlCommand::Cancel {
                 reason: "stop".to_owned(),
             },
+            ControlCommand::Interrupt,
         ]
     }
 
@@ -612,6 +685,63 @@ mod tests {
             .expect("literal is a uuid");
         assert_eq!(String::from(id), "01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60");
         assert!(TaskId::try_from(String::new()).is_err());
+    }
+
+    #[test]
+    fn a_request_id_derives_one_stable_task_id() {
+        let request = "01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60";
+        let first = TaskId::from_request(request).expect("the request id is a uuid");
+        let again = TaskId::from_request(request).expect("the request id is a uuid");
+        assert_eq!(first, again);
+        assert_ne!(
+            first,
+            TaskId::from_request("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f61")
+                .expect("the other request id is a uuid")
+        );
+        assert_eq!(
+            first,
+            TaskId::parse(first.as_str()).expect("the derived id is a uuid")
+        );
+    }
+
+    #[test]
+    fn a_request_id_maps_to_its_checked_in_task_id() {
+        // Changing the namespace, the hash input, or the version would silently remap
+        // every client's resends to a fresh task. This literal is the contract.
+        assert_eq!(
+            TaskId::from_request("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60")
+                .expect("the request id is a uuid")
+                .as_str(),
+            "041ed7ad-db63-5e84-8d95-23b4dea3e462"
+        );
+    }
+
+    #[test]
+    fn any_uuid_version_derives_a_v5_task_id() {
+        for request in [
+            "9f4a2b1c-3d4e-4f60-8a9b-0c1d2e3f4a5b",
+            "01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60",
+            "01890b0c-7f3a-4c2e-9f4a-2b1c3d4e5f60",
+        ] {
+            let id = TaskId::from_request(request).expect("the request id is a uuid");
+            let uuid = Uuid::parse_str(id.as_str()).expect("the derived id is a uuid");
+            assert_eq!(
+                uuid.get_version_num(),
+                5,
+                "{request} must derive a v5 task id"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_id_must_be_a_uuid() {
+        let long = ":".repeat(128);
+        for raw in ["", "task-1", long.as_str()] {
+            assert!(matches!(
+                TaskId::from_request(raw),
+                Err(ControlError::InvalidRequestId(_))
+            ));
+        }
     }
 
     #[test]
@@ -801,6 +931,7 @@ mod tests {
             ControlCommand::Fail {
                 reason: "broken".to_owned(),
             },
+            ControlCommand::Interrupt,
         ] {
             assert_eq!(decide(&state, command), Err(ControlError::NotRunning));
         }
@@ -861,6 +992,12 @@ mod tests {
             decide(&state, ControlCommand::Submit(spec())),
             Err(ControlError::AlreadySubmitted)
         );
+        assert_eq!(
+            decide(&state, ControlCommand::Interrupt),
+            Ok(vec![ControlEvent::Interrupted {
+                reason: INTERRUPTED_REASON.to_owned(),
+            }])
+        );
     }
 
     #[test]
@@ -879,16 +1016,38 @@ mod tests {
 
     #[test]
     fn decide_rejects_every_command_in_a_terminal_state() {
-        for status in [
-            TaskStatus::Completed,
-            TaskStatus::Failed,
-            TaskStatus::Cancelled,
-        ] {
+        for status in ALL.into_iter().filter(|status| status.is_terminal()) {
             let state = reached(status);
             assert_eq!(state.status, status);
             for command in every_command() {
                 assert_eq!(decide(&state, command), Err(ControlError::Terminal));
             }
+        }
+    }
+
+    #[test]
+    fn is_terminal_names_every_finished_status() {
+        let terminal = [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Interrupted,
+        ];
+        for status in ALL {
+            assert_eq!(
+                status.is_terminal(),
+                terminal.contains(&status),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_status_rejects_interrupt_exactly_when_it_is_terminal() {
+        for status in ALL {
+            let refused =
+                decide(&reached(status), ControlCommand::Interrupt) == Err(ControlError::Terminal);
+            assert_eq!(refused, status.is_terminal(), "{status:?}");
         }
     }
 
@@ -955,6 +1114,18 @@ mod tests {
         .expect("cancelled follows submitted");
         assert_eq!(cancelled.status, TaskStatus::Cancelled);
         assert_eq!(cancelled.outcome.as_deref(), Some("stop"));
+
+        let mut interrupted = session_open();
+        evolve(
+            &mut interrupted,
+            &ControlEvent::Interrupted {
+                reason: INTERRUPTED_REASON.to_owned(),
+            },
+        )
+        .expect("interrupted follows running");
+        assert_eq!(interrupted.status, TaskStatus::Interrupted);
+        assert_eq!(interrupted.outcome.as_deref(), Some(INTERRUPTED_REASON));
+        assert_eq!(interrupted.session.as_deref(), Some("session-1"));
     }
 
     #[test]
@@ -994,6 +1165,18 @@ mod tests {
             (
                 reached(TaskStatus::Failed),
                 ControlEvent::UpdateRecorded { update: message() },
+            ),
+            (
+                reached(TaskStatus::Submitted),
+                ControlEvent::Interrupted {
+                    reason: INTERRUPTED_REASON.to_owned(),
+                },
+            ),
+            (
+                reached(TaskStatus::Interrupted),
+                ControlEvent::Completed {
+                    summary: "done".to_owned(),
+                },
             ),
         ];
         for (mut state, event) in pairs {
@@ -1163,6 +1346,10 @@ mod tests {
         let cases = [
             (ControlError::InvalidTaskId("bad id".to_owned()), "bad id"),
             (
+                ControlError::InvalidRequestId("bad request".to_owned()),
+                "invalid request id",
+            ),
+            (
                 ControlError::InvalidSpec {
                     field: "title",
                     reason: "must not be empty".to_owned(),
@@ -1215,6 +1402,12 @@ mod tests {
                 },
                 "dev.mokmok.control.cancelled",
             ),
+            (
+                ControlEvent::Interrupted {
+                    reason: INTERRUPTED_REASON.to_owned(),
+                },
+                "dev.mokmok.control.interrupted",
+            ),
         ];
         for (event, expected) in cases {
             assert_eq!(event.event_type(), expected);
@@ -1243,6 +1436,9 @@ mod tests {
             },
             ControlEvent::Cancelled {
                 reason: "stop".to_owned(),
+            },
+            ControlEvent::Interrupted {
+                reason: INTERRUPTED_REASON.to_owned(),
             },
         ] {
             let json = serde_json::to_string(&event).expect("event encodes");
@@ -1278,6 +1474,16 @@ mod tests {
     }
 
     #[test]
+    fn the_interrupted_event_names_itself_interrupted_on_the_wire() {
+        let event = ControlEvent::Interrupted {
+            reason: INTERRUPTED_REASON.to_owned(),
+        };
+        let json = serde_json::to_value(&event).expect("event encodes");
+        assert_eq!(json["kind"], "interrupted");
+        assert_eq!(json["reason"], INTERRUPTED_REASON);
+    }
+
+    #[test]
     fn every_status_serializes_in_snake_case() {
         for (status, expected) in [
             (TaskStatus::New, "\"new\""),
@@ -1286,6 +1492,7 @@ mod tests {
             (TaskStatus::Completed, "\"completed\""),
             (TaskStatus::Failed, "\"failed\""),
             (TaskStatus::Cancelled, "\"cancelled\""),
+            (TaskStatus::Interrupted, "\"interrupted\""),
         ] {
             assert_eq!(
                 serde_json::to_string(&status).expect("status encodes"),

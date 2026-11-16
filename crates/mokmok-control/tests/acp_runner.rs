@@ -56,6 +56,7 @@ mod tests {
             agent: agent.to_owned(),
             host: None,
             workspace: Some(workspace.display().to_string()),
+            request_id: None,
         }
     }
 
@@ -90,7 +91,7 @@ mod tests {
         let runner = Arc::new(AcpRunner::new(table(args), timeout));
         let journal: JournalHandle = Arc::new(MemoryJournal::new());
         let supervisor = Supervisor::new(system.clone(), runner, journal.clone(), 1);
-        let id = supervisor.submit(task)?;
+        let id = supervisor.submit(task)?.id;
         assert_eq!(supervisor.run_pending()?, 1);
         Ok((store, system, journal, id))
     }
@@ -642,7 +643,7 @@ mod tests {
                 .with_workspace_root(root.path()),
         );
         let supervisor = Supervisor::new(system.clone(), runner, Arc::new(MemoryJournal::new()), 1);
-        let id = supervisor.submit(new_task(&workspace, AGENT))?;
+        let id = supervisor.submit(new_task(&workspace, AGENT))?.id;
         assert_eq!(supervisor.run_pending()?, 1);
         assert_eq!(system.state(&id)?.status, TaskStatus::Completed);
         assert!(recorded(&record).contains("session fake-session"));

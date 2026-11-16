@@ -8,16 +8,32 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mokmok_control_core::{ControlCommand, ControlError, TaskId, TaskSpec, TaskStatus};
+use mokmok_control_core::{ControlCommand, ControlError, StoreError, TaskId, TaskSpec, TaskStatus};
 use mokmok_journal::{Journal, JournalEvent};
 
-use crate::system::{ControlSystem, Error, NewTask};
+use crate::system::{ControlSystem, Error, NewTask, Submission, TaskSummary};
 
 /// How long [`Supervisor::shutdown`] waits for a worker to return before leaving it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How many times one outcome is offered to the log before the task is left for the
+/// next startup sweep to close.
+const SETTLE_ATTEMPTS: usize = SETTLE_BACKOFF.len() + 1;
+
+const SETTLE_BACKOFF: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(100)];
+
 /// The generic answer a journal failure produces.
 const JOURNAL_FAILED: &str = "the control plane could not record the transcript";
+
+/// Why a run that stopped because the supervisor is shutting down is cancelled.
+///
+/// A human cancel commits its own `Cancelled` record before its runner sees the mark, so
+/// a `Cancel` that lands from `settle` while the supervisor is shutting down is the
+/// shutdown path, not a human's.
+const SHUTDOWN_CANCEL_REASON: &str = "the control plane shut down while this task was running";
+
+/// Why a run that chose to stop is cancelled, when nobody asked it to.
+const RUNNER_CANCEL_REASON: &str = "cancelled by the runner";
 
 /// Runs one task and reports what the agent does while it works.
 pub trait Runner: Send + Sync {
@@ -168,7 +184,10 @@ impl Supervisor {
         }
     }
 
-    /// Submits a task and queues it for the workers.
+    /// Submits a task and queues it for the workers when this call created it.
+    ///
+    /// A resend of a request id the log already holds returns the same task and queues
+    /// nothing, so a duplicate submission never runs twice.
     ///
     /// # Errors
     ///
@@ -176,10 +195,12 @@ impl Supervisor {
     pub fn submit(
         &self,
         new: NewTask,
-    ) -> Result<TaskId, Error> {
-        let id = self.work.system.submit(new)?;
-        self.work.queue.push(id.clone());
-        Ok(id)
+    ) -> Result<Submission, Error> {
+        let submitted = self.work.system.submit(new)?;
+        if submitted.created {
+            self.work.queue.push(submitted.id.clone());
+        }
+        Ok(submitted)
     }
 
     /// Asks the task to stop and marks it cancelled for its runner.
@@ -208,18 +229,25 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Runs every task that is submitted, one after another, in this thread.
+    /// Runs every task that is submitted, one after another, in this thread, oldest first.
     ///
     /// Returns how many tasks this call started. A task another worker started first is
-    /// skipped: the `Start` command is the fence, so only one caller wins it.
+    /// skipped: the `Start` command is the fence, so only one caller wins it. Order is
+    /// ascending by the first record's stamp, then by ascending id.
+    ///
+    /// This does not sweep, unlike [`Supervisor::start`]. A `Running` task is either a run
+    /// a dead process left behind or one a live supervisor is working on, and this call
+    /// cannot tell them apart, so closing one here would interrupt a healthy run.
     ///
     /// # Errors
     ///
     /// Returns every error listing the tasks, reading one, starting one, or recording an
     /// outcome reports. A failed task is not an error; it is a [`RunOutcome::Failed`].
     pub fn run_pending(&self) -> Result<usize, Error> {
+        let mut submitted = self.work.system.list()?;
+        submitted.sort_by(compare_oldest_first);
         let mut ran = 0;
-        for summary in self.work.system.list()? {
+        for summary in submitted {
             if summary.status == TaskStatus::Submitted && self.work.run_one(&summary.id)? {
                 ran += 1;
             }
@@ -229,8 +257,9 @@ impl Supervisor {
 
     /// Spawns the worker threads, once.
     ///
-    /// Every task the store still holds in [`TaskStatus::Submitted`] is queued first,
-    /// so a submission a previous process committed runs after a restart.
+    /// Before a worker exists, the store is swept: a run a previous process left
+    /// `Running` is closed as [`TaskStatus::Interrupted`], and a submission a previous
+    /// process committed but never started is queued.
     pub fn start(&self) {
         if self.started.swap(true, Ordering::SeqCst) {
             return;
@@ -239,7 +268,7 @@ impl Supervisor {
         // The cancel mark a previous shutdown raised would make every runner return at
         // once, so a restart clears it with the queue flag.
         self.work.shutting_down.store(false, Ordering::SeqCst);
-        self.work.enqueue_submitted();
+        self.work.sweep();
         let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
         for _ in 0..self.workers {
             let work = Arc::clone(&self.work);
@@ -260,8 +289,9 @@ impl Supervisor {
     /// A run in progress sees [`Reporter::cancelled`] turn true, so a runner that polls
     /// it stops without waiting out its own timeout. A runner blocked elsewhere keeps
     /// its thread, which is left detached once the grace runs out so the process can
-    /// exit. Tasks still queued stay submitted, and [`Supervisor::start`] queues every
-    /// submitted task it finds in the store, so a restarted supervisor picks them up.
+    /// exit. Tasks still queued stay submitted, and the next [`Supervisor::start`] sweeps
+    /// the store and queues every submitted task it finds, so a restarted supervisor picks
+    /// them up.
     pub fn shutdown(&self) {
         self.work.shutting_down.store(true, Ordering::SeqCst);
         self.work.queue.stop();
@@ -319,14 +349,40 @@ impl Work {
         }
     }
 
-    fn enqueue_submitted(&self) {
-        match self.system.submitted() {
-            Ok(ids) => {
-                for id in ids {
-                    self.queue.push(id);
-                }
+    // One appended record per leftover stream, never a rewritten history. The sweep asks only
+    // for the tasks the scan reports as `Running`, and an interrupted one no longer is, so a
+    // second sweep writes nothing.
+    //
+    // A worker detached past the shutdown grace can still be running when a later sweep
+    // sees its task `Running`. `Interrupt` lands first only while no other terminal record
+    // is durable yet, so whichever of the sweep's `Interrupt` or the run's own `Complete` or
+    // `Cancel` commits first wins and the other is dropped as `Terminal`. A sweep can
+    // therefore close a run whose agent did finish.
+    fn sweep(&self) {
+        let recovery = match self.system.recover() {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                tracing::error!(%error, "cannot scan the store");
+                return;
             },
-            Err(error) => tracing::error!(%error, "cannot list submitted tasks"),
+        };
+        for id in recovery.interrupted {
+            match self.system.ask(&id, ControlCommand::Interrupt) {
+                Ok(_) => {
+                    tracing::warn!(
+                        task = id.as_str(),
+                        "closed a run left by a previous process"
+                    );
+                },
+                // A worker detached past the shutdown grace settled it first.
+                Err(Error::Control(ControlError::Terminal)) => {},
+                Err(error) => {
+                    tracing::error!(task = id.as_str(), %error, "a leftover run stays running");
+                },
+            }
+        }
+        for id in recovery.submitted {
+            self.queue.push(id);
         }
     }
 
@@ -395,6 +451,9 @@ impl Work {
 
     // A human cancel can commit while the runner is still working, so the terminal error
     // its own outcome runs into is expected and must not be reported as a failure.
+    //
+    // A retry offers the same command again, so the append is checked at the same `expected`
+    // version rather than against a version read after the failure.
     fn settle(
         &self,
         id: &TaskId,
@@ -403,15 +462,58 @@ impl Work {
         let command = match outcome {
             RunOutcome::Completed { summary } => ControlCommand::Complete { summary },
             RunOutcome::Cancelled => ControlCommand::Cancel {
-                reason: "cancelled by the runner".to_owned(),
+                reason: if self.shutting_down.load(Ordering::SeqCst) {
+                    SHUTDOWN_CANCEL_REASON.to_owned()
+                } else {
+                    RUNNER_CANCEL_REASON.to_owned()
+                },
             },
             RunOutcome::Failed { reason } => ControlCommand::Fail { reason },
         };
-        match self.system.ask(id, command) {
-            Ok(_) | Err(Error::Control(ControlError::Terminal)) => Ok(()),
-            Err(error) => Err(error),
+        let mut attempt = 0;
+        loop {
+            match self.system.ask(id, command.clone()) {
+                Ok(_) | Err(Error::Control(ControlError::Terminal)) => return Ok(()),
+                Err(error) if retryable(&error) && attempt + 1 < SETTLE_ATTEMPTS => {
+                    thread::sleep(SETTLE_BACKOFF[attempt]);
+                    attempt += 1;
+                },
+                Err(error) => {
+                    tracing::error!(
+                        task = id.as_str(),
+                        attempts = attempt + 1,
+                        %error,
+                        "the outcome could not be recorded; the startup sweep closes the task"
+                    );
+                    return Err(error);
+                },
+            }
         }
     }
+}
+
+// A conflict proves the write did not land, and an actor or spawn failure never reached the
+// store. An I/O failure is the ambiguous one: the record may or may not be committed, which is
+// why `EventStore::append` carries its retry obligation.
+const fn retryable(error: &Error) -> bool {
+    match error {
+        Error::Store(StoreError::Conflict { .. } | StoreError::Io(_))
+        | Error::ActorUnavailable
+        | Error::Spawn(_) => true,
+        Error::Store(StoreError::Invalid(_) | StoreError::Corrupt(_))
+        | Error::Control(_)
+        | Error::RequestConflict(_) => false,
+    }
+}
+
+// A stamp is whole seconds, so a burst of submissions ties; the id decides then.
+fn compare_oldest_first(
+    left: &TaskSummary,
+    right: &TaskSummary,
+) -> std::cmp::Ordering {
+    left.submitted_at
+        .cmp(&right.submitted_at)
+        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
 }
 
 struct SystemReporter<'a> {
@@ -499,6 +601,7 @@ mod tests {
             agent: "scripted".to_owned(),
             host: None,
             workspace: Some("/work/mokmok".to_owned()),
+            request_id: None,
         }
     }
 
@@ -516,7 +619,7 @@ mod tests {
     #[test]
     fn a_cancel_marks_the_task_for_its_runner() -> Result<(), Box<dyn std::error::Error>> {
         let (_, supervisor) = supervisor();
-        let id = supervisor.submit(new_task())?;
+        let id = supervisor.submit(new_task())?.id;
         assert!(!supervisor.work.is_cancelled(&id));
         supervisor.cancel(&id, "stop")?;
         assert!(supervisor.work.is_cancelled(&id));
@@ -526,7 +629,7 @@ mod tests {
     #[test]
     fn a_failed_cancel_leaves_no_mark() -> Result<(), Box<dyn std::error::Error>> {
         let (system, supervisor) = supervisor();
-        let id = supervisor.submit(new_task())?;
+        let id = supervisor.submit(new_task())?.id;
         assert_eq!(supervisor.run_pending()?, 1);
         assert_eq!(system.state(&id)?.status, TaskStatus::Completed);
 
@@ -567,6 +670,25 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_request_id_is_queued_once() -> Result<(), Box<dyn std::error::Error>> {
+        let (_, supervisor) = supervisor();
+        let mut new = new_task();
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+
+        supervisor.submit(new.clone())?;
+        supervisor.submit(new)?;
+
+        let queue = supervisor
+            .work
+            .queue
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(queue.len(), 1, "the repeat must not reach the queue");
+        Ok(())
+    }
+
+    #[test]
     fn a_panicking_runner_fails_the_task() -> Result<(), Box<dyn std::error::Error>> {
         let system = system();
         let supervisor = Supervisor::new(
@@ -575,7 +697,7 @@ mod tests {
             Arc::new(MemoryJournal::new()),
             1,
         );
-        let id = supervisor.submit(new_task())?;
+        let id = supervisor.submit(new_task())?.id;
         assert_eq!(supervisor.run_pending()?, 1);
 
         let state = system.state(&id)?;
@@ -630,7 +752,7 @@ mod tests {
             Arc::new(RefusingJournal),
             1,
         );
-        let id = supervisor.submit(new_task())?;
+        let id = supervisor.submit(new_task())?.id;
         assert_eq!(supervisor.run_pending()?, 1);
 
         let state = system.state(&id)?;
@@ -649,7 +771,7 @@ mod tests {
             Arc::new(RefusingJournal),
             1,
         );
-        let id = supervisor.submit(new_task())?;
+        let id = supervisor.submit(new_task())?.id;
         let reporter = SystemReporter {
             work: &supervisor.work,
             id,

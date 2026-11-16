@@ -9,8 +9,8 @@ mod tests {
 
     use mokmok_control::{
         CloudEvent, ControlCommand, ControlError, ControlEvent, ControlPublisher, ControlSystem,
-        EnumerableStore, Error, EventStore, NewTask, NoopPublisher, StoreError, TaskId, TaskSpec,
-        TaskStatus, Version,
+        EnumerableStore, Error, EventStore, NewTask, NoopPublisher, StoreError, Submission, TaskId,
+        TaskSpec, TaskStatus, Version,
     };
     use mokmok_jobs_jsonl::JsonlEventStore;
     use mokmok_jobs_memory::MemoryEventStore;
@@ -22,6 +22,7 @@ mod tests {
             agent: agent.to_owned(),
             host: None,
             workspace: Some("/work/mokmok".to_owned()),
+            request_id: None,
         }
     }
 
@@ -112,6 +113,58 @@ mod tests {
         }
     }
 
+    // Conflicts the first `conflicts` appends, then accepts. A submit bound to two
+    // attempts runs out while the store is still refusing, and one that retries without
+    // a bound eventually lands instead of hanging.
+    struct BoundedConflictStore {
+        conflicts: usize,
+        attempts: AtomicUsize,
+    }
+
+    impl BoundedConflictStore {
+        fn new(conflicts: usize) -> Arc<Self> {
+            Arc::new(Self {
+                conflicts,
+                attempts: AtomicUsize::new(0),
+            })
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl EventStore<TaskId, ControlEvent> for BoundedConflictStore {
+        fn load(
+            &self,
+            _id: &TaskId,
+        ) -> Result<Vec<CloudEvent<ControlEvent>>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn append(
+            &self,
+            _id: &TaskId,
+            expected: Version,
+            _events: &[CloudEvent<ControlEvent>],
+        ) -> Result<Version, StoreError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.conflicts {
+                return Err(StoreError::Conflict {
+                    expected,
+                    actual: expected.next(),
+                });
+            }
+            Ok(expected.next())
+        }
+    }
+
+    impl EnumerableStore<TaskId, ControlEvent> for BoundedConflictStore {
+        fn keys(&self) -> Result<Vec<TaskId>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
     struct IllegalStore {
         id: TaskId,
         records: Vec<CloudEvent<ControlEvent>>,
@@ -174,7 +227,7 @@ mod tests {
         let id = {
             let store = Arc::new(JsonlEventStore::<TaskId, ControlEvent>::open(&root)?);
             let system = ControlSystem::new(store, Arc::new(NoopPublisher));
-            let id = system.submit(new_task("scripted"))?;
+            let id = system.submit(new_task("scripted"))?.id;
             system.ask(&id, ControlCommand::Start)?;
             system.ask(
                 &id,
@@ -214,7 +267,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let store = memory();
         let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
-        let id = system.submit(new_task("scripted"))?;
+        let id = system.submit(new_task("scripted"))?.id;
         system.ask(&id, ControlCommand::Start)?;
 
         let (first, second) = thread::scope(|scope| {
@@ -270,11 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn list_summarises_every_task_sorted_by_id() -> Result<(), Box<dyn std::error::Error>> {
+    fn list_summarises_every_task() -> Result<(), Box<dyn std::error::Error>> {
         let system = ControlSystem::without_idle_timeout(memory(), Arc::new(NoopPublisher));
-        let done = system.submit(new_task("scripted"))?;
-        let waiting = system.submit(new_task("scripted"))?;
-        let running = system.submit(new_task("other"))?;
+        let done = system.submit(new_task("scripted"))?.id;
+        let waiting = system.submit(new_task("scripted"))?.id;
+        let running = system.submit(new_task("other"))?.id;
         system.ask(&done, ControlCommand::Start)?;
         system.ask(
             &done,
@@ -286,11 +339,11 @@ mod tests {
 
         let summaries = system.list()?;
         assert_eq!(summaries.len(), 3);
-
+        let mut listed: Vec<TaskId> = summaries.iter().map(|summary| summary.id.clone()).collect();
+        listed.sort();
         let mut expected = vec![done.clone(), waiting.clone(), running.clone()];
         expected.sort();
-        let listed: Vec<TaskId> = summaries.iter().map(|summary| summary.id.clone()).collect();
-        assert_eq!(listed, expected);
+        assert_eq!(listed, expected, "every task is listed once");
 
         let status = |id: &TaskId| {
             summaries
@@ -314,6 +367,46 @@ mod tests {
     }
 
     #[test]
+    fn list_orders_by_the_first_record_not_the_id() -> Result<(), Box<dyn std::error::Error>> {
+        // The older task has the lower id, so an ascending id sort puts it first and a
+        // newest-first stamp sort puts it last. A comparator that ignored the stamp would
+        // come out in id order, which disagrees.
+        let store = memory();
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let newer = TaskId::from_u128(9);
+        let older = TaskId::from_u128(1);
+        let unstamped = TaskId::from_u128(5);
+        for (id, time) in [
+            (&older, Some("2026-11-01T00:00:00.000Z")),
+            (&newer, Some("2026-11-02T00:00:00.000Z")),
+            (&unstamped, None),
+        ] {
+            let record = CloudEvent::new(
+                id.as_str(),
+                Version::new(1),
+                ControlEvent::Submitted { spec: spec(id) },
+            );
+            let record = match time {
+                Some(time) => record.with_time(time),
+                None => record,
+            };
+            store.append(id, Version::ZERO, &[record])?;
+        }
+
+        let listed: Vec<TaskId> = system
+            .list()?
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![newer, older, unstamped],
+            "newest first by stamp, and a stream with no stamp sorts last"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_zero_idle_timeout_retires_the_actor_and_the_next_command_replays()
     -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(CountingStore::default());
@@ -322,7 +415,7 @@ mod tests {
             Arc::new(NoopPublisher),
             Duration::ZERO,
         );
-        let id = system.submit(new_task("scripted"))?;
+        let id = system.submit(new_task("scripted"))?.id;
         system.ask(&id, ControlCommand::Start)?;
 
         // A busy host stretches the retirement well past 5 s; the bound stays under
@@ -381,6 +474,121 @@ mod tests {
     }
 
     #[test]
+    fn a_submit_that_never_stops_conflicting_gives_up_after_one_retry() {
+        // Two refusals and no more: the retry bound is two attempts, so a third attempt
+        // would land. The bound is finite so that a submit which never gives up fails on
+        // the attempt count instead of hanging the suite.
+        let store = BoundedConflictStore::new(2);
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+
+        let submitted = system.submit(new_task("scripted"));
+
+        assert!(
+            matches!(submitted, Err(Error::Store(StoreError::Conflict { .. }))),
+            "a conflict the retry cannot heal must surface: {submitted:?}"
+        );
+        assert_eq!(store.attempts(), 2, "one attempt and one retry, no more");
+    }
+
+    #[test]
+    fn a_submit_that_conflicts_once_lands_on_its_retry() -> Result<(), Box<dyn std::error::Error>> {
+        let store = BoundedConflictStore::new(1);
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let mut new = new_task("scripted");
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+
+        let submitted = system.submit(new)?;
+
+        assert!(submitted.created, "the retry commits the submission");
+        assert_eq!(store.attempts(), 2, "one refusal and one retry");
+        Ok(())
+    }
+
+    // Commits the record and then reports a conflict, which is what a lost race looks
+    // like: the bytes are in the log, the losing actor's version was stale.
+    struct WonRaceStore {
+        inner: MemoryEventStore<TaskId, ControlEvent>,
+        raced: AtomicBool,
+    }
+
+    impl EventStore<TaskId, ControlEvent> for WonRaceStore {
+        fn load(
+            &self,
+            id: &TaskId,
+        ) -> Result<Vec<CloudEvent<ControlEvent>>, StoreError> {
+            self.inner.load(id)
+        }
+
+        fn append(
+            &self,
+            id: &TaskId,
+            expected: Version,
+            events: &[CloudEvent<ControlEvent>],
+        ) -> Result<Version, StoreError> {
+            let committed = self.inner.append(id, expected, events)?;
+            if !self.raced.swap(true, Ordering::SeqCst) {
+                return Err(StoreError::Conflict {
+                    expected,
+                    actual: committed,
+                });
+            }
+            Ok(committed)
+        }
+    }
+
+    impl EnumerableStore<TaskId, ControlEvent> for WonRaceStore {
+        fn keys(&self) -> Result<Vec<TaskId>, StoreError> {
+            self.inner.keys()
+        }
+    }
+
+    #[test]
+    fn a_submit_that_loses_a_race_answers_from_the_winners_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(WonRaceStore {
+            inner: MemoryEventStore::new(),
+            raced: AtomicBool::new(false),
+        });
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let mut new = new_task("scripted");
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+
+        let submission = system.submit(new)?;
+
+        assert!(
+            !submission.created,
+            "the record was already committed, so this call did not create the task"
+        );
+        assert_eq!(store.load(&submission.id)?.len(), 1, "one submission");
+        assert_eq!(system.state(&submission.id)?.status, TaskStatus::Submitted);
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_submit_for_a_different_spec_over_one_store_conflicts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(WonRaceStore {
+            inner: MemoryEventStore::new(),
+            raced: AtomicBool::new(false),
+        });
+        let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
+        let mut first = new_task("scripted");
+        first.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+        let mut differing = first.clone();
+        differing.instruction = "Make something else pass.".to_owned();
+
+        let winner = system.submit(first)?;
+        let loser = system.submit(differing);
+
+        let conflicts = matches!(&loser, Err(Error::RequestConflict(id)) if *id == winner.id);
+        assert!(
+            conflicts,
+            "a lost race with other content conflicts: {loser:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn submit_validates_the_spec_before_it_appends() -> Result<(), Box<dyn std::error::Error>> {
         let system = ControlSystem::without_idle_timeout(memory(), Arc::new(NoopPublisher));
         let mut new = new_task("scripted");
@@ -402,11 +610,120 @@ mod tests {
     }
 
     #[test]
+    fn a_request_id_names_one_task_whatever_state_it_reached()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = memory();
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let request_id = "01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60";
+        let mut new = new_task("scripted");
+        new.request_id = Some(request_id.to_owned());
+
+        let first = system.submit(new.clone())?;
+        assert!(first.created);
+        let repeated = |system: &ControlSystem| system.submit(new.clone());
+        let same = Submission {
+            id: first.id.clone(),
+            created: false,
+        };
+        assert_eq!(repeated(&system)?, same, "a resend from Submitted");
+
+        system.ask(&first.id, ControlCommand::Start)?;
+        assert_eq!(repeated(&system)?, same, "a resend from Running");
+
+        system.ask(
+            &first.id,
+            ControlCommand::Complete {
+                summary: "done".to_owned(),
+            },
+        )?;
+        assert_eq!(repeated(&system)?, same, "a resend from Completed");
+
+        let submitted = store
+            .load(&first.id)?
+            .into_iter()
+            .filter(|event| matches!(event.data, ControlEvent::Submitted { .. }))
+            .count();
+        assert_eq!(submitted, 1, "a resend commits no second submission");
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_id_names_one_task_after_an_interrupt() -> Result<(), Box<dyn std::error::Error>> {
+        let system = ControlSystem::without_idle_timeout(memory(), Arc::new(NoopPublisher));
+        let mut new = new_task("scripted");
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+
+        let first = system.submit(new.clone())?;
+        system.ask(&first.id, ControlCommand::Start)?;
+        system.ask(&first.id, ControlCommand::Interrupt)?;
+        assert_eq!(system.state(&first.id)?.status, TaskStatus::Interrupted);
+
+        assert_eq!(
+            system.submit(new)?,
+            Submission {
+                id: first.id,
+                created: false
+            },
+            "the state a client is most likely to resend against"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_id_with_different_content_is_a_conflict() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let system = ControlSystem::without_idle_timeout(memory(), Arc::new(NoopPublisher));
+        let mut new = new_task("scripted");
+        new.host = Some("eu".to_owned());
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+        let first = system.submit(new.clone())?;
+
+        // One differing value per field, so a comparison that forgets a field fails here.
+        let mut title = new.clone();
+        title.title = "Another title".to_owned();
+        let mut instruction = new.clone();
+        instruction.instruction = "Make something else pass.".to_owned();
+        let mut agent = new.clone();
+        agent.agent = "other".to_owned();
+        let mut host = new.clone();
+        host.host = None;
+        let mut workspace = new;
+        workspace.workspace = None;
+
+        for (field, changed) in [
+            ("title", title),
+            ("instruction", instruction),
+            ("agent", agent),
+            ("host", host),
+            ("workspace", workspace),
+        ] {
+            let conflict = system.submit(changed);
+            let conflicts = matches!(&conflict, Err(Error::RequestConflict(id)) if *id == first.id);
+            assert!(conflicts, "a differing {field} must conflict: {conflict:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_id_that_is_not_a_uuid_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        let system = ControlSystem::without_idle_timeout(memory(), Arc::new(NoopPublisher));
+        let mut new = new_task("scripted");
+        new.request_id = Some("not-a-uuid".to_owned());
+
+        assert!(matches!(
+            system.submit(new),
+            Err(Error::Control(ControlError::InvalidRequestId(_)))
+        ));
+        assert!(system.list()?.is_empty(), "nothing was appended");
+        Ok(())
+    }
+
+    #[test]
     fn the_publisher_sees_each_batch_before_the_caller_is_answered()
     -> Result<(), Box<dyn std::error::Error>> {
         let publisher = Arc::new(RecordingPublisher::default());
         let system = ControlSystem::without_idle_timeout(memory(), publisher.clone());
-        let id = system.submit(new_task("scripted"))?;
+        let id = system.submit(new_task("scripted"))?.id;
         assert_eq!(publisher.seen().len(), 1);
         assert!(matches!(
             publisher.seen()[0],

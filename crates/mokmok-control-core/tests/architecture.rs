@@ -6,13 +6,14 @@ mod tests {
 
     const DOC: &str = include_str!("../../../ARCHITECTURE.md");
 
-    const STATUSES: [TaskStatus; 6] = [
+    const STATUSES: [TaskStatus; 7] = [
         TaskStatus::New,
         TaskStatus::Submitted,
         TaskStatus::Running,
         TaskStatus::Completed,
         TaskStatus::Failed,
         TaskStatus::Cancelled,
+        TaskStatus::Interrupted,
     ];
 
     fn spec() -> TaskSpec {
@@ -26,7 +27,7 @@ mod tests {
         }
     }
 
-    fn commands() -> [ControlCommand; 6] {
+    fn commands() -> [ControlCommand; 7] {
         [
             ControlCommand::Submit(spec()),
             ControlCommand::Start,
@@ -42,6 +43,7 @@ mod tests {
             ControlCommand::Cancel {
                 reason: "stop".to_owned(),
             },
+            ControlCommand::Interrupt,
         ]
     }
 
@@ -53,6 +55,7 @@ mod tests {
             ControlCommand::Complete { .. } => "Complete",
             ControlCommand::Fail { .. } => "Fail",
             ControlCommand::Cancel { .. } => "Cancel",
+            ControlCommand::Interrupt => "Interrupt",
         }
     }
 
@@ -64,6 +67,7 @@ mod tests {
             TaskStatus::Completed => "Completed",
             TaskStatus::Failed => "Failed",
             TaskStatus::Cancelled => "Cancelled",
+            TaskStatus::Interrupted => "Interrupted",
         }
     }
 
@@ -111,7 +115,16 @@ mod tests {
             },
             TaskStatus::Cancelled,
         );
-        vec![new, submitted, running, completed, failed, cancelled]
+        let interrupted = walk(&running, ControlCommand::Interrupt, TaskStatus::Interrupted);
+        vec![
+            new,
+            submitted,
+            running,
+            completed,
+            failed,
+            cancelled,
+            interrupted,
+        ]
     }
 
     fn machine_edges() -> Vec<(String, String, String)> {

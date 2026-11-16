@@ -3,9 +3,9 @@
 #[cfg(test)]
 mod tests {
     use mokmok_control_core::{
-        AgentUpdate, CloudEvent, ControlCommand, ControlError, ControlEvent, MAX_PROMPT_BYTES,
-        PromptInput, TaskId, TaskSpec, TaskState, TaskStatus, Version, compose_prompt, decide,
-        evolve,
+        AgentUpdate, CloudEvent, ControlCommand, ControlError, ControlEvent, INTERRUPTED_REASON,
+        MAX_PROMPT_BYTES, PromptInput, TaskId, TaskSpec, TaskState, TaskStatus, Version,
+        compose_prompt, decide, evolve,
     };
     use proptest::prelude::*;
 
@@ -50,6 +50,7 @@ mod tests {
             2 => text().prop_map(|summary| ControlCommand::Complete { summary }),
             2 => text().prop_map(|reason| ControlCommand::Fail { reason }),
             2 => text().prop_map(|reason| ControlCommand::Cancel { reason }),
+            2 => Just(ControlCommand::Interrupt),
         ]
     }
 
@@ -68,6 +69,7 @@ mod tests {
             ControlCommand::Cancel {
                 reason: "stop".to_owned(),
             },
+            ControlCommand::Interrupt,
         ]
     }
 
@@ -89,10 +91,7 @@ mod tests {
                         CloudEvent::new(subject.as_str(), Version::new(position + 1), event.clone());
                     evolve(&mut state, &event).expect("decide produced a legal event");
                     log.push(record);
-                    if matches!(
-                        state.status,
-                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-                    ) {
+                    if state.status.is_terminal() {
                         for command in every_command() {
                             prop_assert_eq!(decide(&state, command), Err(ControlError::Terminal));
                         }
@@ -101,6 +100,39 @@ mod tests {
             }
             let replayed = TaskState::replay(&log).expect("decide built a well formed log");
             prop_assert_eq!(&replayed, &state);
+        }
+
+        #[test]
+        fn an_interrupt_records_the_domain_reason_from_running(
+            commands in prop::collection::vec(command(), 0..8),
+        ) {
+            let mut state = TaskState::default();
+            for command in commands {
+                let Ok(events) = decide(&state, command) else {
+                    continue;
+                };
+                for event in events {
+                    evolve(&mut state, &event).expect("decide produced a legal event");
+                }
+            }
+            if state.status != TaskStatus::Running {
+                return Ok(());
+            }
+            prop_assert_eq!(
+                decide(&state, ControlCommand::Interrupt),
+                Ok(vec![ControlEvent::Interrupted {
+                    reason: INTERRUPTED_REASON.to_owned(),
+                }])
+            );
+            evolve(
+                &mut state,
+                &ControlEvent::Interrupted {
+                    reason: INTERRUPTED_REASON.to_owned(),
+                },
+            )
+            .expect("interrupted follows running");
+            prop_assert_eq!(state.status, TaskStatus::Interrupted);
+            prop_assert_eq!(state.outcome.as_deref(), Some(INTERRUPTED_REASON));
         }
 
         #[test]

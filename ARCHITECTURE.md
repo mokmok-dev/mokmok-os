@@ -22,10 +22,11 @@ stateDiagram-v2
     Running --> Completed : Complete, the runner returns a summary
     Running --> Failed : Fail, the runner returns a reason
     Running --> Cancelled : Cancel, from a person or from daemon shutdown
+    Running --> Interrupted : Interrupt, a restart finds the run still claimed
 ```
 
-`Completed`, `Failed`, and `Cancelled` carry no outgoing edge, so every command they
-receive returns `Terminal`.
+`Completed`, `Failed`, `Cancelled`, and `Interrupted` carry no outgoing edge, so every
+command they receive returns `Terminal`.
 
 ### States
 
@@ -37,6 +38,7 @@ receive returns `Terminal`.
 | `Completed` | The runner returned a summary, which is the outcome. | A listing row with status `completed` and the summary, and a `409` on cancel. |
 | `Failed` | The runner returned a reason, which is the outcome. | A listing row with status `failed` and the reason, and a `409` on cancel. |
 | `Cancelled` | A person cancelled, or a shutdown did, and the reason is the outcome. | A listing row with status `cancelled` and the reason, and a `409` on cancel. |
+| `Interrupted` | The control plane stopped while the task was running, and no process can finish it. | A listing row with status `interrupted` and the reason, and a `409` on cancel. |
 
 ### Transitions
 
@@ -49,6 +51,7 @@ receive returns `Terminal`.
 | `Running` | `Complete` | `Completed` | `Completed` | `Work::settle` in `crates/mokmok-control/src/supervisor.rs` |
 | `Running` | `Fail` | `Failed` | `Failed` | `Work::settle` in `crates/mokmok-control/src/supervisor.rs` |
 | `Running` | `Cancel` | `Cancelled` | `Cancelled` | `Supervisor::cancel` from `cancel_task`, or `Work::settle` when a stopped runner returns `Cancelled` |
+| `Running` | `Interrupt` | `Interrupted` | `Interrupted` | `Work::sweep` in `crates/mokmok-control/src/supervisor.rs`, at startup, for a run a previous process left claimed |
 
 ### Rejected commands
 
@@ -59,9 +62,9 @@ A rejected command commits nothing and leaves the stream where it was.
 | `NotSubmitted` | Every command except `Submit`. | `New` |
 | `AlreadySubmitted` | A second `Submit`. | `Submitted`, `Running` |
 | `AlreadyStarted` | A second `Start`. | `Running` |
-| `NotRunning` | `OpenSession`, `Complete`, or `Fail` before `Start`. | `Submitted` |
+| `NotRunning` | `OpenSession`, `Complete`, `Fail`, or `Interrupt` before `Start`. | `Submitted` |
 | `SessionAlreadyOpen` | A second `OpenSession` on a task that already holds a session. | `Running` |
-| `Terminal` | Every command. | `Completed`, `Failed`, `Cancelled` |
+| `Terminal` | Every command. | `Completed`, `Failed`, `Cancelled`, `Interrupted` |
 
 `Submit` on an invalid spec returns `InvalidSpec` and commits nothing. The task actor in
 `handle` in `crates/mokmok-control/src/system.rs` returns `WrongTaskId` before `decide`
@@ -81,8 +84,8 @@ keeps it, so a legacy task still shows its transcript, and no command emits it t
 the machine. Create calls `Supervisor::submit`, which commits `Submitted` before the id
 reaches the caller, so a held id always names a stream that a restart can find. Cancel
 reads the task through `ControlSystem::state` first and answers `409` for a task that is
-already `Completed`, `Failed`, or `Cancelled`. The supervisor therefore only sees a
-cancel the machine can still take.
+already `Completed`, `Failed`, `Cancelled`, or `Interrupted`. The supervisor therefore only
+sees a cancel the machine can still take.
 
 `ControlSystem` in `crates/mokmok-control/src/system.rs` keeps one actor per task. A
 command for a task with no live actor replays the stream, spawns the actor with the state
@@ -97,6 +100,12 @@ fence, so exactly one worker runs a task and a worker that loses the race skips 
 `settle` maps a `RunOutcome` to `Complete`, `Fail`, or `Cancel`. A shutdown sets
 `shutting_down`, so a cooperative runner ends `Cancelled`, queued tasks stay `Submitted`,
 and a restart queues every `Submitted` task it finds.
+
+Before a restart spawns any worker, `Work::sweep` asks `ControlSystem::recover` for the
+streams a previous process left open and appends one `Interrupted` record to each task
+still `Running`. That is the only way a task becomes `Interrupted`, and it is why a run
+whose agent finished cannot be resumed: the sweep records the fact that no process
+finished it, and a later outcome from a detached worker is refused as `Terminal`.
 
 The runners in `crates/mokmok-control/src/runner.rs` are `ScriptedRunner`, `FailingRunner`,
 and `AcpRunner`. `AcpRunner` maps `StopReason::EndTurn` to `Completed`,

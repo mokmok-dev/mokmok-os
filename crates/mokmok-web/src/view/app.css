@@ -241,19 +241,19 @@ textarea {
   background: var(--subtle);
 }
 
-.dot-active {
+.status-dot.tone-active {
   background: var(--info);
 }
 
-.dot-success {
+.status-dot.tone-success {
   background: var(--success);
 }
 
-.dot-danger {
+.status-dot.tone-danger {
   background: var(--danger);
 }
 
-.dot-warning {
+.status-dot.tone-warning {
   background: var(--warning);
 }
 
@@ -319,22 +319,22 @@ textarea {
   white-space: nowrap;
 }
 
-.badge-active {
+.badge.tone-active {
   border-color: var(--info);
   color: var(--info);
 }
 
-.badge-success {
+.badge.tone-success {
   border-color: var(--success);
   color: var(--success);
 }
 
-.badge-danger {
+.badge.tone-danger {
   border-color: var(--danger);
   color: var(--danger);
 }
 
-.badge-warning {
+.badge.tone-warning {
   border-color: var(--warning);
   color: var(--warning);
 }

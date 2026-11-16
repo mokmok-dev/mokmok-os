@@ -5,9 +5,15 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::process::{Child, ChildStderr, Command, Stdio};
+    use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    use mokmok_control::{
+        ControlCommand, ControlEvent, ControlSystem, INTERRUPTED_REASON, NewTask, NoopPublisher,
+        TaskId,
+    };
+    use mokmok_jobs_jsonl::JsonlEventStore;
     use serde_json::Value;
     use tempfile::TempDir;
 
@@ -327,6 +333,39 @@ mod tests {
     }
 
     #[test]
+    fn one_request_id_over_the_socket_answers_one_task() {
+        let dir = TempDir::new().expect("a temp dir");
+        let (_daemon, address) = Daemon::spawn(&dir);
+        let body = r#"{"title":"Fix the build","instruction":"Make the tests pass.","agent":"scripted","request_id":"01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60"}"#;
+
+        let (first, first_body) = request(address, "POST", "/api/tasks", Some(body));
+        assert_eq!(first, 201);
+        let created: Value = serde_json::from_str(&first_body).expect("the answer is JSON");
+        let id = created["id"]
+            .as_str()
+            .expect("the answer carries an id")
+            .to_owned();
+
+        let (second, second_body) = request(address, "POST", "/api/tasks", Some(body));
+        assert_eq!(second, 200);
+        let repeated: Value = serde_json::from_str(&second_body).expect("the answer is JSON");
+        assert_eq!(
+            repeated["id"].as_str(),
+            Some(id.as_str()),
+            "both sends name one task"
+        );
+
+        let (status, body) = request(address, "GET", "/api/tasks", None);
+        assert_eq!(status, 200);
+        let listed: Value = serde_json::from_str(&body).expect("the listing is JSON");
+        assert_eq!(
+            listed["tasks"].as_array().map(Vec::len),
+            Some(1),
+            "one task, not two: {body}"
+        );
+    }
+
+    #[test]
     fn the_journal_flags_shape_the_segments_on_disk() {
         let dir = TempDir::new().expect("a temp dir");
         let (_daemon, address) = Daemon::spawn_with(
@@ -370,5 +409,67 @@ mod tests {
             !journal_dir.join("0.jsonl").exists(),
             "the rotated segment is pruned"
         );
+    }
+
+    #[test]
+    fn a_restart_closes_a_run_left_by_a_previous_process() {
+        let dir = TempDir::new().expect("a temp dir");
+        let id = {
+            let store = Arc::new(
+                JsonlEventStore::<TaskId, ControlEvent>::open(dir.path().join("tasks"))
+                    .expect("the store opens"),
+            );
+            let system = ControlSystem::without_idle_timeout(store, Arc::new(NoopPublisher));
+            let id = system
+                .submit(NewTask {
+                    title: "Fix the build".to_owned(),
+                    instruction: "Make the tests pass.".to_owned(),
+                    agent: "scripted".to_owned(),
+                    host: None,
+                    workspace: None,
+                    request_id: None,
+                })
+                .expect("the task submits")
+                .id;
+            system
+                .ask(&id, ControlCommand::Start)
+                .expect("the task starts");
+            id
+        };
+        let stream = dir
+            .path()
+            .join("tasks")
+            .join(format!("{}.jsonl", id.as_str()));
+
+        let (daemon, address) = Daemon::spawn(&dir);
+        let (status, body) = request(address, "GET", &format!("/api/tasks/{}", id.as_str()), None);
+        assert_eq!(status, 200);
+        let detail: Value = serde_json::from_str(&body).expect("the detail is JSON");
+        assert_eq!(detail["state"]["status"], "interrupted");
+        assert_eq!(detail["state"]["outcome"], INTERRUPTED_REASON);
+
+        let (status, body) = request(address, "GET", &format!("/?session={}", id.as_str()), None);
+        assert_eq!(status, 200);
+        assert!(
+            !body.contains("<meta http-equiv=\"refresh\""),
+            "a closed run must stop refreshing: {body}"
+        );
+        assert!(
+            !body.contains("action=\"/sessions/cancel\""),
+            "a closed run has nothing to cancel: {body}"
+        );
+        assert!(body.contains(INTERRUPTED_REASON), "{body}");
+
+        let settled = std::fs::read(&stream).expect("the stream reads");
+        drop(daemon);
+
+        let (restarted, address) = Daemon::spawn(&dir);
+        assert_eq!(request(address, "GET", "/healthz", None).0, 200);
+        assert_eq!(
+            std::fs::read(&stream).expect("the stream reads"),
+            settled,
+            "a second start finds a terminal state and appends nothing"
+        );
+        drop(restarted);
     }
 }

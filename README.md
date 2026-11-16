@@ -165,8 +165,11 @@ A task is stored twice, with different lifetimes:
 - `<data-dir>/tasks/<id>.jsonl` with `--store file`, or
   `s3://<bucket>/<prefix>/<id>.jsonl` with `--store s3`, is the domain CloudEvent
   stream: `Submitted`, `Started`, `SessionOpened`, `Completed`, `Failed`, `Cancelled`,
-  and bounded facts such as the completed summary. It is the source of truth for the
-  task's state, so replay and listing stay fast however long the transcript grows.
+  `Interrupted`, and bounded facts such as the completed summary. It is the source of
+  truth for the task's state, so replay and listing stay fast however long the
+  transcript grows. `Interrupted` is terminal and means the control plane stopped while
+  the task was running; it carries a reason the domain wrote, and no outcome the agent
+  reported was recorded.
 - `<data-dir>/journal/<id>/<generation>.jsonl` is the execution journal: one compact
   JSON object per line with `seq`, `time`, and a `message`, `thought`, `tool_call`, or
   `permission` record. It is operational telemetry, is never replayed into the domain
@@ -185,6 +188,26 @@ transcript from the journal and the status and outcome from the domain state. Th
 count is cached after the first read, which the startup sweep warms; a count that
 fails is not cached, so the next request tries again and the failure is logged at
 debug level rather than once per poll.
+
+`POST /api/tasks` accepts an optional `request_id`, a UUID the client mints once per
+submission. The daemon derives the task's id from it, so the same `request_id` names the
+same task however often it is sent, and a resend answers `200` with that id instead of
+starting a second run; a `request_id` that already names a task with different content
+answers `409`, and a value that is not a UUID answers `400`. Any spelling `Uuid` accepts,
+such as uppercase or unhyphenated, names the same task. A submission without a
+`request_id` gets a fresh id and answers `201`. The derived key is the only record: the
+`request_id` itself is not stored, so the first event of every stream keeps its shape.
+
+A restart closes what a dead daemon left behind. Before it spawns a worker, the
+supervisor's `start` scans the store: a task still `Running` whose stream replays gets one
+`Interrupted` record, and a task still `Submitted` goes back on the queue. A stream that
+will not read or replay, or a sweep whose append itself fails, is logged and left as it is,
+so a damaged log can hide its own task but never another's. A second start finds the task
+terminal and writes nothing, so the sweep is safe to repeat. A task reaches the sweep three
+ways: the process crashes, a run outlives the five second shutdown grace, or the outcome
+write fails three times. A refused or failed outcome write is retried, because the store
+re-reads the stream after a failed write, so a retry either lands once or reports that the
+record is already there; only a write that keeps failing is left for the next start's sweep.
 
 `/api/events` streams domain CloudEvents and `/api/journal/events` streams
 `{"task":"<uuid>","entry":{…}}` lines. Both feeds carry every task's records; neither

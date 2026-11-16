@@ -193,9 +193,11 @@ where
         let last = check_append(key.as_str(), expected, events)?;
         let mut buffer = Vec::new();
         encode_records(events, &mut buffer)?;
-        file.write_all(&buffer)
-            .map_err(|error| error_at(&path, &error))?;
-        file.sync_data().map_err(|error| error_at(&path, &error))?;
+        // The cache cannot be trusted once this stream's write has failed.
+        if let Err(error) = file.write_all(&buffer).and_then(|()| file.sync_data()) {
+            state.versions.remove(key);
+            return Err(error_at(&path, &error));
+        }
         state.versions.insert(key.clone(), last);
         Ok(last)
     }
@@ -647,6 +649,127 @@ mod tests {
                 actual,
             } if expected == Version::new(1) && actual == Version::ZERO
         ));
+        Ok(())
+    }
+
+    // Leaves `torn` on the end of the committed file, then swaps the file for `/dev/null` for
+    // one append, where `write_all` succeeds and `sync_data` fails with `EINVAL`. A torn tail is
+    // what a failed `write_all` leaves; a durable record with no tail is what a failed
+    // `sync_data` leaves. The adapter keeps its cache across both, which is what a daemon's
+    // single store instance does.
+    #[cfg(unix)]
+    fn redirect_for_one_sync(
+        store: &JsonlEventStore<JobId, JobEvent>,
+        id: &JobId,
+        torn: Option<&[u8]>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = store.path(id);
+        let held = path.with_extension("held");
+        fs::rename(&path, &held)?;
+        if let Some(bytes) = torn {
+            let mut file = OpenOptions::new().append(true).open(&held)?;
+            file.write_all(bytes)?;
+        }
+        std::os::unix::fs::symlink("/dev/null", &path)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn restore_stream(
+        store: &JsonlEventStore<JobId, JobEvent>,
+        id: &JobId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = store.path(id);
+        let held = path.with_extension("held");
+        fs::remove_file(&path)?;
+        fs::rename(&held, &path)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_drops_the_cache_so_the_next_append_re_reads_the_stream()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(30);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
+
+        // The torn tail is what a failed `write_all` leaves and what `ensure` exists to
+        // truncate. A cache that still names version 1 skips `ensure`, so the next append
+        // would write onto the torn line.
+        redirect_for_one_sync(&store, &id, Some(b"{\"specversion\":\"1.0\""))?;
+        let error = store.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        );
+        restore_stream(&store, &id)?;
+        assert!(
+            matches!(error, Err(StoreError::Io(_))),
+            "the failed sync must surface: {error:?}"
+        );
+
+        let version = store.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        )?;
+        assert_eq!(version, Version::new(2));
+        assert_eq!(
+            store.load(&id)?.len(),
+            2,
+            "the torn tail was truncated and the record written once"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_that_left_the_record_durable_is_seen_by_the_next_append()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = store(&directory);
+        let id = id(31);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
+
+        // The record reached the file before its sync failed, so the stream stands at version
+        // 2 while the cache still names version 1. The next append goes to `/dev/null`, where
+        // it reaches the adapter's failure branch and the cache is dropped.
+        let durable = at(&id, 2, JobEvent::Started { attempt: 1 });
+        let mut file = OpenOptions::new().append(true).open(store.path(&id))?;
+        file.write_all(format!("{}\n", line(&durable)).as_bytes())?;
+        file.sync_data()?;
+        drop(file);
+
+        redirect_for_one_sync(&store, &id, None)?;
+        let error = store.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        );
+        restore_stream(&store, &id)?;
+        assert!(
+            matches!(error, Err(StoreError::Io(_))),
+            "the failed sync must surface: {error:?}"
+        );
+
+        // The cache was dropped, so the next append reads the file and refuses the stale
+        // version instead of writing version 2 twice.
+        let stale = store.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        );
+        assert!(
+            matches!(
+                stale,
+                Err(StoreError::Conflict { expected, actual })
+                    if expected == Version::new(1) && actual == Version::new(2)
+            ),
+            "the append must be checked against the committed file: {stale:?}"
+        );
+        assert_eq!(store.load(&id)?.len(), 2);
         Ok(())
     }
 

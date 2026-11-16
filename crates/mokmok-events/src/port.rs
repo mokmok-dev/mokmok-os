@@ -45,6 +45,9 @@ pub trait EventStore<K: StreamKey, E>: Send + Sync {
     /// `events` must be the records `expected.next()..` of `key`'s stream, which
     /// [`check_append`] verifies.
     ///
+    /// A caller may retry `Io`, so after an `Io` the next `append` for that key must be
+    /// checked against what the store actually holds rather than against a cached version.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Conflict`] when the stream's version is not `expected`,

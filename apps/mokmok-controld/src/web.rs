@@ -48,6 +48,7 @@ impl ControlPlane for Plane {
                             agent: task.agent,
                             workspace: task.workspace,
                             outcome: task.outcome,
+                            submitted_at: task.submitted_at,
                         })
                         .collect()
                 })
@@ -152,7 +153,9 @@ impl ControlPlane for Plane {
                     agent: spec.agent,
                     host: None,
                     workspace: spec.workspace,
+                    request_id: spec.request_id,
                 })
+                .map(|submitted| submitted.id)
                 .map_err(refusal)
         })
     }
@@ -220,6 +223,21 @@ fn refusal(error: SystemError) -> PortError {
         },
         SystemError::Control(ControlError::InvalidSpec { field, reason }) => {
             PortError::Refused(format!("{field} {reason}"))
+        },
+        SystemError::Control(ControlError::InvalidRequestId(_)) => {
+            PortError::Refused("the form carried an invalid request id".to_owned())
+        },
+        // The composer mints one request id per render, so a differing spec reaches this
+        // only from a stale form or a client that reused a value.
+        SystemError::RequestConflict(id) => {
+            tracing::debug!(
+                task = id.as_str(),
+                "a resubmitted form carried other content"
+            );
+            PortError::Refused(
+                "this form was already sent with different content; send again to start a new session"
+                    .to_owned(),
+            )
         },
         // The rest name states a page command cannot reach, and a store, actor, or spawn
         // failure has no closer variant than unavailable.

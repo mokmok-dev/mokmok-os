@@ -16,9 +16,9 @@ mod system;
 
 pub use mokmok_control_core::{
     AgentUpdate, CloudEvent, ControlCommand, ControlError, ControlEvent, DEFAULT_PROMPT_BYTES,
-    EnumerableStore, EventStore, EventType, MAX_PROMPT_BYTES, MAX_UPDATES, PromptInput, SOURCE,
-    SequenceType, SpecVersion, StoreError, StreamKey, TaskId, TaskSpec, TaskState, TaskStatus,
-    Version, check_append, compose_prompt, decide, evolve, validate_history,
+    EnumerableStore, EventStore, EventType, INTERRUPTED_REASON, MAX_PROMPT_BYTES, MAX_UPDATES,
+    PromptInput, SOURCE, SequenceType, SpecVersion, StoreError, StreamKey, TaskId, TaskSpec,
+    TaskState, TaskStatus, Version, check_append, compose_prompt, decide, evolve, validate_history,
 };
 pub use mokmok_journal::{Journal, JournalEvent};
 pub use runner::{
@@ -27,7 +27,7 @@ pub use runner::{
 pub use supervisor::{Reporter, RunOutcome, Runner, Supervisor};
 pub use system::{
     Appended, ControlPublisher, ControlSystem, DEFAULT_IDLE_TIMEOUT, Error, NewTask, NoopPublisher,
-    TaskSummary,
+    Recovery, Submission, TaskSummary,
 };
 
 /// The journal shape of an update recorded before the execution journal existed.

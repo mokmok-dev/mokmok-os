@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use mokmok_control_core::{TaskId, TaskStatus};
+use mokmok_control_core::{INTERRUPTED_REASON, TaskId, TaskStatus};
 use mokmok_journal::JournalEvent;
 use mokmok_web::{
     port::{
@@ -35,6 +35,7 @@ impl Fake {
                 agent: "local".to_owned(),
                 workspace: Some("/srv/one".to_owned()),
                 outcome: None,
+                submitted_at: None,
                 updates: Some(1),
             }],
             entries: vec![Entry {
@@ -69,6 +70,7 @@ impl Fake {
             agent: "local".to_owned(),
             workspace: Some("/srv/one".to_owned()),
             outcome: None,
+            submitted_at: None,
             updates: Some(1),
         });
         fake
@@ -87,6 +89,7 @@ impl Fake {
                 agent: "local".to_owned(),
                 workspace: Some("/srv/alpha".to_owned()),
                 outcome: None,
+                submitted_at: None,
                 updates: Some(1),
             },
             Session {
@@ -98,6 +101,7 @@ impl Fake {
                 agent: "local".to_owned(),
                 workspace: Some("/srv/beta".to_owned()),
                 outcome: None,
+                submitted_at: None,
                 updates: Some(1),
             },
         ];
@@ -181,6 +185,12 @@ impl ControlPlane for Fake {
     }
 }
 
+fn minted(body: &str) -> Option<String> {
+    let (_, rest) = body.split_once("name=\"request_id\" value=\"")?;
+    let (value, _) = rest.split_once('"')?;
+    Some(value.to_owned())
+}
+
 /// Sends a request through the page router, the way the daemon mounts it.
 async fn send(
     plane: Arc<dyn ControlPlane>,
@@ -249,6 +259,10 @@ async fn a_running_session_renders_a_live_region() {
     assert_eq!(status, 200);
     assert!(body.contains("live-note"), "{body}");
     assert!(body.contains("action=\"/sessions/cancel\""), "{body}");
+    assert!(
+        body.contains("<meta http-equiv=\"refresh\" content=\"2; url="),
+        "a running session re-reads itself: {body}"
+    );
 }
 
 #[tokio::test]
@@ -258,6 +272,40 @@ async fn a_finished_session_has_no_live_region_and_no_cancel() {
 
     assert!(!body.contains("live-note"), "{body}");
     assert!(!body.contains("action=\"/sessions/cancel\""), "{body}");
+}
+
+#[tokio::test]
+async fn an_interrupted_session_explains_itself_and_stops_refreshing() {
+    let mut interrupted = Fake::with_session(TaskStatus::Interrupted);
+    interrupted.sessions[0].outcome = Some(INTERRUPTED_REASON.to_owned());
+    let fake = Arc::new(interrupted);
+    let (status, _, body) = send(fake, Method::GET, "/", None).await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("Interrupted"), "{body}");
+    assert!(
+        body.contains("badge tone-warning"),
+        "the badge carries the warning tone: {body}"
+    );
+    assert!(body.contains(INTERRUPTED_REASON), "{body}");
+    assert!(body.contains("outcome-note"), "{body}");
+    assert!(!body.contains("<meta http-equiv=\"refresh\""), "{body}");
+    assert!(!body.contains("action=\"/sessions/cancel\""), "{body}");
+}
+
+#[tokio::test]
+async fn a_completed_session_renders_its_transcript_without_an_outcome_note() {
+    let mut completed = Fake::with_session(TaskStatus::Completed);
+    completed.sessions[0].outcome = Some("the tests all pass".to_owned());
+    let fake = Arc::new(completed);
+    let (status, _, body) = send(fake, Method::GET, "/", None).await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("the agent answered"), "{body}");
+    assert!(
+        !body.contains("outcome-note"),
+        "a success is the transcript, not a note: {body}"
+    );
 }
 
 #[tokio::test]
@@ -311,6 +359,67 @@ async fn a_submitted_form_answers_a_redirect_to_the_session() {
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0].instruction, "do it");
     assert_eq!(submitted[0].workspace.as_deref(), Some("/srv/one"));
+}
+
+#[tokio::test]
+async fn the_composer_posts_the_request_id_it_minted() {
+    let fake = Arc::new(Fake::with_session(TaskStatus::Submitted));
+    let (_, _, body) = send(
+        Arc::clone(&fake) as Arc<dyn ControlPlane>,
+        Method::GET,
+        "/",
+        None,
+    )
+    .await;
+
+    let minted = minted(&body).expect("the composer mints a request id");
+    assert_eq!(
+        uuid::Uuid::parse_str(&minted).map(|id| id.get_version_num()),
+        Ok(7),
+        "the composer mints a UUIDv7: {minted}"
+    );
+
+    let form = format!(
+        "instruction=do+it&agent=local&workspace=%2Fsrv%2Fone&request_id={minted}&theme=dark"
+    );
+    let (status, _, _) = send(
+        Arc::clone(&fake) as Arc<dyn ControlPlane>,
+        Method::POST,
+        "/sessions",
+        Some(&form),
+    )
+    .await;
+
+    assert_eq!(status, 303);
+    assert_eq!(
+        fake.submitted()[0].request_id.as_deref(),
+        Some(minted.as_str())
+    );
+}
+
+#[tokio::test]
+async fn two_renders_mint_different_request_ids() {
+    let fake = Arc::new(Fake::with_session(TaskStatus::Submitted));
+    let (_, _, first) = send(
+        Arc::clone(&fake) as Arc<dyn ControlPlane>,
+        Method::GET,
+        "/",
+        None,
+    )
+    .await;
+    let (_, _, second) = send(
+        Arc::clone(&fake) as Arc<dyn ControlPlane>,
+        Method::GET,
+        "/",
+        None,
+    )
+    .await;
+
+    assert_ne!(
+        minted(&first).expect("the composer mints a request id"),
+        minted(&second).expect("the composer mints a request id"),
+        "a composer that minted once would give every visit one id"
+    );
 }
 
 #[tokio::test]
