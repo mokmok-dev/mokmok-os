@@ -288,8 +288,24 @@ async fn an_interrupted_session_explains_itself_and_stops_refreshing() {
         "the badge carries the warning tone: {body}"
     );
     assert!(body.contains(INTERRUPTED_REASON), "{body}");
+    assert!(body.contains("outcome-note"), "{body}");
     assert!(!body.contains("<meta http-equiv=\"refresh\""), "{body}");
     assert!(!body.contains("action=\"/sessions/cancel\""), "{body}");
+}
+
+#[tokio::test]
+async fn a_completed_session_renders_its_transcript_without_an_outcome_note() {
+    let mut completed = Fake::with_session(TaskStatus::Completed);
+    completed.sessions[0].outcome = Some("the tests all pass".to_owned());
+    let fake = Arc::new(completed);
+    let (status, _, body) = send(fake, Method::GET, "/", None).await;
+
+    assert_eq!(status, 200);
+    assert!(body.contains("the agent answered"), "{body}");
+    assert!(
+        !body.contains("outcome-note"),
+        "a success is the transcript, not a note: {body}"
+    );
 }
 
 #[tokio::test]

@@ -2207,14 +2207,35 @@ mod tests {
             "2026-13-08T06:19:08.123Z",
             "2026-02-30T06:19:08.123Z",
             "2026-11-08T24:19:08.123Z",
+            "2026-11-08T06:19:60.123Z",
+            "2026-11-08T06:19:61.123Z",
             "2026-11-08T06:19:08.123+00:00",
             "1969-12-31T00:00:00.000Z",
             "not a stamp at all..",
             "2026-+1-08T06:19:08.123Z",
             "2026-11-+8T06:19:08.123Z",
             "2026-11-08T06:19:08.+23Z",
+            "2026-04-31T06:19:08.123Z",
+            "2026-06-31T06:19:08.123Z",
+            "2026-09-31T06:19:08.123Z",
+            "2026-11-31T06:19:08.123Z",
         ] {
             assert_eq!(parse_timestamp(raw), None, "{raw:?}");
+        }
+        assert_eq!(
+            parse_timestamp("2026-12-31T23:59:59.999Z"),
+            Some(1_798_761_599),
+            "the last second of a 31-day month still parses"
+        );
+        // The day a 30-day month does have must parse, or a reader that treated every
+        // month as February's length would reject a stamp it wrote.
+        for (raw, seconds) in [
+            ("2026-04-30T23:59:59.999Z", 1_777_593_599),
+            ("2026-06-30T23:59:59.999Z", 1_782_863_999),
+            ("2026-09-30T23:59:59.999Z", 1_790_812_799),
+            ("2026-11-30T23:59:59.999Z", 1_796_083_199),
+        ] {
+            assert_eq!(parse_timestamp(raw), Some(seconds), "{raw}");
         }
     }
 

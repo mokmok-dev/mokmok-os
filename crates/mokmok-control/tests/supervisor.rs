@@ -536,6 +536,7 @@ mod tests {
         inner: MemoryEventStore<TaskId, ControlEvent>,
         failure: StoreError,
         remaining: AtomicUsize,
+        refused: AtomicUsize,
     }
 
     impl RefusingOutcomeStore {
@@ -547,7 +548,12 @@ mod tests {
                 inner: MemoryEventStore::new(),
                 failure,
                 remaining: AtomicUsize::new(failures),
+                refused: AtomicUsize::new(0),
             })
+        }
+
+        fn refused(&self) -> usize {
+            self.refused.load(Ordering::SeqCst)
         }
     }
 
@@ -579,6 +585,7 @@ mod tests {
         ) -> Result<Version, StoreError> {
             if terminal(events) && self.remaining.load(Ordering::SeqCst) > 0 {
                 self.remaining.fetch_sub(1, Ordering::SeqCst);
+                self.refused.fetch_add(1, Ordering::SeqCst);
                 return Err(self.failure.clone());
             }
             self.inner.append(id, expected, events)
@@ -863,6 +870,42 @@ mod tests {
             "the failed outcome must surface: {ran:?}"
         );
         assert_eq!(system.state(&id)?.status, TaskStatus::Running);
+        Ok(())
+    }
+
+    // A refusal the store itself names as permanent is not worth another attempt: no
+    // backoff makes a corrupt or invalid stream accept the record.
+    #[test]
+    fn a_permanent_store_failure_is_offered_once_and_surfaces()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for failure in [
+            StoreError::Corrupt("the record is not what this store wrote".to_owned()),
+            StoreError::Invalid("the record breaks the schema".to_owned()),
+        ] {
+            let expected = failure.clone();
+            let store = RefusingOutcomeStore::new(failure, 99);
+            let system =
+                ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+            let supervisor = Supervisor::new(
+                system.clone(),
+                Arc::new(ScriptedRunner::new(Vec::new(), "done")),
+                empty_journal(),
+                1,
+            );
+            let id = supervisor.submit(new_task("scripted"))?.id;
+
+            let ran = supervisor.run_pending();
+            assert!(
+                matches!(&ran, Err(Error::Store(error)) if error == &expected),
+                "a permanent refusal must surface as it arrived: {ran:?}"
+            );
+            assert_eq!(
+                store.refused(),
+                1,
+                "a refused record must be offered once, not retried"
+            );
+            assert_eq!(system.state(&id)?.status, TaskStatus::Running);
+        }
         Ok(())
     }
 

@@ -113,6 +113,58 @@ mod tests {
         }
     }
 
+    // Conflicts the first `conflicts` appends, then accepts. A submit bound to two
+    // attempts runs out while the store is still refusing, and one that retries without
+    // a bound eventually lands instead of hanging.
+    struct BoundedConflictStore {
+        conflicts: usize,
+        attempts: AtomicUsize,
+    }
+
+    impl BoundedConflictStore {
+        fn new(conflicts: usize) -> Arc<Self> {
+            Arc::new(Self {
+                conflicts,
+                attempts: AtomicUsize::new(0),
+            })
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl EventStore<TaskId, ControlEvent> for BoundedConflictStore {
+        fn load(
+            &self,
+            _id: &TaskId,
+        ) -> Result<Vec<CloudEvent<ControlEvent>>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        fn append(
+            &self,
+            _id: &TaskId,
+            expected: Version,
+            _events: &[CloudEvent<ControlEvent>],
+        ) -> Result<Version, StoreError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.conflicts {
+                return Err(StoreError::Conflict {
+                    expected,
+                    actual: expected.next(),
+                });
+            }
+            Ok(expected.next())
+        }
+    }
+
+    impl EnumerableStore<TaskId, ControlEvent> for BoundedConflictStore {
+        fn keys(&self) -> Result<Vec<TaskId>, StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
     struct IllegalStore {
         id: TaskId,
         records: Vec<CloudEvent<ControlEvent>>,
@@ -418,6 +470,37 @@ mod tests {
         assert_eq!(appended.version, Version::new(1));
         assert_eq!(system.state(&id)?.status, TaskStatus::Submitted);
         assert_eq!(store.load(&id)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_submit_that_never_stops_conflicting_gives_up_after_one_retry() {
+        // Two refusals and no more: the retry bound is two attempts, so a third attempt
+        // would land. The bound is finite so that a submit which never gives up fails on
+        // the attempt count instead of hanging the suite.
+        let store = BoundedConflictStore::new(2);
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+
+        let submitted = system.submit(new_task("scripted"));
+
+        assert!(
+            matches!(submitted, Err(Error::Store(StoreError::Conflict { .. }))),
+            "a conflict the retry cannot heal must surface: {submitted:?}"
+        );
+        assert_eq!(store.attempts(), 2, "one attempt and one retry, no more");
+    }
+
+    #[test]
+    fn a_submit_that_conflicts_once_lands_on_its_retry() -> Result<(), Box<dyn std::error::Error>> {
+        let store = BoundedConflictStore::new(1);
+        let system = ControlSystem::without_idle_timeout(store.clone(), Arc::new(NoopPublisher));
+        let mut new = new_task("scripted");
+        new.request_id = Some("01890b0c-7f3a-7c2e-9f4a-2b1c3d4e5f60".to_owned());
+
+        let submitted = system.submit(new)?;
+
+        assert!(submitted.created, "the retry commits the submission");
+        assert_eq!(store.attempts(), 2, "one refusal and one retry");
         Ok(())
     }
 
