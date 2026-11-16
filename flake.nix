@@ -89,10 +89,7 @@
                   ;
                 pname = "mokmok-os-mutants";
                 version = "2026.11.1";
-                nativeBuildInputs = [
-                  pkgs.cargo-mutants
-                  pkgs.cargo-nextest
-                ];
+                nativeBuildInputs = [ pkgs.cargo-mutants ];
                 buildPhaseCargoCommand = "cargo mutants --workspace --jobs 4 --timeout 60 --no-shuffle";
                 doInstallCargoArtifacts = false;
               }
@@ -128,7 +125,6 @@
 
             packages = with pkgs; [
               cargo-mutants
-              cargo-nextest
               linkerPackages
               rustToolchain
               sccache

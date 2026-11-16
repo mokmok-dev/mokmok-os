@@ -42,7 +42,6 @@ pub struct Board {
     pub active: bool,
     pub turns: Vec<Turn>,
     pub agents: Agents,
-    pub has_sessions: bool,
     pub error: Option<String>,
 }
 
@@ -85,7 +84,6 @@ impl Board {
                     active: false,
                     turns: Vec::new(),
                     agents,
-                    has_sessions: false,
                     error: Some(error.to_string()),
                 });
             },
@@ -116,10 +114,6 @@ impl Board {
                 session.selected = selected_id.as_deref() == Some(session.id.as_str());
             }
         }
-        let has_sessions = groups
-            .iter()
-            .find(|group| group.key == shown)
-            .is_some_and(|group| !group.sessions.is_empty());
         let selected = selected_id
             .as_deref()
             .and_then(|id| sessions.iter().find(|session| session.id.as_str() == id));
@@ -143,7 +137,6 @@ impl Board {
             active: selected.is_some_and(|session| is_active(session.status)),
             turns,
             agents,
-            has_sessions,
             error,
         })
     }
@@ -205,7 +198,6 @@ impl Board {
                             }
                             index::chat(
                                 turns: self.turns.clone(),
-                                has_sessions: self.has_sessions,
                                 live_task: live_task,
                             )
                             index::composer(
@@ -247,5 +239,14 @@ mod tests {
         assert_eq!(theme_of(None), "dark");
         assert_eq!(theme_of(Some("light")), "light");
         assert_eq!(theme_of(Some("solarized")), "dark");
+    }
+
+    #[test]
+    fn the_clock_is_the_wall_clock_not_a_constant() {
+        // A constant clock dates every session against 1970 or a fixed instant, which the
+        // sidebar would show as an absurd age.
+        let now = now_seconds();
+        assert!(now > 1_700_000_000, "{now}");
+        assert!(now < 4_000_000_000, "{now}");
     }
 }

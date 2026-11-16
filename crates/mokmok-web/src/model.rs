@@ -502,11 +502,41 @@ mod tests {
     }
 
     #[test]
+    fn relative_time_switches_unit_at_the_exact_boundary() {
+        let base = now();
+        // One second short of a minute stays in seconds, and a minute exactly moves up.
+        assert_eq!(relative_time(Some(base - 59), base), "just now");
+        assert_eq!(relative_time(Some(base - 60), base), "1m ago");
+        // The same two boundaries for minutes into hours.
+        assert_eq!(relative_time(Some(base - 3_599), base), "59m ago");
+        assert_eq!(relative_time(Some(base - 3_600), base), "1h ago");
+        // And for hours into days.
+        assert_eq!(relative_time(Some(base - 86_399), base), "23h ago");
+        assert_eq!(relative_time(Some(base - 86_400), base), "1d ago");
+    }
+
+    #[test]
     fn a_workspace_must_be_absolute_and_free_of_control_bytes() {
         assert_eq!(validate_workspace("/w"), None);
         assert!(validate_workspace("w").is_some());
         assert!(validate_workspace("/w\n").is_some());
         assert!(validate_workspace("/w\0").is_some());
+    }
+
+    #[test]
+    fn a_workspace_at_the_byte_budget_is_accepted() {
+        let exact = format!("/{}", "a".repeat(MAX_WORKSPACE_BYTES - 1));
+        assert_eq!(exact.len(), MAX_WORKSPACE_BYTES);
+        assert_eq!(validate_workspace(&exact), None);
+
+        let over = format!("/{}", "a".repeat(MAX_WORKSPACE_BYTES));
+        assert_eq!(over.len(), MAX_WORKSPACE_BYTES + 1);
+        assert_eq!(
+            validate_workspace(&over),
+            Some(format!(
+                "The workspace path must be at most {MAX_WORKSPACE_BYTES} bytes."
+            ))
+        );
     }
 
     #[test]

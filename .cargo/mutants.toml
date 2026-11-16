@@ -15,7 +15,6 @@ exclude_globs = [
   "crates/mokmok-proofs/**",
 ]
 minimum_test_timeout = 60
-test_tool = "nextest"
 
 exclude_re = [
   # When `max_bytes == len` both arms of the `if` return `len`, so this mutant is
