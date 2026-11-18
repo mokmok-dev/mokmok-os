@@ -446,6 +446,7 @@ mod tests {
         assert_eq!(store.load(&free_id)?.len(), 1);
 
         let _reader = File::open(&path)?;
+        wait_until_finished(&stalled, Duration::from_secs(1))?;
         let _ = stalled.join().expect("stalled append thread");
         Ok(())
     }
@@ -458,6 +459,23 @@ mod tests {
         } else {
             Err(format!("mkfifo failed: {status}").into())
         }
+    }
+
+    // A reader unblocks `open` on the fifo. Skipping the cached-version arm then
+    // `read`s the same fifo while still holding the write end, which never sees EOF.
+    #[cfg(unix)]
+    fn wait_until_finished<T>(
+        handle: &std::thread::JoinHandle<T>,
+        budget: std::time::Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            if started.elapsed() >= budget {
+                return Err("stalled work did not unblock after a reader opened the fifo".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
     }
 
     #[test]

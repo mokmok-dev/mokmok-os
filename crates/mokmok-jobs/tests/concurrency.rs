@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mokmok_jobs::{
     CloudEvent, Error, EventStore, JobCommand, JobError, JobEvent, JobId, JobState, JobSystem,
@@ -207,7 +207,6 @@ fn concurrent_appends_to_one_jsonl_stream_conflict() -> Result<(), Box<dyn std::
 #[test]
 fn a_stuck_jsonl_submit_does_not_block_another_job() -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::{self, File};
-    use std::time::Instant;
 
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("jobs");
@@ -243,6 +242,7 @@ fn a_stuck_jsonl_submit_does_not_block_another_job() -> Result<(), Box<dyn std::
     assert_eq!(store.load(&free)?.len(), 1);
 
     let _reader = File::open(&path)?;
+    wait_until_finished(&stalled, Duration::from_secs(1))?;
     let _ = stalled.join().expect("stalled start thread");
     Ok(())
 }
@@ -255,4 +255,19 @@ fn make_fifo(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err(format!("mkfifo failed: {status}").into())
     }
+}
+
+#[cfg(unix)]
+fn wait_until_finished<T>(
+    handle: &thread::JoinHandle<T>,
+    budget: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() >= budget {
+            return Err("stalled work did not unblock after a reader opened the fifo".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
