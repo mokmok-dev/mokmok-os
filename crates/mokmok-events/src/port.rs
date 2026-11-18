@@ -43,7 +43,10 @@ pub trait EventStore<K: StreamKey, E>: Send + Sync {
     /// Commits the whole slice or nothing, returning the last committed version.
     ///
     /// `events` must be the records `expected.next()..` of `key`'s stream, which
-    /// [`check_append`] verifies.
+    /// [`check_append`] verifies. An empty slice is a version check only: it must not
+    /// create a stream, so [`EnumerableStore::keys`] still omits a key that has never
+    /// held a record. A refused append (conflict or invalid) must leave that key
+    /// unlisted too.
     ///
     /// A caller may retry `Io`, so after an `Io` the next `append` for that key must be
     /// checked against what the store actually holds rather than against a cached version.

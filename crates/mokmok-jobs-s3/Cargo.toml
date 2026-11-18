@@ -17,9 +17,7 @@ axum.workspace = true
 hex = "0.4"
 hmac = "0.12"
 mokmok-jobs-core.workspace = true
-mokmok-jobs-jsonl.workspace = true
 sha2 = "0.10"
-tempfile.workspace = true
 tokio.workspace = true
 
 [lints]
