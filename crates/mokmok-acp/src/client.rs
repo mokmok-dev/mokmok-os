@@ -282,6 +282,9 @@ impl AcpClient {
 
     /// Creates a session in an absolute working directory.
     ///
+    /// There is no `session/load`. A later task cannot reopen this id; each run
+    /// calls this again.
+    ///
     /// # Errors
     ///
     /// Returns [`AcpError::InvalidCwd`] when `cwd` is relative, and the same errors as

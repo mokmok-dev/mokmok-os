@@ -167,9 +167,14 @@ A task is stored twice, with different lifetimes:
   stream: `Submitted`, `Started`, `SessionOpened`, `Completed`, `Failed`, `Cancelled`,
   `Interrupted`, and bounded facts such as the completed summary. It is the source of
   truth for the task's state, so replay and listing stay fast however long the
-  transcript grows. `Interrupted` is terminal and means the control plane stopped while
-  the task was running; it carries a reason the domain wrote, and no outcome the agent
-  reported was recorded.
+  transcript grows. `SessionOpened` records the ACP session id the runner opened for
+  that turn. The id is for debug and trace: `GET /api/tasks/{id}` serves it as
+  `session`, and a later run never loads it. The runner always opens a fresh session
+  with `new_session`; there is no `session/load`, so the value is not a resume handle.
+  `Interrupted` is terminal and means the control plane stopped while the task was
+  running; it carries a reason the domain wrote, and no outcome the agent reported was
+  recorded. An interrupted task cannot continue from the recorded session; submit a
+  new task to run the work again.
 - `<data-dir>/journal/<id>/<generation>.jsonl` is the execution journal: one compact
   JSON object per line with `seq`, `time`, and a `message`, `thought`, `tool_call`, or
   `permission` record. It is operational telemetry, is never replayed into the domain
@@ -200,14 +205,16 @@ such as uppercase or unhyphenated, names the same task. A submission without a
 
 A restart closes what a dead daemon left behind. Before it spawns a worker, the
 supervisor's `start` scans the store: a task still `Running` whose stream replays gets one
-`Interrupted` record, and a task still `Submitted` goes back on the queue. A stream that
-will not read or replay, or a sweep whose append itself fails, is logged and left as it is,
-so a damaged log can hide its own task but never another's. A second start finds the task
-terminal and writes nothing, so the sweep is safe to repeat. A task reaches the sweep three
-ways: the process crashes, a run outlives the five second shutdown grace, or the outcome
-write fails three times. A refused or failed outcome write is retried, because the store
-re-reads the stream after a failed write, so a retry either lands once or reports that the
-record is already there; only a write that keeps failing is left for the next start's sweep.
+`Interrupted` record, and a task still `Submitted` goes back on the queue. The sweep does
+not reopen the ACP session that `SessionOpened` recorded, so an interrupted task stays
+terminal. A stream that will not read or replay, or a sweep whose append itself fails, is
+logged and left as it is, so a damaged log can hide its own task but never another's. A
+second start finds the task terminal and writes nothing, so the sweep is safe to repeat. A
+task reaches the sweep three ways: the process crashes, a run outlives the five second
+shutdown grace, or the outcome write fails three times. A refused or failed outcome write
+is retried, because the store re-reads the stream after a failed write, so a retry either
+lands once or reports that the record is already there; only a write that keeps failing is
+left for the next start's sweep.
 
 `/api/events` streams domain CloudEvents and `/api/journal/events` streams
 `{"task":"<uuid>","entry":{…}}` lines. Both feeds carry every task's records; neither
