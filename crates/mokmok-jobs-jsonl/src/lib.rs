@@ -8,11 +8,13 @@
 //! holds no header and nothing else, so the same record shape is what the in-memory
 //! adapter keeps.
 //!
-//! One store instance owns a root. Each stream has its own mutex and version
-//! cache, so an append to one file does not hold up another. Opening the same
-//! root twice still gives two writers with separate caches; one writer can then
-//! append a duplicate version after the other has moved on. Callers should share
-//! one `Arc<JsonlEventStore>` across every actor system over that root.
+//! One store instance owns a root. The map of streams is an `RwLock` held only
+//! while looking up or inserting a stream. Each stream then has its own mutex
+//! and version cache, so an append to one file does not hold up another. Opening
+//! the same root twice still gives two writers with separate caches; one writer
+//! can then append a duplicate version after the other has moved on. That is
+//! left as a documented limit: callers should share one `Arc<JsonlEventStore>`
+//! across every actor system over that root.
 //!
 //! Correctness across processes is not claimed; the logical fence is the
 //! store's version check.
@@ -22,7 +24,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, EventType, StoreError, StreamKey, Version,
@@ -34,8 +36,13 @@ use serde::de::DeserializeOwned;
 #[derive(Debug)]
 pub struct JsonlEventStore<K, E> {
     root: PathBuf,
-    streams: Mutex<HashMap<K, Arc<Mutex<Stream>>>>,
+    streams: RwLock<HashMap<K, Arc<StreamState>>>,
     event: PhantomData<fn() -> E>,
+}
+
+#[derive(Debug)]
+struct StreamState {
+    inner: Mutex<Stream>,
 }
 
 #[derive(Debug)]
@@ -48,7 +55,8 @@ impl<K, E> JsonlEventStore<K, E> {
     /// touched. A stream's file is named `<key>.jsonl`, where `<key>` is
     /// [`StreamKey::as_str`] (a canonical lowercase UUID for `JobId`).
     ///
-    /// One instance owns a root. Each stream's version cache lives behind that
+    /// One instance owns a root. The stream map is an `RwLock` held only to look
+    /// up or insert an entry. Each stream's version cache lives behind that
     /// stream's mutex. Opening the same root twice still gives two writers with
     /// separate caches; share one `Arc<JsonlEventStore>` across every actor
     /// system instead.
@@ -61,9 +69,32 @@ impl<K, E> JsonlEventStore<K, E> {
         fs::create_dir_all(&root).map_err(|error| error_at(&root, &error))?;
         Ok(Self {
             root,
-            streams: Mutex::new(HashMap::new()),
+            streams: RwLock::new(HashMap::new()),
             event: PhantomData,
         })
+    }
+
+    fn stream_state(
+        &self,
+        key: &K,
+    ) -> Result<Arc<StreamState>, StoreError>
+    where
+        K: StreamKey,
+    {
+        {
+            let streams = self.streams.read().map_err(|_| lock_poisoned())?;
+            if let Some(state) = streams.get(key) {
+                return Ok(Arc::clone(state));
+            }
+        }
+        let mut streams = self.streams.write().map_err(|_| lock_poisoned())?;
+        Ok(Arc::clone(streams.entry(key.clone()).or_insert_with(
+            || {
+                Arc::new(StreamState {
+                    inner: Mutex::new(Stream { version: None }),
+                })
+            },
+        )))
     }
 
     fn with_stream<R>(
@@ -74,20 +105,8 @@ impl<K, E> JsonlEventStore<K, E> {
     where
         K: StreamKey,
     {
-        let handle = {
-            let mut streams = self
-                .streams
-                .lock()
-                .map_err(|_| StoreError::Io("event store lock poisoned".to_owned()))?;
-            Arc::clone(
-                streams
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(Mutex::new(Stream { version: None }))),
-            )
-        };
-        let mut stream = handle
-            .lock()
-            .map_err(|_| StoreError::Io("event store lock poisoned".to_owned()))?;
+        let state = self.stream_state(key)?;
+        let mut stream = state.inner.lock().map_err(|_| lock_poisoned())?;
         body(&mut stream)
     }
 
@@ -254,6 +273,10 @@ fn error_at(
     StoreError::Io(format!("{}: {error}", path.display()))
 }
 
+fn lock_poisoned() -> StoreError {
+    StoreError::Io("event store lock poisoned".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
@@ -338,6 +361,103 @@ mod tests {
         });
         assert_eq!(store.keys()?.len(), 16);
         Ok(())
+    }
+
+    #[test]
+    fn concurrent_appends_to_the_same_stream_conflict() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(store(&directory));
+        let id = id(41);
+        store.append(&id, Version::ZERO, &[first(&id)])?;
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for _ in 0..8 {
+                let store = Arc::clone(&store);
+                let barrier = &barrier;
+                let id = id.clone();
+                joins.push(scope.spawn(move || {
+                    barrier.wait();
+                    store.append(
+                        &id,
+                        Version::new(1),
+                        &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+                    )
+                }));
+            }
+            joins
+                .into_iter()
+                .map(|join| join.join().expect("append thread"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        for result in &results {
+            if result.is_err() {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::Conflict {
+                        expected,
+                        actual,
+                    }) if *expected == Version::new(1) && *actual == Version::new(2)
+                ));
+            }
+        }
+        assert_eq!(store.load(&id)?.len(), 2);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_append_blocked_on_one_stream_does_not_hold_up_another()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(store(&directory));
+        let blocked_id = id(42);
+        let free_id = id(43);
+        store.append(&blocked_id, Version::ZERO, &[first(&blocked_id)])?;
+        let path = store.path(&blocked_id);
+        fs::remove_file(&path)?;
+        make_fifo(&path)?;
+
+        let stalled = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                store.append(
+                    &blocked_id,
+                    Version::new(1),
+                    &[at(&blocked_id, 2, JobEvent::Started { attempt: 1 })],
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !stalled.is_finished(),
+            "the stalled append returned before the sibling ran"
+        );
+
+        let started = Instant::now();
+        store.append(&free_id, Version::ZERO, &[first(&free_id)])?;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a sibling stream must commit while the other append is still in open()"
+        );
+        assert_eq!(store.load(&free_id)?.len(), 1);
+
+        let _reader = File::open(&path)?;
+        let _ = stalled.join().expect("stalled append thread");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let status = std::process::Command::new("mkfifo").arg(path).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("mkfifo failed: {status}").into())
+        }
     }
 
     #[test]
