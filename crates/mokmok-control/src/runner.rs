@@ -534,6 +534,8 @@ impl Runner for AcpRunner {
                 };
             },
         };
+        // Each run opens a fresh ACP session. The recorded id is not loaded later;
+        // the client has no session/load, so this is not a resume handle.
         let session = match client.new_session(&cwd) {
             Ok(session) => session,
             Err(error) => {

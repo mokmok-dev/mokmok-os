@@ -250,6 +250,11 @@ pub enum ControlCommand {
 pub enum ControlEvent {
     Submitted { spec: TaskSpec },
     Started,
+    /// The ACP session this run opened.
+    ///
+    /// The id is for debug and trace. It is not a resume handle: the runner always
+    /// opens a fresh session with `new_session`, and the ACP client has no
+    /// `session/load`.
     SessionOpened { session_id: String },
     UpdateRecorded { update: AgentUpdate },
     Completed { summary: String },
@@ -331,6 +336,10 @@ pub struct TaskState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<TaskSpec>,
     pub status: TaskStatus,
+    /// The ACP session id [`ControlEvent::SessionOpened`] recorded.
+    ///
+    /// Served on the task for listing and trace. The runner does not load it to
+    /// continue a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

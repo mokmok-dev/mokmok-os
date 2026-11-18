@@ -50,7 +50,9 @@ pub trait Runner: Send + Sync {
 
 /// What a runner tells the control plane while it works.
 pub trait Reporter: Send + Sync {
-    /// Records the agent's session, once per run.
+    /// Records the agent's session, once per run, for debug and trace.
+    ///
+    /// The value is not a resume handle; a later run opens a new session.
     ///
     /// # Errors
     ///

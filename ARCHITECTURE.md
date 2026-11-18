@@ -28,10 +28,13 @@ stateDiagram-v2
 `Completed`, `Failed`, `Cancelled`, and `Interrupted` carry no outgoing edge, so every
 command they receive returns `Terminal`.
 
-`SessionOpened` is a domain fact, not an unused leftover. The runner records the ACP
-session id once through `Reporter::started` in `crates/mokmok-control/src/supervisor.rs`,
-`GET /api/tasks/{id}` serves it as `session`, and a second open is `SessionAlreadyOpen`.
-A run that never opens a session stays `Running` without one, which the machine allows.
+`SessionOpened` is a domain fact, not an unused leftover, and it is not a resume
+handle. The runner records the ACP session id once through `Reporter::started` in
+`crates/mokmok-control/src/supervisor.rs`, `GET /api/tasks/{id}` serves it as `session`,
+and a second open is `SessionAlreadyOpen`. `AcpRunner` always opens a fresh session with
+`new_session` in `crates/mokmok-control/src/runner.rs`; the ACP client has no
+`session/load`, so nothing later reads that id to continue a turn. A run that never
+opens a session stays `Running` without one, which the machine allows.
 
 ### States
 
@@ -110,7 +113,9 @@ Before a restart spawns any worker, `Work::sweep` asks `ControlSystem::recover` 
 streams a previous process left open and appends one `Interrupted` record to each task
 still `Running`. That is the only way a task becomes `Interrupted`, and it is why a run
 whose agent finished cannot be resumed: the sweep records the fact that no process
-finished it, and a later outcome from a detached worker is refused as `Terminal`.
+finished it, and a later outcome from a detached worker is refused as `Terminal`. The
+session id on that stream is still only a trace: continue the work by submitting a new
+task, not by loading the recorded session.
 
 The runners in `crates/mokmok-control/src/runner.rs` are `ScriptedRunner`, `FailingRunner`,
 and `AcpRunner`. `AcpRunner` maps `StopReason::EndTurn` to `Completed`,
@@ -201,7 +206,8 @@ stateDiagram-v2
    `Work::sweep` asks `ControlSystem::recover` for leftover work, appends
    `Interrupted` to each `Running` stream, and queues every `Submitted` task. A
    `Running` task is a lease the previous process held, not a run this process can
-   finish.
+   finish. `SessionOpened` does not change that: the recorded session id is not
+   loaded, so an `Interrupted` task has no continue-from-here path.
 6. A cancel is a status change, and the runner learns it by polling. `AcpRunner::run` in
    `crates/mokmok-control/src/runner.rs` asks `Reporter::cancelled` every 50 milliseconds
    and cancels the agent turn when the answer is yes.
