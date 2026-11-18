@@ -10,7 +10,6 @@ use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, StoreError, StreamKey, Version, encode_records,
 };
 use mokmok_jobs_core::{JobEvent, JobId};
-use mokmok_jobs_jsonl::JsonlEventStore;
 use mokmok_jobs_s3::{S3Config, S3Credentials, S3EventStore};
 
 const BUCKET: &str = "mokmok";
@@ -69,63 +68,15 @@ fn encoded(events: &[CloudEvent<JobEvent>]) -> Vec<u8> {
 }
 
 #[test]
-fn two_events_round_trip_through_append_load_and_keys() -> Result<(), Box<dyn std::error::Error>> {
+fn the_store_meets_the_event_store_contract() {
     let fake = FakeS3::start();
-    let store = store(&fake);
-    let id = id(1);
-    let events = [first(&id), started(&id)];
-    assert_eq!(store.append(&id, Version::ZERO, &events)?, Version::new(2));
-    assert_eq!(store.load(&id)?, events);
-    assert_eq!(store.keys()?, vec![id]);
-    Ok(())
-}
-
-#[test]
-fn a_stale_append_reports_the_stored_version() -> Result<(), Box<dyn std::error::Error>> {
-    let fake = FakeS3::start();
-    let store = store(&fake);
-    let id = id(2);
-    store.append(&id, Version::ZERO, &[first(&id)])?;
-    let error = store
-        .append(&id, Version::ZERO, &[first(&id)])
-        .expect_err("a stale append is refused");
-    assert!(matches!(
-        error,
-        StoreError::Conflict {
-            expected,
-            actual,
-        } if expected == Version::ZERO && actual == Version::new(1)
-    ));
-    assert_eq!(store.load(&id)?.len(), 1);
-    Ok(())
-}
-
-#[test]
-fn a_record_for_another_stream_is_refused_and_leaves_the_object_untouched()
--> Result<(), Box<dyn std::error::Error>> {
-    let fake = FakeS3::start();
-    let store = store(&fake);
-    let id = id(3);
-    let other = JobId::from_u128(4);
-    let error = store
-        .append(&id, Version::ZERO, &[first(&other)])
-        .expect_err("a record from another stream is refused");
-    assert!(matches!(error, StoreError::Invalid(_)));
-    assert!(object(&fake, &id).is_none());
-    assert_eq!(store.load(&id)?.len(), 0);
-    Ok(())
-}
-
-#[test]
-fn a_skipped_version_is_refused() {
-    let fake = FakeS3::start();
-    let store = store(&fake);
-    let id = id(5);
-    let error = store
-        .append(&id, Version::ZERO, &[started(&id)])
-        .expect_err("a skipped version is refused");
-    assert!(matches!(error, StoreError::Invalid(_)));
-    assert!(object(&fake, &id).is_none());
+    mokmok_events::conformance::check(
+        &store(&fake),
+        &id(1),
+        &id(2),
+        submitted(),
+        JobEvent::Started { attempt: 1 },
+    );
 }
 
 #[test]
@@ -197,16 +148,6 @@ fn a_refused_put_is_reported_as_a_conflict_with_the_stored_version()
         })
         .expect("the refused append is logged");
     assert_eq!(put.status, 412);
-    Ok(())
-}
-
-#[test]
-fn a_missing_stream_loads_empty() -> Result<(), Box<dyn std::error::Error>> {
-    let fake = FakeS3::start();
-    let store = store(&fake);
-    let id = id(9);
-    assert_eq!(store.load(&id)?, Vec::<CloudEvent<JobEvent>>::new());
-    assert_eq!(store.keys()?, Vec::<JobId>::new());
     Ok(())
 }
 
@@ -521,34 +462,4 @@ fn open_rejects_a_malformed_config() {
         assert!(matches!(error, StoreError::Invalid(_)), "{error}");
         assert!(error.to_string().contains(needle), "{error}");
     }
-}
-
-fn scenario<S>(store: &S) -> Result<(Version, Vec<Version>, Vec<JobId>), StoreError>
-where
-    S: EventStore<JobId, JobEvent> + EnumerableStore<JobId, JobEvent>,
-{
-    let id = id(23);
-    let version = store.append(&id, Version::ZERO, &[first(&id), started(&id)])?;
-    let loaded: Vec<Version> = store.load(&id)?.iter().map(|event| event.version).collect();
-    store.append(
-        &id,
-        version,
-        &[at(
-            &id,
-            3,
-            JobEvent::Succeeded {
-                output: b"out".to_vec(),
-            },
-        )],
-    )?;
-    Ok((version, loaded, store.keys()?))
-}
-
-#[test]
-fn both_backends_agree_on_the_same_scenario() -> Result<(), Box<dyn std::error::Error>> {
-    let fake = FakeS3::start();
-    let directory = tempfile::tempdir()?;
-    let jsonl = JsonlEventStore::<JobId, JobEvent>::open(directory.path().join("jobs"))?;
-    assert_eq!(scenario(&jsonl)?, scenario(&store(&fake))?);
-    Ok(())
 }

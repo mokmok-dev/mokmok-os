@@ -5,6 +5,7 @@
 //! subsystem. [`record`] owns the `JSONL` byte format those adapters share.
 
 mod cloud_event;
+pub mod conformance;
 mod port;
 mod record;
 mod stream;

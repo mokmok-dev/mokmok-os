@@ -28,6 +28,11 @@ stateDiagram-v2
 `Completed`, `Failed`, `Cancelled`, and `Interrupted` carry no outgoing edge, so every
 command they receive returns `Terminal`.
 
+`SessionOpened` is a domain fact, not an unused leftover. The runner records the ACP
+session id once through `Reporter::started` in `crates/mokmok-control/src/supervisor.rs`,
+`GET /api/tasks/{id}` serves it as `session`, and a second open is `SessionAlreadyOpen`.
+A run that never opens a session stays `Running` without one, which the machine allows.
+
 ### States
 
 | State | What it means for the task | How an operator sees it |
@@ -192,9 +197,11 @@ stateDiagram-v2
    records that only the read endpoints touch, so an edit there cannot change a status.
 4. A run is one shot. `crates/mokmok-control/src/runner.rs` returns one `RunOutcome` from
    each `run` call, and a failed run ends `Failed` instead of starting again.
-5. A restart resumes only `Submitted` tasks. `Supervisor::start` in
-   `crates/mokmok-control/src/supervisor.rs` queues what `ControlSystem::submitted`
-   returns, and that filter keeps `Submitted` and drops every other status.
+5. A restart resumes only `Submitted` tasks. `Supervisor::start` sweeps first:
+   `Work::sweep` asks `ControlSystem::recover` for leftover work, appends
+   `Interrupted` to each `Running` stream, and queues every `Submitted` task. A
+   `Running` task is a lease the previous process held, not a run this process can
+   finish.
 6. A cancel is a status change, and the runner learns it by polling. `AcpRunner::run` in
    `crates/mokmok-control/src/runner.rs` asks `Reporter::cancelled` every 50 milliseconds
    and cancels the agent turn when the answer is yes.

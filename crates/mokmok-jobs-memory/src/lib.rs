@@ -45,14 +45,23 @@ impl<K: StreamKey, E: Clone + Send + Sync> EventStore<K, E> for MemoryEventStore
         events: &[CloudEvent<E>],
     ) -> Result<Version, StoreError> {
         let mut streams = self.streams.lock().map_err(|_| poisoned())?;
-        let log = streams.entry(key.clone()).or_default();
-        let length = u64::try_from(log.len()).map_err(|error| StoreError::Io(error.to_string()))?;
-        let actual = Version::new(length);
+        let actual = match streams.get(key) {
+            Some(log) => Version::new(
+                u64::try_from(log.len()).map_err(|error| StoreError::Io(error.to_string()))?,
+            ),
+            None => Version::ZERO,
+        };
         if actual != expected {
             return Err(StoreError::Conflict { expected, actual });
         }
+        if events.is_empty() {
+            return Ok(actual);
+        }
         let last = check_append(key.as_str(), expected, events)?;
-        log.extend_from_slice(events);
+        streams
+            .entry(key.clone())
+            .or_default()
+            .extend_from_slice(events);
         drop(streams);
         Ok(last)
     }
@@ -142,60 +151,14 @@ mod tests {
     }
 
     #[test]
-    fn append_commits_a_contiguous_stream() {
-        let store = MemoryEventStore::new();
-        let id = id();
-        let last = store
-            .append(&id, Version::ZERO, &[at(&id, 1, submitted())])
-            .expect("first append fits");
-        assert_eq!(last, Version::new(1));
-        let last = store
-            .append(
-                &id,
-                Version::new(1),
-                &[at(&id, 2, JobEvent::Started { attempt: 1 })],
-            )
-            .expect("second append fits");
-        assert_eq!(last, Version::new(2));
-        let events = store.load(&id).expect("stream reads back");
-        let versions: Vec<u64> = events.iter().map(|event| event.version.get()).collect();
-        assert_eq!(versions, vec![1, 2]);
-    }
-
-    #[test]
-    fn append_rejects_a_stale_expected_version() {
-        let store = MemoryEventStore::new();
-        let id = id();
-        store
-            .append(&id, Version::ZERO, &[at(&id, 1, submitted())])
-            .expect("first append fits");
-        let error = store
-            .append(
-                &id,
-                Version::ZERO,
-                &[at(&id, 1, JobEvent::Started { attempt: 1 })],
-            )
-            .expect_err("stale append is refused");
-        assert!(matches!(
-            error,
-            StoreError::Conflict {
-                expected,
-                actual,
-            } if expected == Version::ZERO && actual == Version::new(1)
-        ));
-        assert_eq!(store.load(&id).expect("stream reads back").len(), 1);
-    }
-
-    #[test]
-    fn append_rejects_a_record_from_another_stream() {
-        let store = MemoryEventStore::new();
-        let id = id();
-        let other = JobId::from_u128(2);
-        let error = store
-            .append(&id, Version::ZERO, &[at(&other, 1, submitted())])
-            .expect_err("a record from another stream is refused");
-        assert!(matches!(error, StoreError::Invalid(_)));
-        assert_eq!(store.load(&id).expect("stream reads back").len(), 0);
+    fn the_store_meets_the_event_store_contract() {
+        mokmok_events::conformance::check(
+            &MemoryEventStore::new(),
+            &JobId::from_u128(1),
+            &JobId::from_u128(2),
+            submitted(),
+            JobEvent::Started { attempt: 1 },
+        );
     }
 
     #[test]
@@ -208,25 +171,5 @@ mod tests {
         publisher.publish(std::slice::from_ref(&second));
         assert_eq!(publisher.published(), vec![first, second]);
         assert_eq!(publisher.len(), 2);
-    }
-
-    #[test]
-    fn keys_of_an_empty_store_is_empty() {
-        let store: MemoryEventStore<JobId, JobEvent> = MemoryEventStore::new();
-        assert_eq!(store.keys().expect("store lists"), Vec::<JobId>::new());
-    }
-
-    #[test]
-    fn keys_lists_every_stream_in_key_order() {
-        let store = MemoryEventStore::new();
-        let first = JobId::from_u128(1);
-        let second = JobId::from_u128(2);
-        store
-            .append(&second, Version::ZERO, &[at(&second, 1, submitted())])
-            .expect("second stream commits");
-        store
-            .append(&first, Version::ZERO, &[at(&first, 1, submitted())])
-            .expect("first stream commits");
-        assert_eq!(store.keys().expect("store lists"), vec![first, second]);
     }
 }

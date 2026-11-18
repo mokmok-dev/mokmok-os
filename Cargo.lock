@@ -1460,11 +1460,9 @@ dependencies = [
  "hmac 0.12.1",
  "mokmok-events",
  "mokmok-jobs-core",
- "mokmok-jobs-jsonl",
  "quick-xml",
  "serde",
  "sha2 0.10.9",
- "tempfile",
  "tokio",
  "ureq",
 ]

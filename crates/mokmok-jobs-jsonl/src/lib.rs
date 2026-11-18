@@ -146,51 +146,29 @@ where
     ) -> Result<Version, StoreError> {
         let path = self.path(key);
         let mut state = self.lock()?;
-        if events.is_empty() {
-            let current = match state.versions.get(key) {
-                Some(version) => *version,
-                None => match fs::read(&path) {
-                    Ok(bytes) => {
-                        parse_records::<E>(
-                            &path.display().to_string(),
-                            key.as_str(),
-                            complete_prefix(&bytes),
-                        )?
-                        .0
-                    },
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Version::ZERO,
-                    Err(error) => return Err(error_at(&path, &error)),
-                },
-            };
-            if current != expected {
-                return Err(StoreError::Conflict {
-                    expected,
-                    actual: current,
-                });
-            }
-            return Ok(current);
-        }
-        let (current, mut file) = if let Some(version) = state.versions.get(key) {
-            if let Ok(file) = OpenOptions::new().append(true).open(&path) {
-                (*version, file)
-            } else {
-                // A missing file is the common case; every other error repeats in `ensure`.
-                let (version, file) = ensure::<E>(&path, key.as_str())?;
-                state.versions.insert(key.clone(), version);
-                (version, file)
-            }
-        } else {
-            let (version, file) = ensure::<E>(&path, key.as_str())?;
-            state.versions.insert(key.clone(), version);
-            (version, file)
+        let cached = state.versions.get(key).copied();
+        let existing = cached.and_then(|_| OpenOptions::new().append(true).open(&path).ok());
+        let current = match (cached, &existing) {
+            (Some(version), Some(_)) => version,
+            _ => stored_version::<E>(&path, key.as_str())?,
         };
         if current != expected {
+            if cached.is_some() && existing.is_none() {
+                state.versions.remove(key);
+            }
             return Err(StoreError::Conflict {
                 expected,
                 actual: current,
             });
         }
+        if events.is_empty() {
+            return Ok(current);
+        }
         let last = check_append(key.as_str(), expected, events)?;
+        let mut file = match existing {
+            Some(file) => file,
+            None => ensure::<E>(&path, key.as_str())?.1,
+        };
         let mut buffer = Vec::new();
         encode_records(events, &mut buffer)?;
         // The cache cannot be trusted once this stream's write has failed.
@@ -226,6 +204,25 @@ where
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
         Ok(canonical_keys(names))
+    }
+}
+
+fn stored_version<E>(
+    path: &Path,
+    subject: &str,
+) -> Result<Version, StoreError>
+where
+    E: EventType + DeserializeOwned,
+{
+    match fs::read(path) {
+        Ok(bytes) => parse_records::<E>(
+            &path.display().to_string(),
+            subject,
+            complete_prefix(&bytes),
+        )
+        .map(|(version, _)| version),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Version::ZERO),
+        Err(error) => Err(error_at(path, &error)),
     }
 }
 
@@ -275,6 +272,19 @@ mod tests {
 
     fn store(directory: &tempfile::TempDir) -> JsonlEventStore<JobId, JobEvent> {
         JsonlEventStore::open(directory.path().join("jobs")).expect("store opens")
+    }
+
+    #[test]
+    fn the_store_meets_the_event_store_contract() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        mokmok_events::conformance::check(
+            &store(&directory),
+            &id(1),
+            &id(2),
+            submitted(),
+            JobEvent::Started { attempt: 1 },
+        );
+        Ok(())
     }
 
     #[test]
@@ -386,15 +396,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_stream_loads_empty() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = id(7);
-        assert_eq!(store.load(&id)?.len(), 0);
-        Ok(())
-    }
-
-    #[test]
     fn an_empty_append_reports_the_current_version_without_creating_a_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -404,30 +405,6 @@ mod tests {
         assert!(!store.path(&id).exists());
         store.append(&id, Version::ZERO, &[first(&id)])?;
         assert_eq!(store.append(&id, Version::new(1), &[])?, Version::new(1));
-        Ok(())
-    }
-
-    #[test]
-    fn a_stale_append_is_refused_without_writing() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = id(9);
-        store.append(&id, Version::ZERO, &[first(&id)])?;
-        let error = store
-            .append(
-                &id,
-                Version::ZERO,
-                &[at(&id, 1, JobEvent::Started { attempt: 1 })],
-            )
-            .expect_err("stale append is refused");
-        assert!(matches!(
-            error,
-            StoreError::Conflict {
-                expected,
-                actual,
-            } if expected == Version::ZERO && actual == Version::new(1)
-        ));
-        assert_eq!(store.load(&id)?.len(), 1);
         Ok(())
     }
 
@@ -530,33 +507,6 @@ mod tests {
         assert_eq!(record["sequence"], "1");
         assert_eq!(record["sequencetype"], "Integer");
         assert_eq!(record["data"]["kind"], "submitted");
-        Ok(())
-    }
-
-    #[test]
-    fn append_refuses_a_record_from_another_stream() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let other = id(17);
-        let id = id(16);
-        let error = store
-            .append(&id, Version::ZERO, &[first(&other)])
-            .expect_err("a record from another stream is refused");
-        assert!(matches!(error, StoreError::Invalid(_)));
-        assert_eq!(store.load(&id)?.len(), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn append_refuses_a_record_that_skips_a_version() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = id(18);
-        let error = store
-            .append(&id, Version::ZERO, &[at(&id, 2, submitted())])
-            .expect_err("a skipped version is refused");
-        assert!(matches!(error, StoreError::Invalid(_)));
-        assert_eq!(store.load(&id)?.len(), 0);
         Ok(())
     }
 
@@ -804,26 +754,6 @@ mod tests {
                 serde_json::from_str(&encoded).expect("record decodes");
             assert_eq!(decoded, record);
         }
-    }
-
-    #[test]
-    fn keys_of_an_empty_root_is_empty() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        assert_eq!(store.keys()?, Vec::<JobId>::new());
-        Ok(())
-    }
-
-    #[test]
-    fn keys_lists_every_stream_in_key_order() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let low = id(31);
-        let high = id(32);
-        store.append(&high, Version::ZERO, &[first(&high)])?;
-        store.append(&low, Version::ZERO, &[first(&low)])?;
-        assert_eq!(store.keys()?, vec![low, high]);
-        Ok(())
     }
 
     #[test]
