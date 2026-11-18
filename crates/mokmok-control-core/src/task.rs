@@ -248,19 +248,33 @@ pub enum ControlCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlEvent {
-    Submitted { spec: TaskSpec },
+    Submitted {
+        spec: TaskSpec,
+    },
     Started,
     /// The ACP session this run opened.
     ///
     /// The id is for debug and trace. It is not a resume handle: the runner always
     /// opens a fresh session with `new_session`, and the ACP client has no
     /// `session/load`.
-    SessionOpened { session_id: String },
-    UpdateRecorded { update: AgentUpdate },
-    Completed { summary: String },
-    Failed { reason: String },
-    Cancelled { reason: String },
-    Interrupted { reason: String },
+    SessionOpened {
+        session_id: String,
+    },
+    UpdateRecorded {
+        update: AgentUpdate,
+    },
+    Completed {
+        summary: String,
+    },
+    Failed {
+        reason: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+    Interrupted {
+        reason: String,
+    },
 }
 
 impl ControlEvent {
