@@ -8,11 +8,11 @@
 //! holds no header and nothing else, so the same record shape is what the in-memory
 //! adapter keeps.
 //!
-//! One store instance owns a root. The version cache lives in the instance, so
-//! opening the same root twice gives two writers with separate caches. One
-//! writer can then append a duplicate version after the other has moved on.
-//! Callers should share one `Arc<JsonlEventStore>` across every actor system over
-//! that root.
+//! One store instance owns a root. Each stream has its own mutex and version
+//! cache, so an append to one file does not hold up another. Opening the same
+//! root twice still gives two writers with separate caches; one writer can then
+//! append a duplicate version after the other has moved on. Callers should share
+//! one `Arc<JsonlEventStore>` across every actor system over that root.
 //!
 //! Correctness across processes is not claimed; the logical fence is the
 //! store's version check.
@@ -22,7 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, EventType, StoreError, StreamKey, Version,
@@ -34,13 +34,13 @@ use serde::de::DeserializeOwned;
 #[derive(Debug)]
 pub struct JsonlEventStore<K, E> {
     root: PathBuf,
-    state: Mutex<Locked<K>>,
+    streams: Mutex<HashMap<K, Arc<Mutex<Stream>>>>,
     event: PhantomData<fn() -> E>,
 }
 
 #[derive(Debug)]
-struct Locked<K> {
-    versions: HashMap<K, Version>,
+struct Stream {
+    version: Option<Version>,
 }
 
 impl<K, E> JsonlEventStore<K, E> {
@@ -48,10 +48,10 @@ impl<K, E> JsonlEventStore<K, E> {
     /// touched. A stream's file is named `<key>.jsonl`, where `<key>` is
     /// [`StreamKey::as_str`] (a canonical lowercase UUID for `JobId`).
     ///
-    /// One instance owns a root. The version cache lives in the instance, so
-    /// opening the same root twice gives two writers with separate caches. One
-    /// writer can then append a duplicate version after the other has moved on.
-    /// Share one `Arc<JsonlEventStore>` across every actor system instead.
+    /// One instance owns a root. Each stream's version cache lives behind that
+    /// stream's mutex. Opening the same root twice still gives two writers with
+    /// separate caches; share one `Arc<JsonlEventStore>` across every actor
+    /// system instead.
     ///
     /// # Errors
     ///
@@ -61,17 +61,34 @@ impl<K, E> JsonlEventStore<K, E> {
         fs::create_dir_all(&root).map_err(|error| error_at(&root, &error))?;
         Ok(Self {
             root,
-            state: Mutex::new(Locked {
-                versions: HashMap::new(),
-            }),
+            streams: Mutex::new(HashMap::new()),
             event: PhantomData,
         })
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Locked<K>>, StoreError> {
-        self.state
+    fn with_stream<R>(
+        &self,
+        key: &K,
+        body: impl FnOnce(&mut Stream) -> Result<R, StoreError>,
+    ) -> Result<R, StoreError>
+    where
+        K: StreamKey,
+    {
+        let handle = {
+            let mut streams = self
+                .streams
+                .lock()
+                .map_err(|_| StoreError::Io("event store lock poisoned".to_owned()))?;
+            Arc::clone(
+                streams
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(Stream { version: None }))),
+            )
+        };
+        let mut stream = handle
             .lock()
-            .map_err(|_| StoreError::Io("event store lock poisoned".to_owned()))
+            .map_err(|_| StoreError::Io("event store lock poisoned".to_owned()))?;
+        body(&mut stream)
     }
 
     fn path(
@@ -124,20 +141,23 @@ where
         key: &K,
     ) -> Result<Vec<CloudEvent<E>>, StoreError> {
         let path = self.path(key);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error_at(&path, &error)),
-        };
-        let (_, events) = parse_records(
-            &path.display().to_string(),
-            key.as_str(),
-            complete_prefix(&bytes),
-        )?;
-        Ok(events)
+        self.with_stream(key, |_| {
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                },
+                Err(error) => return Err(error_at(&path, &error)),
+            };
+            let (_, events) = parse_records(
+                &path.display().to_string(),
+                key.as_str(),
+                complete_prefix(&bytes),
+            )?;
+            Ok(events)
+        })
     }
 
-    #[allow(clippy::significant_drop_tightening)] // The guard is this stream's single-writer fence.
     fn append(
         &self,
         key: &K,
@@ -145,39 +165,40 @@ where
         events: &[CloudEvent<E>],
     ) -> Result<Version, StoreError> {
         let path = self.path(key);
-        let mut state = self.lock()?;
-        let cached = state.versions.get(key).copied();
-        let existing = cached.and_then(|_| OpenOptions::new().append(true).open(&path).ok());
-        let current = match (cached, &existing) {
-            (Some(version), Some(_)) => version,
-            _ => stored_version::<E>(&path, key.as_str())?,
-        };
-        if current != expected {
-            if cached.is_some() && existing.is_none() {
-                state.versions.remove(key);
+        self.with_stream(key, |stream| {
+            let cached = stream.version;
+            let existing = cached.and_then(|_| OpenOptions::new().append(true).open(&path).ok());
+            let current = match (cached, &existing) {
+                (Some(version), Some(_)) => version,
+                _ => stored_version::<E>(&path, key.as_str())?,
+            };
+            if current != expected {
+                if cached.is_some() && existing.is_none() {
+                    stream.version = None;
+                }
+                return Err(StoreError::Conflict {
+                    expected,
+                    actual: current,
+                });
             }
-            return Err(StoreError::Conflict {
-                expected,
-                actual: current,
-            });
-        }
-        if events.is_empty() {
-            return Ok(current);
-        }
-        let last = check_append(key.as_str(), expected, events)?;
-        let mut file = match existing {
-            Some(file) => file,
-            None => ensure::<E>(&path, key.as_str())?.1,
-        };
-        let mut buffer = Vec::new();
-        encode_records(events, &mut buffer)?;
-        // The cache cannot be trusted once this stream's write has failed.
-        if let Err(error) = file.write_all(&buffer).and_then(|()| file.sync_data()) {
-            state.versions.remove(key);
-            return Err(error_at(&path, &error));
-        }
-        state.versions.insert(key.clone(), last);
-        Ok(last)
+            if events.is_empty() {
+                return Ok(current);
+            }
+            let last = check_append(key.as_str(), expected, events)?;
+            let mut file = match existing {
+                Some(file) => file,
+                None => ensure::<E>(&path, key.as_str())?.1,
+            };
+            let mut buffer = Vec::new();
+            encode_records(events, &mut buffer)?;
+            // The cache cannot be trusted once this stream's write has failed.
+            if let Err(error) = file.write_all(&buffer).and_then(|()| file.sync_data()) {
+                stream.version = None;
+                return Err(error_at(&path, &error));
+            }
+            stream.version = Some(last);
+            Ok(last)
+        })
     }
 }
 
@@ -296,6 +317,26 @@ mod tests {
         store.append(&id, Version::ZERO, &[first(&id)])?;
         assert_eq!(store.load(&id)?.len(), 1);
         assert!(root.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_appends_to_distinct_streams_all_commit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let store = Arc::new(store(&directory));
+        std::thread::scope(|scope| {
+            for n in 40..56 {
+                let store = Arc::clone(&store);
+                scope.spawn(move || {
+                    let id = id(n);
+                    store
+                        .append(&id, Version::ZERO, &[first(&id)])
+                        .expect("each stream commits");
+                });
+            }
+        });
+        assert_eq!(store.keys()?.len(), 16);
         Ok(())
     }
 
