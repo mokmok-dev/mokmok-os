@@ -1,19 +1,5 @@
 [workspace]
-members = [
-  "apps/mokmok-controld",
-  "crates/mokmok-acp",
-  "crates/mokmok-control",
-  "crates/mokmok-control-core",
-  "crates/mokmok-events",
-  "crates/mokmok-jobs",
-  "crates/mokmok-jobs-core",
-  "crates/mokmok-jobs-jsonl",
-  "crates/mokmok-jobs-memory",
-  "crates/mokmok-jobs-s3",
-  "crates/mokmok-journal",
-  "crates/mokmok-proofs",
-  "crates/mokmok-web",
-]
+members = ["apps/*", "crates/*"]
 resolver = "3"
 
 [workspace.dependencies]
