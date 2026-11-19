@@ -30,7 +30,22 @@
         let
           rustToolchain = pkgs.rust-bin.stable.latest.default;
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
-          src = pkgs.lib.cleanSourceWith { src = ./.; };
+          # crane keeps only Rust and cargo files, so the files the code reads with
+          # `include_str!` are added back here.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./ARCHITECTURE.md
+              (pkgs.lib.fileset.fileFilter (
+                file:
+                pkgs.lib.any (extension: file.hasExt extension) [
+                  "css"
+                  "svg"
+                ]
+              ) ./crates/mokmok-web/src/view)
+            ];
+          };
           commonArgs = {
             inherit src;
             strictDeps = true;
@@ -49,6 +64,21 @@
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
           '';
           kani = pkgs.callPackage ./nix/kani.nix { };
+          inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
+
+          mokmok-controld = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit
+                cargoArtifacts
+                version
+                ;
+              pname = "mokmok-controld";
+              cargoExtraArgs = "-p mokmok-controld";
+              doCheck = false;
+              meta.mainProgram = "mokmok-controld";
+            }
+          );
         in
         {
           _module.args = {
@@ -59,23 +89,26 @@
           };
 
           checks = {
+            inherit mokmok-controld;
+
             clippy = craneLib.cargoClippy (
               commonArgs
               // {
-                inherit
-                  src
-                  cargoArtifacts
-                  ;
+                inherit cargoArtifacts;
                 cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
               }
             );
             test = craneLib.cargoTest (
               commonArgs
               // {
-                inherit
-                  src
-                  cargoArtifacts
-                  ;
+                inherit cargoArtifacts;
+              }
+            );
+            doc = craneLib.cargoDoc (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                env.RUSTDOCFLAGS = "--deny warnings";
               }
             );
           }
@@ -84,11 +117,10 @@
               commonArgs
               // {
                 inherit
-                  src
                   cargoArtifacts
+                  version
                   ;
                 pname = "mokmok-os-mutants";
-                version = "2026.11.1";
                 nativeBuildInputs = [ pkgs.cargo-mutants ];
                 buildPhaseCargoCommand = "cargo mutants --workspace --jobs 4 --timeout 60 --no-shuffle";
                 doInstallCargoArtifacts = false;
@@ -100,11 +132,10 @@
               commonArgs
               // {
                 inherit
-                  src
                   cargoArtifacts
+                  version
                   ;
                 pname = "mokmok-os-kani";
-                version = "2026.11.1";
                 nativeBuildInputs = [ kani ];
                 buildPhaseCargoCommand = "PATH=${kani}/bin:$PATH kani-driver crates/mokmok-proofs/src/lib.rs";
                 doInstallCargoArtifacts = false;
@@ -112,13 +143,9 @@
             );
           };
 
-          packages.default = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              meta.mainProgram = "mokmok-controld";
-            }
-          );
+          # The daemon is the only thing shipped. A bare workspace build also
+          # installs the test agents, and a consumer would depend on both.
+          packages.default = mokmok-controld;
 
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
