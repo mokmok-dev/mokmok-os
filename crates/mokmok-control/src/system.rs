@@ -55,7 +55,7 @@ pub struct Recovery {
 ///
 /// The row carries enough to place the task in a workspace and to seed its first
 /// user turn, so a browser does not need to replay each task's stream to render it.
-/// The instruction is a preview clipped to [`LISTING_INSTRUCTION_BYTES`] on a character
+/// The instruction is a preview clipped to `LISTING_INSTRUCTION_BYTES` on a character
 /// boundary plus an ellipsis; the task detail endpoint carries the full instruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSummary {

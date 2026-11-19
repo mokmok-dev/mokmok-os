@@ -1,6 +1,6 @@
 //! Server-rendered HTML for the control plan.
 //!
-//! The pages read a [`ControlPlane`](port::ControlPlane) instead of the daemon's state,
+//! The pages read a [`ControlPlane`] instead of the daemon's state,
 //! so this crate tests against a fake and the daemon decides what the port answers. The
 //! [`model`] turns those reads into the owned data a page renders.
 //!
