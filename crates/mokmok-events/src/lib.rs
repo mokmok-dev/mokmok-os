@@ -2,7 +2,7 @@
 //!
 //! An adapter stores [`CloudEvent`] records under a [`StreamKey`]. Nothing here
 //! knows which domain produced the data, so one store serves every event-sourced
-//! subsystem. [`record`] owns the `JSONL` byte format those adapters share.
+//! subsystem. `record` owns the `JSONL` byte format those adapters share.
 
 mod cloud_event;
 pub mod conformance;

@@ -328,7 +328,7 @@ impl AcpClient {
 
     /// Sends one prompt and streams its updates until the agent stops or `cancel` is set.
     ///
-    /// A cancel writes one `session/cancel` notification, waits [`CANCEL_GRACE`] for the agent
+    /// A cancel writes one `session/cancel` notification, waits `CANCEL_GRACE` for the agent
     /// to answer, and then reports [`StopReason::Cancelled`]. An agent that answers first, with
     /// any stop reason, has that answer used.
     ///
