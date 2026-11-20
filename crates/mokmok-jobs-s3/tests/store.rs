@@ -3,14 +3,13 @@
 mod common;
 
 use std::num::NonZeroU32;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use common::{ACCESS_KEY, FakeS3, SECRET_KEY, SESSION_TOKEN};
 use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, StoreError, StreamKey, Version, encode_records,
 };
-use mokmok_events_conformance::Backend;
+use mokmok_events_conformance::{Backend, Roots};
 use mokmok_jobs_core::{JobEvent, JobId};
 use mokmok_jobs_s3::{S3Config, S3Credentials, S3EventStore};
 
@@ -69,27 +68,19 @@ fn encoded(events: &[CloudEvent<JobEvent>]) -> Vec<u8> {
     bytes
 }
 
-/// A bucket and prefix per `store()` call, so every shared check starts clean and
+/// A bucket per `store()` call, so every shared check starts clean and
 /// `reopen`/`write_raw` reach the objects the last call named.
 struct S3Backend {
     fake: FakeS3,
-    roots: Mutex<Vec<(String, String)>>,
+    roots: Roots<(String, String)>,
 }
 
 impl S3Backend {
     fn new() -> Self {
         Self {
             fake: FakeS3::start(),
-            roots: Mutex::new(Vec::new()),
+            roots: Roots::default(),
         }
-    }
-
-    fn current(&self) -> Option<(String, String)> {
-        self.roots
-            .lock()
-            .expect("the fixture is not poisoned")
-            .last()
-            .cloned()
     }
 }
 
@@ -99,15 +90,14 @@ impl mokmok_events_conformance::Backend for S3Backend {
     type Store = S3EventStore<JobId, JobEvent>;
 
     fn store(&self) -> Self::Store {
-        let mut roots = self.roots.lock().expect("the fixture is not poisoned");
-        let root = (format!("{BUCKET}-{}", roots.len()), PREFIX.to_owned());
-        roots.push(root.clone());
-        drop(roots);
-        S3EventStore::open(self.fake.config(&root.0, &root.1)).expect("the store opens")
+        let (bucket, prefix) = self
+            .roots
+            .open(|n| (format!("{BUCKET}-{n}"), PREFIX.to_owned()));
+        S3EventStore::open(self.fake.config(&bucket, &prefix)).expect("the store opens")
     }
 
     fn reopen(&self) -> Option<Self::Store> {
-        let (bucket, prefix) = self.current()?;
+        let (bucket, prefix) = self.roots.reopen()?;
         Some(S3EventStore::open(self.fake.config(&bucket, &prefix)).expect("the store reopens"))
     }
 
@@ -117,7 +107,8 @@ impl mokmok_events_conformance::Backend for S3Backend {
         bytes: &[u8],
     ) -> Result<(), StoreError> {
         let (bucket, prefix) = self
-            .current()
+            .roots
+            .reopen()
             .ok_or_else(|| StoreError::Io("no root is open".to_owned()))?;
         self.fake
             .put_object(&bucket, &format!("{prefix}/{name}"), bytes);

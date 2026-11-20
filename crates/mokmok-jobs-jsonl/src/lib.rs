@@ -282,7 +282,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use mokmok_events::{CloudEvent, EventType};
-    use mokmok_events_conformance::Backend;
+    use mokmok_events_conformance::{Backend, Roots};
     use mokmok_jobs_core::{JobEvent, JobId};
     use serde::{Deserialize, Serialize};
 
@@ -323,19 +323,15 @@ mod tests {
     /// starts clean and `reopen`/`write_raw` reach the bytes the last call named.
     struct JsonlBackend {
         directory: tempfile::TempDir,
-        roots: Mutex<Vec<PathBuf>>,
+        roots: Roots<PathBuf>,
     }
 
     impl JsonlBackend {
         fn new() -> Self {
             Self {
                 directory: tempfile::tempdir().expect("a temporary directory"),
-                roots: Mutex::new(Vec::new()),
+                roots: Roots::default(),
             }
-        }
-
-        fn roots(&self) -> std::sync::MutexGuard<'_, Vec<PathBuf>> {
-            self.roots.lock().expect("the fixture is not poisoned")
         }
     }
 
@@ -345,15 +341,14 @@ mod tests {
         type Store = JsonlEventStore<JobId, JobEvent>;
 
         fn store(&self) -> Self::Store {
-            let mut roots = self.roots();
-            let root = self.directory.path().join(format!("root-{}", roots.len()));
-            roots.push(root.clone());
-            drop(roots);
+            let root = self
+                .roots
+                .open(|n| self.directory.path().join(format!("root-{n}")));
             JsonlEventStore::open(root).expect("store opens")
         }
 
         fn reopen(&self) -> Option<Self::Store> {
-            let root = self.roots().last().cloned()?;
+            let root = self.roots.reopen()?;
             Some(JsonlEventStore::open(root).expect("store reopens"))
         }
 
@@ -363,9 +358,8 @@ mod tests {
             bytes: &[u8],
         ) -> Result<(), StoreError> {
             let root = self
-                .roots()
-                .last()
-                .cloned()
+                .roots
+                .reopen()
                 .ok_or_else(|| StoreError::Io("no root is open".to_owned()))?;
             fs::write(root.join(name), bytes).map_err(|error| error_at(&root, &error))
         }

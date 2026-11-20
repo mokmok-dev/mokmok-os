@@ -10,6 +10,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::fmt::Debug;
+use std::sync::Mutex;
 
 use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, EventType, StoreError, StreamKey, Version,
@@ -96,12 +97,51 @@ pub trait Backend {
     ) -> Result<(), StoreError>;
 }
 
+/// The root bookkeeping every [`Backend`] would otherwise repeat.
+///
+/// [`Roots::open`] records a root and returns it, so [`Roots::reopen`] always names the
+/// most recent one. An adapter that shares memory rather than a place supplies no root,
+/// and the checks that need one skip.
+#[derive(Debug, Default)]
+pub struct Roots<R> {
+    opened: Mutex<Vec<R>>,
+}
+
+impl<R: Clone> Roots<R> {
+    /// Records the root `make` builds from the next unused index and returns it.
+    ///
+    /// The index counts roots already opened, so an adapter can name a root that no
+    /// earlier call named.
+    pub fn open(
+        &self,
+        make: impl FnOnce(usize) -> R,
+    ) -> R {
+        let mut opened = self.lock();
+        let root = make(opened.len());
+        opened.push(root.clone());
+        root
+    }
+
+    /// The most recent root, or `None` when none was opened.
+    #[must_use]
+    pub fn reopen(&self) -> Option<R> {
+        self.lock().last().cloned()
+    }
+
+    /// A panic elsewhere cannot leave this list inconsistent, so a poisoned lock still
+    /// hands out the roots it holds.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<R>> {
+        self.opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Pins that an uncommitted tail is neither read nor kept.
 ///
 /// A writer that dies mid-record leaves bytes past the last newline. A reader must return
 /// only the committed records, and the next append must drop the partial record rather
-/// than write after it. The read goes through a handle opened after the tail appeared,
-/// which is the handle a restarted process holds.
+/// than write after it.
 ///
 /// # Panics
 ///
@@ -488,7 +528,6 @@ mod tests {
             parse_records::<Tick>("probe", key.as_str(), &bytes).map(|(version, _)| version)
         }
 
-        /// Commits `events` after the committed prefix, dropping any tail.
         fn push(
             &self,
             key: &Probe,
@@ -554,24 +593,20 @@ mod tests {
     /// A [`Backend`] that keeps every root it opened, so `reopen` and `write_raw` reach
     /// the same bytes as the last `store`.
     struct Fixture<S> {
-        roots: Mutex<Vec<Objects>>,
+        roots: Roots<Objects>,
         build: fn(Objects) -> S,
     }
 
     impl<S> Fixture<S> {
         fn new(build: fn(Objects) -> S) -> Self {
             Self {
-                roots: Mutex::new(Vec::new()),
+                roots: Roots::default(),
                 build,
             }
         }
 
         fn current(&self) -> Option<Objects> {
-            self.roots
-                .lock()
-                .expect("the fixture is not poisoned")
-                .last()
-                .cloned()
+            self.roots.reopen()
         }
     }
 
@@ -584,11 +619,7 @@ mod tests {
         type Store = S;
 
         fn store(&self) -> S {
-            let objects = Objects::default();
-            self.roots
-                .lock()
-                .expect("the fixture is not poisoned")
-                .push(Arc::clone(&objects));
+            let objects = self.roots.open(|_| Objects::default());
             (self.build)(objects)
         }
 
