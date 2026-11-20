@@ -10,11 +10,12 @@
 //!
 //! One store instance owns a root. The map of streams is an `RwLock` held only
 //! while looking up or inserting a stream. Each stream then has its own mutex
-//! and version cache, so an append to one file does not hold up another. Opening
-//! the same root twice still gives two writers with separate caches; one writer
-//! can then append a duplicate version after the other has moved on. That is
-//! left as a documented limit: callers should share one `Arc<JsonlEventStore>`
-//! across every actor system over that root.
+//! and version cache, so an append to one file does not hold up another. The
+//! cache also remembers the file's length, so a second handle over the same
+//! root sees the bytes the first one appended and re-reads the version instead
+//! of committing a duplicate. Two appends that pass that check at the same
+//! moment can still both write, so share one `Arc<JsonlEventStore>` across every
+//! actor system over that root.
 //!
 //! Correctness across processes is not claimed; the logical fence is the
 //! store's version check.
@@ -42,12 +43,17 @@ pub struct JsonlEventStore<K, E> {
 
 #[derive(Debug)]
 struct StreamState {
-    inner: Mutex<Stream>,
+    cache: Mutex<Option<Cache>>,
 }
 
-#[derive(Debug)]
-struct Stream {
-    version: Option<Version>,
+/// The version this handle last read or wrote, and the bytes the file held then.
+///
+/// The length is what makes the cache safe with more than one handle over a root: an
+/// append that finds the file longer than this no longer knows its version.
+#[derive(Clone, Copy, Debug)]
+struct Cache {
+    version: Version,
+    length: u64,
 }
 
 impl<K, E> JsonlEventStore<K, E> {
@@ -57,9 +63,10 @@ impl<K, E> JsonlEventStore<K, E> {
     ///
     /// One instance owns a root. The stream map is an `RwLock` held only to look
     /// up or insert an entry. Each stream's version cache lives behind that
-    /// stream's mutex. Opening the same root twice still gives two writers with
-    /// separate caches; share one `Arc<JsonlEventStore>` across every actor
-    /// system instead.
+    /// stream's mutex. A second handle over the same root sees the bytes the
+    /// first one appended and re-reads the version rather than committing a
+    /// duplicate, but two appends that pass that check together can still both
+    /// write, so share one `Arc<JsonlEventStore>` across every actor system.
     ///
     /// # Errors
     ///
@@ -91,7 +98,7 @@ impl<K, E> JsonlEventStore<K, E> {
         Ok(Arc::clone(streams.entry(key.clone()).or_insert_with(
             || {
                 Arc::new(StreamState {
-                    inner: Mutex::new(Stream { version: None }),
+                    cache: Mutex::new(None),
                 })
             },
         )))
@@ -100,14 +107,14 @@ impl<K, E> JsonlEventStore<K, E> {
     fn with_stream<R>(
         &self,
         key: &K,
-        body: impl FnOnce(&mut Stream) -> Result<R, StoreError>,
+        body: impl FnOnce(&mut Option<Cache>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError>
     where
         K: StreamKey,
     {
         let state = self.stream_state(key)?;
-        let mut stream = state.inner.lock().map_err(|_| lock_poisoned())?;
-        body(&mut stream)
+        let mut cache = state.cache.lock().map_err(|_| lock_poisoned())?;
+        body(&mut cache)
     }
 
     fn path(
@@ -124,7 +131,7 @@ impl<K, E> JsonlEventStore<K, E> {
 fn ensure<E>(
     path: &Path,
     subject: &str,
-) -> Result<(Version, File), StoreError>
+) -> Result<(Cache, File), StoreError>
 where
     E: EventType + DeserializeOwned,
 {
@@ -147,7 +154,8 @@ where
     }
     let (version, _) =
         parse_records::<E>(&path.display().to_string(), subject, &bytes[..committed])?;
-    Ok((version, file))
+    let length = u64::try_from(committed).map_err(|error| StoreError::Io(error.to_string()))?;
+    Ok((Cache { version, length }, file))
 }
 
 impl<K, E> EventStore<K, E> for JsonlEventStore<K, E>
@@ -184,17 +192,26 @@ where
         events: &[CloudEvent<E>],
     ) -> Result<Version, StoreError> {
         let path = self.path(key);
-        self.with_stream(key, |stream| {
-            let cached = stream.version;
-            let existing = cached.and_then(|_| OpenOptions::new().append(true).open(&path).ok());
-            let current = match (cached, &existing) {
-                (Some(version), Some(_)) => version,
-                _ => stored_version::<E>(&path, key.as_str())?,
+        self.with_stream(key, |cache| {
+            // A cached version describes the file only while the file still ends where
+            // this handle left it. Another handle over the same root moves that end.
+            let mut at_tip = None;
+            if let Some(seen) = *cache
+                && let Ok(file) = OpenOptions::new().append(true).open(&path)
+                && file.metadata().is_ok_and(|meta| meta.len() == seen.length)
+            {
+                at_tip = Some((seen, file));
+            }
+            let current = if let Some((seen, _)) = at_tip {
+                seen.version
+            } else {
+                // Whatever this handle last saw, the file is the authority. Read it now,
+                // so a stale append becomes the conflict it already is.
+                let stored = stored_stream::<E>(&path, key.as_str())?;
+                *cache = Some(stored);
+                stored.version
             };
             if current != expected {
-                if cached.is_some() && existing.is_none() {
-                    stream.version = None;
-                }
                 return Err(StoreError::Conflict {
                     expected,
                     actual: current,
@@ -204,18 +221,37 @@ where
                 return Ok(current);
             }
             let last = check_append(key.as_str(), expected, events)?;
-            let mut file = match existing {
-                Some(file) => file,
-                None => ensure::<E>(&path, key.as_str())?.1,
+            // A handle kept in `at_tip` already sits at the file's end. A handle that had
+            // to re-read opens through `ensure`, which drops a torn tail and returns the
+            // version it finds; that version decides, because the file could have moved
+            // between the read above and this open.
+            let (before, mut file) = if let Some((seen, file)) = at_tip {
+                (seen, file)
+            } else {
+                let (stored, file) = ensure::<E>(&path, key.as_str())?;
+                *cache = Some(stored);
+                if stored.version != expected {
+                    return Err(StoreError::Conflict {
+                        expected,
+                        actual: stored.version,
+                    });
+                }
+                (stored, file)
             };
             let mut buffer = Vec::new();
             encode_records(events, &mut buffer)?;
-            // The cache cannot be trusted once this stream's write has failed.
-            if let Err(error) = file.write_all(&buffer).and_then(|()| file.sync_data()) {
-                stream.version = None;
-                return Err(error_at(&path, &error));
-            }
-            stream.version = Some(last);
+            // A failed write needs no invalidation: if a byte landed, the file is longer
+            // than `before` and the next append re-reads it. If none did, this cache still
+            // describes the file.
+            file.write_all(&buffer)
+                .and_then(|()| file.sync_data())
+                .map_err(|error| error_at(&path, &error))?;
+            let written =
+                u64::try_from(buffer.len()).map_err(|error| StoreError::Io(error.to_string()))?;
+            *cache = Some(Cache {
+                version: last,
+                length: before.length + written,
+            });
             Ok(last)
         })
     }
@@ -247,21 +283,25 @@ where
     }
 }
 
-fn stored_version<E>(
+fn stored_stream<E>(
     path: &Path,
     subject: &str,
-) -> Result<Version, StoreError>
+) -> Result<Cache, StoreError>
 where
     E: EventType + DeserializeOwned,
 {
     match fs::read(path) {
-        Ok(bytes) => parse_records::<E>(
-            &path.display().to_string(),
-            subject,
-            complete_prefix(&bytes),
-        )
-        .map(|(version, _)| version),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Version::ZERO),
+        Ok(bytes) => {
+            let committed = complete_prefix(&bytes);
+            let (version, _) = parse_records::<E>(&path.display().to_string(), subject, committed)?;
+            let length = u64::try_from(committed.len())
+                .map_err(|error| StoreError::Io(error.to_string()))?;
+            Ok(Cache { version, length })
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Cache {
+            version: Version::ZERO,
+            length: 0,
+        }),
         Err(error) => Err(error_at(path, &error)),
     }
 }
@@ -344,6 +384,36 @@ mod tests {
     }
 
     #[test]
+    fn independent_handles_commit_to_distinct_streams_together()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("jobs");
+        let results = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for n in 40..56 {
+                let root = root.clone();
+                joins.push(scope.spawn(move || {
+                    let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+                    let id = id(n);
+                    store.append(&id, Version::ZERO, &[first(&id)])?;
+                    Ok::<_, StoreError>(())
+                }));
+            }
+            joins
+                .into_iter()
+                .map(|join| join.join().expect("append thread"))
+                .collect::<Vec<_>>()
+        });
+        for result in results {
+            result.expect("each handle commits its own stream");
+        }
+
+        let store = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+        assert_eq!(store.keys()?.len(), 16);
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_appends_to_distinct_streams_all_commit() -> Result<(), Box<dyn std::error::Error>>
     {
         let directory = tempfile::tempdir()?;
@@ -406,7 +476,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_append_blocked_on_one_stream_does_not_hold_up_another()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -417,12 +486,17 @@ mod tests {
         let blocked_id = id(42);
         let free_id = id(43);
         store.append(&blocked_id, Version::ZERO, &[first(&blocked_id)])?;
-        let path = store.path(&blocked_id);
-        fs::remove_file(&path)?;
-        make_fifo(&path)?;
 
+        // Holding one stream's fence is what a slow append does. A sibling that commits
+        // while it is held proves the two streams do not share one.
+        let fence = store.stream_state(&blocked_id)?;
+        let held = fence
+            .cache
+            .lock()
+            .map_err(|_| "the fence is not poisoned")?;
         let stalled = {
             let store = Arc::clone(&store);
+            let blocked_id = blocked_id.clone();
             std::thread::spawn(move || {
                 store.append(
                     &blocked_id,
@@ -441,40 +515,14 @@ mod tests {
         store.append(&free_id, Version::ZERO, &[first(&free_id)])?;
         assert!(
             started.elapsed() < Duration::from_millis(500),
-            "a sibling stream must commit while the other append is still in open()"
+            "a sibling stream must commit while the other append is still blocked"
         );
         assert_eq!(store.load(&free_id)?.len(), 1);
 
-        let _reader = File::open(&path)?;
-        wait_until_finished(&stalled, Duration::from_secs(1))?;
-        let _ = stalled.join().expect("stalled append thread");
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn make_fifo(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let status = std::process::Command::new("mkfifo").arg(path).status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("mkfifo failed: {status}").into())
-        }
-    }
-
-    // A reader unblocks `open` on the fifo. Skipping the cached-version arm then
-    // `read`s the same fifo while still holding the write end, which never sees EOF.
-    #[cfg(unix)]
-    fn wait_until_finished<T>(
-        handle: &std::thread::JoinHandle<T>,
-        budget: std::time::Duration,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let started = std::time::Instant::now();
-        while !handle.is_finished() {
-            if started.elapsed() >= budget {
-                return Err("stalled work did not unblock after a reader opened the fifo".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        drop(held);
+        let version = stalled.join().expect("the stalled append thread")?;
+        assert_eq!(version, Version::new(2));
+        assert_eq!(store.load(&blocked_id)?.len(), 2);
         Ok(())
     }
 
@@ -523,7 +571,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "repro for MOK-243: each handle caches its own version"]
     fn independent_handles_reject_stale_appends() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("jobs");
@@ -598,6 +645,38 @@ mod tests {
         )?;
         assert_eq!(version, Version::new(2));
         assert_eq!(store.load(&id)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_handle_that_cached_the_file_still_drops_another_writers_torn_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("jobs");
+        let id = id(61);
+        let reader = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+        let writer = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+        writer.append(&id, Version::ZERO, &[first(&id)])?;
+        // The reader now caches version 1 at this file's length.
+        reader.append(&id, Version::new(1), &[])?;
+
+        let mut file = OpenOptions::new().append(true).open(reader.path(&id))?;
+        file.write_all(b"{\"specversion\":\"1.0\"")?;
+        drop(file);
+
+        // The file is longer than the reader cached, so the reader re-reads and writes
+        // through `ensure`, which drops the tail the other writer left.
+        let version = reader.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        )?;
+        assert_eq!(version, Version::new(2));
+        assert_eq!(
+            fs::read_to_string(reader.path(&id))?.lines().count(),
+            2,
+            "the torn tail is gone, so the file holds exactly its two records"
+        );
         Ok(())
     }
 
@@ -820,24 +899,15 @@ mod tests {
         Ok(())
     }
 
-    // Leaves `torn` on the end of the committed file, then swaps the file for `/dev/null` for
-    // one append, where `write_all` succeeds and `sync_data` fails with `EINVAL`. A torn tail is
-    // what a failed `write_all` leaves; a durable record with no tail is what a failed
-    // `sync_data` leaves. The adapter keeps its cache across both, which is what a daemon's
-    // single store instance does.
+    /// A `write_all` to `/dev/null` succeeds and `sync_data` fails with `EINVAL`, so this
+    /// reaches the failure branch without a real disk error.
     #[cfg(unix)]
     fn redirect_for_one_sync(
         store: &JsonlEventStore<JobId, JobEvent>,
         id: &JobId,
-        torn: Option<&[u8]>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = store.path(id);
-        let held = path.with_extension("held");
-        fs::rename(&path, &held)?;
-        if let Some(bytes) = torn {
-            let mut file = OpenOptions::new().append(true).open(&held)?;
-            file.write_all(bytes)?;
-        }
+        fs::rename(&path, path.with_extension("held"))?;
         std::os::unix::fs::symlink("/dev/null", &path)?;
         Ok(())
     }
@@ -848,29 +918,27 @@ mod tests {
         id: &JobId,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = store.path(id);
-        let held = path.with_extension("held");
         fs::remove_file(&path)?;
-        fs::rename(&held, &path)?;
+        fs::rename(path.with_extension("held"), &path)?;
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_failed_sync_drops_the_cache_so_the_next_append_re_reads_the_stream()
+    fn a_failed_write_is_reported_and_a_record_it_never_saw_is_not_duplicated()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let id = id(30);
-        store.append(&id, Version::ZERO, &[first(&id)])?;
-
-        // The torn tail is what a failed `write_all` leaves and what `ensure` exists to
-        // truncate. A cache that still names version 1 skips `ensure`, so the next append
-        // would write onto the torn line.
-        redirect_for_one_sync(&store, &id, Some(b"{\"specversion\":\"1.0\""))?;
+        // An empty append caches the empty file, so the redirect's length of zero is what
+        // this handle last saw and the append below reaches the write.
+        fs::write(store.path(&id), b"")?;
+        store.append(&id, Version::ZERO, &[])?;
+        redirect_for_one_sync(&store, &id)?;
         let error = store.append(
             &id,
-            Version::new(1),
-            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+            Version::ZERO,
+            &[at(&id, 1, JobEvent::Started { attempt: 1 })],
         );
         restore_stream(&store, &id)?;
         assert!(
@@ -878,66 +946,23 @@ mod tests {
             "the failed sync must surface: {error:?}"
         );
 
-        let version = store.append(
-            &id,
-            Version::new(1),
-            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
-        )?;
-        assert_eq!(version, Version::new(2));
-        assert_eq!(
-            store.load(&id)?.len(),
-            2,
-            "the torn tail was truncated and the record written once"
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_failed_write_that_left_the_record_durable_is_seen_by_the_next_append()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = id(31);
-        store.append(&id, Version::ZERO, &[first(&id)])?;
-
-        // The record reached the file before its sync failed, so the stream stands at version
-        // 2 while the cache still names version 1. The next append goes to `/dev/null`, where
-        // it reaches the adapter's failure branch and the cache is dropped.
-        let durable = at(&id, 2, JobEvent::Started { attempt: 1 });
+        // A record this handle never saw reaches the file afterwards. The cache still
+        // names the empty file, so only the length check makes the retry re-read it and
+        // refuse version 1 instead of writing it a second time.
         let mut file = OpenOptions::new().append(true).open(store.path(&id))?;
-        file.write_all(format!("{}\n", line(&durable)).as_bytes())?;
+        file.write_all(format!("{}\n", line(&first(&id))).as_bytes())?;
         file.sync_data()?;
         drop(file);
-
-        redirect_for_one_sync(&store, &id, None)?;
-        let error = store.append(
-            &id,
-            Version::new(1),
-            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
-        );
-        restore_stream(&store, &id)?;
-        assert!(
-            matches!(error, Err(StoreError::Io(_))),
-            "the failed sync must surface: {error:?}"
-        );
-
-        // The cache was dropped, so the next append reads the file and refuses the stale
-        // version instead of writing version 2 twice.
-        let stale = store.append(
-            &id,
-            Version::new(1),
-            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
-        );
+        let duplicate = store.append(&id, Version::ZERO, &[first(&id)]);
         assert!(
             matches!(
-                stale,
+                duplicate,
                 Err(StoreError::Conflict { expected, actual })
-                    if expected == Version::new(1) && actual == Version::new(2)
+                    if expected == Version::ZERO && actual == Version::new(1)
             ),
-            "the append must be checked against the committed file: {stale:?}"
+            "the record it never saw must be refused: {duplicate:?}"
         );
-        assert_eq!(store.load(&id)?.len(), 2);
+        assert_eq!(store.load(&id)?.len(), 1);
         Ok(())
     }
 

@@ -1,5 +1,7 @@
 use std::num::NonZeroU32;
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -203,71 +205,78 @@ fn concurrent_appends_to_one_jsonl_stream_conflict() -> Result<(), Box<dyn std::
     Ok(())
 }
 
-#[cfg(unix)]
+/// Blocks one job's `append` until the test releases it, the way a slow disk on that
+/// stream does. Every other stream goes straight through.
+struct StallingStore {
+    inner: JsonlEventStore<JobId, JobEvent>,
+    stalled: JobId,
+    armed: AtomicBool,
+    entered: Sender<()>,
+    release: Mutex<Receiver<()>>,
+}
+
+impl EventStore<JobId, JobEvent> for StallingStore {
+    fn load(
+        &self,
+        id: &JobId,
+    ) -> Result<Vec<CloudEvent<JobEvent>>, StoreError> {
+        self.inner.load(id)
+    }
+
+    fn append(
+        &self,
+        id: &JobId,
+        expected: Version,
+        events: &[CloudEvent<JobEvent>],
+    ) -> Result<Version, StoreError> {
+        if id == &self.stalled && self.armed.load(Ordering::SeqCst) {
+            let _ = self.entered.send(());
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+        }
+        self.inner.append(id, expected, events)
+    }
+}
+
 #[test]
 fn a_stuck_jsonl_submit_does_not_block_another_job() -> Result<(), Box<dyn std::error::Error>> {
-    use std::fs::{self, File};
-
     let directory = tempfile::tempdir()?;
-    let root = directory.path().join("jobs");
-    let store: Arc<JsonlEventStore<JobId, JobEvent>> = Arc::new(JsonlEventStore::open(&root)?);
-    let system = JobSystem::without_idle_timeout(
-        Arc::clone(&store) as Arc<dyn EventStore<JobId, JobEvent>>,
-        Arc::new(RecordingPublisher::new()),
-    );
     let stuck = JobId::from_u128(4);
     let free = JobId::from_u128(5);
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let stalling = Arc::new(StallingStore {
+        inner: JsonlEventStore::open(directory.path().join("jobs"))?,
+        stalled: stuck.clone(),
+        armed: AtomicBool::new(false),
+        entered,
+        release: Mutex::new(release_rx),
+    });
+    let store: Arc<dyn EventStore<JobId, JobEvent>> = Arc::clone(&stalling) as _;
+    let system =
+        JobSystem::without_idle_timeout(Arc::clone(&store), Arc::new(RecordingPublisher::new()));
     system.ask(&stuck, submit(b"payload")?)?;
-
-    let path = root.join(format!("{}.jsonl", stuck.as_str()));
-    fs::remove_file(&path)?;
-    make_fifo(&path)?;
+    // The stall only applies once the job exists, so the submit above lands normally.
+    stalling.armed.store(true, Ordering::SeqCst);
 
     let stalled = {
         let system = system.clone();
         thread::spawn(move || system.ask(&stuck, JobCommand::Start))
     };
-    thread::sleep(Duration::from_millis(100));
-    assert!(
-        !stalled.is_finished(),
-        "the stalled start returned before the sibling submit ran"
-    );
+    entered_rx.recv_timeout(Duration::from_secs(1))?;
 
     let started = Instant::now();
     system.ask(&free, submit(b"payload")?)?;
     assert!(
         started.elapsed() < Duration::from_millis(500),
-        "an unrelated submit must finish while another stream is still in open()"
+        "an unrelated submit must finish while another stream's append is stuck"
     );
     assert_eq!(store.load(&free)?.len(), 1);
 
-    let _reader = File::open(&path)?;
-    wait_until_finished(&stalled, Duration::from_secs(1))?;
+    release.send(())?;
     let _ = stalled.join().expect("stalled start thread");
-    Ok(())
-}
-
-#[cfg(unix)]
-fn make_fifo(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let status = std::process::Command::new("mkfifo").arg(path).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("mkfifo failed: {status}").into())
-    }
-}
-
-#[cfg(unix)]
-fn wait_until_finished<T>(
-    handle: &thread::JoinHandle<T>,
-    budget: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let started = Instant::now();
-    while !handle.is_finished() {
-        if started.elapsed() >= budget {
-            return Err("stalled work did not unblock after a reader opened the fifo".into());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
     Ok(())
 }
