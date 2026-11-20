@@ -713,9 +713,9 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_tail_that_is_kept_fails_the_contract() {
-        /// Writes past the tail instead of dropping it, so the tail and the next record
-        /// read as one broken line.
+    fn a_torn_tail_that_is_parsed_fails_the_contract() {
+        /// Reads and writes the whole object, so the tail counts as a record and the next
+        /// append lands after it.
         struct Ghost(Memory);
 
         impl EventStore<Probe, Tick> for Ghost {
@@ -723,7 +723,11 @@ mod tests {
                 &self,
                 key: &Probe,
             ) -> Result<Vec<CloudEvent<Tick>>, StoreError> {
-                self.0.load(key)
+                let bytes = self.0.objects().get(&object_name(key.as_str())).cloned();
+                let Some(bytes) = bytes else {
+                    return Ok(Vec::new());
+                };
+                parse_records("probe", key.as_str(), &bytes).map(|(_, events)| events)
             }
 
             fn append(
@@ -766,7 +770,7 @@ mod tests {
         });
         assert!(
             result.is_err(),
-            "a store that keeps a torn tail must fail the contract"
+            "a store that parses a torn tail must fail the contract"
         );
     }
 
