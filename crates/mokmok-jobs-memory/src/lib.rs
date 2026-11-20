@@ -150,6 +150,9 @@ mod tests {
         CloudEvent::new(id.as_str(), Version::new(version), event)
     }
 
+    // Only the store-interface checks apply. The torn-tail, stray-entry, and shared-root
+    // checks need a `Backend`, and this adapter has no root to reopen and no bytes to
+    // write, so a `Backend` impl here could only return `None` or `Err`.
     #[test]
     fn the_store_meets_the_event_store_contract() {
         mokmok_events_conformance::check(
