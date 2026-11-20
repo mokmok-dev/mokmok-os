@@ -64,9 +64,13 @@ impl Storage<JobId, JobEvent> for Server {
         );
     }
 
-    fn plant_stray(&self) {
+    fn plant_stray(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) {
         self.fake
-            .put_object(BUCKET, &format!("{PREFIX}/notes.txt"), b"not a stream");
+            .put_object(BUCKET, &format!("{PREFIX}/{name}"), bytes);
     }
 }
 

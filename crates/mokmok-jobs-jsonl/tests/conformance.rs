@@ -71,8 +71,12 @@ impl Storage<JobId, JobEvent> for Directory {
         write(&self.file(key), &bytes);
     }
 
-    fn plant_stray(&self) {
-        write(&self.root.join("notes.txt"), b"not a stream");
+    fn plant_stray(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) {
+        write(&self.root.join(name), bytes);
     }
 }
 

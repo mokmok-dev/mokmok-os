@@ -49,9 +49,9 @@ pub trait StoreFactory<K: StreamKey, E> {
 /// A [`StoreFactory`] whose streams are bytes at rest.
 ///
 /// This is what [`check_storage`] needs beyond [`check`]: the ability to leave a stream
-/// as a writer that died would have left it, and to place an entry beside the streams.
+/// as a writer that died would have left it, and to place entries beside the streams.
 pub trait Storage<K: StreamKey, E>: StoreFactory<K, E> {
-    /// Stores `committed`, then `torn_tail`, as the bytes of `key`'s stream.
+    /// Stores `planted`, then `torn_tail`, as the bytes of `key`'s stream.
     ///
     /// That is what a writer leaves when it dies mid-record: whole records up to the
     /// last newline, then a partial one. `torn_tail` is not a record any writer
@@ -59,12 +59,20 @@ pub trait Storage<K: StreamKey, E>: StoreFactory<K, E> {
     fn plant(
         &self,
         key: &K,
-        committed: &[CloudEvent<E>],
+        planted: &[CloudEvent<E>],
         torn_tail: &[u8],
     );
 
-    /// Places an entry beside the streams that is not one, such as `notes.txt`.
-    fn plant_stray(&self);
+    /// Writes an entry beside the streams whose name is `name`.
+    ///
+    /// The suite passes two names that no stream can occupy: one that is not a stream
+    /// object at all, and one that carries the stream suffix over a stem that is not a
+    /// key. Both must stay out of [`EnumerableStore::keys`].
+    fn plant_stray(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    );
 }
 
 /// Runs every store check that needs no access to the stored bytes.
@@ -150,7 +158,8 @@ pub fn check_storage<F, K, E>(
     );
 
     let listed = store.keys().expect("the store lists before a stray entry");
-    fixture.plant_stray();
+    fixture.plant_stray("notes.txt", b"not a stream");
+    fixture.plant_stray("not-a-key.jsonl", b"not a stream either");
     assert_eq!(
         store.keys().expect("the store lists after a stray entry"),
         listed,
@@ -406,7 +415,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use mokmok_events::{
-        OBJECT_SUFFIX, check_append, complete_prefix, encode_records, parse_records,
+        OBJECT_SUFFIX, canonical_keys, check_append, complete_prefix, encode_records, parse_records,
     };
     use serde::{Deserialize, Serialize};
 
@@ -421,7 +430,9 @@ mod tests {
         }
 
         fn parse_key(raw: &str) -> Result<Self, StoreError> {
-            Ok(Self(raw.to_owned()))
+            raw.starts_with("probe-")
+                .then(|| Self(raw.to_owned()))
+                .ok_or_else(|| StoreError::Invalid(format!("{raw:?} is not a probe key")))
         }
     }
 
@@ -510,11 +521,11 @@ mod tests {
         fn plant(
             &self,
             key: &Probe,
-            committed: &[CloudEvent<Tick>],
+            planted: &[CloudEvent<Tick>],
             torn_tail: &[u8],
         ) {
             let mut bytes = Vec::new();
-            encode_records(committed, &mut bytes).expect("the probe encodes");
+            encode_records(planted, &mut bytes).expect("the probe encodes");
             bytes.extend_from_slice(torn_tail);
             self.shared
                 .objects
@@ -523,12 +534,16 @@ mod tests {
                 .insert(name(key), bytes);
         }
 
-        fn plant_stray(&self) {
+        fn plant_stray(
+            &self,
+            name: &str,
+            bytes: &[u8],
+        ) {
             self.shared
                 .objects
                 .lock()
                 .expect("the probe is not poisoned")
-                .insert("notes.txt".to_owned(), b"not a stream".to_vec());
+                .insert(name.to_owned(), bytes.to_vec());
         }
     }
 
@@ -628,26 +643,24 @@ mod tests {
 
     impl EnumerableStore<Probe, Tick> for ProbeStore {
         fn keys(&self) -> Result<Vec<Probe>, StoreError> {
-            let mut keys: Vec<Probe> = {
-                let objects = self
-                    .shared
-                    .objects
-                    .lock()
-                    .expect("the probe is not poisoned");
-                objects
-                    .keys()
-                    .filter_map(|name| {
-                        match (self.shared.deviation, name.strip_suffix(OBJECT_SUFFIX)) {
-                            (Deviation::StrayListed, None) => Some(Probe(name.clone())),
-                            (_, Some(stem)) => Some(Probe(stem.to_owned())),
-                            (_, None) => None,
-                        }
-                    })
-                    .collect()
+            let names: Vec<String> = self
+                .shared
+                .objects
+                .lock()
+                .expect("the probe is not poisoned")
+                .keys()
+                .cloned()
+                .collect();
+            let mut keys = match self.shared.deviation {
+                // Lists every name, suffix or not, without asking whether it is a key.
+                Deviation::StrayListed => names
+                    .iter()
+                    .map(|name| Probe(name.strip_suffix(OBJECT_SUFFIX).unwrap_or(name).to_owned()))
+                    .collect(),
+                _ => canonical_keys(names),
             };
-            match self.shared.deviation {
-                Deviation::UnsortedKeys => keys.reverse(),
-                _ => keys.sort_by(|left, right| left.as_str().cmp(right.as_str())),
+            if self.shared.deviation == Deviation::UnsortedKeys {
+                keys.reverse();
             }
             Ok(keys)
         }
