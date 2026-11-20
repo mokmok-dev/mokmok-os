@@ -197,7 +197,9 @@ stateDiagram-v2
    so two writers cannot interleave in one task's log.
 2. Every append carries the expected version. `EventStore::append` in
    `crates/mokmok-events/src/port.rs` takes the version the writer read and returns
-   `StoreError::Conflict` when the stream has moved past it.
+   `StoreError::Conflict` when the stream has moved past it. That rule and the rest of
+   the adapter contract are executed by `crates/mokmok-events-conformance`, a dev-only
+   crate each adapter's `tests/conformance.rs` runs against its own storage.
 3. The journal is never replayed. `crates/mokmok-journal/src/lib.rs` stores transcript
    records that only the read endpoints touch, so an edit there cannot change a status.
 4. A run is one shot. `crates/mokmok-control/src/runner.rs` returns one `RunOutcome` from

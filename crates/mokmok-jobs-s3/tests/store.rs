@@ -68,18 +68,6 @@ fn encoded(events: &[CloudEvent<JobEvent>]) -> Vec<u8> {
 }
 
 #[test]
-fn the_store_meets_the_event_store_contract() {
-    let fake = FakeS3::start();
-    mokmok_events::conformance::check(
-        &store(&fake),
-        &id(1),
-        &id(2),
-        submitted(),
-        JobEvent::Started { attempt: 1 },
-    );
-}
-
-#[test]
 fn an_empty_append_creates_no_object() -> Result<(), Box<dyn std::error::Error>> {
     let fake = FakeS3::start();
     let store = store(&fake);

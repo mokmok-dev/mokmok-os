@@ -319,19 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn the_store_meets_the_event_store_contract() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        mokmok_events::conformance::check(
-            &store(&directory),
-            &id(1),
-            &id(2),
-            submitted(),
-            JobEvent::Started { attempt: 1 },
-        );
-        Ok(())
-    }
-
-    #[test]
     fn open_creates_missing_parent_directories() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("nested").join("deeper");
