@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn the_store_meets_the_event_store_contract() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        mokmok_events::conformance::check(
+        mokmok_events_conformance::check(
             &store(&directory),
             &id(1),
             &id(2),

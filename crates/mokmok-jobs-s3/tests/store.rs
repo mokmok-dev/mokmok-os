@@ -70,7 +70,7 @@ fn encoded(events: &[CloudEvent<JobEvent>]) -> Vec<u8> {
 #[test]
 fn the_store_meets_the_event_store_contract() {
     let fake = FakeS3::start();
-    mokmok_events::conformance::check(
+    mokmok_events_conformance::check(
         &store(&fake),
         &id(1),
         &id(2),

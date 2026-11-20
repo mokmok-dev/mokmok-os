@@ -15,6 +15,7 @@ mokmok-acp = { path = "crates/mokmok-acp" }
 mokmok-control = { path = "crates/mokmok-control" }
 mokmok-control-core = { path = "crates/mokmok-control-core" }
 mokmok-events = { path = "crates/mokmok-events" }
+mokmok-events-conformance = { path = "crates/mokmok-events-conformance" }
 mokmok-jobs = { path = "crates/mokmok-jobs" }
 mokmok-jobs-core = { path = "crates/mokmok-jobs-core" }
 mokmok-jobs-jsonl = { path = "crates/mokmok-jobs-jsonl" }

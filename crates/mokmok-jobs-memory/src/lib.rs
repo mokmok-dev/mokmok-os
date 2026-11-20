@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn the_store_meets_the_event_store_contract() {
-        mokmok_events::conformance::check(
+        mokmok_events_conformance::check(
             &MemoryEventStore::new(),
             &JobId::from_u128(1),
             &JobId::from_u128(2),

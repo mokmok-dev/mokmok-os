@@ -8,6 +8,7 @@ mokmok-events.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+mokmok-events-conformance.workspace = true
 mokmok-jobs-core.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

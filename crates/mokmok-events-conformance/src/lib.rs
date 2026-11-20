@@ -1,17 +1,18 @@
-//! Shared contract checks every [`EventStore`] adapter must pass.
+//! The checks every [`EventStore`] adapter must pass.
 //!
-//! An adapter keeps its own tests for a file, a bucket, or a cache. This module is
-//! the overlap: append, load, conflict, listing, and the empty-append rule. A test
-//! opens a fresh store and calls [`check`].
+//! An adapter keeps its own tests for a file, a bucket, or a cache. This crate is the
+//! overlap: append, load, conflict, listing, and the empty-append rule. A test opens a
+//! fresh store and calls [`check`].
+//!
+//! Nothing in the daemon depends on this crate. Only adapter tests do.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::fmt::Debug;
 
-use crate::StreamKey;
-use crate::cloud_event::{CloudEvent, EventType};
-use crate::port::{EnumerableStore, EventStore, StoreError};
-use crate::stream::Version;
+use mokmok_events::{
+    CloudEvent, EnumerableStore, EventStore, EventType, StoreError, StreamKey, Version,
+};
 
 /// Runs every shared store check against `store`.
 ///
@@ -244,10 +245,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use mokmok_events::check_append;
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::port::check_append;
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
     struct Probe(String);
