@@ -523,6 +523,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "repro for MOK-243: each handle caches its own version"]
+    fn independent_handles_reject_stale_appends() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("jobs");
+        let older = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+        let newer = JsonlEventStore::<JobId, JobEvent>::open(&root)?;
+        let id = id(60);
+
+        older.append(&id, Version::ZERO, &[first(&id)])?;
+        newer.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        )?;
+
+        let stale = older.append(
+            &id,
+            Version::new(1),
+            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
+        );
+        assert!(
+            matches!(
+                stale,
+                Err(StoreError::Conflict {
+                    expected,
+                    actual,
+                }) if expected == Version::new(1) && actual == Version::new(2)
+            ),
+            "the older handle must refuse the version the newer one took: {stale:?}"
+        );
+        assert_eq!(
+            older.load(&id)?.len(),
+            2,
+            "the refused append must leave the history alone"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn opening_an_existing_stream_keeps_its_version() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("jobs");
