@@ -42,7 +42,4 @@ exclude_re = [
   # Without the EOF arm the reader loop cannot advance, so the mutant is only ever seen
   # as a timeout and no test can distinguish it from a hang.
   "crates/mokmok-jobs-s3/src/listing.rs:[0-9]+:.*delete match arm Event::Eof in parse_page",
-  # Dropping the JSONL version cache on a conflict when the file is already gone is
-  # equivalent to leaving it: the next append re-reads the file either way.
-  "crates/mokmok-jobs-jsonl/src/lib.rs:[0-9]+:.*replace && with \\|\\| in .*JsonlEventStore",
 ]

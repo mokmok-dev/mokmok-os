@@ -237,11 +237,12 @@ fn a_stuck_jsonl_submit_does_not_block_another_job() -> Result<(), Box<dyn std::
     system.ask(&free, submit(b"payload")?)?;
     assert!(
         started.elapsed() < Duration::from_millis(500),
-        "an unrelated submit must finish while another stream is still in open()"
+        "an unrelated submit must finish while another stream is still reading"
     );
     assert_eq!(store.load(&free)?.len(), 1);
 
-    let _reader = File::open(&path)?;
+    let writer = File::create(&path)?;
+    drop(writer);
     wait_until_finished(&stalled, Duration::from_secs(1))?;
     let _ = stalled.join().expect("stalled start thread");
     Ok(())
