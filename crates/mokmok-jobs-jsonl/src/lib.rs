@@ -455,7 +455,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
     #[test]
     fn an_append_blocked_on_one_stream_does_not_hold_up_another()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -466,12 +465,15 @@ mod tests {
         let blocked_id = id(42);
         let free_id = id(43);
         store.append(&blocked_id, Version::ZERO, &[first(&blocked_id)])?;
-        let path = store.path(&blocked_id);
-        fs::remove_file(&path)?;
-        make_fifo(&path)?;
 
+        // One append holds the fence while it is reading and writing. Holding the same
+        // fence here is what a slow append does, and it pins that `stream_state` hands
+        // back one fence per stream rather than a fresh one per call.
+        let fence = store.stream_state(&blocked_id)?;
+        let held = fence.lock().map_err(|_| "the fence is not poisoned")?;
         let stalled = {
             let store = Arc::clone(&store);
+            let blocked_id = blocked_id.clone();
             std::thread::spawn(move || {
                 store.append(
                     &blocked_id,
@@ -483,54 +485,21 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             !stalled.is_finished(),
-            "the stalled append returned before the sibling ran"
+            "the same stream's append ran while its fence was held"
         );
 
         let started = Instant::now();
         store.append(&free_id, Version::ZERO, &[first(&free_id)])?;
         assert!(
             started.elapsed() < Duration::from_millis(500),
-            "a sibling stream must commit while the other append is still reading"
+            "a sibling stream must commit while the other stream's fence is held"
         );
         assert_eq!(store.load(&free_id)?.len(), 1);
 
-        release_fifo(&path)?;
-        wait_until_finished(&stalled, Duration::from_secs(1))?;
-        let _ = stalled.join().expect("stalled append thread");
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn make_fifo(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let status = std::process::Command::new("mkfifo").arg(path).status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("mkfifo failed: {status}").into())
-        }
-    }
-
-    // A reader blocked in `open` resumes once a writer opens the fifo, and sees end of
-    // file when that writer closes without writing.
-    #[cfg(unix)]
-    fn release_fifo(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let writer = OpenOptions::new().write(true).open(path)?;
-        drop(writer);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn wait_until_finished<T>(
-        handle: &std::thread::JoinHandle<T>,
-        budget: std::time::Duration,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let started = std::time::Instant::now();
-        while !handle.is_finished() {
-            if started.elapsed() >= budget {
-                return Err("stalled work did not unblock after a writer opened the fifo".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        drop(held);
+        let version = stalled.join().expect("stalled append thread")?;
+        assert_eq!(version, Version::new(2));
+        assert_eq!(store.load(&blocked_id)?.len(), 2);
         Ok(())
     }
 
