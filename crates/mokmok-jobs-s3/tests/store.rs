@@ -9,6 +9,7 @@ use common::{ACCESS_KEY, FakeS3, SECRET_KEY, SESSION_TOKEN};
 use mokmok_events::{
     CloudEvent, EnumerableStore, EventStore, StoreError, StreamKey, Version, encode_records,
 };
+use mokmok_events_conformance::{Backend, Roots};
 use mokmok_jobs_core::{JobEvent, JobId};
 use mokmok_jobs_s3::{S3Config, S3Credentials, S3EventStore};
 
@@ -67,15 +68,94 @@ fn encoded(events: &[CloudEvent<JobEvent>]) -> Vec<u8> {
     bytes
 }
 
+/// A bucket per `store()` call, so every shared check starts clean and
+/// `reopen`/`write_raw` reach the objects the last call named.
+struct S3Backend {
+    fake: FakeS3,
+    roots: Roots<(String, String)>,
+}
+
+impl S3Backend {
+    fn new() -> Self {
+        Self {
+            fake: FakeS3::start(),
+            roots: Roots::default(),
+        }
+    }
+}
+
+impl mokmok_events_conformance::Backend for S3Backend {
+    type Key = JobId;
+    type Event = JobEvent;
+    type Store = S3EventStore<JobId, JobEvent>;
+
+    fn store(&self) -> Self::Store {
+        let (bucket, prefix) = self
+            .roots
+            .open(|n| (format!("{BUCKET}-{n}"), PREFIX.to_owned()));
+        S3EventStore::open(self.fake.config(&bucket, &prefix)).expect("the store opens")
+    }
+
+    fn reopen(&self) -> Option<Self::Store> {
+        let (bucket, prefix) = self.roots.reopen()?;
+        Some(S3EventStore::open(self.fake.config(&bucket, &prefix)).expect("the store reopens"))
+    }
+
+    fn write_raw(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let (bucket, prefix) = self
+            .roots
+            .reopen()
+            .ok_or_else(|| StoreError::Io("no root is open".to_owned()))?;
+        self.fake
+            .put_object(&bucket, &format!("{prefix}/{name}"), bytes);
+        Ok(())
+    }
+}
+
 #[test]
 fn the_store_meets_the_event_store_contract() {
-    let fake = FakeS3::start();
-    mokmok_events::conformance::check(
-        &store(&fake),
+    let backend = S3Backend::new();
+    mokmok_events_conformance::check(
+        &backend.store(),
         &id(1),
         &id(2),
         submitted(),
         JobEvent::Started { attempt: 1 },
+    );
+}
+
+#[test]
+fn an_uncommitted_tail_is_neither_read_nor_kept() {
+    let backend = S3Backend::new();
+    mokmok_events_conformance::check_torn_tail(
+        &backend,
+        &id(1),
+        submitted(),
+        JobEvent::Started { attempt: 1 },
+    );
+}
+
+#[test]
+fn listing_names_only_the_streams_the_root_holds() {
+    let backend = S3Backend::new();
+    mokmok_events_conformance::check_stray_entries(&backend, &id(1), submitted());
+}
+
+#[test]
+fn two_handles_over_one_root_share_one_version_sequence() {
+    let backend = S3Backend::new();
+    mokmok_events_conformance::check_shared_root(
+        &backend,
+        &id(1),
+        submitted(),
+        JobEvent::Started { attempt: 1 },
+        JobEvent::Succeeded {
+            output: b"out".to_vec(),
+        },
     );
 }
 

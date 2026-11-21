@@ -7,5 +7,8 @@ version.workspace = true
 mokmok-events.workspace = true
 mokmok-jobs-core.workspace = true
 
+[dev-dependencies]
+mokmok-events-conformance.workspace = true
+
 [lints]
 workspace = true

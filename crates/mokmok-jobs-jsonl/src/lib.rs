@@ -282,6 +282,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use mokmok_events::{CloudEvent, EventType};
+    use mokmok_events_conformance::{Backend, Roots};
     use mokmok_jobs_core::{JobEvent, JobId};
     use serde::{Deserialize, Serialize};
 
@@ -318,17 +319,96 @@ mod tests {
         JsonlEventStore::open(directory.path().join("jobs")).expect("store opens")
     }
 
+    /// A root per `store()` call under one temporary directory, so every shared check
+    /// starts clean and `reopen`/`write_raw` reach the bytes the last call named.
+    struct JsonlBackend {
+        directory: tempfile::TempDir,
+        roots: Roots<PathBuf>,
+    }
+
+    impl JsonlBackend {
+        fn new() -> Self {
+            Self {
+                directory: tempfile::tempdir().expect("a temporary directory"),
+                roots: Roots::default(),
+            }
+        }
+    }
+
+    impl mokmok_events_conformance::Backend for JsonlBackend {
+        type Key = JobId;
+        type Event = JobEvent;
+        type Store = JsonlEventStore<JobId, JobEvent>;
+
+        fn store(&self) -> Self::Store {
+            let root = self
+                .roots
+                .open(|n| self.directory.path().join(format!("root-{n}")));
+            JsonlEventStore::open(root).expect("store opens")
+        }
+
+        fn reopen(&self) -> Option<Self::Store> {
+            let root = self.roots.reopen()?;
+            Some(JsonlEventStore::open(root).expect("store reopens"))
+        }
+
+        fn write_raw(
+            &self,
+            name: &str,
+            bytes: &[u8],
+        ) -> Result<(), StoreError> {
+            let root = self
+                .roots
+                .reopen()
+                .ok_or_else(|| StoreError::Io("no root is open".to_owned()))?;
+            fs::write(root.join(name), bytes).map_err(|error| error_at(&root, &error))
+        }
+    }
+
     #[test]
-    fn the_store_meets_the_event_store_contract() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        mokmok_events::conformance::check(
-            &store(&directory),
+    fn the_store_meets_the_event_store_contract() {
+        let backend = JsonlBackend::new();
+        mokmok_events_conformance::check(
+            &backend.store(),
             &id(1),
             &id(2),
             submitted(),
             JobEvent::Started { attempt: 1 },
         );
-        Ok(())
+    }
+
+    #[test]
+    fn an_uncommitted_tail_is_neither_read_nor_kept() {
+        let backend = JsonlBackend::new();
+        mokmok_events_conformance::check_torn_tail(
+            &backend,
+            &id(1),
+            submitted(),
+            JobEvent::Started { attempt: 1 },
+        );
+    }
+
+    #[test]
+    fn listing_names_only_the_streams_the_root_holds() {
+        let backend = JsonlBackend::new();
+        mokmok_events_conformance::check_stray_entries(&backend, &id(1), submitted());
+    }
+
+    // MOK-243: two `JsonlEventStore`s over one root keep separate version caches, so the
+    // first can append a second version 2 and leave the file unreadable.
+    #[test]
+    #[ignore = "MOK-243: double-open keeps separate version caches"]
+    fn two_handles_over_one_root_share_one_version_sequence() {
+        let backend = JsonlBackend::new();
+        mokmok_events_conformance::check_shared_root(
+            &backend,
+            &id(1),
+            submitted(),
+            JobEvent::Started { attempt: 1 },
+            JobEvent::Succeeded {
+                output: b"out".to_vec(),
+            },
+        );
     }
 
     #[test]
@@ -541,27 +621,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn torn_tail_is_discarded_before_the_next_append() -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let writer = store(&directory);
-        let id = id(5);
-        writer.append(&id, Version::ZERO, &[first(&id)])?;
-        let mut file = OpenOptions::new().append(true).open(writer.path(&id))?;
-        file.write_all(format!("{{\"specversion\":\"1.0\",\"id\":\"{}", id.as_str()).as_bytes())?;
-        drop(file);
-        let store = store(&directory);
-        assert_eq!(store.load(&id)?.len(), 1);
-        let version = store.append(
-            &id,
-            Version::new(1),
-            &[at(&id, 2, JobEvent::Started { attempt: 1 })],
-        )?;
-        assert_eq!(version, Version::new(2));
-        assert_eq!(store.load(&id)?.len(), 2);
-        Ok(())
-    }
-
+    // The shared torn-tail check starts from a committed record; this pins the case where
+    // the file's only bytes are the tail.
     #[test]
     fn a_torn_first_record_is_replaced_on_append() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -936,25 +997,12 @@ mod tests {
     }
 
     #[test]
-    fn keys_ignores_an_entry_that_is_not_a_stream_file() -> Result<(), Box<dyn std::error::Error>> {
+    fn keys_ignores_a_directory_named_like_a_stream() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let store = store(&directory);
         let id = id(33);
         store.append(&id, Version::ZERO, &[first(&id)])?;
-        fs::write(store.root.join("notes.txt"), b"not a stream")?;
         fs::create_dir(store.root.join("archive.jsonl"))?;
-        assert_eq!(store.keys()?, vec![id]);
-        Ok(())
-    }
-
-    #[test]
-    fn keys_skips_a_stream_file_whose_stem_is_not_a_key() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let directory = tempfile::tempdir()?;
-        let store = store(&directory);
-        let id = id(33);
-        store.append(&id, Version::ZERO, &[first(&id)])?;
-        fs::write(store.root.join("not-a-uuid.jsonl"), b"")?;
         assert_eq!(store.keys()?, vec![id]);
         Ok(())
     }

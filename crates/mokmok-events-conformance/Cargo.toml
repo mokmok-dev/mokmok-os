@@ -1,0 +1,12 @@
+[package]
+edition.workspace = true
+name = "mokmok-events-conformance"
+publish = false
+version.workspace = true
+
+[dependencies]
+mokmok-events.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
