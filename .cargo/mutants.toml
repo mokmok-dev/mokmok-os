@@ -10,9 +10,6 @@ exclude_globs = [
   "apps/mokmok-controld/tests/**",
   "crates/mokmok-acp/tests/**",
   "crates/mokmok-control/tests/**",
-  # Adapter tests call `check`; emptying one helper leaves the rest of the suite
-  # green, which is not a production miss.
-  "crates/mokmok-events-conformance/**",
   # The proofs crate's harnesses run under `checks.kani`, not `cargo test`, so this
   # sweep would report every harness body as missed even when Kani rejects it.
   "crates/mokmok-proofs/**",

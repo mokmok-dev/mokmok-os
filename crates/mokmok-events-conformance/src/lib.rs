@@ -453,7 +453,11 @@ fn keys_lists_every_stream_in_key_order<K, E, S>(
 {
     let mut expected = vec![alpha.clone(), beta.clone()];
     expected.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    assert_eq!(store.keys().expect("the store lists its streams"), expected);
+    assert_eq!(
+        store.keys().expect("the store lists its streams"),
+        expected,
+        "keys must be sorted by the key's text"
+    );
 }
 
 #[cfg(test)]
@@ -462,7 +466,7 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard};
 
     use mokmok_events::{
-        OBJECT_SUFFIX, canonical_keys, check_append, complete_prefix, parse_records,
+        OBJECT_SUFFIX, canonical_keys, check_append, complete_prefix, encode_records, parse_records,
     };
     use serde::{Deserialize, Serialize};
 
@@ -919,5 +923,191 @@ mod tests {
             result.is_err(),
             "a second handle with a stale cache must fail the contract"
         );
+    }
+
+    /// One way a store can break a clause of [`check`].
+    ///
+    /// Each variant pairs with the helper below that must catch it, so a mutant in that
+    /// helper is observable. The three checks that need a root have their own ghosts.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Fault {
+        /// A stream that was never written reads as a record.
+        GhostRecord,
+        /// A conflict reports the expected version as the stored one.
+        WrongConflictVersion,
+        /// A record that names another stream is accepted.
+        ForeignSubjectAccepted,
+        /// A record that skips a position is accepted.
+        GapAccepted,
+        /// `keys` returns the streams in reverse order.
+        UnsortedKeys,
+    }
+
+    /// A [`Memory`] store that breaks one clause and honours the rest.
+    struct Faulty {
+        inner: Memory,
+        fault: Fault,
+    }
+
+    impl Faulty {
+        fn fixture(fault: Fault) -> Fixture<Self> {
+            let build: fn(Objects) -> Self = match fault {
+                Fault::GhostRecord => Self::ghost_record,
+                Fault::WrongConflictVersion => Self::wrong_conflict_version,
+                Fault::ForeignSubjectAccepted => Self::foreign_subject_accepted,
+                Fault::GapAccepted => Self::gap_accepted,
+                Fault::UnsortedKeys => Self::unsorted_keys,
+            };
+            Fixture::new(build)
+        }
+
+        fn ghost_record(objects: Objects) -> Self {
+            Self {
+                inner: Memory { objects },
+                fault: Fault::GhostRecord,
+            }
+        }
+
+        fn wrong_conflict_version(objects: Objects) -> Self {
+            Self {
+                inner: Memory { objects },
+                fault: Fault::WrongConflictVersion,
+            }
+        }
+
+        fn foreign_subject_accepted(objects: Objects) -> Self {
+            Self {
+                inner: Memory { objects },
+                fault: Fault::ForeignSubjectAccepted,
+            }
+        }
+
+        fn gap_accepted(objects: Objects) -> Self {
+            Self {
+                inner: Memory { objects },
+                fault: Fault::GapAccepted,
+            }
+        }
+
+        fn unsorted_keys(objects: Objects) -> Self {
+            Self {
+                inner: Memory { objects },
+                fault: Fault::UnsortedKeys,
+            }
+        }
+    }
+
+    impl EventStore<Probe, Tick> for Faulty {
+        fn load(
+            &self,
+            key: &Probe,
+        ) -> Result<Vec<CloudEvent<Tick>>, StoreError> {
+            let loaded = self.inner.load(key)?;
+            if loaded.is_empty() && self.fault == Fault::GhostRecord {
+                return Ok(vec![record(key, 1, Tick(0))]);
+            }
+            Ok(loaded)
+        }
+
+        fn append(
+            &self,
+            key: &Probe,
+            expected: Version,
+            events: &[CloudEvent<Tick>],
+        ) -> Result<Version, StoreError> {
+            let current = self.inner.stored_version(key)?;
+            if current != expected {
+                let actual = if self.fault == Fault::WrongConflictVersion {
+                    expected
+                } else {
+                    current
+                };
+                return Err(StoreError::Conflict { expected, actual });
+            }
+            if events.is_empty() {
+                return Ok(current);
+            }
+            let last = match self.fault {
+                Fault::ForeignSubjectAccepted => Version::new(expected.get() + events.len() as u64),
+                Fault::GapAccepted => {
+                    for event in events {
+                        if event.subject != key.as_str() {
+                            return Err(StoreError::Invalid("foreign subject".to_owned()));
+                        }
+                    }
+                    Version::new(expected.get() + events.len() as u64)
+                },
+                _ => check_append(key.as_str(), expected, events)?,
+            };
+            self.inner.push(key, events)?;
+            Ok(last)
+        }
+    }
+
+    impl EnumerableStore<Probe, Tick> for Faulty {
+        fn keys(&self) -> Result<Vec<Probe>, StoreError> {
+            let mut keys = self.inner.keys()?;
+            if self.fault == Fault::UnsortedKeys {
+                keys.reverse();
+            }
+            Ok(keys)
+        }
+    }
+
+    /// Requires `fault` to be caught by `check`.
+    fn check_rejects(
+        fault: Fault,
+        expected: &str,
+    ) {
+        let fixture = Faulty::fixture(fault);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check(&fixture.store(), &alpha(), &beta(), Tick(1), Tick(2));
+        }));
+        let payload = outcome.expect_err("the suite must reject this store");
+        let message = payload.downcast_ref::<String>().map_or_else(
+            || {
+                payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .unwrap_or_default()
+                    .to_owned()
+            },
+            Clone::clone,
+        );
+        assert!(
+            message.contains(expected),
+            "the {fault:?} store must fail at {expected:?}, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_was_never_written_reading_as_a_record_fails_the_contract() {
+        check_rejects(Fault::GhostRecord, "a missing stream loads empty");
+    }
+
+    #[test]
+    fn a_conflict_that_hides_the_stored_version_fails_the_contract() {
+        check_rejects(
+            Fault::WrongConflictVersion,
+            "stale append must name the stored version",
+        );
+    }
+
+    #[test]
+    fn a_foreign_subject_that_is_accepted_fails_the_contract() {
+        check_rejects(
+            Fault::ForeignSubjectAccepted,
+            "a record from another stream is refused",
+        );
+    }
+
+    #[test]
+    fn a_skipped_version_that_is_accepted_fails_the_contract() {
+        check_rejects(Fault::GapAccepted, "a skipped version is refused");
+    }
+
+    #[test]
+    fn keys_that_are_not_ordered_fail_the_contract() {
+        check_rejects(Fault::UnsortedKeys, "keys must be sorted");
     }
 }
