@@ -7,8 +7,16 @@
     "packages/*"
   ],
   "type": "module",
+  "scripts": {
+    "dev": "bun --cwd apps/agent run dev",
+    "deploy": "bun --cwd apps/agent run deploy",
+    "mutants": "mutator"
+  },
   "dependencies": {},
   "devDependencies": {
-    "@types/bun": "1.4.5"
+    "@mizchi/mutator": "0.5.3",
+    "@types/bun": "1.4.5",
+    "fast-check": "4.5.0",
+    "wrangler": "4.166.0"
   }
 }

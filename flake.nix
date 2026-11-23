@@ -37,6 +37,8 @@
             ./bun.lock
             ./bunfig.toml
             ./package.json
+            (pkgs.lib.fileset.maybeMissing ./apps)
+            (pkgs.lib.fileset.maybeMissing ./packages)
           ];
           src = pkgs.lib.fileset.toSource {
             root = ./.;
@@ -44,17 +46,18 @@
               depsInputs
               ./tsconfig.base.json
               ./tsconfig.json
-              (pkgs.lib.fileset.maybeMissing ./apps)
-              (pkgs.lib.fileset.maybeMissing ./packages)
+              ./mutator.config.ts
+              (pkgs.lib.fileset.maybeMissing ./mutator.accepted.json)
             ];
+          };
+          depsSrc = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = depsInputs;
           };
           bunDeps = pkgs.stdenvNoCC.mkDerivation {
             pname = "mokmok-os-deps";
             inherit (pkgs.lib.importJSON ./package.json) version;
-            src = pkgs.lib.fileset.toSource {
-              root = ./.;
-              fileset = depsInputs;
-            };
+            src = depsSrc;
             nativeBuildInputs = [ pkgs.bun ];
             dontFixup = true;
             buildPhase = ''
@@ -66,7 +69,7 @@
               cp -r node_modules $out/node_modules
             '';
             outputHashMode = "recursive";
-            outputHash = "sha256-56l5JMGpvGSugB3u7j20Dh3ghpN0DWrTgg3CtE6AYX0=";
+            outputHash = "sha256-yKA1Ox9Q/VnoO0jYwWXq+IvWtulJ5T1k1wYoo6BER4w=";
           };
           bunRun =
             name: command:
@@ -84,6 +87,26 @@
               '';
               installPhase = "touch $out";
             };
+          # `@mizchi/mutator` is a Node CLI that drives `bun test`, so both are
+          # needed. Its quality gate is the check itself, not a wrapper script.
+          mutantRun = bunRun "mutants" ''
+            ${pkgs.nodejs_24}/bin/node node_modules/.bin/mutator
+          '';
+          # The npm workerd binary is linked against a generic glibc on Linux.
+          # NixOS hosts without `nix-ld` cannot exec it, and `wrangler dev` needs
+          # it, so the binary is repackaged with its interpreter patched and the
+          # dev shell points `MINIFLARE_WORKERD_PATH` at it. On Darwin the npm
+          # binary links against system frameworks and needs no patching.
+          workerd = pkgs.stdenvNoCC.mkDerivation {
+            pname = "workerd";
+            inherit (pkgs.lib.importJSON ./package.json) version;
+            dontUnpack = true;
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.stdenv.cc.cc.lib ];
+            installPhase = ''
+              install -Dm755 ${bunDeps}/node_modules/workerd/bin/workerd $out/bin/workerd
+            '';
+          };
         in
         {
           _module.args = {
@@ -99,17 +122,23 @@
             fmt = bunRun "fmt" "bun fmt --check";
             test = bunRun "test" "bun test --pass-with-no-tests";
             types = bunRun "types" "bun check -b";
+            mutants = mutantRun;
+          };
+
+          packages = {
+            inherit workerd;
+            default = workerd;
           };
 
           devShells.default = pkgs.mkShellNoCC {
             packages = with pkgs; [
               bun
+              nodejs_24
               ni
               skills
             ];
+            env.MINIFLARE_WORKERD_PATH = "${workerd}/bin/workerd";
           };
-
-          packages = { };
 
           pre-commit.settings = {
             hooks = {

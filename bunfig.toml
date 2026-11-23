@@ -8,3 +8,4 @@ exact = true
 
 [test]
 randomize = true
+root = "./packages/workflow-core/test"
