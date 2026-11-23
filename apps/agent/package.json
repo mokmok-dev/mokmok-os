@@ -1,0 +1,22 @@
+{
+  "name": "@mokmok-os/agent",
+  "version": "2026.11.1",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@cloudflare/codemode": "0.5.6",
+    "@earendil-works/chord": "1.6.0",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-durable": "1.6.0",
+    "@earendil-works/pi-schema": "1.6.0",
+    "@mokmok-os/workflow-core": "workspace:*",
+    "agents": "0.34.0",
+    "ai": "7.0.179",
+    "zod": "4.6.7"
+  }
+}
