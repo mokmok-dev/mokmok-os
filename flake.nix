@@ -41,7 +41,7 @@
           checks = { };
 
           devShells.default = pkgs.mkShellNoCC {
-            packages = with pkgs; [ ];
+            packages = with pkgs; [ skills ];
           };
 
           packages = { };
