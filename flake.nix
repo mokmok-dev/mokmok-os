@@ -44,7 +44,7 @@
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
 
-            packages = with pkgs; [ ];
+            packages = with pkgs; [ skills ];
           };
 
           packages = { };
