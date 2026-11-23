@@ -57,6 +57,26 @@
         "type": "github"
       }
     },
+    "nix-bun": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1795425374,
+        "narHash": "sha256-OOL4PPLCr90VW5JWvLtwroR6DLrdSWQlfAMvy0D9/28=",
+        "owner": "ryoppippi",
+        "repo": "nix-bun",
+        "rev": "83e13d42faaa656873e54b83a520a2f1a1b078d4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ryoppippi",
+        "repo": "nix-bun",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1793949877,
@@ -76,6 +96,7 @@
       "inputs": {
         "flake-parts": "flake-parts",
         "git-hooks": "git-hooks",
+        "nix-bun": "nix-bun",
         "nixpkgs": "nixpkgs",
         "treefmt-nix": "treefmt-nix"
       }

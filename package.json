@@ -1,0 +1,14 @@
+{
+  "name": "@mokmok-os/monorepo",
+  "version": "2026.11.1",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "type": "module",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "1.4.5"
+  }
+}

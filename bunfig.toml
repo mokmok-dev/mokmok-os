@@ -1,0 +1,10 @@
+[fmt]
+jsdoc = true
+sortImports = true
+sortPackageJson = true
+
+[install]
+exact = true
+
+[test]
+randomize = true

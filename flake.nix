@@ -7,6 +7,8 @@
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+    nix-bun.url = "github:ryoppippi/nix-bun";
+    nix-bun.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -15,6 +17,7 @@
       flake-parts,
       git-hooks,
       treefmt-nix,
+      nix-bun,
       ...
     }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -29,19 +32,81 @@
           system,
           ...
         }:
+        let
+          depsInputs = pkgs.lib.fileset.unions [
+            ./bun.lock
+            ./bunfig.toml
+            ./package.json
+          ];
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              depsInputs
+              ./tsconfig.base.json
+              ./tsconfig.json
+              (pkgs.lib.fileset.maybeMissing ./apps)
+              (pkgs.lib.fileset.maybeMissing ./packages)
+            ];
+          };
+          bunDeps = pkgs.stdenvNoCC.mkDerivation {
+            pname = "mokmok-os-deps";
+            inherit (pkgs.lib.importJSON ./package.json) version;
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = depsInputs;
+            };
+            nativeBuildInputs = [ pkgs.bun ];
+            dontFixup = true;
+            buildPhase = ''
+              export HOME=$TMPDIR
+              bun install --frozen-lockfile --linker hoisted
+            '';
+            installPhase = ''
+              mkdir -p $out
+              cp -r node_modules $out/node_modules
+            '';
+            outputHashMode = "recursive";
+            outputHash = "sha256-56l5JMGpvGSugB3u7j20Dh3ghpN0DWrTgg3CtE6AYX0=";
+          };
+          bunRun =
+            name: command:
+            pkgs.stdenvNoCC.mkDerivation {
+              inherit name src;
+              nativeBuildInputs = [
+                pkgs.bun
+                pkgs.git
+              ];
+              buildPhase = ''
+                export HOME=$TMPDIR
+                cp -r ${bunDeps}/node_modules ./node_modules
+                chmod -R u+w node_modules
+                ${command}
+              '';
+              installPhase = "touch $out";
+            };
+        in
         {
           _module.args = {
             pkgs = import nixpkgs {
               inherit system;
+              overlays = [ nix-bun.overlays.default ];
             };
           };
 
           apps = { };
 
-          checks = { };
+          checks = {
+            fmt = bunRun "fmt" "bun fmt --check";
+            test = bunRun "test" "bun test --pass-with-no-tests";
+            types = bunRun "types" "bun check -b";
+          };
 
           devShells.default = pkgs.mkShellNoCC {
-            packages = with pkgs; [ skills ];
+            packages = with pkgs; [
+              bun
+              ni
+              skills
+            ];
           };
 
           packages = { };
