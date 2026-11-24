@@ -1,9 +1,10 @@
 [package]
 edition.workspace = true
-name = "removeme"
+name = "session"
 version.workspace = true
 
 [dependencies]
+stateright.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
