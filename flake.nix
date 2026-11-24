@@ -7,6 +7,9 @@
     git-hooks.inputs.nixpkgs.follows = "nixpkgs";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
@@ -15,6 +18,8 @@
       flake-parts,
       git-hooks,
       treefmt-nix,
+      rust-overlay,
+      crane,
       ...
     }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -30,21 +35,76 @@
           system,
           ...
         }:
+        let
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          src = craneLib.cleanCargoSource ./.;
+          commonArgs = {
+            inherit src;
+            strictDeps = true;
+          };
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          linkerPackages = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+            with pkgs;
+            [
+              clang
+              mold
+            ]
+          );
+          linkerEnv = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="clang"
+          '';
+        in
         {
           _module.args = {
             pkgs = import nixpkgs {
               inherit system;
+              overlays = [ rust-overlay.overlays.default ];
             };
           };
 
           apps = { };
 
-          checks = { };
+          checks = {
+            clippy = craneLib.cargoClippy (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
+              }
+            );
+            fmt = craneLib.cargoFmt (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+              }
+            );
+            test = craneLib.cargoTest (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+              }
+            );
+          };
 
           devShells.default = pkgs.mkShellNoCC {
             inputsFrom = [ config.pre-commit.devShell ];
 
-            packages = with pkgs; [ skills ];
+            packages = with pkgs; [
+              linkerPackages
+              rustToolchain
+              sccache
+              skills
+            ];
+
+            shellHook = ''
+              export CARGO_INCREMENTAL=0
+              export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
+              ${linkerEnv}
+            '';
           };
 
           packages = { };
