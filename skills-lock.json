@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "mutation-test-loop": {
+      "source": "mokmok-dev/mutator",
+      "sourceType": "github",
+      "skillPath": "skills/mutation-test-loop/SKILL.md",
+      "computedHash": "19279790d5ca4e9c08b3f37bdf74ede79315d63f365c14d4856cb26179912f0c"
+    }
+  }
+}

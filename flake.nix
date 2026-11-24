@@ -10,6 +10,8 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
+    mutator.url = "github:mokmok-dev/mutator";
+    mutator.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -20,12 +22,14 @@
       treefmt-nix,
       rust-overlay,
       crane,
+      mutator,
       ...
     }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         git-hooks.flakeModule
         treefmt-nix.flakeModule
+        mutator.flakeModules.default
       ];
 
       perSystem =
@@ -82,6 +86,7 @@
                 inherit cargoArtifacts;
               }
             );
+            mutator = config.packages.mutator;
             test = craneLib.cargoTest (
               commonArgs
               // {
@@ -94,7 +99,9 @@
             inputsFrom = [ config.pre-commit.devShell ];
 
             packages = with pkgs; [
+              cargo-mutants
               linkerPackages
+              mutator.packages.${system}.default
               rustToolchain
               sccache
               skills
@@ -105,6 +112,11 @@
               export RUSTC_WRAPPER="${pkgs.sccache}/bin/sccache"
               ${linkerEnv}
             '';
+          };
+
+          mutator = {
+            enable = true;
+            check = false;
           };
 
           packages = { };
