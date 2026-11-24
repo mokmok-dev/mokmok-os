@@ -96,6 +96,7 @@ pub const fn transition(phase: SessionPhase, event: SessionEvent) -> Option<Sess
 pub struct Session {
     phase: SessionPhase,
     ever_terminal: bool,
+    was_expired: bool,
 }
 
 impl Session {
@@ -105,10 +106,12 @@ impl Session {
         Self {
             phase: SessionPhase::Pending,
             ever_terminal: false,
+            was_expired: false,
         }
     }
 
-    /// Advances the session along [`transition`], recording that a terminal phase was reached.
+    /// Advances the session along [`transition`], recording every terminal or expired phase it
+    /// has reached.
     ///
     /// # Errors
     ///
@@ -120,6 +123,7 @@ impl Session {
         Some(Self {
             phase: next,
             ever_terminal: self.ever_terminal || next.is_terminal(),
+            was_expired: self.was_expired || next == SessionPhase::Expired,
         })
     }
 
@@ -133,5 +137,12 @@ impl Session {
     #[must_use]
     pub const fn ever_terminal(self) -> bool {
         self.ever_terminal
+    }
+
+    /// Whether the session has ever been in [`SessionPhase::Expired`], which is what a retry
+    /// returns to pending.
+    #[must_use]
+    pub const fn was_expired(self) -> bool {
+        self.was_expired
     }
 }

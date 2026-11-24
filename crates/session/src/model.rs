@@ -7,8 +7,8 @@ use crate::session::{Session, SessionEvent, SessionPhase};
 /// Exhaustive model of the session state space.
 ///
 /// The state is a [`Session`], the actions are the six [`SessionEvent`]s, and the successor
-/// relation is [`Session::apply`]. Because the state space is six states, the checker reports
-/// every reachable state, which is what the tests pin.
+/// relation is [`Session::apply`]. Because a session also remembers whether it was expired, the
+/// checker reaches eleven states, which is what the tests pin.
 pub struct SessionModel;
 
 impl Model for SessionModel {
@@ -46,7 +46,9 @@ impl Model for SessionModel {
             }),
             Property::sometimes(
                 "an expired session can return to pending",
-                |_: &Self, session: &Session| session.phase() == SessionPhase::Pending,
+                |_: &Self, session: &Session| {
+                    session.was_expired() && session.phase() == SessionPhase::Pending
+                },
             ),
         ]
     }

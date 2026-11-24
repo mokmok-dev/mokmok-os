@@ -33,6 +33,22 @@ fn advance(events: &[SessionEvent]) -> Result<Session, &'static str> {
         })
 }
 
+/// Walks `events` through [`transition`] alone, returning the phase it lands in and whether it
+/// ever entered `Expired`. Uses the table directly so the test checks the history flags without
+/// restating [`Session::apply`].
+fn expected_history(events: &[SessionEvent]) -> (SessionPhase, bool) {
+    let mut phase = SessionPhase::Pending;
+    let mut was_expired = false;
+    for event in events {
+        let Some(next) = transition(phase, *event) else {
+            break;
+        };
+        phase = next;
+        was_expired |= phase == SessionPhase::Expired;
+    }
+    (phase, was_expired)
+}
+
 #[test]
 fn transition_matches_the_table() {
     for (phase_index, phase) in SessionPhase::ALL.iter().enumerate() {
@@ -111,7 +127,11 @@ fn checker_explores_every_phase() {
     let states = checker.unique_state_count();
     println!("unique states: {states}");
     checker.assert_properties();
-    assert_eq!(states, 6, "every session phase is reachable exactly once");
+    assert_eq!(
+        states, 11,
+        "five phases are reachable with and without a prior expiry, plus Expired, which \
+         exists only after one"
+    );
     checker.assert_discovery(
         "an expired session can return to pending",
         vec![
@@ -122,22 +142,51 @@ fn checker_explores_every_phase() {
     );
 }
 
+/// A retry property that the initial `Pending` state satisfies is found on a zero-action path
+/// and proves nothing. Reject that state and assert the three-action path that remains.
+#[test]
+fn retry_property_needs_a_real_retry() {
+    let property = SessionModel.property("an expired session can return to pending");
+    assert!(
+        !(property.condition)(&SessionModel, &Session::pending()),
+        "the initial state satisfies the retry property, so its discovery proves nothing"
+    );
+
+    let checker = SessionModel.checker().spawn_bfs().join();
+    assert!(checker.is_done());
+    let discovery = checker
+        .discovery("an expired session can return to pending")
+        .map(Path::into_actions);
+    assert_eq!(
+        discovery,
+        Some(vec![
+            SessionEvent::Claim,
+            SessionEvent::Expire,
+            SessionEvent::Retry,
+        ])
+    );
+}
+
 proptest! {
     #[test]
-    fn terminal_flag_tracks_the_phase(
+    fn history_flags_track_the_events(
         events in proptest::collection::vec(
             proptest::sample::select(&SessionEvent::ALL[..]),
             0..8,
         ),
     ) {
         let mut session = Session::pending();
+        prop_assert!(!session.was_expired());
         prop_assert_eq!(session.phase().is_terminal(), session.ever_terminal());
-        for event in events {
-            let Some(next) = session.apply(event) else {
+        for event in &events {
+            let Some(next) = session.apply(*event) else {
                 break;
             };
             session = next;
             prop_assert_eq!(session.phase().is_terminal(), session.ever_terminal());
         }
+        let (phase, was_expired) = expected_history(&events);
+        prop_assert_eq!(session.phase(), phase);
+        prop_assert_eq!(session.was_expired(), was_expired);
     }
 }
