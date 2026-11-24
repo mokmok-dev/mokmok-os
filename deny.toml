@@ -1,0 +1,12 @@
+[licenses]
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+]
+unused-allowed-license = "allow"
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"
