@@ -10,6 +10,8 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     crane.url = "github:ipetkov/crane";
+    advisory-db.url = "github:rustsec/advisory-db";
+    advisory-db.flake = false;
     mutator.url = "github:mokmok-dev/mutator";
     mutator.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -22,6 +24,7 @@
       treefmt-nix,
       rust-overlay,
       crane,
+      advisory-db,
       mutator,
       ...
     }@inputs:
@@ -73,6 +76,12 @@
           apps = { };
 
           checks = {
+            audit = craneLib.cargoAudit (
+              commonArgs
+              // {
+                inherit advisory-db;
+              }
+            );
             clippy = craneLib.cargoClippy (
               commonArgs
               // {
@@ -80,6 +89,7 @@
                 cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
               }
             );
+            deny = craneLib.cargoDeny commonArgs;
             fmt = craneLib.cargoFmt (
               commonArgs
               // {
@@ -99,6 +109,8 @@
             inputsFrom = [ config.pre-commit.devShell ];
 
             packages = with pkgs; [
+              cargo-audit
+              cargo-deny
               cargo-mutants
               linkerPackages
               mutator.packages.${system}.default
