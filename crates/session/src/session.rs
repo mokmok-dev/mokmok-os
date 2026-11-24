@@ -1,5 +1,3 @@
-//! The session value, its phases, its events, and the table that links them.
-
 /// Where a session sits in its lifecycle.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionPhase {
@@ -18,7 +16,7 @@ pub enum SessionPhase {
 }
 
 impl SessionPhase {
-    /// Every phase, in table order.
+    /// Every phase.
     pub const ALL: [Self; 6] = [
         Self::Pending,
         Self::Claimed,
@@ -53,7 +51,7 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
-    /// Every event, in table order.
+    /// Every event.
     pub const ALL: [Self; 6] = [
         Self::Claim,
         Self::Start,
@@ -65,13 +63,6 @@ impl SessionEvent {
 }
 
 /// The single source of truth for which event may follow which phase.
-///
-/// Terminal phases have no outgoing edge.
-///
-/// # Errors
-///
-/// Returns `None` when the event has no edge out of `phase`, which includes every event
-/// on a terminal phase.
 #[must_use]
 pub const fn transition(phase: SessionPhase, event: SessionEvent) -> Option<SessionPhase> {
     use SessionEvent as E;
@@ -89,9 +80,8 @@ pub const fn transition(phase: SessionPhase, event: SessionEvent) -> Option<Sess
 
 /// A session as a caller stores it and as the model checker sees it.
 ///
-/// The fields are private on purpose. A session starts at [`Session::pending`] and only ever
-/// changes through [`Session::apply`], so no caller can build a finished session or revive one
-/// that has already finished.
+/// A session starts at [`Session::pending`] and only ever changes through [`Session::apply`],
+/// so no caller can build a finished session or revive one that has already finished.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Session {
     phase: SessionPhase,
@@ -110,13 +100,8 @@ impl Session {
         }
     }
 
-    /// Advances the session along [`transition`], recording every terminal or expired phase it
-    /// has reached.
-    ///
-    /// # Errors
-    ///
-    /// Returns `None` when no edge exists for `event` in the current phase, leaving the caller
-    /// with the session it already had.
+    /// Advances the session along [`transition`], returning `None` when no edge exists for
+    /// `event` in the current phase.
     #[must_use]
     pub fn apply(self, event: SessionEvent) -> Option<Self> {
         let next = transition(self.phase, event)?;
@@ -139,8 +124,7 @@ impl Session {
         self.ever_terminal
     }
 
-    /// Whether the session has ever been in [`SessionPhase::Expired`], which is what a retry
-    /// returns to pending.
+    /// Whether the session has ever been in [`SessionPhase::Expired`].
     #[must_use]
     pub const fn was_expired(self) -> bool {
         self.was_expired

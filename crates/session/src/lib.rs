@@ -2,7 +2,7 @@
 //!
 //! A session moves through [`SessionPhase`]s under [`SessionEvent`]s. [`transition`] is the one
 //! place that decides which move is legal, [`Session::apply`] is the only way to take one, and
-//! [`SessionModel`] hands the same table to stateright. Tests live in `tests/session.rs`.
+//! [`SessionModel`] hands the same table to stateright.
 
 mod model;
 mod session;

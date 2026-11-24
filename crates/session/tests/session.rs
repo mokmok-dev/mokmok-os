@@ -2,27 +2,22 @@ use proptest::prelude::*;
 use session::{Session, SessionEvent, SessionModel, SessionPhase, transition};
 use stateright::{Checker, Model, Path};
 
-/// The transition table written out independently of the implementation.
-const EXPECTED: [[Option<SessionPhase>; 6]; 6] = {
+/// The legal edges, written out independently of `transition`.
+const LEGAL: [(SessionPhase, SessionEvent, SessionPhase); 7] = {
+    use SessionEvent as E;
     use SessionPhase as P;
     [
-        [Some(P::Claimed), None, None, None, None, None],
-        [None, Some(P::Running), Some(P::Expired), None, None, None],
-        [
-            None,
-            None,
-            Some(P::Expired),
-            None,
-            Some(P::Succeed),
-            Some(P::Failed),
-        ],
-        [None, None, None, Some(P::Pending), None, None],
-        [None, None, None, None, None, None],
-        [None, None, None, None, None, None],
+        (P::Pending, E::Claim, P::Claimed),
+        (P::Claimed, E::Start, P::Running),
+        (P::Claimed, E::Expire, P::Expired),
+        (P::Running, E::Expire, P::Expired),
+        (P::Expired, E::Retry, P::Pending),
+        (P::Running, E::Succeed, P::Succeed),
+        (P::Running, E::Fail, P::Failed),
     ]
 };
 
-/// Folds `events` onto a fresh session, stopping at the first event with no edge.
+/// Folds `events` onto a fresh session, returning an error at the first event with no edge.
 fn advance(events: &[SessionEvent]) -> Result<Session, &'static str> {
     events
         .iter()
@@ -34,8 +29,7 @@ fn advance(events: &[SessionEvent]) -> Result<Session, &'static str> {
 }
 
 /// Walks `events` through [`transition`] alone, returning the phase it lands in and whether it
-/// ever entered `Expired`. Uses the table directly so the test checks the history flags without
-/// restating [`Session::apply`].
+/// ever entered `Expired`.
 fn expected_history(events: &[SessionEvent]) -> (SessionPhase, bool) {
     let mut phase = SessionPhase::Pending;
     let mut was_expired = false;
@@ -51,13 +45,13 @@ fn expected_history(events: &[SessionEvent]) -> (SessionPhase, bool) {
 
 #[test]
 fn transition_matches_the_table() {
-    for (phase_index, phase) in SessionPhase::ALL.iter().enumerate() {
-        for (event_index, event) in SessionEvent::ALL.iter().enumerate() {
-            assert_eq!(
-                transition(*phase, *event),
-                EXPECTED[phase_index][event_index],
-                "{phase:?} + {event:?}"
-            );
+    for phase in SessionPhase::ALL {
+        for event in SessionEvent::ALL {
+            let expected = LEGAL
+                .iter()
+                .find(|(from, on, _)| *from == phase && *on == event)
+                .map(|(_, _, next)| *next);
+            assert_eq!(transition(phase, event), expected, "{phase:?} + {event:?}");
         }
     }
 }
@@ -125,7 +119,6 @@ fn checker_explores_every_phase() {
     let checker = SessionModel.checker().spawn_bfs().join();
     assert!(checker.is_done());
     let states = checker.unique_state_count();
-    println!("unique states: {states}");
     checker.assert_properties();
     assert_eq!(
         states, 11,

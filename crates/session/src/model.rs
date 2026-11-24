@@ -1,14 +1,8 @@
-//! The stateright model whose state space is every session a caller can build.
-
 use stateright::{Model, Property};
 
 use crate::session::{Session, SessionEvent, SessionPhase};
 
 /// Exhaustive model of the session state space.
-///
-/// The state is a [`Session`], the actions are the six [`SessionEvent`]s, and the successor
-/// relation is [`Session::apply`]. Because a session also remembers whether it was expired, the
-/// checker reaches eleven states, which is what the tests pin.
 pub struct SessionModel;
 
 impl Model for SessionModel {
